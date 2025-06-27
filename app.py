@@ -108,7 +108,7 @@ if st.button("Run Analysis"):
             fig.add_trace(go.Scatter(x=data.index, y=data['bb_upper'], name="BB Upper", line=dict(dash='dot')))
             fig.add_trace(go.Scatter(x=data.index, y=data['bb_lower'], name="BB Lower", line=dict(dash='dot')))
             fig.update_layout(title=f"{ticker} Price Chart")
-            st.plotly_chart(fig)
+            st.plotly_chart(fig, use_container_width=True)
 
         except Exception as e:
             st.warning(f"{ticker}: {e}")
