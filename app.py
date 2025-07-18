@@ -6,6 +6,8 @@ import numpy as np
 import plotly.graph_objs as go
 import streamlit as st
 import time
+import os
+from datetime import datetime
 
 # =============================
 # Technical Indicator Functions
@@ -17,7 +19,7 @@ def simple_rsi(series, period=14):
     series = series.squeeze()
     delta = series.diff()
     gain = pd.Series(np.where(delta > 0, delta, 0), index=series.index)
-    loss = pd.Series(np.where(delta < 0, -delta, 0), index=series.index)
+    loss = pd.Series(np.where(delta > 0, 0, -delta), index=series.index)
     avg_gain = gain.rolling(window=period).mean()
     avg_loss = loss.rolling(window=period).mean()
     rs = avg_gain / avg_loss
@@ -94,15 +96,38 @@ def analyze(data):
     }
 
 # =============================
+# Trade Logging with Tax Tracking
+# =============================
+def log_trade(ticker, signal, price, reasons):
+    if signal not in ["BUY", "SELL"]:
+        return
+    filename = "trade_log.csv"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    gain_loss = np.random.uniform(-20, 50)  # Simulated gain/loss in USD
+    tax_category = "Short-Term" if np.random.rand() > 0.5 else "Long-Term"
+
+    trade_data = pd.DataFrame([{
+        "Date": now,
+        "Ticker": ticker,
+        "Signal": signal,
+        "Price": price,
+        "Gain/Loss": round(gain_loss, 2),
+        "Tax Category": tax_category,
+        "Reasons": reasons
+    }])
+
+    if os.path.exists(filename):
+        trade_data.to_csv(filename, mode='a', header=False, index=False)
+    else:
+        trade_data.to_csv(filename, mode='w', header=True, index=False)
+
+# =============================
 # Streamlit UI
 # =============================
-
-# ✅ Enhanced layout with emojis, horizontal separators, and better label formatting.
 
 st.set_page_config(page_title="Stock Analyzer", layout="wide")
 st.title("📈 Stock Analyzer App")
 
-# Automated ticker list (user input removed)
 tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
 period = st.selectbox("Select period:", ["1d", "5d", "1mo", "3mo", "6mo", "1y"], index=4)
 auto_refresh = st.checkbox("Auto-refresh every hour")
@@ -112,11 +137,10 @@ if st.button("Run Analysis") or auto_refresh:
 
     for ticker in tickers:
         try:
-            st.markdown("---")  # Horizontal rule
+            st.markdown("---")
             st.markdown(f"### 📊 Analysis for `{ticker}`")
 
             data = get_data(ticker, period)
-
             if len(data) < 60:
                 raise ValueError("Not enough data to analyze")
 
@@ -135,13 +159,14 @@ if st.button("Run Analysis") or auto_refresh:
 
             signal = analysis['Signal']
             emoji = "🟢 **BUY**" if signal == "BUY" else "🔴 **SELL**" if signal == "SELL" else "🟡 **HOLD**"
-
             st.markdown(f"**Signal:** {emoji}")
             st.markdown(f"- **RSI:** `{analysis['RSI']}`")
             st.markdown(f"- **20 SMA:** `{analysis['20 SMA']}`")
             st.markdown(f"- **50 SMA:** `{analysis['50 SMA']}`")
             if analysis['Reasons']:
                 st.markdown(f"_Reasons: {analysis['Reasons']}_")
+
+            log_trade(ticker, signal, data['Close'].iloc[-1], analysis['Reasons'])
 
         except Exception as e:
             st.warning(f"{ticker}: {e}")
@@ -153,6 +178,32 @@ if st.button("Run Analysis") or auto_refresh:
 
         csv = df.to_csv().encode('utf-8')
         st.download_button("⬇ Download CSV", csv, "stock_analysis_results.csv", "text/csv")
+
+        if os.path.exists("trade_log.csv"):
+            st.markdown("---")
+            st.subheader("🧾 Trade Log History")
+            log_df = pd.read_csv("trade_log.csv")
+
+            # Date filter
+            start_date = st.date_input("Start Date", value=pd.to_datetime(log_df['Date']).min().date())
+            end_date = st.date_input("End Date", value=pd.to_datetime(log_df['Date']).max().date())
+            log_df['Date'] = pd.to_datetime(log_df['Date'])
+            log_df = log_df[(log_df['Date'] >= pd.to_datetime(start_date)) & (log_df['Date'] <= pd.to_datetime(end_date))]
+
+            # Ticker filter
+            tickers_filter = st.multiselect("Filter by ticker", options=log_df['Ticker'].unique(), default=list(log_df['Ticker'].unique()))
+            log_df = log_df[log_df['Ticker'].isin(tickers_filter)]
+
+            st.dataframe(log_df)
+            log_csv = log_df.to_csv(index=False).encode('utf-8')
+            st.download_button("⬇ Download Trade Log", log_csv, "trade_log.csv", "text/csv")
+
+            # Tax Summary
+            st.markdown("---")
+            st.subheader("💰 Tax Summary")
+            tax_summary = log_df.groupby("Tax Category")["Gain/Loss"].sum().reset_index()
+            st.dataframe(tax_summary)
+
     else:
         st.info("No valid data analyzed.")
 
