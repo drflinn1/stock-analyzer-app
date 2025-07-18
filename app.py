@@ -49,7 +49,7 @@ def get_data(ticker, period):
     return data.dropna()
 
 def analyze(data):
-    if len(data) < 2:
+    if len(data) < 60:
         raise ValueError("Not enough data to analyze")
 
     latest = data.iloc[-1]
@@ -104,7 +104,7 @@ st.title("📈 Stock Analyzer App")
 
 # Automated ticker list (user input removed)
 tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
-period = st.selectbox("Select period:", ["1d", "5d", "1mo", "3mo", "6mo", "1y"], index=2)
+period = st.selectbox("Select period:", ["1d", "5d", "1mo", "3mo", "6mo", "1y"], index=4)
 auto_refresh = st.checkbox("Auto-refresh every hour")
 
 if st.button("Run Analysis") or auto_refresh:
@@ -116,6 +116,10 @@ if st.button("Run Analysis") or auto_refresh:
             st.markdown(f"### 📊 Analysis for `{ticker}`")
 
             data = get_data(ticker, period)
+
+            if len(data) < 60:
+                raise ValueError("Not enough data to analyze")
+
             analysis = analyze(data)
             analysis["Ticker"] = ticker
             results.append(analysis)
