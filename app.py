@@ -203,6 +203,8 @@ if st.button("Run Analysis") or auto_refresh:
             st.subheader("💰 Tax Summary")
             tax_summary = log_df.groupby("Tax Category")["Gain/Loss"].sum().reset_index()
             st.dataframe(tax_summary)
+            tax_csv = tax_summary.to_csv(index=False).encode('utf-8')
+            st.download_button("⬇ Download Tax Summary", tax_csv, "tax_summary.csv", "text/csv")
 
     else:
         st.info("No valid data analyzed.")
