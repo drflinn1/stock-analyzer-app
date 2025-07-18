@@ -11,9 +11,10 @@ import time
 # Technical Indicator Functions
 # =============================
 def simple_sma(series, window):
-    return series.rolling(window=window).mean()
+    return series.squeeze().rolling(window=window).mean()
 
 def simple_rsi(series, period=14):
+    series = series.squeeze()
     delta = series.diff()
     gain = pd.Series(np.where(delta > 0, delta, 0), index=series.index)
     loss = pd.Series(np.where(delta < 0, -delta, 0), index=series.index)
@@ -24,6 +25,7 @@ def simple_rsi(series, period=14):
     return pd.Series(rsi, index=series.index)
 
 def bollinger_bands(series, window=20, num_std=2):
+    series = series.squeeze()
     sma = simple_sma(series, window)
     rolling_std = series.rolling(window=window).std()
     upper_band = sma + num_std * rolling_std
@@ -94,6 +96,9 @@ def analyze(data):
 # =============================
 # Streamlit UI
 # =============================
+
+# ✅ Enhanced layout with emojis, horizontal separators, and better label formatting.
+
 st.set_page_config(page_title="Stock Analyzer", layout="wide")
 st.title("📈 Stock Analyzer App")
 
