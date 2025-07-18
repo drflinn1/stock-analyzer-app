@@ -5,13 +5,15 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objs as go
 import streamlit as st
+import time
 
-# Technical indicator functions
+# =============================
+# Technical Indicator Functions
+# =============================
 def simple_sma(series, window):
     return series.rolling(window=window).mean()
 
 def simple_rsi(series, period=14):
-    series = series.squeeze()
     delta = series.diff()
     gain = pd.Series(np.where(delta > 0, delta, 0), index=series.index)
     loss = pd.Series(np.where(delta < 0, -delta, 0), index=series.index)
@@ -28,8 +30,14 @@ def bollinger_bands(series, window=20, num_std=2):
     lower_band = sma - num_std * rolling_std
     return sma, upper_band, lower_band
 
+# =============================
+# Data and Analysis Functions
+# =============================
 def get_data(ticker, period):
     data = yf.download(ticker, period=period, auto_adjust=False)
+    if data.empty:
+        raise ValueError("No data fetched for ticker.")
+
     data['sma_20'] = simple_sma(data['Close'], window=20)
     data['sma_50'] = simple_sma(data['Close'], window=50)
     data['rsi'] = simple_rsi(data['Close'])
@@ -83,42 +91,61 @@ def analyze(data):
         "Reasons": "; ".join(reasons)
     }
 
+# =============================
 # Streamlit UI
+# =============================
+st.set_page_config(page_title="Stock Analyzer", layout="wide")
 st.title("📈 Stock Analyzer App")
 
-symbols = st.text_input("Enter stock tickers (comma-separated):", "AAPL, MSFT, GOOGL, AMZN, TSLA")
-period = st.selectbox("Select period:", ["1mo", "3mo", "6mo", "1y"], index=2)
+# Automated ticker list (user input removed)
+tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
+period = st.selectbox("Select period:", ["1d", "5d", "1mo", "3mo", "6mo", "1y"], index=2)
+auto_refresh = st.checkbox("Auto-refresh every hour")
 
-if st.button("Run Analysis"):
-    tickers = [ticker.strip().upper() for ticker in symbols.split(",") if ticker.strip()]
+if st.button("Run Analysis") or auto_refresh:
     results = []
 
     for ticker in tickers:
         try:
+            st.markdown("---")  # Horizontal rule
+            st.markdown(f"### 📊 Analysis for `{ticker}`")
+
             data = get_data(ticker, period)
             analysis = analyze(data)
             analysis["Ticker"] = ticker
             results.append(analysis)
 
-            # Plot
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=data.index, y=data['Close'], name="Close"))
-            fig.add_trace(go.Scatter(x=data.index, y=data['sma_20'], name="20 SMA"))
-            fig.add_trace(go.Scatter(x=data.index, y=data['sma_50'], name="50 SMA"))
+            fig.add_trace(go.Scatter(x=data.index, y=data['sma_20'], name="20 SMA", line=dict(color='blue')))
+            fig.add_trace(go.Scatter(x=data.index, y=data['sma_50'], name="50 SMA", line=dict(color='orange')))
             fig.add_trace(go.Scatter(x=data.index, y=data['bb_upper'], name="BB Upper", line=dict(dash='dot')))
             fig.add_trace(go.Scatter(x=data.index, y=data['bb_lower'], name="BB Lower", line=dict(dash='dot')))
-            fig.update_layout(title=f"{ticker} Price Chart")
+            fig.update_layout(title=f"{ticker} Price Chart", margin=dict(l=20, r=20, t=40, b=20))
             st.plotly_chart(fig, use_container_width=True)
+
+            signal = analysis['Signal']
+            emoji = "🟢 **BUY**" if signal == "BUY" else "🔴 **SELL**" if signal == "SELL" else "🟡 **HOLD**"
+
+            st.markdown(f"**Signal:** {emoji}")
+            st.markdown(f"- **RSI:** `{analysis['RSI']}`")
+            st.markdown(f"- **20 SMA:** `{analysis['20 SMA']}`")
+            st.markdown(f"- **50 SMA:** `{analysis['50 SMA']}`")
+            if analysis['Reasons']:
+                st.markdown(f"_Reasons: {analysis['Reasons']}_")
 
         except Exception as e:
             st.warning(f"{ticker}: {e}")
 
     if results:
         df = pd.DataFrame(results).set_index("Ticker")
-        st.subheader("📊 Analysis Summary")
+        st.subheader("📋 Summary Table")
         st.dataframe(df)
 
         csv = df.to_csv().encode('utf-8')
-        st.download_button("Download CSV", csv, "stock_analysis_results.csv", "text/csv")
+        st.download_button("⬇ Download CSV", csv, "stock_analysis_results.csv", "text/csv")
     else:
         st.info("No valid data analyzed.")
+
+    if auto_refresh:
+        st.experimental_rerun()
