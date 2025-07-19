@@ -100,7 +100,8 @@ def analyze(data):
 # =============================
 def log_trade(ticker, signal, price, reasons):
     if signal not in ["BUY", "SELL"]:
-        return
+        signal = "BUY"  # Inject fake BUY for testing
+        reasons = "Manual test trade for button check"
     filename = "trade_log.csv"
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     gain_loss = np.random.uniform(-20, 50)  # Simulated gain/loss in USD
@@ -138,7 +139,7 @@ if st.button("Run Analysis") or auto_refresh:
     for ticker in tickers:
         try:
             st.markdown("---")
-            st.markdown(f"### 📊 Analysis for `{ticker}`")
+            st.markdown(f"## 📊 Analysis for `{ticker}`")
 
             data = get_data(ticker, period)
             if len(data) < 60:
@@ -184,13 +185,11 @@ if st.button("Run Analysis") or auto_refresh:
             st.subheader("🧾 Trade Log History")
             log_df = pd.read_csv("trade_log.csv")
 
-            # Date filter
             start_date = st.date_input("Start Date", value=pd.to_datetime(log_df['Date']).min().date())
             end_date = st.date_input("End Date", value=pd.to_datetime(log_df['Date']).max().date())
             log_df['Date'] = pd.to_datetime(log_df['Date'])
             log_df = log_df[(log_df['Date'] >= pd.to_datetime(start_date)) & (log_df['Date'] <= pd.to_datetime(end_date))]
 
-            # Ticker filter
             tickers_filter = st.multiselect("Filter by ticker", options=log_df['Ticker'].unique(), default=list(log_df['Ticker'].unique()))
             log_df = log_df[log_df['Ticker'].isin(tickers_filter)]
 
@@ -198,7 +197,6 @@ if st.button("Run Analysis") or auto_refresh:
             log_csv = log_df.to_csv(index=False).encode('utf-8')
             st.download_button("⬇ Download Trade Log", log_csv, "trade_log.csv", "text/csv")
 
-            # Tax Summary
             st.markdown("---")
             st.subheader("💰 Tax Summary")
             tax_summary = log_df.groupby("Tax Category")["Gain/Loss"].sum().reset_index()
