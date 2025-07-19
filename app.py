@@ -133,6 +133,9 @@ tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
 period = st.selectbox("Select period:", ["1d", "5d", "1mo", "3mo", "6mo", "1y"], index=4)
 auto_refresh = st.checkbox("Auto-refresh every hour")
 
+if "results" not in st.session_state:
+    st.session_state.results = []
+
 if st.button("Run Analysis") or auto_refresh:
     results = []
 
@@ -172,40 +175,42 @@ if st.button("Run Analysis") or auto_refresh:
         except Exception as e:
             st.warning(f"{ticker}: {e}")
 
-    if results:
-        df = pd.DataFrame(results).set_index("Ticker")
-        st.subheader("📋 Summary Table")
-        st.dataframe(df)
+    st.session_state.results = results
 
-        csv = df.to_csv().encode('utf-8')
-        st.download_button("⬇ Download CSV", csv, "stock_analysis_results.csv", "text/csv")
+if st.session_state.results:
+    df = pd.DataFrame(st.session_state.results).set_index("Ticker")
+    st.subheader("📋 Summary Table")
+    st.dataframe(df)
 
-        if os.path.exists("trade_log.csv"):
-            st.markdown("---")
-            st.subheader("🧾 Trade Log History")
-            log_df = pd.read_csv("trade_log.csv")
+    csv = df.to_csv().encode('utf-8')
+    st.download_button("⬇ Download CSV", csv, "stock_analysis_results.csv", "text/csv")
 
-            start_date = st.date_input("Start Date", value=pd.to_datetime(log_df['Date']).min().date())
-            end_date = st.date_input("End Date", value=pd.to_datetime(log_df['Date']).max().date())
-            log_df['Date'] = pd.to_datetime(log_df['Date'])
-            log_df = log_df[(log_df['Date'] >= pd.to_datetime(start_date)) & (log_df['Date'] <= pd.to_datetime(end_date))]
+    if os.path.exists("trade_log.csv"):
+        st.markdown("---")
+        st.subheader("🧾 Trade Log History")
+        log_df = pd.read_csv("trade_log.csv")
 
-            tickers_filter = st.multiselect("Filter by ticker", options=log_df['Ticker'].unique(), default=list(log_df['Ticker'].unique()))
-            log_df = log_df[log_df['Ticker'].isin(tickers_filter)]
+        start_date = st.date_input("Start Date", value=pd.to_datetime(log_df['Date']).min().date())
+        end_date = st.date_input("End Date", value=pd.to_datetime(log_df['Date']).max().date())
+        log_df['Date'] = pd.to_datetime(log_df['Date'])
+        log_df = log_df[(log_df['Date'] >= pd.to_datetime(start_date)) & (log_df['Date'] <= pd.to_datetime(end_date))]
 
-            st.dataframe(log_df)
-            log_csv = log_df.to_csv(index=False).encode('utf-8')
-            st.download_button("⬇ Download Trade Log", log_csv, "trade_log.csv", "text/csv")
+        tickers_filter = st.multiselect("Filter by ticker", options=log_df['Ticker'].unique(), default=list(log_df['Ticker'].unique()))
+        log_df = log_df[log_df['Ticker'].isin(tickers_filter)]
 
-            st.markdown("---")
-            st.subheader("💰 Tax Summary")
-            tax_summary = log_df.groupby("Tax Category")["Gain/Loss"].sum().reset_index()
-            st.dataframe(tax_summary)
-            tax_csv = tax_summary.to_csv(index=False).encode('utf-8')
-            st.download_button("⬇ Download Tax Summary", tax_csv, "tax_summary.csv", "text/csv")
+        st.dataframe(log_df)
+        log_csv = log_df.to_csv(index=False).encode('utf-8')
+        st.download_button("⬇ Download Trade Log", log_csv, "trade_log.csv", "text/csv")
 
-    else:
-        st.info("No valid data analyzed.")
+        st.markdown("---")
+        st.subheader("💰 Tax Summary")
+        tax_summary = log_df.groupby("Tax Category")["Gain/Loss"].sum().reset_index()
+        st.dataframe(tax_summary)
+        tax_csv = tax_summary.to_csv(index=False).encode('utf-8')
+        st.download_button("⬇ Download Tax Summary", tax_csv, "tax_summary.csv", "text/csv")
 
-    if auto_refresh:
-        st.experimental_rerun()
+else:
+    st.info("No valid data analyzed.")
+
+if auto_refresh:
+    st.experimental_rerun()
