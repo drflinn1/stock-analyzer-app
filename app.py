@@ -132,18 +132,19 @@ st.title("📈 Stock Analyzer App")
 tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
 period = st.selectbox("Select period:", ["1d", "5d", "1mo", "3mo", "6mo", "1y"], index=4)
 auto_refresh = st.checkbox("Auto-refresh every hour")
-
 if "results" not in st.session_state:
     st.session_state.results = []
 
+# Store full analysis data too (charts)
+if "full_results" not in st.session_state:
+    st.session_state.full_results = {}
+
 if st.button("Run Analysis") or auto_refresh:
     results = []
+    full_results = {}
 
     for ticker in tickers:
         try:
-            st.markdown("---")
-            st.markdown(f"## 📊 Analysis for `{ticker}`")
-
             data = get_data(ticker, period)
             if len(data) < 60:
                 raise ValueError("Not enough data to analyze")
@@ -151,7 +152,24 @@ if st.button("Run Analysis") or auto_refresh:
             analysis = analyze(data)
             analysis["Ticker"] = ticker
             results.append(analysis)
+            full_results[ticker] = data
+            log_trade(ticker, analysis['Signal'], data['Close'].iloc[-1], analysis['Reasons'])
 
+        except Exception as e:
+            st.warning(f"{ticker}: {e}")
+
+    st.session_state.results = results
+    st.session_state.full_results = full_results
+
+# REDRAW even after download
+if st.session_state.results:
+    for analysis in st.session_state.results:
+        ticker = analysis["Ticker"]
+        st.markdown("---")
+        st.markdown(f"## 📊 Analysis for `{ticker}`")
+
+        if ticker in st.session_state.full_results:
+            data = st.session_state.full_results[ticker]
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=data.index, y=data['Close'], name="Close"))
             fig.add_trace(go.Scatter(x=data.index, y=data['sma_20'], name="20 SMA", line=dict(color='blue')))
@@ -161,27 +179,18 @@ if st.button("Run Analysis") or auto_refresh:
             fig.update_layout(title=f"{ticker} Price Chart", margin=dict(l=20, r=20, t=40, b=20))
             st.plotly_chart(fig, use_container_width=True)
 
-            signal = analysis['Signal']
-            emoji = "🟢 **BUY**" if signal == "BUY" else "🔴 **SELL**" if signal == "SELL" else "🟡 **HOLD**"
-            st.markdown(f"**Signal:** {emoji}")
-            st.markdown(f"- **RSI:** `{analysis['RSI']}`")
-            st.markdown(f"- **20 SMA:** `{analysis['20 SMA']}`")
-            st.markdown(f"- **50 SMA:** `{analysis['50 SMA']}`")
-            if analysis['Reasons']:
-                st.markdown(f"_Reasons: {analysis['Reasons']}_")
+        signal = analysis['Signal']
+        emoji = "🟢 **BUY**" if signal == "BUY" else "🔴 **SELL**" if signal == "SELL" else "🟡 **HOLD**"
+        st.markdown(f"**Signal:** {emoji}")
+        st.markdown(f"- **RSI:** `{analysis['RSI']}`")
+        st.markdown(f"- **20 SMA:** `{analysis['20 SMA']}`")
+        st.markdown(f"- **50 SMA:** `{analysis['50 SMA']}`")
+        if analysis['Reasons']:
+            st.markdown(f"_Reasons: {analysis['Reasons']}_")
 
-            log_trade(ticker, signal, data['Close'].iloc[-1], analysis['Reasons'])
-
-        except Exception as e:
-            st.warning(f"{ticker}: {e}")
-
-    st.session_state.results = results
-
-if st.session_state.results:
     df = pd.DataFrame(st.session_state.results).set_index("Ticker")
     st.subheader("📋 Summary Table")
     st.dataframe(df)
-
     csv = df.to_csv().encode('utf-8')
     st.download_button("⬇ Download CSV", csv, "stock_analysis_results.csv", "text/csv")
 
