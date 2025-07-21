@@ -63,7 +63,7 @@ def get_data(ticker, period, retries=3, delay=2):
 
 def analyze(data):
     if len(data) < 60:
-        raise ValueError("Not enough data to analyze")
+        return None  # Not enough data to analyze
 
     latest = data.iloc[-1]
     prev = data.iloc[-2]
@@ -151,6 +151,9 @@ if st.button("▶ Run Analysis"):
         try:
             data = get_data(ticker, period)
             summary = analyze(data)
+            if summary is None:
+                st.warning(f"{ticker}: Skipped — not enough data to analyze.")
+                continue
             log_trade(ticker, summary["Signal"], float(data['Close'].iloc[-1]), summary["Reasons"])
             results[ticker] = summary
 
