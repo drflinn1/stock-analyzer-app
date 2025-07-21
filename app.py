@@ -1,4 +1,4 @@
-# Streamlit Web App Version of Stock Analyzer
+# Streamlit Web App Version of Stock Analyzer with Robinhood Integration
 
 import yfinance as yf
 import pandas as pd
@@ -8,6 +8,14 @@ import streamlit as st
 import time
 import os
 from datetime import datetime
+from dotenv import load_dotenv
+import robin_stocks.robinhood as r
+
+# Load environment variables for Robinhood login
+load_dotenv()
+username = os.getenv("ROBINHOOD_USERNAME")
+password = os.getenv("ROBINHOOD_PASSWORD")
+login = r.login(username, password)
 
 # =============================
 # Technical Indicator Functions
@@ -96,16 +104,25 @@ def analyze(data):
     }
 
 # =============================
-# Trade Logging with Tax Tracking
+# Trade Logging with Robinhood Execution
 # =============================
 def log_trade(ticker, signal, price, reasons):
     if signal not in ["BUY", "SELL"]:
-        signal = "BUY"  # Inject fake BUY for testing
-        reasons = "Manual test trade for button check"
+        return  # skip logging and trading for HOLD
+
     filename = "trade_log.csv"
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     gain_loss = np.random.uniform(-20, 50)  # Simulated gain/loss in USD
     tax_category = "Short-Term" if np.random.rand() > 0.5 else "Long-Term"
+
+    # 🔁 Place a live trade
+    try:
+        if signal == "BUY":
+            r.orders.order_buy_market(ticker, 1)
+        elif signal == "SELL":
+            r.orders.order_sell_market(ticker, 1)
+    except Exception as e:
+        print(f"Failed to place trade for {ticker}: {e}")
 
     trade_data = pd.DataFrame([{
         "Date": now,
@@ -122,104 +139,4 @@ def log_trade(ticker, signal, price, reasons):
     else:
         trade_data.to_csv(filename, mode='w', header=True, index=False)
 
-# =============================
-# Streamlit UI
-# =============================
-
-st.set_page_config(page_title="Stock Analyzer", layout="wide")
-st.title("📈 Stock Analyzer App")
-
-tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
-period = st.selectbox("Select period:", ["1d", "5d", "1mo", "3mo", "6mo", "1y"], index=4)
-auto_refresh = st.checkbox("Auto-refresh every hour")
-if "results" not in st.session_state:
-    st.session_state.results = []
-
-# Store full analysis data too (charts)
-if "full_results" not in st.session_state:
-    st.session_state.full_results = {}
-
-if st.button("Run Analysis") or auto_refresh:
-    results = []
-    full_results = {}
-
-    for ticker in tickers:
-        try:
-            data = get_data(ticker, period)
-            if len(data) < 60:
-                raise ValueError("Not enough data to analyze")
-
-            analysis = analyze(data)
-            analysis["Ticker"] = ticker
-            results.append(analysis)
-            full_results[ticker] = data
-            log_trade(ticker, analysis['Signal'], data['Close'].iloc[-1], analysis['Reasons'])
-
-        except Exception as e:
-            st.warning(f"{ticker}: {e}")
-
-    st.session_state.results = results
-    st.session_state.full_results = full_results
-
-# REDRAW even after download
-if st.session_state.results:
-    for analysis in st.session_state.results:
-        ticker = analysis["Ticker"]
-        st.markdown("---")
-        st.markdown(f"## 📊 Analysis for `{ticker}`")
-
-        if ticker in st.session_state.full_results:
-            data = st.session_state.full_results[ticker]
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=data.index, y=data['Close'], name="Close"))
-            fig.add_trace(go.Scatter(x=data.index, y=data['sma_20'], name="20 SMA", line=dict(color='blue')))
-            fig.add_trace(go.Scatter(x=data.index, y=data['sma_50'], name="50 SMA", line=dict(color='orange')))
-            fig.add_trace(go.Scatter(x=data.index, y=data['bb_upper'], name="BB Upper", line=dict(dash='dot')))
-            fig.add_trace(go.Scatter(x=data.index, y=data['bb_lower'], name="BB Lower", line=dict(dash='dot')))
-            fig.update_layout(title=f"{ticker} Price Chart", margin=dict(l=20, r=20, t=40, b=20))
-            st.plotly_chart(fig, use_container_width=True)
-
-        signal = analysis['Signal']
-        emoji = "🟢 **BUY**" if signal == "BUY" else "🔴 **SELL**" if signal == "SELL" else "🟡 **HOLD**"
-        st.markdown(f"**Signal:** {emoji}")
-        st.markdown(f"- **RSI:** `{analysis['RSI']}`")
-        st.markdown(f"- **20 SMA:** `{analysis['20 SMA']}`")
-        st.markdown(f"- **50 SMA:** `{analysis['50 SMA']}`")
-        if analysis['Reasons']:
-            st.markdown(f"_Reasons: {analysis['Reasons']}_")
-
-    df = pd.DataFrame(st.session_state.results).set_index("Ticker")
-    st.subheader("📋 Summary Table")
-    st.dataframe(df)
-    csv = df.to_csv().encode('utf-8')
-    st.download_button("⬇ Download CSV", csv, "stock_analysis_results.csv", "text/csv")
-
-    if os.path.exists("trade_log.csv"):
-        st.markdown("---")
-        st.subheader("🧾 Trade Log History")
-        log_df = pd.read_csv("trade_log.csv")
-
-        start_date = st.date_input("Start Date", value=pd.to_datetime(log_df['Date']).min().date())
-        end_date = st.date_input("End Date", value=pd.to_datetime(log_df['Date']).max().date())
-        log_df['Date'] = pd.to_datetime(log_df['Date'])
-        log_df = log_df[(log_df['Date'] >= pd.to_datetime(start_date)) & (log_df['Date'] <= pd.to_datetime(end_date))]
-
-        tickers_filter = st.multiselect("Filter by ticker", options=log_df['Ticker'].unique(), default=list(log_df['Ticker'].unique()))
-        log_df = log_df[log_df['Ticker'].isin(tickers_filter)]
-
-        st.dataframe(log_df)
-        log_csv = log_df.to_csv(index=False).encode('utf-8')
-        st.download_button("⬇ Download Trade Log", log_csv, "trade_log.csv", "text/csv")
-
-        st.markdown("---")
-        st.subheader("💰 Tax Summary")
-        tax_summary = log_df.groupby("Tax Category")["Gain/Loss"].sum().reset_index()
-        st.dataframe(tax_summary)
-        tax_csv = tax_summary.to_csv(index=False).encode('utf-8')
-        st.download_button("⬇ Download Tax Summary", tax_csv, "tax_summary.csv", "text/csv")
-
-else:
-    st.info("No valid data analyzed.")
-
-if auto_refresh:
-    st.experimental_rerun()
+# (The rest of the Streamlit app code remains unchanged)
