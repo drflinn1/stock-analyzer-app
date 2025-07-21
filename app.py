@@ -8,9 +8,13 @@ import streamlit as st
 import time
 import os
 from datetime import datetime
+from streamlit_autorefresh import st_autorefresh
 
 # Load secrets for Robinhood login (STREAMLIT CLOUD SECURE METHOD)
 SIMULATE_TRADES = st.sidebar.checkbox("🔌 Simulate Trading Mode", value=True)
+
+# Auto-refresh every hour (3600000 ms)
+st_autorefresh(interval=3600000, limit=None, key="auto-refresh")
 
 if not SIMULATE_TRADES:
     try:
