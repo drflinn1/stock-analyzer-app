@@ -5,3 +5,4 @@ numpy
 plotly
 python-dotenv
 robin_stocks
+streamlit-autorefresh
