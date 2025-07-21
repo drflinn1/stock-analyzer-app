@@ -8,17 +8,15 @@ import streamlit as st
 import time
 import os
 from datetime import datetime
-from dotenv import load_dotenv
 
-# Load environment variables for Robinhood login (DISABLED FOR STREAMLIT CLOUD)
+# Load secrets for Robinhood login (STREAMLIT CLOUD SECURE METHOD)
 SIMULATE_TRADES = st.sidebar.checkbox("🔌 Simulate Trading Mode", value=True)
 
 if not SIMULATE_TRADES:
     try:
         from robin_stocks import robinhood as r
-        load_dotenv()
-        username = os.getenv("ROBINHOOD_USERNAME")
-        password = os.getenv("ROBINHOOD_PASSWORD")
+        username = st.secrets["ROBINHOOD_USERNAME"]
+        password = st.secrets["ROBINHOOD_PASSWORD"]
         r.login(username, password)
         st.sidebar.success("✅ Connected to Robinhood!")
     except Exception as e:
@@ -130,8 +128,11 @@ def log_trade(ticker, signal, price, reasons):
         st.info(f"Simulated {signal} trade for {ticker} at ${price}")
     else:
         try:
-            r.orders.order_buy_market(ticker, 1) if signal == "BUY" else r.orders.order_sell_market(ticker, 1)
-            st.success(f"Live {signal} trade for {ticker} placed at ${price}!")
+            if signal == "BUY":
+                r.orders.order_buy_fractional_by_price(ticker, 1.00, timeInForce='gfd')
+            else:
+                r.orders.order_sell_fractional_by_price(ticker, 1.00, timeInForce='gfd')
+            st.success(f"Live {signal} trade for {ticker} placed at $1.00!")
         except Exception as e:
             st.error(f"Live trade failed: {e}")
             return
