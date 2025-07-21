@@ -1,4 +1,4 @@
- # Streamlit Web App Version of Stock Analyzer with Robinhood Integration
+# Streamlit Web App Version of Stock Analyzer with Robinhood Integration
 
 import yfinance as yf
 import pandas as pd
@@ -44,9 +44,13 @@ def bollinger_bands(series, window=20, num_std=2):
 # =============================
 # Data and Analysis Functions
 # =============================
-def get_data(ticker, period):
-    data = yf.download(ticker, period=period, auto_adjust=False)
-    if data.empty:
+def get_data(ticker, period, retries=3, delay=2):
+    for attempt in range(retries):
+        data = yf.download(ticker, period=period, auto_adjust=False)
+        if not data.empty:
+            break
+        time.sleep(delay)
+    else:
         raise ValueError("No data fetched for ticker.")
 
     data['sma_20'] = simple_sma(data['Close'], window=20)
