@@ -108,14 +108,13 @@ def analyze(data):
 # =============================
 def log_trade(ticker, signal, price, reasons):
     if signal not in ["BUY", "SELL"]:
-        return  # skip logging and trading for HOLD
+        return
 
     filename = "trade_log.csv"
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    gain_loss = np.random.uniform(-20, 50)  # Simulated gain/loss in USD
+    gain_loss = np.random.uniform(-20, 50)
     tax_category = "Short-Term" if np.random.rand() > 0.5 else "Long-Term"
 
-    # 🔁 Place a live trade
     try:
         if signal == "BUY":
             r.orders.order_buy_market(ticker, 1)
@@ -139,4 +138,52 @@ def log_trade(ticker, signal, price, reasons):
     else:
         trade_data.to_csv(filename, mode='w', header=True, index=False)
 
-# (The rest of the Streamlit app code remains unchanged)
+# =============================
+# Streamlit UI Starts Here
+# =============================
+st.set_page_config(page_title="Stock Analyzer Bot", layout="wide")
+st.title("📊 Stock Analyzer Bot (Live Trading + Tax Logs)")
+
+tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
+period = "3mo"
+
+if st.button("▶ Run Analysis"):
+    results = {}
+    for ticker in tickers:
+        try:
+            data = get_data(ticker, period)
+            summary = analyze(data)
+            log_trade(ticker, summary["Signal"], float(data['Close'].iloc[-1]), summary["Reasons"])
+            results[ticker] = summary
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=data.index, y=data['Close'], mode='lines', name='Close'))
+            fig.add_trace(go.Scatter(x=data.index, y=data['sma_20'], mode='lines', name='20 SMA', line=dict(color='blue')))
+            fig.add_trace(go.Scatter(x=data.index, y=data['sma_50'], mode='lines', name='50 SMA', line=dict(color='orange')))
+            fig.add_trace(go.Scatter(x=data.index, y=data['bb_upper'], mode='lines', name='BB Upper', line=dict(dash='dot')))
+            fig.add_trace(go.Scatter(x=data.index, y=data['bb_lower'], mode='lines', name='BB Lower', line=dict(dash='dot')))
+            st.plotly_chart(fig, use_container_width=True)
+
+            emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}
+            st.markdown(f"### {emoji.get(summary['Signal'], '❓')} {ticker} - {summary['Signal']}")
+            st.write(summary)
+            st.markdown("---")
+
+        except Exception as e:
+            st.error(f"Error analyzing {ticker}: {e}")
+
+    if results:
+        df = pd.DataFrame(results).T
+        df.to_csv("stock_analysis_results.csv")
+        st.download_button("⬇ Download CSV", df.to_csv().encode(), file_name="stock_analysis_results.csv", mime="text/csv")
+
+if os.path.exists("trade_log.csv"):
+    df_trades = pd.read_csv("trade_log.csv")
+    st.subheader("🧾 Trade Log")
+    st.dataframe(df_trades)
+    st.download_button("⬇ Download Trade Log", df_trades.to_csv(index=False).encode(), file_name="trade_log.csv", mime="text/csv")
+
+    tax_summary = df_trades.groupby("Tax Category")["Gain/Loss"].sum().reset_index()
+    st.subheader("💰 Tax Summary")
+    st.dataframe(tax_summary)
+    st.download_button("⬇ Download Tax Summary", tax_summary.to_csv(index=False).encode(), file_name="tax_summary.csv", mime="text/csv")
