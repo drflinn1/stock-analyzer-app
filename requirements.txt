@@ -3,3 +3,6 @@ yfinance
 pandas
 numpy
 plotly
+python-dotenv
+robin_stocks
+Add required packages for Robinhood trading and .env support
