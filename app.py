@@ -10,11 +10,20 @@ import os
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Load environment variables for Robinhood login (DISABLED FOR NOW)
-# load_dotenv()
-# username = os.getenv("ROBINHOOD_USERNAME")
-# password = os.getenv("ROBINHOOD_PASSWORD")
-# login = r.login(username, password)
+# Load environment variables for Robinhood login (DISABLED FOR STREAMLIT CLOUD)
+SIMULATE_TRADES = st.sidebar.checkbox("🔌 Simulate Trading Mode", value=True)
+
+if not SIMULATE_TRADES:
+    try:
+        from robin_stocks import robinhood as r
+        load_dotenv()
+        username = os.getenv("ROBINHOOD_USERNAME")
+        password = os.getenv("ROBINHOOD_PASSWORD")
+        r.login(username, password)
+        st.sidebar.success("✅ Connected to Robinhood!")
+    except Exception as e:
+        st.sidebar.error("❌ Failed to log in to Robinhood")
+        SIMULATE_TRADES = True
 
 # =============================
 # Technical Indicator Functions
@@ -63,7 +72,7 @@ def get_data(ticker, period, retries=3, delay=2):
 
 def analyze(data):
     if len(data) < 60:
-        return None  # Not enough data to analyze
+        return None
 
     latest = data.iloc[-1]
     prev = data.iloc[-2]
@@ -107,18 +116,25 @@ def analyze(data):
     }
 
 # =============================
-# Trade Logging (SIMULATED)
+# Trade Logging (SIMULATED or LIVE)
 # =============================
 def log_trade(ticker, signal, price, reasons):
     if signal not in ["BUY", "SELL"]:
         return
 
-    filename = "trade_log.csv"
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     gain_loss = np.random.uniform(-20, 50)
     tax_category = "Short-Term" if np.random.rand() > 0.5 else "Long-Term"
 
-    print(f"Simulated {signal} trade for {ticker} at {price}")
+    if SIMULATE_TRADES:
+        st.info(f"Simulated {signal} trade for {ticker} at ${price}")
+    else:
+        try:
+            r.orders.order_buy_market(ticker, 1) if signal == "BUY" else r.orders.order_sell_market(ticker, 1)
+            st.success(f"Live {signal} trade for {ticker} placed at ${price}!")
+        except Exception as e:
+            st.error(f"Live trade failed: {e}")
+            return
 
     trade_data = pd.DataFrame([{
         "Date": now,
@@ -130,6 +146,7 @@ def log_trade(ticker, signal, price, reasons):
         "Reasons": reasons
     }])
 
+    filename = "trade_log.csv"
     if os.path.exists(filename):
         trade_data.to_csv(filename, mode='a', header=False, index=False)
     else:
@@ -142,14 +159,14 @@ st.set_page_config(page_title="Stock Analyzer Bot", layout="wide")
 st.title("📊 Stock Analyzer Bot (Live Trading + Tax Logs)")
 
 tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
-period = "6mo"  # increased from 3mo to ensure enough data
+period = "6mo"
 
 if st.button("▶ Run Analysis"):
     results = {}
     for ticker in tickers:
         try:
             data = get_data(ticker, period)
-            st.write(f"{ticker} data rows: {len(data)}")  # debugging count
+            st.write(f"{ticker} data rows: {len(data)}")
             summary = analyze(data)
             if summary is None:
                 st.warning(f"{ticker}: Skipped — not enough data to analyze.")
