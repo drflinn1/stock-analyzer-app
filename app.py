@@ -1,4 +1,4 @@
-# Streamlit Web App Version of Stock Analyzer with Robinhood Integration
+ # Streamlit Web App Version of Stock Analyzer with Robinhood Integration
 
 import yfinance as yf
 import pandas as pd
@@ -9,13 +9,12 @@ import time
 import os
 from datetime import datetime
 from dotenv import load_dotenv
-import robin_stocks.robinhood as r
 
-# Load environment variables for Robinhood login
-load_dotenv()
-username = os.getenv("ROBINHOOD_USERNAME")
-password = os.getenv("ROBINHOOD_PASSWORD")
-login = r.login(username, password)
+# Load environment variables for Robinhood login (DISABLED FOR NOW)
+# load_dotenv()
+# username = os.getenv("ROBINHOOD_USERNAME")
+# password = os.getenv("ROBINHOOD_PASSWORD")
+# login = r.login(username, password)
 
 # =============================
 # Technical Indicator Functions
@@ -104,7 +103,7 @@ def analyze(data):
     }
 
 # =============================
-# Trade Logging with Robinhood Execution
+# Trade Logging (SIMULATED)
 # =============================
 def log_trade(ticker, signal, price, reasons):
     if signal not in ["BUY", "SELL"]:
@@ -115,13 +114,8 @@ def log_trade(ticker, signal, price, reasons):
     gain_loss = np.random.uniform(-20, 50)
     tax_category = "Short-Term" if np.random.rand() > 0.5 else "Long-Term"
 
-    try:
-        if signal == "BUY":
-            r.orders.order_buy_market(ticker, 1)
-        elif signal == "SELL":
-            r.orders.order_sell_market(ticker, 1)
-    except Exception as e:
-        print(f"Failed to place trade for {ticker}: {e}")
+    # Simulate a trade (DISABLED real Robinhood trading)
+    print(f"Simulated {signal} trade for {ticker} at {price}")
 
     trade_data = pd.DataFrame([{
         "Date": now,
