@@ -118,7 +118,6 @@ def log_trade(ticker, signal, price, reasons):
     gain_loss = np.random.uniform(-20, 50)
     tax_category = "Short-Term" if np.random.rand() > 0.5 else "Long-Term"
 
-    # Simulate a trade (DISABLED real Robinhood trading)
     print(f"Simulated {signal} trade for {ticker} at {price}")
 
     trade_data = pd.DataFrame([{
@@ -143,13 +142,14 @@ st.set_page_config(page_title="Stock Analyzer Bot", layout="wide")
 st.title("📊 Stock Analyzer Bot (Live Trading + Tax Logs)")
 
 tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
-period = "3mo"
+period = "6mo"  # increased from 3mo to ensure enough data
 
 if st.button("▶ Run Analysis"):
     results = {}
     for ticker in tickers:
         try:
             data = get_data(ticker, period)
+            st.write(f"{ticker} data rows: {len(data)}")  # debugging count
             summary = analyze(data)
             if summary is None:
                 st.warning(f"{ticker}: Skipped — not enough data to analyze.")
