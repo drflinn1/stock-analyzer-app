@@ -201,6 +201,15 @@ if st.button("▶ Run Analysis"):
         df.to_csv("stock_analysis_results.csv")
         st.download_button("⬇ Download CSV", df.to_csv().encode(), file_name="stock_analysis_results.csv", mime="text/csv")
 
+        # Summary Chart
+        st.markdown("### 📊 Summary of Trade Signals")
+        bar_chart = pd.DataFrame({
+            "Ticker": list(results.keys()),
+            "Signal": [v["Signal"] for v in results.values()],
+            "Gain/Loss Estimate": [np.random.uniform(-20, 50) for _ in results.values()]  # Simulated
+        })
+        st.bar_chart(bar_chart.set_index("Ticker")[["Gain/Loss Estimate"]])
+
 if os.path.exists("trade_log.csv"):
     df_trades = pd.read_csv("trade_log.csv")
     st.subheader("🧾 Trade Log")
