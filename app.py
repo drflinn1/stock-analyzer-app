@@ -13,7 +13,7 @@ from streamlit_autorefresh import st_autorefresh
 # Load secrets for Robinhood login (STREAMLIT CLOUD SECURE METHOD)
 SIMULATE_TRADES = st.sidebar.checkbox("🔌 Simulate Trading Mode", value=True)
 
-# Auto-refresh every hour (3600000 ms)
+# Auto-refresh every 1 hour (3600000 ms) — helps simulate scheduled execution
 st_autorefresh(interval=3600000, limit=None, key="auto-refresh")
 
 if not SIMULATE_TRADES:
@@ -163,8 +163,10 @@ def log_trade(ticker, signal, price, reasons):
 st.set_page_config(page_title="Stock Analyzer Bot", layout="wide")
 st.title("📊 Stock Analyzer Bot (Live Trading + Tax Logs)")
 
-tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
-period = "6mo"
+# User Custom Inputs
+ticker_options = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "NFLX"]
+tickers = st.sidebar.multiselect("📈 Choose tickers:", ticker_options, default=["AAPL", "TSLA"])
+period = st.sidebar.selectbox("🗓️ Select date range:", ["1mo", "3mo", "6mo", "1y", "2y"], index=2)
 
 if st.button("▶ Run Analysis"):
     results = {}
@@ -206,7 +208,7 @@ if st.button("▶ Run Analysis"):
         bar_chart = pd.DataFrame({
             "Ticker": list(results.keys()),
             "Signal": [v["Signal"] for v in results.values()],
-            "Gain/Loss Estimate": [np.random.uniform(-20, 50) for _ in results.values()]  # Simulated
+            "Gain/Loss Estimate": [np.random.uniform(-20, 50) for _ in results.values()]
         })
         st.bar_chart(bar_chart.set_index("Ticker")["Gain/Loss Estimate"])
 
@@ -222,3 +224,8 @@ if os.path.exists("trade_log.csv"):
     st.markdown(f"**📈 Total Profit/Loss: ${total_profit:.2f}**")
     st.dataframe(tax_summary)
     st.download_button("⬇ Download Tax Summary", tax_summary.to_csv(index=False).encode(), file_name="tax_summary.csv", mime="text/csv")
+
+    # Cumulative Profit Chart
+    df_trades["Cumulative P/L"] = df_trades["Gain/Loss"].cumsum()
+    st.markdown("### 📉 Portfolio Cumulative Profit Over Time")
+    st.line_chart(df_trades.set_index("Date")["Cumulative P/L"])
