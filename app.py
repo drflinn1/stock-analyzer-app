@@ -9,6 +9,8 @@ import time
 import os
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
+import smtplib
+from email.message import EmailMessage
 
 # Load secrets for Robinhood login (STREAMLIT CLOUD SECURE METHOD)
 SIMULATE_TRADES = st.sidebar.checkbox("🔌 Simulate Trading Mode", value=True)
@@ -51,6 +53,24 @@ def bollinger_bands(series, window=20, num_std=2):
     upper_band = sma + num_std * rolling_std
     lower_band = sma - num_std * rolling_std
     return sma, upper_band, lower_band
+
+# =============================
+# Email Notification Function
+# =============================
+def send_email_notification(subject, body):
+    try:
+        msg = EmailMessage()
+        msg.set_content(body)
+        msg["Subject"] = subject
+        msg["From"] = st.secrets["EMAIL_ADDRESS"]
+        msg["To"] = st.secrets["EMAIL_RECEIVER"]
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+            smtp.login(st.secrets["EMAIL_ADDRESS"], st.secrets["EMAIL_PASSWORD"])
+            smtp.send_message(msg)
+            st.sidebar.success("📧 Email sent!")
+    except Exception as e:
+        st.sidebar.error(f"❌ Failed to send email: {e}")
 
 # =============================
 # Data and Analysis Functions
@@ -156,6 +176,12 @@ def log_trade(ticker, signal, price, reasons):
         trade_data.to_csv(filename, mode='a', header=False, index=False)
     else:
         trade_data.to_csv(filename, mode='w', header=True, index=False)
+
+    # Email alert
+    send_email_notification(
+        subject=f"{signal} Signal for {ticker}",
+        body=f"Ticker: {ticker}\nSignal: {signal}\nPrice: {price}\nReasons: {reasons}\nTime: {now}"
+    )
 
 # =============================
 # Streamlit UI Starts Here
