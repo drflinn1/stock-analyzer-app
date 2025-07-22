@@ -208,7 +208,7 @@ if st.button("▶ Run Analysis"):
             "Signal": [v["Signal"] for v in results.values()],
             "Gain/Loss Estimate": [np.random.uniform(-20, 50) for _ in results.values()]  # Simulated
         })
-        st.bar_chart(bar_chart.set_index("Ticker")[["Gain/Loss Estimate"]])
+        st.bar_chart(bar_chart.set_index("Ticker")["Gain/Loss Estimate"])
 
 if os.path.exists("trade_log.csv"):
     df_trades = pd.read_csv("trade_log.csv")
@@ -217,6 +217,8 @@ if os.path.exists("trade_log.csv"):
     st.download_button("⬇ Download Trade Log", df_trades.to_csv(index=False).encode(), file_name="trade_log.csv", mime="text/csv")
 
     tax_summary = df_trades.groupby("Tax Category")["Gain/Loss"].sum().reset_index()
+    total_profit = df_trades["Gain/Loss"].sum()
     st.subheader("💰 Tax Summary")
+    st.markdown(f"**📈 Total Profit/Loss: ${total_profit:.2f}**")
     st.dataframe(tax_summary)
     st.download_button("⬇ Download Tax Summary", tax_summary.to_csv(index=False).encode(), file_name="tax_summary.csv", mime="text/csv")
