@@ -179,6 +179,7 @@ if st.button("▶ Run Analysis"):
             log_trade(ticker, summary["Signal"], float(data['Close'].iloc[-1]), summary["Reasons"])
             results[ticker] = summary
 
+            st.markdown(f"## 📈 {ticker} Price Chart")
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=data.index, y=data['Close'], mode='lines', name='Close'))
             fig.add_trace(go.Scatter(x=data.index, y=data['sma_20'], mode='lines', name='20 SMA', line=dict(color='blue')))
