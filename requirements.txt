@@ -6,3 +6,5 @@ plotly
 python-dotenv
 robin_stocks
 streamlit-autorefresh
+streamlit-autorefresh
+robin_stocks
