@@ -1,0 +1,19 @@
+# GitHub Actions workflow: nightly ping for Streamlit auto-refresh
+# Save this as .github/workflows/schedule.yml in your repo
+
+name: Nightly Streamlit Ping
+
+on:
+  schedule:
+    # Every day at 11:00 PM US Eastern (03:00 UTC)
+    - cron: '0 3 * * *'
+
+jobs:
+  ping_streamlit_app:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Curl Streamlit App URL
+        run: |
+          echo "Pinging Streamlit app to trigger analysis..."
+          curl --fail "https://share.streamlit.io/<your-github-username>/stock-analyzer-app/main/app.py" -o /dev/null \
+            && echo "✅ Ping successful" || echo "❌ Ping failed"
