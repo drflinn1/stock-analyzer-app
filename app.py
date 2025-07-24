@@ -85,12 +85,15 @@ def simple_sma(series: pd.Series, window: int) -> pd.Series:
 
 def simple_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gain).rolling(period).mean()
-    avg_loss = pd.Series(loss).rolling(period).mean()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+
     rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
 def bollinger_bands(series: pd.Series, window: int = 20, num_std: int = 2):
     sma = simple_sma(series, window)
