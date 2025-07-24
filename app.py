@@ -14,9 +14,9 @@ import yfinance as yf
 from email.message import EmailMessage
 from streamlit_autorefresh import st_autorefresh
 
-# -------------------------
+# ----------------------------------
 # ▶  CONFIG & SECRETS
-# -------------------------
+# ----------------------------------
 PAGE_TITLE = "Stock Analyzer Bot (Live Trading + Tax Logs)"
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 
@@ -26,9 +26,9 @@ try:
 except ImportError:
     r = None  # will simulate
 
-# -------------------------
-# ▶  SIDEBAR UI
-# -------------------------
+# ----------------------------------
+# ▶  SIDEBAR UI & TRIGGER
+# ----------------------------------
 with st.sidebar:
     st.markdown("## ⚙️ Settings")
     with st.expander("General", expanded=True):
@@ -42,11 +42,16 @@ with st.sidebar:
         tickers = st.multiselect("📈 Choose tickers", ticker_options, default=["AAPL","TSLA"])
         period = st.selectbox("🗓️ Date range", ["1mo","3mo","6mo","1y","2y"], index=2)
 
+# Main "Run Analysis" button
+run_analysis = st.button("▶️ Run Analysis")
+if not run_analysis:
+    st.stop()
+
 status_badge = "🟢 LIVE" if not simulate_mode else "🔴 SIM"
 
-# -------------------------
+# ----------------------------------
 # ▶  Robinhood login
-# -------------------------
+# ----------------------------------
 if not simulate_mode:
     if r is None:
         st.sidebar.error("robin_stocks missing – switching to simulate mode")
@@ -59,9 +64,9 @@ if not simulate_mode:
             st.sidebar.error(f"Robinhood login failed: {e}")
             simulate_mode = True
 
-# -------------------------
+# ----------------------------------
 # ▶  CACHED DATA FETCHING
-# -------------------------
+# ----------------------------------
 @st.cache_data(show_spinner=False)
 def get_data(ticker: str, period: str, retries: int = 3) -> pd.DataFrame:
     """Download OHLC data, compute indicators, cache results per session."""
@@ -77,9 +82,9 @@ def get_data(ticker: str, period: str, retries: int = 3) -> pd.DataFrame:
         time.sleep(1)
     raise ValueError(f"No data for {ticker}")
 
-# -------------------------
+# ----------------------------------
 # ▶  INDICATORS & ANALYSIS
-# -------------------------
+# ----------------------------------
 def simple_sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window).mean()
 
@@ -97,19 +102,23 @@ def bollinger_bands(series: pd.Series, window: int = 20, num_std: int = 2):
     std = series.rolling(window).std()
     return sma, sma + num_std * std, sma - num_std * std
 
-# Updated analyze to cast to float and avoid ambiguous Series comparisons
-
+# ----------------------------------
+# ▶  TRADE SIGNAL ANALYSIS
+# ----------------------------------
 def analyze(df: pd.DataFrame) -> dict | None:
-    if len(df) < 30:  # lowered threshold
+    # require at least 30 data points
+    if len(df) < 30:
         if debug_mode:
             st.warning(f"⏳ Only {len(df)} rows fetched — skipping due to low data.")
         return None
+
     cur = df.iloc[-1]
     prev = df.iloc[-2]
-    rsi_val = float(cur['rsi'])
-    sma20_val = float(cur['sma_20'])
-    sma50_val = float(cur['sma_50'])
-    price_val = float(cur['Close'])
+    # cast to Python floats
+    rsi_val      = float(cur['rsi'])
+    sma20_val    = float(cur['sma_20'])
+    sma50_val    = float(cur['sma_50'])
+    price_val    = float(cur['Close'])
     bb_lower_val = float(cur['bb_lower'])
     bb_upper_val = float(cur['bb_upper'])
 
@@ -118,10 +127,12 @@ def analyze(df: pd.DataFrame) -> dict | None:
         reasons.append('RSI below 30 (oversold)')
     if rsi_val > 70:
         reasons.append('RSI above 70 (overbought)')
+    # SMA crossovers
     if float(prev['sma_20']) < float(prev['sma_50']) and sma20_val >= sma50_val:
         reasons.append('20 SMA crossed above 50 SMA (bullish)')
     if float(prev['sma_20']) > float(prev['sma_50']) and sma20_val <= sma50_val:
         reasons.append('20 SMA crossed below 50 SMA (bearish)')
+    # Bollinger band breaks
     if price_val < bb_lower_val:
         reasons.append('Price below lower BB')
     if price_val > bb_upper_val:
@@ -135,10 +146,10 @@ def analyze(df: pd.DataFrame) -> dict | None:
         signal = 'SELL'
 
     return {
-        'RSI': round(rsi_val,2),
-        '20 SMA': round(sma20_val,2),
+        'RSI': round(rsi_val, 2),
+        '20 SMA': round(sma20_val, 2),
         'Signal': signal,
         'Reasons': '; '.join(reasons)
     }
 
-# rest of the file unchanged...
+# … rest of your plotting & logging code unchanged …
