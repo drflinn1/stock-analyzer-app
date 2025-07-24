@@ -42,9 +42,12 @@ with st.sidebar:
         tickers = st.multiselect("📈 Choose tickers", ticker_options, default=["AAPL","TSLA"])
         period = st.selectbox("🗓️ Date range", ["1mo","3mo","6mo","1y","2y"], index=2)
 
-# Main "Run Analysis" button
+# ----------------------------------
+# ▶  MAIN TRIGGER
+# ----------------------------------
 run_analysis = st.button("▶️ Run Analysis")
 if not run_analysis:
+    # don't load data or show any charts until button is pressed
     st.stop()
 
 status_badge = "🟢 LIVE" if not simulate_mode else "🔴 SIM"
@@ -114,7 +117,6 @@ def analyze(df: pd.DataFrame) -> dict | None:
 
     cur = df.iloc[-1]
     prev = df.iloc[-2]
-    # cast to Python floats
     rsi_val      = float(cur['rsi'])
     sma20_val    = float(cur['sma_20'])
     sma50_val    = float(cur['sma_50'])
@@ -127,12 +129,10 @@ def analyze(df: pd.DataFrame) -> dict | None:
         reasons.append('RSI below 30 (oversold)')
     if rsi_val > 70:
         reasons.append('RSI above 70 (overbought)')
-    # SMA crossovers
     if float(prev['sma_20']) < float(prev['sma_50']) and sma20_val >= sma50_val:
         reasons.append('20 SMA crossed above 50 SMA (bullish)')
     if float(prev['sma_20']) > float(prev['sma_50']) and sma20_val <= sma50_val:
         reasons.append('20 SMA crossed below 50 SMA (bearish)')
-    # Bollinger band breaks
     if price_val < bb_lower_val:
         reasons.append('Price below lower BB')
     if price_val > bb_upper_val:
@@ -152,4 +152,20 @@ def analyze(df: pd.DataFrame) -> dict | None:
         'Reasons': '; '.join(reasons)
     }
 
-# … rest of your plotting & logging code unchanged …
+# ----------------------------------
+# ▶  PLOTTING & OUTPUT
+# ----------------------------------
+for ticker in tickers:
+    try:
+        df = get_data(ticker, period)
+        result = analyze(df)
+        if result:
+            st.subheader(f"{ticker} — {result['Signal']}")
+            st.json(result)
+        else:
+            st.info(f"{ticker}: Not enough data, skipped")
+    except Exception as e:
+        st.error(f"{ticker} error: {e}")
+
+
+# End of app.py
