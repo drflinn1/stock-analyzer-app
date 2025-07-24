@@ -38,8 +38,19 @@ except ImportError:
 # -------------------------
 @st.cache_data
 def get_sp500_tickers():
-    table = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-    return table['Symbol'].tolist()
+    """
+    Fetch S&P 500 tickers, with fallback if parser dependency missing.
+    """
+    try:
+        # use html5lib flavor to avoid lxml dependency
+        table = pd.read_html(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            flavor='html5lib'
+        )[0]
+        return table['Symbol'].tolist()
+    except (ImportError, ValueError, OSError) as e:
+        st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
+        return []
 
 @st.cache_data
 def get_top_tickers(n=50):
