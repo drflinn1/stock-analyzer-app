@@ -68,11 +68,11 @@ def get_data(ticker: str, period: str, retries: int = 3) -> pd.DataFrame:
     for _ in range(retries):
         df = yf.download(ticker, period=period, auto_adjust=False, progress=False)
         if not df.empty:
-            # Indicators
-            sma20, upper, lower = bollinger_bands(df["Close"])
+            close = df["Close"].squeeze()
+            sma20, upper, lower = bollinger_bands(close)
             df["sma_20"], df["bb_upper"], df["bb_lower"] = sma20, upper, lower
-            df["sma_50"] = simple_sma(df["Close"], 50)
-            df["rsi"] = simple_rsi(df["Close"])
+            df["sma_50"] = simple_sma(close, 50)
+            df["rsi"] = simple_rsi(close)
             return df.dropna()
         time.sleep(1)
     raise ValueError(f"No data for {ticker}")
