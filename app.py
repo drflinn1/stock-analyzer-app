@@ -37,19 +37,38 @@ except ImportError:
 # ▶  Helper to fetch top tickers
 # -------------------------
 @st.cache_data
+```python
 def get_sp500_tickers():
     """
-    Fetch S&P 500 tickers, with fallback if parser dependency missing.
+    Fetch S&P 500 tickers, with fallback if pandas parser or html5lib missing.
     """
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     try:
-        # use built-in bs4 parser to avoid extra html5lib/lxml deps
+        # primary: use pandas + bs4 flavor
         table = pd.read_html(
             url,
             flavor='bs4',
             attrs={"class": "wikitable"}
         )[0]
         return table['Symbol'].tolist()
+    except Exception:
+        # fallback: manual scrape via requests + BeautifulSoup
+        try:
+            import requests
+            from bs4 import BeautifulSoup
+            resp = requests.get(url)
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            table = soup.find('table', {'class': 'wikitable'})
+            symbols = []
+            for row in table.find_all('tr')[1:]:
+                cols = row.find_all('td')
+                if cols:
+                    symbols.append(cols[0].text.strip())
+            return symbols
+        except Exception as e:
+            st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
+            return []
+```
     except Exception as e:
         st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
         return []
@@ -70,6 +89,7 @@ def get_top_tickers(n=50):
 # -------------------------
 def simple_sma(series: pd.Series, window: int):
     return series.squeeze().rolling(window).mean()
+
 
 
 def simple_rsi(series: pd.Series, period: int = 14):
