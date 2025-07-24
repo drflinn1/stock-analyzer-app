@@ -110,7 +110,8 @@ def get_data(ticker: str, period: str, retries: int = 3):
 
 
 def analyze(df: pd.DataFrame):
-    if len(df) < 60:
+    # require at least 30 data points (lowered from 60)
+    if len(df) < 30:
         return None
     cur, prev = df.iloc[-1], df.iloc[-2]
     reasons, signal = [], "HOLD"
