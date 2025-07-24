@@ -1,8 +1,8 @@
-name: Auto-Run Stock Analyzer
+name: Auto‑Run Stock Analyzer
 
 on:
   schedule:
-    # Runs at the top of every hour
+    # Runs at the top of every hour (UTC)
     - cron: '0 * * * *'
 
 jobs:
@@ -24,10 +24,5 @@ jobs:
 
       - name: Run headless analysis script
         run: |
-          # Invoke your analysis logic without UI
+          # Invoke your analysis logic without the Streamlit UI
           python app.py
-      - name: Curl Streamlit App URL
-        run: |
-          echo "Pinging Streamlit app to trigger analysis..."
-          curl --fail "https://share.streamlit.io/<your-github-username>/stock-analyzer-app/main/app.py" -o /dev/null \
-            && echo "✅ Ping successful" || echo "❌ Ping failed"
