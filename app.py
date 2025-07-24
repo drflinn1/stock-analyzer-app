@@ -37,7 +37,6 @@ except ImportError:
 # ▶  Helper to fetch top tickers
 # -------------------------
 @st.cache_data
-```python
 def get_sp500_tickers():
     """
     Fetch S&P 500 tickers, with fallback if pandas parser or html5lib missing.
@@ -66,12 +65,8 @@ def get_sp500_tickers():
                     symbols.append(cols[0].text.strip())
             return symbols
         except Exception as e:
-            st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
+            st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
             return []
-```
-    except Exception as e:
-        st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
-        return []
 
 @st.cache_data
 def get_top_tickers(n=50):
