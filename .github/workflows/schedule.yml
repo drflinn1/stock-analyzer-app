@@ -1,9 +1,10 @@
-name: Auto‑Run Stock Analyzer
+name: Auto-Run Stock Analyzer
 
 on:
   schedule:
-    # Runs at the top of every hour (UTC)
+    # Runs at the top of every hour
     - cron: '0 * * * *'
+  workflow_dispatch:  # 👈 allows you to run manually via GitHub UI
 
 jobs:
   auto_analysis:
@@ -24,9 +25,4 @@ jobs:
 
       - name: Run headless analysis script
         run: |
-          # Invoke your analysis logic without the Streamlit UI
           python app.py
-          on:
-  schedule:
-    - cron: '0 * * * *'
-  workflow_dispatch:   # 👈 enables the “Run workflow” button in Actions tab
