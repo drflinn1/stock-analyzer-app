@@ -1,26 +1,28 @@
 name: Auto-Run Stock Analyzer
 
 on:
-  workflow_dispatch:  # Enables the "Run workflow" button
   schedule:
-    - cron: '0 * * * *'  # Runs every hour
+    - cron: '0 * * * *'  # runs every hour
+  workflow_dispatch:     # enables "Run workflow" button manually
 
 jobs:
-  run-stock-analyzer:
+  run-analyzer:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v3
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run stock analyzer script
-        run: python app.py
+      - name: Run Stock Analyzer
+        run: |
+          python main.py
