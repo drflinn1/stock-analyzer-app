@@ -41,15 +41,17 @@ def get_sp500_tickers():
     """
     Fetch S&P 500 tickers, with fallback if parser dependency missing.
     """
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     try:
-        # use html5lib flavor to avoid lxml dependency
+        # use built-in bs4 parser to avoid extra html5lib/lxml deps
         table = pd.read_html(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-            flavor='html5lib'
+            url,
+            flavor='bs4',
+            attrs={"class": "wikitable"}
         )[0]
         return table['Symbol'].tolist()
-    except (ImportError, ValueError, OSError) as e:
-        st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
+    except Exception as e:
+        st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
         return []
 
 @st.cache_data
@@ -68,6 +70,7 @@ def get_top_tickers(n=50):
 # -------------------------
 def simple_sma(series: pd.Series, window: int):
     return series.squeeze().rolling(window).mean()
+
 
 def simple_rsi(series: pd.Series, period: int = 14):
     series = series.squeeze()
