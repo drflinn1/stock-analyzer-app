@@ -107,16 +107,16 @@ def analyze(df: pd.DataFrame) -> dict | None:
         return None
     cur, prev = df.iloc[-1], df.iloc[-2]
     reasons, signal = [], "HOLD"
-    if cur.rsi < 30: reasons.append("RSI below 30 (oversold)")
-    if cur.rsi > 70: reasons.append("RSI above 70 (overbought)")
-    if prev.sma_20 < prev.sma_50 <= cur.sma_20: reasons.append("20 SMA→50 SMA bullish")
-    if prev.sma_20 > prev.sma_50 >= cur.sma_20: reasons.append("20 SMA→50 SMA bearish")
-    if cur.Close < cur.bb_lower: reasons.append("Price < lower BB")
-    if cur.Close > cur.bb_upper: reasons.append("Price > upper BB")
+    if cur["rsi"] < 30: reasons.append("RSI below 30 (oversold)")
+    if cur["rsi"] > 70: reasons.append("RSI above 70 (overbought)")
+    if prev["sma_20"] < prev["sma_50"] <= cur["sma_20"]: reasons.append("20 SMA→50 SMA bullish")
+    if prev["sma_20"] > prev["sma_50"] >= cur["sma_20"]: reasons.append("20 SMA→50 SMA bearish")
+    if cur["Close"] < cur["bb_lower"]: reasons.append("Price < lower BB")
+    if cur["Close"] > cur["bb_upper"]: reasons.append("Price > upper BB")
     text = "; ".join(reasons).lower()
     if "buy" in text or "bullish" in text: signal = "BUY"
     elif "sell" in text or "bearish" in text: signal = "SELL"
-    return {"RSI": round(cur.rsi,2), "20 SMA":round(cur.sma_20,2), "Signal":signal, "Reasons":"; ".join(reasons)}
+    return {"RSI": round(cur["rsi"],2), "20 SMA":round(cur["sma_20"],2), "Signal":signal, "Reasons":"; ".join(reasons)}
 
 # -------------------------
 # ▶  NOTIFICATION HELPERS
@@ -167,12 +167,12 @@ if st.button("▶ Run Analysis"):
             summ = analyze(df)
             if not summ: continue
             results[tkr]=summ
-            price = float(df.Close.iloc[-1])
+            price = float(df["Close"].iloc[-1])
             log_trade(tkr,summ,price)
             # chart
             st.markdown(f"#### {tkr} Price Chart")
             fig=go.Figure()
-            fig.add_trace(go.Scatter(x=df.index,y=df.Close,name="Close"))
+            fig.add_trace(go.Scatter(x=df.index,y=df["Close"],name="Close"))
             st.plotly_chart(fig,use_container_width=True)
         except Exception as e:
             st.error(f"{tkr} error: {e}")
