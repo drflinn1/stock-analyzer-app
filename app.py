@@ -1,4 +1,4 @@
-# app.py – Streamlit Web App Version of Stock Analyzer with Robinhood Integration
+# app.py – Streamlit Web App Version of Stock Analyzer with Robinhood Integration – **Full Restored Version**
 
 import os
 import time
@@ -30,39 +30,25 @@ except ImportError:
 # ▶  Helper to fetch S&P 500 & Top Movers
 # -------------------------
 @st.cache_data
-
 def get_sp500_tickers():
-    """
-    Fetch S&P 500 tickers, fallback through BeautifulSoup if needed.
-    """
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     try:
         df_list = pd.read_html(url, flavor='bs4', attrs={'class':'wikitable'})
-        table = df_list[0]
-        return table['Symbol'].tolist()
+        return df_list[0]['Symbol'].tolist()
     except Exception:
+        # fallback via BeautifulSoup
         try:
-            import requests
             from bs4 import BeautifulSoup
             resp = requests.get(url)
             soup = BeautifulSoup(resp.text, 'html.parser')
-            tbl = soup.find('table', {'class':'wikitable'})
-            syms = []
-            for row in tbl.find_all('tr')[1:]:
-                cols = row.find_all('td')
-                if cols:
-                    syms.append(cols[0].text.strip())
-            return syms
+            table = soup.find('table', {'class':'wikitable'})
+            return [row.find_all('td')[0].text.strip() for row in table.find_all('tr')[1:]]
         except Exception as e:
             st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
             return []
 
 @st.cache_data
-
 def get_top_tickers(n=50):
-    """
-    Return top N tickers by 1-day percent change.
-    """
     symbols = get_sp500_tickers()
     perf = {}
     for sym in symbols:
@@ -72,8 +58,7 @@ def get_top_tickers(n=50):
                 perf[sym] = df['Close'].pct_change().iloc[-1]
         except Exception:
             continue
-    sorted_syms = sorted(perf, key=perf.get, reverse=True)
-    return sorted_syms[:n]
+    return sorted(perf, key=perf.get, reverse=True)[:n]
 
 # -------------------------
 # ▶  Analysis Helpers
@@ -100,7 +85,6 @@ def bollinger_bands(series: pd.Series, window: int = 20, num_std: int = 2):
 # ▶  Data Fetch & Indicator Computation
 # -------------------------
 @st.cache_data
-
 def get_data(ticker: str, period: str, retries: int = 3) -> pd.DataFrame:
     for _ in range(retries):
         df = yf.download(ticker, period=period, auto_adjust=False, progress=False)
@@ -124,36 +108,32 @@ def analyze(df: pd.DataFrame) -> dict | None:
         return None
     cur, prev = df.iloc[-1], df.iloc[-2]
     reasons = []
-    # RSI signals
     rsi = float(cur['rsi'])
     if rsi < 30:
         reasons.append('RSI below 30 (oversold)')
     if rsi > 70:
         reasons.append('RSI above 70 (overbought)')
-    # SMA crossover
     sma20_cur, sma50_cur = float(cur['sma_20']), float(cur['sma_50'])
     sma20_prev, sma50_prev = float(prev['sma_20']), float(prev['sma_50'])
     if sma20_prev < sma50_prev <= sma20_cur:
         reasons.append('20 SMA crossed above 50 SMA (bullish)')
     if sma20_prev > sma50_prev >= sma20_cur:
         reasons.append('20 SMA crossed below 50 SMA (bearish)')
-    # Bollinger break
     close_price = float(cur['Close'])
     if close_price < float(cur['bb_lower']):
         reasons.append('Price below lower BB')
     if close_price > float(cur['bb_upper']):
         reasons.append('Price above upper BB')
-    # Determine signal
     text = '; '.join(reasons).lower()
     signal = 'HOLD'
-    if any(x in text for x in ['buy', 'bullish']):
+    if any(x in text for x in ['buy','bullish']):
         signal = 'BUY'
-    elif any(x in text for x in ['sell', 'bearish']):
+    elif any(x in text for x in ['sell','bearish']):
         signal = 'SELL'
     return {
-        'RSI': round(rsi, 2),
-        '20 SMA': round(sma20_cur, 2),
-        '50 SMA': round(sma50_cur, 2),
+        'RSI': round(rsi,2),
+        '20 SMA': round(sma20_cur,2),
+        '50 SMA': round(sma50_cur,2),
         'Signal': signal,
         'Reasons': '; '.join(reasons)
     }
@@ -170,7 +150,6 @@ def notify_email(tkr: str, summ: dict, price: float):
     with smtplib.SMTP_SSL('smtp.gmail.com',465) as s:
         s.login(st.secrets['EMAIL_ADDRESS'], st.secrets['EMAIL_PASSWORD'])
         s.send_message(msg)
-
 
 def log_trade(tkr: str, summ: dict, price: float):
     if summ['Signal'] == 'HOLD':
@@ -190,65 +169,55 @@ with st.sidebar:
     with st.expander('General', expanded=True):
         simulate_mode = st.checkbox('Simulate Trading Mode', True)
         debug_mode = st.checkbox('Show debug logs', False)
-        st_autorefresh(3600000, None, key='hour')
+        st_autorefresh(interval=3600000, limit=None, key='hour')  # refresh every hour
+
     with st.expander('Analysis Options', expanded=True):
         scan_top = st.checkbox('Scan top N performers', False)
-        if scan_top:
-            top_n = st.slider('Top tickers', 10, 100, 50)
-        else:
-            default_list = ['AAPL','MSFT','GOOGL','AMZN','TSLA']
-            user_list = st.multiselect('📈 Choose tickers', get_sp500_tickers(), default=default_list)
-        period = st.selectbox('🗓️ Date range', ['1mo','3mo','6mo','1y','2y'], index=2)
-    status_badge = '🟢 LIVE' if not simulate_mode else '🔴 SIM'
+        top_n = st.slider('Top tickers to scan', 10, 100, 50) if scan_top else None
+        chooser = st.multiselect('Choose tickers', get_top_tickers(top_n) if scan_top else get_sp500_tickers(), default=[])
+        tickers = chooser
+        period = st.selectbox('Date range', ['1mo','3mo','6mo','1y','2y'], index=2)
 
 # -------------------------
-# ▶  Robinhood Login
+# ▶  Main Page
 # -------------------------
-if not simulate_mode and r:
-    try:
-        r.login(st.secrets['ROBINHOOD_USERNAME'], st.secrets['ROBINHOOD_PASSWORD'])
-        st.sidebar.success('Logged into Robinhood')
-    except Exception as e:
-        st.sidebar.error(f'Robinhood login error: {e}')
-        simulate_mode = True
-
-# -------------------------
-# ▶  MAIN CONTENT
-# -------------------------
-st.markdown(f"### {status_badge} {PAGE_TITLE}")
-if st.button('▶ Run Analysis'):
-    ticks = get_top_tickers(top_n) if scan_top else user_list
+st.markdown(f"### {'🔴 SIM' if simulate_mode else '🟢 LIVE'} {PAGE_TITLE}")
+if st.button('▶ Run Analysis', use_container_width=True):
+    if not tickers:
+        st.warning('Select at least one ticker')
+        st.stop()
     results = {}
-    for t in ticks:
+    for tkr in tickers:
         try:
-            df = get_data(t, period)
-            if debug_mode: st.write(f'{t}: {len(df)} rows')
+            df = get_data(tkr, period)
+            if debug_mode:
+                st.write(f"{tkr} rows: {len(df)}")
             summ = analyze(df)
-            if not summ:
-                st.info(f'{t} skipped, insufficient data')
+            if summ is None:
+                st.warning(f"{tkr}: Not enough data, skipped")
                 continue
-            price = float(df['Close'].iloc[-1])
-            results[t] = summ
-            log_trade(t, summ, price)
-            st.markdown(f'#### 📈 {t} Price Chart')
+            results[tkr] = summ
+            log_trade(tkr, summ, float(df.Close.iloc[-1]))
+            st.markdown(f"#### 📈 {tkr} Price Chart")
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name='Close'))
-            fig.add_trace(go.Scatter(x=df.index, y=df['sma_20'], name='20 SMA'))
-            fig.add_trace(go.Scatter(x=df.index, y=df['sma_50'], name='50 SMA'))
-            fig.add_trace(go.Scatter(x=df.index, y=df['bb_upper'], name='BB Upper', line=dict(dash='dot')))
-            fig.add_trace(go.Scatter(x=df.index, y=df['bb_lower'], name='BB Lower', line=dict(dash='dot')))
+            fig.add_trace(go.Scatter(x=df.index, y=df.Close, name='Close'))
+            fig.add_trace(go.Scatter(x=df.index, y=df.sma_20, name='20 SMA'))
+            fig.add_trace(go.Scatter(x=df.index, y=df.sma_50, name='50 SMA'))
+            fig.add_trace(go.Scatter(x=df.index, y=df.bb_upper, name='BB Upper', line=dict(dash='dot')))
+            fig.add_trace(go.Scatter(x=df.index, y=df.bb_lower, name='BB Lower', line=dict(dash='dot')))
             st.plotly_chart(fig, use_container_width=True)
-            emoji = {'BUY':'🟢','SELL':'🔴','HOLD':'🟡'}[summ['Signal']]
-            st.markdown(f'**{emoji} {t} – {summ['Signal']}**')
+            badge = {'BUY':'🟢','SELL':'🔴','HOLD':'🟡'}[summ['Signal']]
+            st.markdown(f"**{badge} {tkr} – {summ['Signal']}**")
             st.json(summ)
             st.divider()
         except Exception as e:
-            st.error(f'{t} error: {e}')
+            st.error(f"{tkr} failed: {e}")
     if results:
-        df_res = pd.DataFrame(results).T
-        st.download_button('⬇ Download CSV', df_res.to_csv().encode(), 'analysis.csv')
-        st.markdown('### 📊 Summary of Signals')
-        st.bar_chart(pd.Series({k:(1 if v['Signal']=='BUY' else -1 if v['Signal']=='SELL' else 0) for k,v in results.items()}))
+        res_df = pd.DataFrame(results).T
+        st.download_button('⬇ Download CSV', res_df.to_csv().encode(), 'results.csv')
+        st.markdown('### 📊 Summary')
+        smap = {'BUY':1,'SELL':-1,'HOLD':0}
+        st.bar_chart(pd.Series({k:smap[v['Signal']] for k,v in results.items()}))
 
 # -------------------------
 # ▶  Trade Log & Tax Summary
@@ -258,13 +227,11 @@ if os.path.exists('trade_log.csv'):
     st.subheader('🧾 Trade Log')
     st.dataframe(trades)
     st.download_button('⬇ Download Trade Log', trades.to_csv(index=False).encode(), 'trade_log.csv')
-    # tax summary
     tax = trades.groupby('Tax Category')['Gain/Loss'].sum().reset_index()
-    total_pl = trades['Gain/Loss'].sum()
-    st.markdown(f'## 💰 Total P/L: ${total_pl:.2f}')
+    total = trades['Gain/Loss'].sum()
+    st.markdown(f"## 💰 Total P/L: ${total:.2f}")
     st.subheader('Tax Summary')
     st.dataframe(tax)
-    st.download_button('⬇ Download Tax Summary', tax.to_csv(index=False).encode(), 'tax_summary.csv')
     trades['Cum P/L'] = trades['Gain/Loss'].cumsum()
-    st.markdown('### 📈 Cum. P/L Over Time')
+    st.markdown('### 📈 Cumulative P/L')
     st.line_chart(trades.set_index('Date')['Cum P/L'])
