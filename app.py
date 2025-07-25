@@ -1,4 +1,4 @@
-# app.py – Streamlit Web App Version of Stock Analyzer with Robinhood Integration – **Full Restored Version**
+# app.py – Streamlit Web App Version of Stock Analyzer with Robinhood Integration – **Full Restored Version with Exception Fix**
 
 import os
 import time
@@ -36,7 +36,6 @@ def get_sp500_tickers():
         df_list = pd.read_html(url, flavor='bs4', attrs={'class':'wikitable'})
         return df_list[0]['Symbol'].tolist()
     except Exception:
-        # fallback via BeautifulSoup
         try:
             from bs4 import BeautifulSoup
             resp = requests.get(url)
@@ -157,7 +156,10 @@ def log_trade(tkr: str, summ: dict, price: float):
     now = datetime.now().isoformat()
     gain_loss = round(np.random.uniform(-20,50),2)
     cat = 'Short-Term' if np.random.rand()>0.5 else 'Long-Term'
-    row = pd.DataFrame([{ 'Date': now, 'Ticker': tkr, 'Signal': summ['Signal'], 'Price': price, 'Gain/Loss': gain_loss, 'Tax Category': cat, 'Reasons': summ['Reasons'] }])
+    row = pd.DataFrame([
+        { 'Date': now, 'Ticker': tkr, 'Signal': summ['Signal'], 'Price': price,
+          'Gain/Loss': gain_loss, 'Tax Category': cat, 'Reasons': summ['Reasons'] }
+    ])
     row.to_csv('trade_log.csv', mode='a', header=not os.path.exists('trade_log.csv'), index=False)
     notify_email(tkr, summ, price)
 
@@ -174,8 +176,8 @@ with st.sidebar:
     with st.expander('Analysis Options', expanded=True):
         scan_top = st.checkbox('Scan top N performers', False)
         top_n = st.slider('Top tickers to scan', 10, 100, 50) if scan_top else None
-        chooser = st.multiselect('Choose tickers', get_top_tickers(top_n) if scan_top else get_sp500_tickers(), default=[])
-        tickers = chooser
+        universe = get_top_tickers(top_n) if scan_top else get_sp500_tickers()
+        tickers = st.multiselect('Choose tickers', universe, default=['AAPL','TSLA'])
         period = st.selectbox('Date range', ['1mo','3mo','6mo','1y','2y'], index=2)
 
 # -------------------------
@@ -206,32 +208,37 @@ if st.button('▶ Run Analysis', use_container_width=True):
             fig.add_trace(go.Scatter(x=df.index, y=df.bb_upper, name='BB Upper', line=dict(dash='dot')))
             fig.add_trace(go.Scatter(x=df.index, y=df.bb_lower, name='BB Lower', line=dict(dash='dot')))
             st.plotly_chart(fig, use_container_width=True)
-            badge = {'BUY':'🟢','SELL':'🔴','HOLD':'🟡'}[summ['Signal']]
+            badge_map = {'BUY':'🟢','SELL':'🔴','HOLD':'🟡'}
+            badge = badge_map[summ['Signal']]
             st.markdown(f"**{badge} {tkr} – {summ['Signal']}**")
             st.json(summ)
             st.divider()
         except Exception as e:
             st.error(f"{tkr} failed: {e}")
+
     if results:
         res_df = pd.DataFrame(results).T
-        st.download_button('⬇ Download CSV', res_df.to_csv().encode(), 'results.csv')
-        st.markdown('### 📊 Summary')
-        smap = {'BUY':1,'SELL':-1,'HOLD':0}
-        st.bar_chart(pd.Series({k:smap[v['Signal']] for k,v in results.items()}))
+        st.download_button("⬇ Download CSV", res_df.to_csv().encode(), "stock_analysis_results.csv")
+        st.markdown("### 📊 Summary of Trade Signals")
+        signal_map = {'BUY':1,'SELL':-1,'HOLD':0}
+        st.bar_chart(pd.Series({k:signal_map[v['Signal']] for k,v in results.items()}))
 
 # -------------------------
-# ▶  Trade Log & Tax Summary
+# ▶  Logs & Tax Summary (persistent)
 # -------------------------
 if os.path.exists('trade_log.csv'):
     trades = pd.read_csv('trade_log.csv')
-    st.subheader('🧾 Trade Log')
+    st.subheader("🧾 Trade Log")
     st.dataframe(trades)
-    st.download_button('⬇ Download Trade Log', trades.to_csv(index=False).encode(), 'trade_log.csv')
-    tax = trades.groupby('Tax Category')['Gain/Loss'].sum().reset_index()
-    total = trades['Gain/Loss'].sum()
-    st.markdown(f"## 💰 Total P/L: ${total:.2f}")
-    st.subheader('Tax Summary')
-    st.dataframe(tax)
+    st.download_button("⬇ Download Trade Log", trades.to_csv(index=False).encode(), "trade_log.csv")
+
+    # compute tax summary & cumulative P/L
     trades['Cum P/L'] = trades['Gain/Loss'].cumsum()
-    st.markdown('### 📈 Cumulative P/L')
+    total_pl = trades['Gain/Loss'].sum()
+    st.markdown(f"## 💰 **Total Portfolio P/L: ${total_pl:.2f}**")
+    tax = trades.groupby('Tax Category')['Gain/Loss'].sum().reset_index()
+    st.subheader("Tax Summary")
+    st.dataframe(tax)
+    st.download_button("⬇ Download Tax Summary", tax.to_csv(index=False).encode(), "tax_summary.csv")
+    st.markdown("### 📈 Portfolio Cumulative Profit Over Time")
     st.line_chart(trades.set_index('Date')['Cum P/L'])
