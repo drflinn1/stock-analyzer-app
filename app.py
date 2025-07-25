@@ -27,7 +27,7 @@ except ImportError:
     r = None
 
 # -------------------------
-# ▶  Helper to fetch S&P 500 & Top Movers
+# ▶  Helper to fetch S&P 500 & Top Movers
 # -------------------------
 @st.cache_data
 def get_sp500_tickers() -> list[str]:
@@ -43,13 +43,13 @@ def get_sp500_tickers() -> list[str]:
             table = soup.find('table', {'class':'wikitable'})
             return [row.find_all('td')[0].text.strip() for row in table.find_all('tr')[1:]]
         except Exception as e:
-            st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
+            st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
             return []
 
 # Removed caching here to avoid stale data errors
 def get_top_tickers(n: int = 50) -> list[str]:
     """
-    Fetches S&P 500 symbols, computes each one's 1-day performance,
+    Fetches S&P 500 symbols, computes each one's 1-day performance,
     and returns the top `n` tickers by percentage gain.
     """
     symbols = get_sp500_tickers()
@@ -192,8 +192,13 @@ with st.sidebar:
     with st.expander('Analysis Options', expanded=True):
         scan_top = st.checkbox('Scan top N performers', False)
         top_n = st.slider('Top tickers to scan', 10, 100, 50) if scan_top else None
-        universe = get_top_tickers(top_n) if scan_top else get_sp500_tickers()
-        tickers  = st.multiselect('Choose tickers', universe, default=['AAPL','TSLA'])
+        if scan_top:
+            universe = get_top_tickers(top_n)
+            default_tickers = universe[:2]
+        else:
+            universe = get_sp500_tickers()
+            default_tickers = ['AAPL','TSLA']
+        tickers  = st.multiselect('Choose tickers', universe, default=default_tickers)
         period   = st.selectbox('Date range', ['1mo','3mo','6mo','1y','2y'], index=2)
 
 # -------------------------
@@ -218,11 +223,11 @@ if st.button('▶ Run Analysis', use_container_width=True):
             log_trade(tkr, summ, float(df.Close.iloc[-1]))
             st.markdown(f"#### 📈 {tkr} Price Chart")
             fig = go.Figure()
-            fig.add_trace(go.scatter(x=df.index, y=df.Close, name='Close'))
-            fig.add_trace(go.scatter(x=df.index, y=df.sma_20, name='20 SMA'))
-            fig.add_trace(go.scatter(x=df.index, y=df.sma_50, name='50 SMA'))
-            fig.add_trace(go.scatter(x=df.index, y=df.bb_upper, name='BB Upper', line=dict(dash='dot')))
-            fig.add_trace(go.scatter(x=df.index, y=df.bb_lower, name='BB Lower', line=dict(dash='dot')))
+            fig.add_trace(go.Scatter(x=df.index, y=df.Close, name='Close'))
+            fig.add_trace(go.Scatter(x=df.index, y=df.sma_20, name='20 SMA'))
+            fig.add_trace(go.Scatter(x=df.index, y=df.sma_50, name='50 SMA'))
+            fig.add_trace(go.Scatter(x=df.index, y=df.bb_upper, name='BB Upper', line=dict(dash='dot')))
+            fig.add_trace(go.Scatter(x=df.index, y=df.bb_lower, name='BB Lower', line=dict(dash='dot')))
             st.plotly_chart(fig, use_container_width=True)
             badge_map = {'BUY':'🟢','SELL':'🔴','HOLD':'🟡'}
             badge = badge_map[summ['Signal']]
