@@ -47,17 +47,24 @@ def get_sp500_tickers():
             return []
 
 @st.cache_data
-def get_top_tickers(n=50):
+def get_top_tickers(n: int = 50) -> list[str]:
+    """
+    Fetches the current S&P 500 symbols, computes each one's 1-day performance,
+    and returns the top `n` tickers by percentage gain.
+    """
     symbols = get_sp500_tickers()
-    perf = {}
+    perf: dict[str, float] = {}
     for sym in symbols:
         try:
             df = yf.download(sym, period='2d', progress=False)
             if len(df) >= 2:
-                perf[sym] = df['Close'].pct_change().iloc[-1]
+                # compute 1-day pct change as a float
+                change = df['Close'].pct_change().iloc[-1]
+                perf[sym] = float(change)
         except Exception:
             continue
-    return sorted(perf, key=perf.get, reverse=True)[:n]
+    # sort by performance (highest first) and return top n
+    return sorted(perf, key=lambda k: perf[k], reverse=True)[:n]
 
 # -------------------------
 # ▶  Analysis Helpers
