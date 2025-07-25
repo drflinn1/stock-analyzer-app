@@ -198,7 +198,10 @@ with st.sidebar:
         else:
             universe = get_sp500_tickers()
             default_tickers = ['AAPL','TSLA']
-        tickers  = st.multiselect('Choose tickers', universe, default=default_tickers)
+        tickers = st.multiselect(
+        'Choose tickers', universe, default=default_tickers,
+        key='tickers'
+    )
         period   = st.selectbox('Date range', ['1mo','3mo','6mo','1y','2y'], index=2)
 
 # -------------------------
