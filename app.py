@@ -180,19 +180,14 @@ with st.sidebar:
         universe = get_top_tickers(top_n) if scan_top else get_sp500_tickers()
         default_tickers = universe[:2] if scan_top else ['AAPL','TSLA']
 
-        # init session state
         if 'tickers' not in st.session_state or not scan_top:
             st.session_state['tickers'] = default_tickers
         default_list = [t for t in st.session_state['tickers'] if t in universe]
         if not default_list:
             default_list = default_tickers
 
-        tickers = st.multiselect(
-            'Choose tickers', universe,
-            default=default_list,
-            key='tickers'
-        )
-        period   = st.selectbox('Date range', ['1mo','3mo','6mo','1y','2y'], index=2)
+        tickers = st.multiselect('Choose tickers', universe, default=default_list, key='tickers')
+        period = st.selectbox('Date range', ['1mo','3mo','6mo','1y','2y'], index=2)
 
 # -------------------------
 # ▶  Main Page
@@ -213,8 +208,7 @@ if st.button('▶ Run Analysis', use_container_width=True):
                 st.warning(f"{tkr}: Not enough data, skipped")
                 continue
             results[tkr] = summ
-            price = float(df.Close.iloc[-1])
-            log_trade(tkr, summ, price)
+            log_trade(tkr, summ, float(df.Close.iloc[-1]))
             st.markdown(f"#### 📈 {tkr} Price Chart")
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df.index, y=df.Close, name='Close'))
@@ -238,9 +232,9 @@ if st.button('▶ Run Analysis', use_container_width=True):
         signal_map = {'BUY':1,'SELL':-1,'HOLD':0}
         st.bar_chart(pd.Series({k:signal_map[v['Signal']] for k,v in results.items()}))
 
-# ------------------------
-# Logs & Tax Summary
-# ------------------------
+# -------------------------
+# ▶  Logs & Tax Summary (persistent)
+# -------------------------
 if os.path.exists('trade_log.csv'):
     trades = pd.read_csv('trade_log.csv')
     st.subheader("🧾 Trade Log")
