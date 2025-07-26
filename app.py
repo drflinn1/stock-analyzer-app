@@ -186,7 +186,9 @@ with st.sidebar:
         if not default_list:
             default_list = default_tickers
 
-        tickers = st.multiselect('Choose tickers', universe, default=default_list, key='tickers')
+        tickers = st.multiselect(
+            'Choose tickers', universe, key='tickers'
+        )
         period = st.selectbox('Date range', ['1mo','3mo','6mo','1y','2y'], index=2)
 
 # -------------------------
