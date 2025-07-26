@@ -47,7 +47,6 @@ def get_sp500_tickers() -> list[str]:
             return []
 
 # No caching on this to always get fresh top performers
-
 def get_top_tickers(n: int) -> list[str]:
     symbols = get_sp500_tickers()
     perf: dict[str, float] = {}
@@ -104,25 +103,54 @@ def get_data(ticker: str, period: str, retries: int = 3) -> pd.DataFrame:
 # ▶  Signal Analysis
 # -------------------------
 def analyze(df: pd.DataFrame) -> dict | None:
-    if len(df) < 30:
+    # require at least 30 valid rows
+    if not isinstance(df, pd.DataFrame) or len(df) < 30:
         return None
-    cur, prev = df.iloc[-1], df.iloc[-2]
+    # extract last two rows
+    cur = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    # cast to python scalars for comparisons
+    rsi = float(cur['rsi'])
+    sma20_cur = float(cur['sma_20'])
+    sma50_cur = float(cur['sma_50'])
+    sma20_prev = float(prev['sma_20'])
+    sma50_prev = float(prev['sma_50'])
+    price = float(cur['Close'])
+
     reasons = []
-    if cur['rsi'] < 30:
+    # RSI
+    if rsi < 30:
         reasons.append('RSI below 30 (oversold)')
-    if cur['rsi'] > 70:
+    if rsi > 70:
         reasons.append('RSI above 70 (overbought)')
-    if prev['sma_20'] < prev['sma_50'] <= cur['sma_20']:
+    # SMA cross
+    if sma20_prev < sma50_prev <= sma20_cur:
         reasons.append('20 SMA crossed above 50 SMA (bullish)')
-    if prev['sma_20'] > prev['sma_50'] >= cur['sma_20']:
+    if sma20_prev > sma50_prev >= sma20_cur:
         reasons.append('20 SMA crossed below 50 SMA (bearish)')
-    if cur['Close'] < cur['bb_lower']:
+    # Bollinger Bands
+    if price < float(cur['bb_lower']):
         reasons.append('Price below lower BB')
-    if cur['Close'] > cur['bb_upper']:
+    if price > float(cur['bb_upper']):
         reasons.append('Price above upper BB')
-    text = '; '.join(reasons).lower()
-    signal = 'BUY' if any(k in text for k in ['bullish','buy']) else 'SELL' if any(k in text for k in ['bearish','sell']) else 'HOLD'
-    return {'RSI': round(cur['rsi'],2), '20 SMA': round(cur['sma_20'],2), '50 SMA': round(cur['sma_50'],2), 'Signal': signal, 'Reasons': '; '.join(reasons)}
+
+    text = "; ".join(reasons).lower()
+    # decide signal
+    if any(k in text for k in ['buy', 'bullish']):
+        signal = 'BUY'
+    elif any(k in text for k in ['sell', 'bearish']):
+        signal = 'SELL'
+    else:
+        signal = 'HOLD'
+
+    return {
+        'RSI': round(rsi, 2),
+        '20 SMA': round(sma20_cur, 2),
+        '50 SMA': round(sma50_cur, 2),
+        'Signal': signal,
+        'Reasons': '; '.join(reasons)
+    }
 
 # -------------------------
 # ▶  Notifications & Logging
@@ -131,14 +159,18 @@ WEBHOOK = st.secrets.get('SLACK_WEBHOOK_URL')
 
 def notify_slack(tkr: str, summ: dict, price: float):
     if WEBHOOK:
-        requests.post(WEBHOOK, json={'text':f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}"})
+        requests.post(WEBHOOK, json={'text': f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}"})
 
 def notify_email(tkr: str, summ: dict, price: float):
     msg = EmailMessage()
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     msg.set_content(f"Ticker: {tkr}\nSignal: {summ['Signal']} @ ${price}\nReasons: {summ['Reasons']}\nTime: {now}")
-    msg['Subject'], msg['From'], msg['To'] = (f"{summ['Signal']} {tkr}", st.secrets['EMAIL_ADDRESS'], st.secrets['EMAIL_RECEIVER'])
-    with smtplib.SMTP_SSL('smtp.gmail.com',465) as s:
+    msg['Subject'], msg['From'], msg['To'] = (
+        f"{summ['Signal']} {tkr}",
+        st.secrets['EMAIL_ADDRESS'],
+        st.secrets['EMAIL_RECEIVER']
+    )
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as s:
         s.login(st.secrets['EMAIL_ADDRESS'], st.secrets['EMAIL_PASSWORD'])
         s.send_message(msg)
 
@@ -149,20 +181,18 @@ with st.sidebar:
     st.markdown('## ⚙️ Settings')
     with st.expander('General', expanded=True):
         simulate_mode = st.checkbox('Simulate Trading Mode', True)
-        debug_mode    = st.checkbox('Show debug logs', False)
+        debug_mode = st.checkbox('Show debug logs', False)
         st_autorefresh(interval=3600000, limit=None, key='hour_refresh')
 
     with st.expander('Analysis Options', expanded=True):
         scan_top = st.checkbox('Scan top N performers', False)
         top_n = st.slider('Top tickers to scan', 10, 100, 50) if scan_top else None
         universe = get_top_tickers(top_n) if scan_top else get_sp500_tickers()
-        
-        # defaults
-        default_list = universe[:2]
 
-        # multiselect without forcing session state
+        # free multiselect
+        default_list = universe[:2]
         tickers = st.multiselect('Choose tickers', universe, default=default_list)
-        period = st.selectbox('Date range', ['1mo','3mo','6mo','1y','2y'], index=2)
+        period = st.selectbox('Date range', ['1mo', '3mo', '6mo', '1y', '2y'], index=2)
 
 # -------------------------
 # ▶  Main Page
@@ -183,9 +213,10 @@ if st.button('▶ Run Analysis', use_container_width=True):
                 st.warning(f"{tkr}: Not enough data, skipped")
                 continue
             results[tkr] = summ
-            log_trade = globals().get('log_trade')
-            if log_trade:
-                log_trade(tkr, summ, float(df.Close.iloc[-1]))
+            # logging (if defined)
+            if 'log_trade' in globals():
+                globals()['log_trade'](tkr, summ, float(df.Close.iloc[-1]))
+            # chart
             st.markdown(f"#### 📈 {tkr} Price Chart")
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df.index, y=df.Close, name='Close'))
@@ -194,7 +225,7 @@ if st.button('▶ Run Analysis', use_container_width=True):
             fig.add_trace(go.Scatter(x=df.index, y=df.bb_upper, name='BB Upper', line=dict(dash='dot')))
             fig.add_trace(go.Scatter(x=df.index, y=df.bb_lower, name='BB Lower', line=dict(dash='dot')))
             st.plotly_chart(fig, use_container_width=True)
-            badge_map = {'BUY':'🟢','SELL':'🔴','HOLD':'🟡'}
+            badge_map = {'BUY': '🟢', 'SELL': '🔴', 'HOLD': '🟡'}
             st.markdown(f"**{badge_map[summ['Signal']]} {tkr} – {summ['Signal']}**")
             st.json(summ)
             st.divider()
@@ -205,8 +236,8 @@ if st.button('▶ Run Analysis', use_container_width=True):
         res_df = pd.DataFrame(results).T
         st.download_button("⬇ Download CSV", res_df.to_csv().encode(), "stock_analysis_results.csv")
         st.markdown("### 📊 Summary of Trade Signals")
-        signal_map = {'BUY':1,'SELL':-1,'HOLD':0}
-        st.bar_chart(pd.Series({k:signal_map[v['Signal']] for k,v in results.items()}))
+        signal_map = {'BUY': 1, 'SELL': -1, 'HOLD': 0}
+        st.bar_chart(pd.Series({k: signal_map[v['Signal']] for k, v in results.items()}))
 
 # -------------------------
 # ▶  Logs & Tax Summary (persistent)
