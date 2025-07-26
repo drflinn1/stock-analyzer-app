@@ -52,9 +52,7 @@ def get_top_tickers(n: int) -> list[str]:
     if not symbols:
         return []
     try:
-        # Bulk download close prices for all symbols
         df = yf.download(symbols, period='2d', progress=False)['Close']
-        # Handle single-symbol vs multi-symbol cases
         if isinstance(df, pd.Series):
             changes = df.pct_change().iloc[-1:]
             changes = changes.to_frame().T
@@ -64,7 +62,6 @@ def get_top_tickers(n: int) -> list[str]:
         return top
     except Exception as e:
         st.sidebar.error(f"Error fetching top tickers vectorized: {e}")
-        # Fallback to original loop method
         perf: dict[str, float] = {}
         for sym in symbols:
             try:
@@ -73,10 +70,7 @@ def get_top_tickers(n: int) -> list[str]:
                     perf[sym] = float(tmp.pct_change().iloc[-1])
             except Exception:
                 continue
-        try:
-            return sorted(perf, key=lambda k: perf[k], reverse=True)[:n]
-        except:
-            return []
+        return sorted(perf, key=lambda k: perf[k], reverse=True)[:n]
 
 # -------------------------
 # ▶  Analysis Helpers
@@ -103,15 +97,12 @@ def bollinger_bands(series: pd.Series, window: int = 20, num_std: int = 2):
 # -------------------------
 @st.cache_data(show_spinner=False)
 def get_data(ticker: str, period: str, retries: int = 3) -> pd.DataFrame:
-    # Download OHLC data
     for _ in range(retries):
         df = yf.download(ticker, period=period, auto_adjust=False, progress=False)
-        # If multi-column (unexpected), flatten to single ticker
         if isinstance(df.columns, pd.MultiIndex):
             try:
                 df = df.xs(ticker, axis=1, level=1)
             except Exception:
-                # fallback: select first sub-column
                 df = df.iloc[:, df.columns.get_level_values(1) == ticker]
                 df.columns = df.columns.get_level_values(0)
         if not df.empty:
@@ -124,10 +115,14 @@ def get_data(ticker: str, period: str, retries: int = 3) -> pd.DataFrame:
     raise ValueError(f"No data fetched for {ticker}")
 
 # -------------------------
-# ▶  Signal Analysis
+# ▶  Signals & Thresholds
 # -------------------------
-def analyze(df: pd.DataFrame) -> dict | None:
-    if not isinstance(df, pd.DataFrame) or len(df) < 30:
+@st.cache_data(show_spinner=False)
+def analyze(df: pd.DataFrame,
+            min_rows: int,
+            rsi_ovr: float,
+            rsi_obh: float) -> dict | None:
+    if not isinstance(df, pd.DataFrame) or len(df) < min_rows:
         return None
     cur, prev = df.iloc[-1], df.iloc[-2]
     rsi = float(cur['rsi'])
@@ -136,10 +131,10 @@ def analyze(df: pd.DataFrame) -> dict | None:
     price = float(cur['Close'])
 
     reasons = []
-    if rsi < 30:
-        reasons.append('RSI below 30 (oversold)')
-    if rsi > 70:
-        reasons.append('RSI above 70 (overbought)')
+    if rsi < rsi_ovr:
+        reasons.append(f'RSI below {rsi_ovr} (oversold)')
+    if rsi > rsi_obh:
+        reasons.append(f'RSI above {rsi_obh} (overbought)')
     if sma20_prev < sma50_prev <= sma20_cur:
         reasons.append('20 SMA crossed above 50 SMA (bullish)')
     if sma20_prev > sma50_prev >= sma20_cur:
@@ -150,12 +145,11 @@ def analyze(df: pd.DataFrame) -> dict | None:
         reasons.append('Price above upper BB')
 
     text = "; ".join(reasons).lower()
+    signal = 'HOLD'
     if any(k in text for k in ['buy', 'bullish']):
         signal = 'BUY'
     elif any(k in text for k in ['sell', 'bearish']):
         signal = 'SELL'
-    else:
-        signal = 'HOLD'
 
     return {
         'RSI': round(rsi, 2),
@@ -202,8 +196,13 @@ with st.sidebar:
         top_n = st.slider('Top tickers to scan', 10, 100, 50) if scan_top else None
         universe = get_top_tickers(top_n) if scan_top else get_sp500_tickers()
 
+        # Threshold controls
+        min_rows = st.slider('Minimum data rows', 10, 100, 30)
+        rsi_ovr = st.slider('RSI oversold threshold', 0, 100, 30)
+        rsi_obh = st.slider('RSI overbought threshold', 0, 100, 70)
+
         default_list = universe[:2]
-        tickers = st.multiselect('Choose tickers', universe, default=default_list)
+        tickers = st.multiselect('Choose tickers', universe, default=default_list, key='tickers')
         period = st.selectbox('Date range', ['1mo', '3mo', '6mo', '1y', '2y'], index=2)
 
 # -------------------------
@@ -220,7 +219,7 @@ if st.button('▶ Run Analysis', use_container_width=True):
             df = get_data(tkr, period)
             if debug_mode:
                 st.write(f"{tkr} rows: {len(df)}")
-            summ = analyze(df)
+            summ = analyze(df, min_rows, rsi_ovr, rsi_obh)
             if summ is None:
                 st.warning(f"{tkr}: Not enough data, skipped")
                 continue
@@ -247,9 +246,10 @@ if st.button('▶ Run Analysis', use_container_width=True):
     if results:
         res_df = pd.DataFrame(results).T
         st.download_button("⬇ Download CSV", res_df.to_csv().encode(), "stock_analysis_results.csv")
+        st.dataframe(res_df)  # show full table
         st.markdown("### 📊 Summary of Trade Signals")
         signal_map = {'BUY': 1, 'SELL': -1, 'HOLD': 0}
-        st.bar_chart(pd.Series({k: signal_map[v['Signal']] for k,v in results.items()}))
+        st.bar_chart(pd.Series({k: signal_map[v['Signal']] for k, v in results.items()}))
 
 # -------------------------
 # ▶  Logs & Tax Summary (persistent)
