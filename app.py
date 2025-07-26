@@ -186,7 +186,7 @@ with st.sidebar:
         if not default_list:
             default_list = default_tickers
 
-                tickers = st.multiselect(
+        tickers = st.multiselect(
             'Choose tickers', universe,
             default=default_list,
             key='tickers'
@@ -198,11 +198,11 @@ with st.sidebar:
 # -------------------------
 st.markdown(f"### {'🔴 SIM' if simulate_mode else '🟢 LIVE'} {PAGE_TITLE}")
 if st.button('▶ Run Analysis', use_container_width=True):
-    if not tickers:
+    if not st.session_state['tickers']:
         st.warning('Select at least one ticker')
         st.stop()
     results = {}
-    for tkr in tickers:
+    for tkr in st.session_state['tickers']:
         try:
             df = get_data(tkr, period)
             if debug_mode:
