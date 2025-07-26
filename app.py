@@ -48,20 +48,39 @@ def get_sp500_tickers() -> list[str]:
 
 # No caching on this to always get fresh top performers
 def get_top_tickers(n: int) -> list[str]:
+    """
+    Fetch the top-n tickers by recent performance using a vectorized yfinance download.
+    """
     symbols = get_sp500_tickers()
-    perf: dict[str, float] = {}
-    for sym in symbols:
-        try:
-            df = yf.download(sym, period='2d', progress=False)
-            if len(df) >= 2:
-                perf[sym] = float(df['Close'].pct_change().iloc[-1])
-        except Exception:
-            continue
-    try:
-        return sorted(perf, key=lambda k: perf[k], reverse=True)[:n]
-    except Exception as e:
-        st.sidebar.error(f"Error sorting tickers: {e}")
+    if not symbols:
         return []
+    try:
+        # Bulk download close prices for all symbols
+        df = yf.download(symbols, period='2d', progress=False)['Close']
+        # Compute percentage changes from penultimate to last
+        if isinstance(df, pd.Series):
+            changes = df.pct_change().iloc[-1:]
+            changes = changes.to_frame().T
+        else:
+            changes = df.pct_change().iloc[-1]
+        # Drop missing and sort
+        top = changes.dropna().sort_values(ascending=False).head(n).index.tolist()
+        return top
+    except Exception as e:
+        st.sidebar.error(f"Error fetching top tickers vectorized: {e}")
+        # Fallback to original loop method
+        perf: dict[str, float] = {}
+        for sym in symbols:
+            try:
+                tmp = yf.download(sym, period='2d', progress=False)['Close']
+                if len(tmp) >= 2:
+                    perf[sym] = float(tmp.pct_change().iloc[-1])
+            except Exception:
+                continue
+        try:
+            return sorted(perf, key=lambda k: perf[k], reverse=True)[:n]
+        except:
+            return []
 
 # -------------------------
 # ▶  Analysis Helpers
