@@ -43,7 +43,7 @@ def get_sp500_tickers() -> list[str]:
             table = soup.find('table', {'class':'wikitable'})
             return [row.find_all('td')[0].text.strip() for row in table.find_all('tr')[1:]]
         except Exception as e:
-            st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
+            st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
             return []
 
 # Removed caching here to avoid stale data errors
@@ -58,8 +58,6 @@ def get_top_tickers(n: int = 50) -> list[str]:
                 perf[sym] = float(change)
         except Exception:
             continue
-    # Ensure values are floats
-    perf = {k: float(v) for k, v in perf.items()}
     try:
         sorted_syms = sorted(perf, key=lambda k: perf[k], reverse=True)
         return sorted_syms[:n]
@@ -70,10 +68,8 @@ def get_top_tickers(n: int = 50) -> list[str]:
 # -------------------------
 # ▶  Analysis Helpers
 # -------------------------
-
 def simple_sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window).mean()
-
 
 def simple_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -83,7 +79,6 @@ def simple_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     avg_loss = loss.rolling(period).mean()
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
-
 
 def bollinger_bands(series: pd.Series, window: int = 20, num_std: int = 2):
     sma = simple_sma(series, window)
@@ -155,57 +150,52 @@ def notify_slack(tkr: str, summ: dict, price: float):
     payload = {'text': f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}"}
     requests.post(WEBHOOK, json=payload)
 
-
 def notify_email(tkr: str, summ: dict, price: float):
     msg = EmailMessage()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     body = f"Ticker: {tkr}\nSignal: {summ['Signal']} @ ${price}\nReasons: {summ['Reasons']}\nTime: {now}"
     msg.set_content(body)
-    msg['Subject'] = f"{summ['Signal']} Signal: {tkr}"
-    msg['From'] = st.secrets['EMAIL_ADDRESS']
-    msg['To'] = st.secrets['EMAIL_RECEIVER']
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as s:
+    msg['Subject'], msg['From'], msg['To'] = (
+        f"{summ['Signal']} {tkr}",
+        st.secrets['EMAIL_ADDRESS'],
+        st.secrets['EMAIL_RECEIVER']
+    )
+    with smtplib.SMTP_SSL('smtp.gmail.com',465) as s:
         s.login(st.secrets['EMAIL_ADDRESS'], st.secrets['EMAIL_PASSWORD'])
         s.send_message(msg)
 
 # -------------------------
-# ▶  Trade Logging
-# -------------------------
-def log_trade(tkr: str, summ: dict, price: float):
-    if summ['Signal'] == 'HOLD':
-        return
-    now = datetime.now().isoformat()
-    gain_loss = round(np.random.uniform(-20,50),2)
-    cat = 'Short-Term' if np.random.rand()>0.5 else 'Long-Term'
-    row = pd.DataFrame([{ 'Date':now, 'Ticker':tkr, 'Signal':summ['Signal'], 'Price':price,
-          'Gain/Loss':gain_loss, 'Tax Category':cat, 'Reasons':summ['Reasons'] }])
-    row.to_csv('trade_log.csv', mode='a', header=not os.path.exists('trade_log.csv'), index=False)
-    notify_email(tkr, summ, price)
-    notify_slack(tkr, summ, price)
-
-# -------------------------
-# ▶  SIDEBAR UI & Controls
+# ▶  Sidebar UI & Controls
 # -------------------------
 with st.sidebar:
     st.markdown('## ⚙️ Settings')
     with st.expander('General', expanded=True):
         simulate_mode = st.checkbox('Simulate Trading Mode', True)
-        debug_mode = st.checkbox('Show debug logs', False)
-        st_autorefresh(interval=3600000, limit=None, key='hour')
+        debug_mode    = st.checkbox('Show debug logs', False)
+        st_autorefresh(interval=3600000, limit=None, key='hour_refresh')
 
     with st.expander('Analysis Options', expanded=True):
         scan_top = st.checkbox('Scan top N performers', False)
-        if scan_top:
-            top_n = st.slider('Top tickers to scan', 10, 100, 50)
-            universe = get_top_tickers(top_n)
-        else:
-            universe = get_sp500_tickers()
+        top_n = st.slider('Top tickers to scan', 10, 100, 50) if scan_top else None
+        universe = get_top_tickers(top_n) if scan_top else get_sp500_tickers()
         default_tickers = universe[:2] if scan_top else ['AAPL','TSLA']
-        tickers = st.multiselect('Choose tickers', universe, default=default_tickers, key='tickers')
-        period = st.selectbox('Date range', ['1mo','3mo','6mo','1y','2y'], index=2)
+
+        # init session state
+        if 'tickers' not in st.session_state or not scan_top:
+            st.session_state['tickers'] = default_tickers
+        default_list = [t for t in st.session_state['tickers'] if t in universe]
+        if not default_list:
+            default_list = default_tickers
+
+        tickers = st.multiselect(
+            'Choose tickers', universe,
+            default=default_list,
+            key='tickers'
+        )
+        period   = st.selectbox('Date range', ['1mo','3mo','6mo','1y','2y'], index=2)
 
 # -------------------------
-# ▶  MAIN PAGE
+# ▶  Main Page
 # -------------------------
 st.markdown(f"### {'🔴 SIM' if simulate_mode else '🟢 LIVE'} {PAGE_TITLE}")
 if st.button('▶ Run Analysis', use_container_width=True):
@@ -223,7 +213,8 @@ if st.button('▶ Run Analysis', use_container_width=True):
                 st.warning(f"{tkr}: Not enough data, skipped")
                 continue
             results[tkr] = summ
-            log_trade(tkr, summ, float(df.Close.iloc[-1]))
+            price = float(df.Close.iloc[-1])
+            log_trade(tkr, summ, price)
             st.markdown(f"#### 📈 {tkr} Price Chart")
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df.index, y=df.Close, name='Close'))
@@ -239,6 +230,7 @@ if st.button('▶ Run Analysis', use_container_width=True):
             st.divider()
         except Exception as e:
             st.error(f"{tkr} failed: {e}")
+
     if results:
         res_df = pd.DataFrame(results).T
         st.download_button("⬇ Download CSV", res_df.to_csv().encode(), "stock_analysis_results.csv")
@@ -246,13 +238,21 @@ if st.button('▶ Run Analysis', use_container_width=True):
         signal_map = {'BUY':1,'SELL':-1,'HOLD':0}
         st.bar_chart(pd.Series({k:signal_map[v['Signal']] for k,v in results.items()}))
 
-# -------------------------
-# ▶  Logs & Tax Summary (persistent)
-# -------------------------
+# ------------------------
+# Logs & Tax Summary
+# ------------------------
 if os.path.exists('trade_log.csv'):
     trades = pd.read_csv('trade_log.csv')
     st.subheader("🧾 Trade Log")
     st.dataframe(trades)
     st.download_button("⬇ Download Trade Log", trades.to_csv(index=False).encode(), "trade_log.csv")
 
-...
+    trades['Cum P/L'] = trades['Gain/Loss'].cumsum()
+    total_pl = trades['Gain/Loss'].sum()
+    st.markdown(f"## 💰 **Total Portfolio P/L: ${total_pl:.2f}**")
+    tax = trades.groupby('Tax Category')['Gain/Loss'].sum().reset_index()
+    st.subheader("Tax Summary")
+    st.dataframe(tax)
+    st.download_button("⬇ Download Tax Summary", tax.to_csv(index=False).encode(), "tax_summary.csv")
+    st.markdown("### 📈 Portfolio Cumulative Profit Over Time")
+    st.line_chart(trades.set_index('Date')['Cum P/L'])
