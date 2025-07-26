@@ -1,4 +1,4 @@
-# app.py – Streamlit Web App Version of Stock Analyzer with Robinhood Integration – **Full Restored Version with Debugged Ticker Scanner**
+# app.py – Streamlit Web App Version of Stock Analyzer with Robinhood Integration – **Full Restored Version with Debugged Ticker Scanner & Default Fix**
 
 import os
 import time
@@ -48,10 +48,6 @@ def get_sp500_tickers() -> list[str]:
 
 # Removed caching here to avoid stale data errors
 def get_top_tickers(n: int = 50) -> list[str]:
-    """
-    Fetches S&P 500 symbols, computes each one's 1-day performance,
-    and returns the top `n` tickers by percentage gain.
-    """
     symbols = get_sp500_tickers()
     perf: dict[str, float] = {}
     for sym in symbols:
@@ -62,7 +58,6 @@ def get_top_tickers(n: int = 50) -> list[str]:
                 perf[sym] = float(change)
         except Exception:
             continue
-    # Ensure values are floats
     perf = {k: float(v) for k, v in perf.items()}
     try:
         sorted_syms = sorted(perf, key=lambda k: perf[k], reverse=True)
@@ -194,18 +189,21 @@ with st.sidebar:
         top_n = st.slider('Top tickers to scan', 10, 100, 50) if scan_top else None
         if scan_top:
             universe = get_top_tickers(top_n)
-            default_tickers = universe[:2]
         else:
             universe = get_sp500_tickers()
-            default_tickers = ['AAPL','TSLA']
+        default_tickers = universe[:2] if scan_top else ['AAPL','TSLA']
 
         # initialize session state default tickers on first load
-        if 'tickers' not in st.session_state:
+        if 'tickers' not in st.session_state or not scan_top:
             st.session_state['tickers'] = default_tickers
-        # multiselect without overriding user selection thereafter
+        # build default list: intersection of previous selections and current universe
+        default_list = [t for t in st.session_state['tickers'] if t in universe]
+        if not default_list:
+            default_list = default_tickers
+
         tickers = st.multiselect(
             'Choose tickers', universe,
-            default=st.session_state['tickers'],
+            default=default_list,
             key='tickers'
         )
         period   = st.selectbox('Date range', ['1mo','3mo','6mo','1y','2y'], index=2)
