@@ -48,22 +48,18 @@ def get_sp500_tickers() -> list[str]:
 
 # No caching on this to always get fresh top performers
 def get_top_tickers(n: int) -> list[str]:
-    """
-    Fetch the top-n tickers by recent performance using a vectorized yfinance download.
-    """
     symbols = get_sp500_tickers()
     if not symbols:
         return []
     try:
         # Bulk download close prices for all symbols
         df = yf.download(symbols, period='2d', progress=False)['Close']
-        # Compute percentage changes from penultimate to last
+        # Handle single-symbol vs multi-symbol cases
         if isinstance(df, pd.Series):
             changes = df.pct_change().iloc[-1:]
             changes = changes.to_frame().T
         else:
             changes = df.pct_change().iloc[-1]
-        # Drop missing and sort
         top = changes.dropna().sort_values(ascending=False).head(n).index.tolist()
         return top
     except Exception as e:
@@ -107,13 +103,22 @@ def bollinger_bands(series: pd.Series, window: int = 20, num_std: int = 2):
 # -------------------------
 @st.cache_data(show_spinner=False)
 def get_data(ticker: str, period: str, retries: int = 3) -> pd.DataFrame:
+    # Download OHLC data
     for _ in range(retries):
         df = yf.download(ticker, period=period, auto_adjust=False, progress=False)
+        # If multi-column (unexpected), flatten to single ticker
+        if isinstance(df.columns, pd.MultiIndex):
+            try:
+                df = df.xs(ticker, axis=1, level=1)
+            except Exception:
+                # fallback: select first sub-column
+                df = df.iloc[:, df.columns.get_level_values(1) == ticker]
+                df.columns = df.columns.get_level_values(0)
         if not df.empty:
-            sma20, upper, lower = bollinger_bands(df['Close'])
+            sma20, upper, lower = bollinger_bands(df['Close'].squeeze())
             df['sma_20'], df['bb_upper'], df['bb_lower'] = sma20, upper, lower
-            df['sma_50'] = simple_sma(df['Close'], 50)
-            df['rsi'] = simple_rsi(df['Close'])
+            df['sma_50'] = simple_sma(df['Close'].squeeze(), 50)
+            df['rsi'] = simple_rsi(df['Close'].squeeze())
             return df.dropna()
         time.sleep(1)
     raise ValueError(f"No data fetched for {ticker}")
@@ -122,40 +127,29 @@ def get_data(ticker: str, period: str, retries: int = 3) -> pd.DataFrame:
 # ▶  Signal Analysis
 # -------------------------
 def analyze(df: pd.DataFrame) -> dict | None:
-    # require at least 30 valid rows
     if not isinstance(df, pd.DataFrame) or len(df) < 30:
         return None
-    # extract last two rows
-    cur = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    # cast to python scalars for comparisons
+    cur, prev = df.iloc[-1], df.iloc[-2]
     rsi = float(cur['rsi'])
-    sma20_cur = float(cur['sma_20'])
-    sma50_cur = float(cur['sma_50'])
-    sma20_prev = float(prev['sma_20'])
-    sma50_prev = float(prev['sma_50'])
+    sma20_cur, sma50_cur = float(cur['sma_20']), float(cur['sma_50'])
+    sma20_prev, sma50_prev = float(prev['sma_20']), float(prev['sma_50'])
     price = float(cur['Close'])
 
     reasons = []
-    # RSI
     if rsi < 30:
         reasons.append('RSI below 30 (oversold)')
     if rsi > 70:
         reasons.append('RSI above 70 (overbought)')
-    # SMA cross
     if sma20_prev < sma50_prev <= sma20_cur:
         reasons.append('20 SMA crossed above 50 SMA (bullish)')
     if sma20_prev > sma50_prev >= sma20_cur:
         reasons.append('20 SMA crossed below 50 SMA (bearish)')
-    # Bollinger Bands
     if price < float(cur['bb_lower']):
         reasons.append('Price below lower BB')
     if price > float(cur['bb_upper']):
         reasons.append('Price above upper BB')
 
     text = "; ".join(reasons).lower()
-    # decide signal
     if any(k in text for k in ['buy', 'bullish']):
         signal = 'BUY'
     elif any(k in text for k in ['sell', 'bearish']):
@@ -208,7 +202,6 @@ with st.sidebar:
         top_n = st.slider('Top tickers to scan', 10, 100, 50) if scan_top else None
         universe = get_top_tickers(top_n) if scan_top else get_sp500_tickers()
 
-        # free multiselect
         default_list = universe[:2]
         tickers = st.multiselect('Choose tickers', universe, default=default_list)
         period = st.selectbox('Date range', ['1mo', '3mo', '6mo', '1y', '2y'], index=2)
@@ -232,10 +225,9 @@ if st.button('▶ Run Analysis', use_container_width=True):
                 st.warning(f"{tkr}: Not enough data, skipped")
                 continue
             results[tkr] = summ
-            # logging (if defined)
-            if 'log_trade' in globals():
-                globals()['log_trade'](tkr, summ, float(df.Close.iloc[-1]))
-            # chart
+            notify_email(tkr, summ, float(df.Close.iloc[-1]))
+            notify_slack(tkr, summ, float(df.Close.iloc[-1]))
+
             st.markdown(f"#### 📈 {tkr} Price Chart")
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df.index, y=df.Close, name='Close'))
@@ -244,6 +236,7 @@ if st.button('▶ Run Analysis', use_container_width=True):
             fig.add_trace(go.Scatter(x=df.index, y=df.bb_upper, name='BB Upper', line=dict(dash='dot')))
             fig.add_trace(go.Scatter(x=df.index, y=df.bb_lower, name='BB Lower', line=dict(dash='dot')))
             st.plotly_chart(fig, use_container_width=True)
+
             badge_map = {'BUY': '🟢', 'SELL': '🔴', 'HOLD': '🟡'}
             st.markdown(f"**{badge_map[summ['Signal']]} {tkr} – {summ['Signal']}**")
             st.json(summ)
@@ -256,7 +249,7 @@ if st.button('▶ Run Analysis', use_container_width=True):
         st.download_button("⬇ Download CSV", res_df.to_csv().encode(), "stock_analysis_results.csv")
         st.markdown("### 📊 Summary of Trade Signals")
         signal_map = {'BUY': 1, 'SELL': -1, 'HOLD': 0}
-        st.bar_chart(pd.Series({k: signal_map[v['Signal']] for k, v in results.items()}))
+        st.bar_chart(pd.Series({k: signal_map[v['Signal']] for k,v in results.items()}))
 
 # -------------------------
 # ▶  Logs & Tax Summary (persistent)
