@@ -18,6 +18,8 @@ from streamlit_autorefresh import st_autorefresh
 # ▶  CONFIG & SECRETS
 # -------------------------
 PAGE_TITLE = "Stock Analyzer Bot (Live Trading + Tax Logs)"
+# Optional public app URL for links
+APP_URL = st.secrets.get('APP_URL', '')
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 
 # Robinhood API client (if installed)
@@ -127,7 +129,6 @@ def analyze(df: pd.DataFrame,
     cur, prev = df.iloc[-1], df.iloc[-2]
     rsi = float(cur['rsi'])
     sma20_cur, sma50_cur = float(cur['sma_20']), float(cur['sma_50'])
-    sma20_prev, sma50_prev = float(prev['sma_20']), float(prev['sma_50'])
     price = float(cur['Close'])
 
     reasons = []
@@ -135,9 +136,9 @@ def analyze(df: pd.DataFrame,
         reasons.append(f'RSI below {rsi_ovr} (oversold)')
     if rsi > rsi_obh:
         reasons.append(f'RSI above {rsi_obh} (overbought)')
-    if sma20_prev < sma50_prev <= sma20_cur:
+    if prev['sma_20'] < prev['sma_50'] <= sma20_cur:
         reasons.append('20 SMA crossed above 50 SMA (bullish)')
-    if sma20_prev > sma50_prev >= sma20_cur:
+    if prev['sma_20'] > prev['sma_50'] >= sma20_cur:
         reasons.append('20 SMA crossed below 50 SMA (bearish)')
     if price < float(cur['bb_lower']):
         reasons.append('Price below lower BB')
@@ -166,12 +167,16 @@ WEBHOOK = st.secrets.get('SLACK_WEBHOOK_URL')
 
 def notify_slack(tkr: str, summ: dict, price: float):
     if WEBHOOK:
-        requests.post(WEBHOOK, json={'text': f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}"})
+        link = f" (<{APP_URL}|View in App>)" if APP_URL else ''
+        text = f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}{link}"
+        requests.post(WEBHOOK, json={'text': text})
 
 def notify_email(tkr: str, summ: dict, price: float):
     msg = EmailMessage()
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    msg.set_content(f"Ticker: {tkr}\nSignal: {summ['Signal']} @ ${price}\nReasons: {summ['Reasons']}\nTime: {now}")
+    link = f"\n\nView in app: {APP_URL}" if APP_URL else ''
+    body = f"Ticker: {tkr}\nSignal: {summ['Signal']} @ ${price}\nReasons: {summ['Reasons']}\nTime: {now}{link}"
+    msg.set_content(body)
     msg['Subject'], msg['From'], msg['To'] = (
         f"{summ['Signal']} {tkr}",
         st.secrets['EMAIL_ADDRESS'],
@@ -269,3 +274,4 @@ if os.path.exists('trade_log.csv'):
     st.download_button("⬇ Download Tax Summary", tax.to_csv(index=False).encode(), "tax_summary.csv")
     st.markdown("### 📈 Portfolio Cumulative Profit Over Time")
     st.line_chart(trades.set_index('Date')['Cum P/L'])
+
