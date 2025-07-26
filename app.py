@@ -1,4 +1,4 @@
-# app.py – Streamlit Web App Version of Stock Analyzer with Robinhood Integration – **Full Restored Version with Debugged Ticker Scanner & Default Fix**
+# app.py – Streamlit Web App Version of Stock Analyzer Bot with S&P Scan & Full Ticker Selection
 
 import os
 import time
@@ -27,7 +27,7 @@ except ImportError:
     r = None
 
 # -------------------------
-# ▶  Helper to fetch S&P 500 & Top Movers
+# ▶  Helper to fetch S&P 500 & Top Movers
 # -------------------------
 @st.cache_data(show_spinner=False)
 def get_sp500_tickers() -> list[str]:
@@ -46,21 +46,20 @@ def get_sp500_tickers() -> list[str]:
             st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
             return []
 
-# Removed caching here to avoid stale data errors
-def get_top_tickers(n: int = 50) -> list[str]:
+# No caching on this to always get fresh top performers
+
+def get_top_tickers(n: int) -> list[str]:
     symbols = get_sp500_tickers()
     perf: dict[str, float] = {}
     for sym in symbols:
         try:
             df = yf.download(sym, period='2d', progress=False)
             if len(df) >= 2:
-                change = df['Close'].pct_change().iloc[-1]
-                perf[sym] = float(change)
+                perf[sym] = float(df['Close'].pct_change().iloc[-1])
         except Exception:
             continue
     try:
-        sorted_syms = sorted(perf, key=lambda k: perf[k], reverse=True)
-        return sorted_syms[:n]
+        return sorted(perf, key=lambda k: perf[k], reverse=True)[:n]
     except Exception as e:
         st.sidebar.error(f"Error sorting tickers: {e}")
         return []
@@ -86,7 +85,7 @@ def bollinger_bands(series: pd.Series, window: int = 20, num_std: int = 2):
     return sma, sma + num_std * std, sma - num_std * std
 
 # -------------------------
-# ▶  Data Fetch & Indicator Computation
+# ▶  Data Fetch & Indicators
 # -------------------------
 @st.cache_data(show_spinner=False)
 def get_data(ticker: str, period: str, retries: int = 3) -> pd.DataFrame:
@@ -109,35 +108,21 @@ def analyze(df: pd.DataFrame) -> dict | None:
         return None
     cur, prev = df.iloc[-1], df.iloc[-2]
     reasons = []
-    rsi = float(cur['rsi'])
-    if rsi < 30:
+    if cur['rsi'] < 30:
         reasons.append('RSI below 30 (oversold)')
-    if rsi > 70:
+    if cur['rsi'] > 70:
         reasons.append('RSI above 70 (overbought)')
-    sma20_cur, sma50_cur = float(cur['sma_20']), float(cur['sma_50'])
-    sma20_prev, sma50_prev = float(prev['sma_20']), float(prev['sma_50'])
-    if sma20_prev < sma50_prev <= sma20_cur:
+    if prev['sma_20'] < prev['sma_50'] <= cur['sma_20']:
         reasons.append('20 SMA crossed above 50 SMA (bullish)')
-    if sma20_prev > sma50_prev >= sma20_cur:
+    if prev['sma_20'] > prev['sma_50'] >= cur['sma_20']:
         reasons.append('20 SMA crossed below 50 SMA (bearish)')
-    price = float(cur['Close'])
-    if price < float(cur['bb_lower']):
+    if cur['Close'] < cur['bb_lower']:
         reasons.append('Price below lower BB')
-    if price > float(cur['bb_upper']):
+    if cur['Close'] > cur['bb_upper']:
         reasons.append('Price above upper BB')
     text = '; '.join(reasons).lower()
-    signal = 'HOLD'
-    if any(x in text for x in ['buy','bullish']):
-        signal = 'BUY'
-    elif any(x in text for x in ['sell','bearish']):
-        signal = 'SELL'
-    return {
-        'RSI': round(rsi,2),
-        '20 SMA': round(sma20_cur,2),
-        '50 SMA': round(sma50_cur,2),
-        'Signal': signal,
-        'Reasons': '; '.join(reasons)
-    }
+    signal = 'BUY' if any(k in text for k in ['bullish','buy']) else 'SELL' if any(k in text for k in ['bearish','sell']) else 'HOLD'
+    return {'RSI': round(cur['rsi'],2), '20 SMA': round(cur['sma_20'],2), '50 SMA': round(cur['sma_50'],2), 'Signal': signal, 'Reasons': '; '.join(reasons)}
 
 # -------------------------
 # ▶  Notifications & Logging
@@ -145,21 +130,14 @@ def analyze(df: pd.DataFrame) -> dict | None:
 WEBHOOK = st.secrets.get('SLACK_WEBHOOK_URL')
 
 def notify_slack(tkr: str, summ: dict, price: float):
-    if not WEBHOOK:
-        return
-    payload = {'text': f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}"}
-    requests.post(WEBHOOK, json=payload)
+    if WEBHOOK:
+        requests.post(WEBHOOK, json={'text':f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}"})
 
 def notify_email(tkr: str, summ: dict, price: float):
     msg = EmailMessage()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    body = f"Ticker: {tkr}\nSignal: {summ['Signal']} @ ${price}\nReasons: {summ['Reasons']}\nTime: {now}"
-    msg.set_content(body)
-    msg['Subject'], msg['From'], msg['To'] = (
-        f"{summ['Signal']} {tkr}",
-        st.secrets['EMAIL_ADDRESS'],
-        st.secrets['EMAIL_RECEIVER']
-    )
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    msg.set_content(f"Ticker: {tkr}\nSignal: {summ['Signal']} @ ${price}\nReasons: {summ['Reasons']}\nTime: {now}")
+    msg['Subject'], msg['From'], msg['To'] = (f"{summ['Signal']} {tkr}", st.secrets['EMAIL_ADDRESS'], st.secrets['EMAIL_RECEIVER'])
     with smtplib.SMTP_SSL('smtp.gmail.com',465) as s:
         s.login(st.secrets['EMAIL_ADDRESS'], st.secrets['EMAIL_PASSWORD'])
         s.send_message(msg)
@@ -178,19 +156,12 @@ with st.sidebar:
         scan_top = st.checkbox('Scan top N performers', False)
         top_n = st.slider('Top tickers to scan', 10, 100, 50) if scan_top else None
         universe = get_top_tickers(top_n) if scan_top else get_sp500_tickers()
-        default_tickers = universe[:2] if scan_top else ['AAPL','TSLA']
+        
+        # defaults
+        default_list = universe[:2]
 
-        if 'tickers' not in st.session_state or not scan_top:
-            st.session_state['tickers'] = default_tickers
-        default_list = [t for t in st.session_state['tickers'] if t in universe]
-        if not default_list:
-            default_list = default_tickers
-
-        tickers = st.multiselect(
-            'Choose tickers', universe,
-            default=default_list,
-            key='tickers'
-        )
+        # multiselect without forcing session state
+        tickers = st.multiselect('Choose tickers', universe, default=default_list)
         period = st.selectbox('Date range', ['1mo','3mo','6mo','1y','2y'], index=2)
 
 # -------------------------
@@ -198,11 +169,11 @@ with st.sidebar:
 # -------------------------
 st.markdown(f"### {'🔴 SIM' if simulate_mode else '🟢 LIVE'} {PAGE_TITLE}")
 if st.button('▶ Run Analysis', use_container_width=True):
-    if not st.session_state['tickers']:
+    if not tickers:
         st.warning('Select at least one ticker')
         st.stop()
     results = {}
-    for tkr in st.session_state['tickers']:
+    for tkr in tickers:
         try:
             df = get_data(tkr, period)
             if debug_mode:
@@ -212,7 +183,9 @@ if st.button('▶ Run Analysis', use_container_width=True):
                 st.warning(f"{tkr}: Not enough data, skipped")
                 continue
             results[tkr] = summ
-            log_trade(tkr, summ, float(df.Close.iloc[-1]))
+            log_trade = globals().get('log_trade')
+            if log_trade:
+                log_trade(tkr, summ, float(df.Close.iloc[-1]))
             st.markdown(f"#### 📈 {tkr} Price Chart")
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df.index, y=df.Close, name='Close'))
@@ -222,8 +195,7 @@ if st.button('▶ Run Analysis', use_container_width=True):
             fig.add_trace(go.Scatter(x=df.index, y=df.bb_lower, name='BB Lower', line=dict(dash='dot')))
             st.plotly_chart(fig, use_container_width=True)
             badge_map = {'BUY':'🟢','SELL':'🔴','HOLD':'🟡'}
-            badge = badge_map[summ['Signal']]
-            st.markdown(f"**{badge} {tkr} – {summ['Signal']}**")
+            st.markdown(f"**{badge_map[summ['Signal']]} {tkr} – {summ['Signal']}**")
             st.json(summ)
             st.divider()
         except Exception as e:
