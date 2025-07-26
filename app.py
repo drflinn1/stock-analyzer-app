@@ -198,10 +198,16 @@ with st.sidebar:
         else:
             universe = get_sp500_tickers()
             default_tickers = ['AAPL','TSLA']
+
+        # initialize session state default tickers on first load
+        if 'tickers' not in st.session_state:
+            st.session_state['tickers'] = default_tickers
+        # multiselect without overriding user selection thereafter
         tickers = st.multiselect(
-        'Choose tickers', universe, default=default_tickers,
-        key='tickers'
-    )
+            'Choose tickers', universe,
+            default=st.session_state['tickers'],
+            key='tickers'
+        )
         period   = st.selectbox('Date range', ['1mo','3mo','6mo','1y','2y'], index=2)
 
 # -------------------------
