@@ -54,15 +54,13 @@ def get_top_tickers(n: int) -> list[str]:
     try:
         df = yf.download(symbols, period='2d', progress=False)['Close']
         if isinstance(df, pd.Series):
-            changes = df.pct_change().iloc[-1:]
-            changes = changes.to_frame().T
+            changes = df.pct_change().iloc[-1:].to_frame().T
         else:
             changes = df.pct_change().iloc[-1]
-        top = changes.dropna().sort_values(ascending=False).head(n).index.tolist()
-        return top
+        return changes.dropna().sort_values(ascending=False).head(n).index.tolist()
     except Exception as e:
         st.sidebar.error(f"Error fetching top tickers vectorized: {e}")
-        perf: dict[str, float] = {}
+        perf = {}
         for sym in symbols:
             try:
                 tmp = yf.download(sym, period='2d', progress=False)['Close']
@@ -70,10 +68,7 @@ def get_top_tickers(n: int) -> list[str]:
                     perf[sym] = float(tmp.pct_change().iloc[-1])
             except Exception:
                 continue
-        try:
-            return sorted(perf, key=lambda k: perf[k], reverse=True)[:n]
-        except:
-            return []
+        return sorted(perf, key=lambda k: perf[k], reverse=True)[:n]
 
 # -------------------------
 # ▶  Analysis Helpers
@@ -126,6 +121,7 @@ def analyze(df: pd.DataFrame) -> dict | None:
     cur, prev = df.iloc[-1], df.iloc[-2]
     rsi = float(cur['rsi'])
     sma20_cur, sma50_cur = float(cur['sma_20']), float(cur['sma_50'])
+    sma20_prev, sma50_prev = float(prev['sma_20']), float(prev['sma_50'])
     price = float(cur['Close'])
 
     reasons = []
@@ -133,7 +129,6 @@ def analyze(df: pd.DataFrame) -> dict | None:
         reasons.append('RSI below 30 (oversold)')
     if rsi > 70:
         reasons.append('RSI above 70 (overbought)')
-    sma20_prev, sma50_prev = float(prev['sma_20']), float(prev['sma_50'])
     if sma20_prev < sma50_prev <= sma20_cur:
         reasons.append('20 SMA crossed above 50 SMA (bullish)')
     if sma20_prev > sma50_prev >= sma20_cur:
@@ -214,50 +209,5 @@ if st.button('▶ Run Analysis', use_container_width=True):
             df = get_data(tkr, period)
             summ = analyze(df)
             if summ is None:
-                st.warning(f"{tkr}: Not enough data, skipped")
-                continue
-            results[tkr] = summ
-            notify_email(tkr, summ, float(df.Close.iloc[-1]))
-            notify_slack(tkr, summ, float(df.Close.iloc[-1]))
-
-            st.markdown(f"#### 📈 {tkr} Price Chart")
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df.index, y=df.Close, name='Close'))
-            fig.add_trace(go.Scatter(x=df.index, y=df.sma_20, name='20 SMA'))
-            fig.add_trace(go.Scatter(x=df.index, y=df.sma_50, name='50 SMA'))
-            fig.add_trace(go.Scatter(x=df.index, y=df.bb_upper, name='BB Upper', line=dict(dash='dot')))
-            fig.add_trace(go.Scatter(x=df.index, y=df.bb_lower, name='BB Lower', line=dict(dash='dot')))
-            st.plotly_chart(fig,use_container_width=True)
-
-            badge_map={'BUY':'🟢','SELL':'🔴','HOLD':'🟡'}
-            st.markdown(f"**{badge_map[summ['Signal']]} {tkr} – {summ['Signal']}**")
-            st.json(summ)
-            st.divider()
-        except Exception as e:
-            st.error(f"{tkr} failed: {e}")
-
-    if results:
-        res_df=pd.DataFrame(results).T
-        st.download_button("⬇ Download CSV", res_df.to_csv().encode(), "stock_analysis_results.csv")
-        st.markdown("### 📊 Summary of Trade Signals")
-        signal_map={'BUY':1,'SELL':-1,'HOLD':0}
-        st.bar_chart(pd.Series({k:signal_map[v['Signal']] for k,v in results.items()}))
-
-# -------------------------
-# ▶  Logs & Tax Summary (persistent)
-# -------------------------
-if os.path.exists('trade_log.csv'):
-    trades=pd.read_csv('trade_log.csv')
-    st.subheader("🧾 Trade Log")
-    st.dataframe(trades)
-    st.download_button("⬇ Download Trade Log", trades.to_csv(index=False).encode(), "trade_log.csv")
-
-    trades['Cum P/L']=trades['Gain/Loss'].cumsum()
-    total_pl=trades['Gain/Loss'].sum()
-    st.markdown(f"## 💰 **Total Portfolio P/L: ${total_pl:.2f}**")
-    tax=trades.groupby('Tax Category')['Gain/Loss'].sum().reset_index()
-    st.subheader("Tax Summary")
-    st.dataframe(tax)
-    st.download_button("⬇ Download Tax Summary", tax.to_csv(index=False).encode(), "tax_summary.csv")
-    st.markdown("### 📈 Portfolio Cumulative Profit Over Time")
-    st.line_chart(trades.set_index('Date')['Cum P/L'])
+                st.warning
+```
