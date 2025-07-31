@@ -214,7 +214,7 @@ if st.button('▶ Run Analysis', use_container_width=True):
         try:
             df = get_data(tkr, period)
             if debug_mode:
-                st.write(f"{tktr} rows: {len(df)}")
+                st.write(f"{tkr} rows: {len(df)}")
             summ = analyze(df, min_rows, rsi_ovr, rsi_obh)
             if summ is None:
                 st.warning(f"{tkr}: Not enough data, skipped")
