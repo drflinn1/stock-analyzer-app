@@ -27,7 +27,7 @@ except ImportError:
     r = None
 
 # -------------------------
-# ▶  Helper to fetch S&P 500 & Top Movers
+# ▶  Helper to fetch S&P 500 & Top Movers
 # -------------------------
 @st.cache_data(show_spinner=False)
 def get_sp500_tickers() -> list[str]:
@@ -43,7 +43,7 @@ def get_sp500_tickers() -> list[str]:
             table = soup.find('table', {'class':'wikitable'})
             return [row.find_all('td')[0].text.strip() for row in table.find_all('tr')[1:]]
         except Exception as e:
-            st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
+            st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
             return []
 
 # No caching here to always get fresh top performers
@@ -162,7 +162,7 @@ def notify_slack(tkr: str, summ: dict, price: float):
 def notify_email(tkr: str, summ: dict, price: float):
     msg = EmailMessage()
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    msg.set_content(f"Ticker: {tkr}\nSignal: {summ['Signal']} @ ${price}\nReasons: {summ['Reasons']}\nTime: {now}")
+    msg.set_content(f"Ticker: {tkr}\nSignal: {summ['Signal']} @ ${price}\nReasons__: {summ['Reasons']}\nTime__: {now}")
     msg['Subject'], msg['From'], msg['To'] = (
         f"{summ['Signal']} {tkr}",
         st.secrets['EMAIL_ADDRESS'],
@@ -221,4 +221,39 @@ if st.button('▶ Run Analysis', use_container_width=True):
             fig.add_trace(go.Scatter(x=df.index, y=df.sma_20, name='20 SMA'))
             fig.add_trace(go.Scatter(x=df.index, y=df.sma_50, name='50 SMA'))
             fig.add_trace(go.Scatter(x=df.index, y=df.bb_upper, name='BB Upper', line=dict(dash='dot')))
-            fig.add_trace(go.Scatter(x=df.index, y=df.bb_lower, name='BB Lower', line=dict
+            fig.add_trace(go.Scatter(x=df.index, y=df.bb_lower, name='BB Lower', line=dict(dash='dot')))
+            st.plotly_chart(fig, use_container_width=True)
+
+            badge_map = {'BUY':'🟢','SELL':'🔴','HOLD':'🟡'}
+            st.markdown(f"**{badge_map[summ['Signal']]} {tkr} – {summ['Signal']}**")
+            st.json(summ)
+            st.divider()
+        except Exception as e:
+            st.error(f"{tkr} failed: {e}")
+
+    if results:
+        res_df = pd.DataFrame(results).T
+        st.download_button("⬇ Download CSV", res_df.to_csv().encode(), "stock_analysis_results.csv")
+        st.dataframe(res_df)
+        st.markdown("### 📊 Summary of Trade Signals")
+        signal_map = {'BUY':1,'SELL':-1,'HOLD':0}
+        st.bar_chart(pd.Series({k:signal_map[v['Signal']] for k,v in results.items()}))
+
+# -------------------------
+# ▶  Logs & Tax Summary (persistent)
+# -------------------------
+if os.path.exists('trade_log.csv'):
+    trades = pd.read_csv('trade_log.csv')
+    st.subheader("🧾 Trade Log")
+    st.dataframe(trades)
+    st.download_button("⬇ Download Trade Log", trades.to_csv(index=False).encode(), "trade_log.csv")
+
+    trades['Cum P/L'] = trades['Gain/Loss'].cumsum()
+    total_pl = trades['Gain/Loss'].sum()
+    st.markdown(f"## 💰 **Total Portfolio P/L: ${total_pl:.2f}**")
+    tax = trades.groupby('Tax Category')['Gain/Loss'].sum().reset_index()
+    st.subheader("Tax Summary")
+    st.dataframe(tax)
+    st.download_button("⬇ Download Tax Summary", tax.to_csv(index=False).encode(), "tax_summary.csv")
+    st.markdown("### 📈 Portfolio Cumulative Profit Over Time")
+    st.line_chart(trades.set_index('Date')['Cum P/L'])
