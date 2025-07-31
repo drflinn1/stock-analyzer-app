@@ -22,6 +22,14 @@ PAGE_TITLE = "Stock Analyzer Bot (Live Trading + Tax Logs)"
 APP_URL = st.secrets.get('APP_URL', '')
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 
+# Validate required secrets
+missing = []
+for key in ['EMAIL_ADDRESS','EMAIL_RECEIVER','SLACK_WEBHOOK_URL']:
+    if not st.secrets.get(key):
+        missing.append(key)
+if missing:
+    st.sidebar.error(f"Missing secrets: {', '.join(missing)}. Please set these in your Streamlit Cloud settings.")
+
 # Robinhood API client (if installed)
 try:
     from robin_stocks import robinhood as r
@@ -139,10 +147,10 @@ def analyze(df: pd.DataFrame, min_rows: int, rsi_ovr: float, rsi_obh: float) -> 
     if price > float(cur['bb_upper']):
         reasons.append('Price above upper BB')
 
-    txt = "; ".join(reasons).lower()
+    text = "; ".join(reasons).lower()
     signal = 'HOLD'
-    if any(k in txt for k in ['buy','bullish']): signal = 'BUY'
-    elif any(k in txt for k in ['sell','bearish']): signal = 'SELL'
+    if any(k in text for k in ['buy','bullish']): signal = 'BUY'
+    elif any(k in text for k in ['sell','bearish']): signal = 'SELL'
 
     return {
         'RSI': round(rsi, 2),
@@ -213,27 +221,22 @@ if st.button('▶ Run Analysis', use_container_width=True):
     for tkr in tickers:
         try:
             df = get_data(tkr, period)
-            if debug_mode:
-                st.write(f"{tkr} rows: {len(df)}")
             summ = analyze(df, min_rows, rsi_ovr, rsi_obh)
             if summ is None:
                 st.warning(f"{tkr}: Not enough data, skipped")
                 continue
             results[tkr] = summ
-            notify_email(tkr, summ, float(df['Close'].iloc[-1]))
-            notify_slack(tkr, summ, float(df['Close'].iloc[-1]))
+            notify_email(tkr, summ, float(df.Close.iloc[-1]))
+            notify_slack(tkr, summ, float(df.Close.iloc[-1]))
 
             st.markdown(f"#### 📈 {tkr} Price Chart")
-            try:
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name='Close'))
-                fig.add_trace(go.Scatter(x=df.index, y=df['sma_20'], name='20 SMA'))
-                fig.add_trace(go.Scatter(x=df.index, y=df['sma_50'], name='50 SMA'))
-                fig.add_trace(go.Scatter(x=df.index, y=df['bb_upper'], name='BB Upper', line=dict(dash='dot')))
-                fig.add_trace(go.Scatter(x=df.index, y=df['bb_lower'], name='BB Lower', line=dict(dash='dot')))
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception as e_chart:
-                st.warning(f"Chart failed for {tkr}: {e_chart}")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df.index, y=df.Close, name='Close'))
+            fig.add_trace(go.Scatter(x=df.index, y=df.sma_20, name='20 SMA'))
+            fig.add_trace(go.Scatter(x=df.index, y=df.sma_50, name='50 SMA'))
+            fig.add_trace(go.Scatter(x=df.index, y=df.bb_upper, name='BB Upper', line=dict(dash='dot')))
+            fig.add_trace(go.Scatter(x=df.index, y=df.bb_lower, name='BB Lower', line=dict(dash='dot')))
+            st.plotly_chart(fig, use_container_width=True)
 
             badge_map = {'BUY':'🟢','SELL':'🔴','HOLD':'🟡'}
             st.markdown(f"**{badge_map[summ['Signal']]} {tkr} – {summ['Signal']}**")
@@ -248,7 +251,7 @@ if st.button('▶ Run Analysis', use_container_width=True):
         st.dataframe(res_df)
         st.markdown("### 📊 Summary of Trade Signals")
         signal_map = {'BUY':1,'SELL':-1,'HOLD':0}
-        st.bar_chart(pd.Series({k: signal_map[v['Signal']] for k,v in results.items()}))
+        st.bar_chart(pd.Series({k:signal_map[v['Signal']] for k,v in results.items()}))
 
 # -------------------------
 # ▶  Logs & Tax Summary (persistent)
