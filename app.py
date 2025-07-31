@@ -168,7 +168,7 @@ def notify_slack(tkr: str, summ: dict, price: float):
         link = f" (<{APP_URL}|View in App>)" if APP_URL else ''
         text = f"*{summ['Signal']}* {tkr} @ ${price}
 {summ['Reasons']}{link}"
-        requests.post(WEBHOOK, json={'text': text})
+        requests.post(WEBHOOK, json={'text': text})(WEBHOOK, json={'text': text})
 
 def notify_email(tkr: str, summ: dict, price: float):
     msg = EmailMessage()
