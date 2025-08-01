@@ -166,16 +166,25 @@ def analyze(df: pd.DataFrame, min_rows: int, rsi_ovr: float, rsi_obh: float) -> 
 WEBHOOK = st.secrets.get('SLACK_WEBHOOK_URL')
 
 def notify_slack(tkr: str, summ: dict, price: float):
+    if WEBHOOK and APP_URL:
+        qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}"
+        link = f" (<{APP_URL}{qs}|View in App>)"
+    else:
+        link = ''
+    text = f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}{link}"
     if WEBHOOK:
-        link = f" (<{APP_URL}|View in App>)" if APP_URL else ''
-        text = f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}{link}"
         requests.post(WEBHOOK, json={'text': text})
 
 def notify_email(tkr: str, summ: dict, price: float):
-    msg = EmailMessage()
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    link = f"\n\nView in app: {APP_URL}" if APP_URL else ''
-    body = f"Ticker: {tkr}\nSignal: {summ['Signal']} @ ${price}\nReasons: {summ['Reasons']}\nTime: {now}{link}"
+    if APP_URL:
+        qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}"
+        link = f"\n\nView in app: {APP_URL}{qs}"
+    else:
+        link = ''
+    body = (f"Ticker: {tkr}\nSignal: {summ['Signal']} @ ${price}\n"
+            f"Reasons: {summ['Reasons']}\nTime: {now}{link}")
+    msg = EmailMessage()
     msg.set_content(body)
     msg['Subject'], msg['From'], msg['To'] = (
         f"{summ['Signal']} {tkr}",
@@ -205,9 +214,32 @@ with st.sidebar:
         rsi_ovr = st.slider('RSI oversold threshold', 0, 100, 30)
         rsi_obh = st.slider('RSI overbought threshold', 0, 100, 70)
 
-        default_list = universe[:2]
-        tickers = st.multiselect('Choose tickers', universe, default=default_list, key='tickers')
-        period = st.selectbox('Date range', ['1mo','3mo','6mo','1y','2y'], index=2)
+        # load any URL query params
+        params = st.experimental_get_query_params()
+        qs_tickers = params.get('tickers', [])
+        options = ['1mo','3mo','6mo','1y','2y']
+        qs_period = params.get('period', [])
+
+        # defaults from query or sidebar defaults
+        if qs_tickers:
+            default_list = qs_tickers[0].split(',')
+        else:
+            default_list = universe[:2]
+        if qs_period and qs_period[0] in options:
+            default_period = qs_period[0]
+        else:
+            default_period = '6mo'
+
+        # expose to session_state for notifications
+        st.session_state['tickers'] = default_list
+        st.session_state['period'] = default_period
+
+        tickers = st.multiselect('Choose tickers', universe,
+                                  default=default_list,
+                                  key='tickers')
+        period = st.selectbox('Date range', options,
+                              index=options.index(default_period),
+                              key='period')
 
 # -------------------------
 # ▶  Main Page
