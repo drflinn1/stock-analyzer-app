@@ -18,8 +18,7 @@ from streamlit_autorefresh import st_autorefresh
 # ▶  CONFIG & SECRETS
 # -------------------------
 PAGE_TITLE = "Stock Analyzer Bot (Live Trading + Tax Logs)"
-# Optional public app URL for links
-APP_URL = st.secrets.get('APP_URL', '')
+# Optional public app URL for links\ nAPP_URL = st.secrets.get('APP_URL', '')
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 
 # Validate required secrets
