@@ -18,7 +18,7 @@ from streamlit_autorefresh import st_autorefresh
 # ▶  CONFIG & SECRETS
 # -------------------------
 PAGE_TITLE = "Stock Analyzer Bot (Live Trading + Tax Logs)"
-# Set up page
+# Set up page layout
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 
 # Validate required secrets
@@ -29,7 +29,7 @@ for key in ['EMAIL_ADDRESS','EMAIL_RECEIVER','SLACK_WEBHOOK_URL','APP_URL']:
 if missing:
     st.sidebar.error(f"Missing secrets: {', '.join(missing)}. Please set these in your Streamlit Cloud settings.")
 
-# Optional Robinhood client
+# Optional Robinhood API client
 try:
     from robin_stocks import robinhood as r
 except ImportError:
@@ -55,7 +55,7 @@ def get_sp500_tickers() -> list[str]:
             st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
             return []
 
-# No caching on this to always get fresh top performers
+# No caching here to always get fresh top performers
 def get_top_tickers(n: int) -> list[str]:
     symbols = get_sp500_tickers()
     if not symbols:
@@ -105,6 +105,7 @@ def bollinger_bands(series: pd.Series, window: int = 20, num_std: int = 2):
 def get_data(ticker: str, period: str, retries: int = 3) -> pd.DataFrame:
     for _ in range(retries):
         df = yf.download(ticker, period=period, auto_adjust=False, progress=False)
+        # flatten multi-index if present
         if isinstance(df.columns, pd.MultiIndex):
             try:
                 df = df.xs(ticker, axis=1, level=1)
@@ -220,7 +221,6 @@ with st.sidebar:
         options = ['1mo','3mo','6mo','1y','2y']
         qs_period = params.get('period', [])
 
-        # defaults from query or sidebar defaults
         if qs_tickers:
             default_list = qs_tickers[0].split(',')
         else:
@@ -230,7 +230,6 @@ with st.sidebar:
         else:
             default_period = '6mo'
 
-        # expose to session_state for notifications
         st.session_state['tickers'] = default_list
         st.session_state['period'] = default_period
 
