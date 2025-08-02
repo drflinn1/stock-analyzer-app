@@ -56,7 +56,6 @@ def get_sp500_tickers() -> list[str]:
             st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
             return []
 
-# No caching on this to always get fresh top performers
 @st.cache_data(show_spinner=False)
 def get_top_tickers(n: int) -> list[str]:
     symbols = get_sp500_tickers()
@@ -215,13 +214,11 @@ with st.sidebar:
         rsi_ovr = st.slider('RSI oversold threshold', 0, 100, 30)
         rsi_obh = st.slider('RSI overbought threshold', 0, 100, 70)
 
-        # load any URL query params
         params = st.experimental_get_query_params()
         qs_tickers = params.get('tickers', [])
         options = ['1mo','3mo','6mo','1y','2y']
         qs_period = params.get('period', [])
 
-        # defaults from query or sidebar defaults
         if qs_tickers:
             default_list = qs_tickers[0].split(',')
         else:
@@ -231,7 +228,6 @@ with st.sidebar:
         else:
             default_period = '6mo'
 
-        # expose to session_state for notifications
         st.session_state['tickers'] = default_list
         st.session_state['period'] = default_period
 
@@ -245,7 +241,6 @@ with st.sidebar:
 # -------------------------
 # ▶  Main Page
 # -------------------------
-# Fix: use st.markdown (not st.stakeholder)
 st.markdown(f"### {'🔴 SIM' if simulate_mode else '🟢 LIVE'} {PAGE_TITLE}")
 if st.button('▶ Run Analysis', use_container_width=True):
     if not tickers:
@@ -267,9 +262,9 @@ if st.button('▶ Run Analysis', use_container_width=True):
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df.index, y=df.Close, name='Close'))
             fig.add_trace(go.Scatter(x=df.index, y=df.sma_20, name='20 SMA'))
-            fig.add(trace(go.Scatter(x=df.index, y=df.sma_50, name='50 SMA')))
-            fig.add(trace(go.Scatter(x=df.index, y=df.bb_upper, name='BB Upper', line=dict(dash='dot'))))
-            fig.add(trace(go.Scatter(x=df.index, y=df.bb_lower, name='BB Lower', line=dict(dash='dot'))))
+            fig.add_trace(go.Scatter(x=df.index, y=df.sma_50, name='50 SMA'))
+            fig.add_trace(go.Scatter(x=df.index, y=df.bb_upper, name='BB Upper', line=dict(dash='dot')))
+            fig.add_trace(go.Scatter(x=df.index, y=df.bb_lower, name='BB Lower', line=dict(dash='dot')))
             st.plotly_chart(fig, use_container_width=True)
 
             badge_map = {'BUY':'🟢','SELL':'🔴','HOLD':'🟡'}
@@ -289,18 +284,19 @@ if st.button('▶ Run Analysis', use_container_width=True):
 
 # -------------------------
 # ▶  Logs & Tax Summary (persistent)
-#if os.path.exists('trade_log.csv'):
-#    trades = pd.read_csv('trade_log.csv')
-#    st.subheader("🧾 Trade Log")
-#    st.dataframe(trades)
-#    st.download_button("⬇ Download Trade Log", trades.to_csv(index=False).encode(), "trade_log.csv")
+# -------------------------
+if os.path.exists('trade_log.csv'):
+    trades = pd.read_csv('trade_log.csv')
+    st.subheader("🧾 Trade Log")
+    st.dataframe(trades)
+    st.download_button("⬇ Download Trade Log", trades.to_csv(index=False).encode(), "trade_log.csv")
 
-#    trades['Cum P/L'] = trades['Gain/Loss'].cumsum()
-#    total_pl = trades['Gain/Loss'].sum()
-#    st.markdown(f"## 💰 **Total Portfolio P/L: ${total_pl:.2f}**")
-#    tax = trades.groupby('Tax Category')['Gain/Loss'].sum().reset_index()
-#    st.subheader("Tax Summary")
-#    st.dataframe(tax)
-#    st.download_button("⬇ Download Tax Summary", tax.to_csv(index=False).encode(), "tax_summary.csv")
-#    st.markdown("### 📈 Portfolio Cumulative Profit Over Time")
-#    st.line_chart(trades.set_index('Date')['Cum P/L'])
+    trades['Cum P/L'] = trades['Gain/Loss'].cumsum()
+    total_pl = trades['Gain/Loss'].sum()
+    st.markdown(f"## 💰 **Total Portfolio P/L: ${total_pl:.2f}**")
+    tax = trades.groupby('Tax Category')['Gain/Loss'].sum().reset_index()
+    st.subheader("Tax Summary")
+    st.dataframe(tax)
+    st.download_button("⬇ Download Tax Summary", tax.to_csv(index=False).encode(), "tax_summary.csv")
+    st.markdown("### 📈 Portfolio Cumulative Profit Over Time")
+    st.line_chart(trades.set_index('Date')['Cum P/L'])
