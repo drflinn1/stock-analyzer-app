@@ -168,7 +168,7 @@ WEBHOOK = st.secrets.get('SLACK_WEBHOOK_URL')
 
 def notify_slack(tkr: str, summ: dict, price: float):
     if WEBHOOK and APP_URL:
-        qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}" 
+        qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}"
         link = f" (<{APP_URL}{qs}|View in App>)"
     else:
         link = ''
@@ -229,11 +229,18 @@ with st.sidebar:
         else:
             default_period = '6mo'
 
-        st.session_state['tickers'] = default_list
+        # filter out any URL tickers not in the current universe
+        valid_defaults = [t for t in default_list if t in universe]
+        if len(valid_defaults) < len(default_list):
+            dropped = set(default_list) - set(valid_defaults)
+            st.warning(f"Dropped unknown tickers from URL: {', '.join(dropped)}")
+
+        # initialize session state for notifications
+        st.session_state['tickers'] = valid_defaults or universe[:2]
         st.session_state['period'] = default_period
 
         tickers = st.multiselect('Choose tickers', universe,
-                                  default=default_list,
+                                  default=st.session_state['tickers'],
                                   key='tickers')
         period = st.selectbox('Date range', options,
                               index=options.index(default_period),
