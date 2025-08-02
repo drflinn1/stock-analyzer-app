@@ -18,19 +18,18 @@ from streamlit_autorefresh import st_autorefresh
 # ▶  CONFIG & SECRETS
 # -------------------------
 PAGE_TITLE = "Stock Analyzer Bot (Live Trading + Tax Logs)"
-# Optional public app URL for links\ nAPP_URL = st.secrets.get('APP_URL', '')
+# Set up page
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 
 # Validate required secrets
 missing = []
-# Slack webhook is optional; email credentials are required
-for key in ['EMAIL_ADDRESS','EMAIL_RECEIVER']:
+for key in ['EMAIL_ADDRESS','EMAIL_RECEIVER','SLACK_WEBHOOK_URL','APP_URL']:
     if not st.secrets.get(key):
         missing.append(key)
 if missing:
     st.sidebar.error(f"Missing secrets: {', '.join(missing)}. Please set these in your Streamlit Cloud settings.")
 
-# Robinhood API client (if installed)
+# Optional Robinhood client
 try:
     from robin_stocks import robinhood as r
 except ImportError:
@@ -56,7 +55,7 @@ def get_sp500_tickers() -> list[str]:
             st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
             return []
 
-@st.cache_data(show_spinner=False)
+# No caching on this to always get fresh top performers
 def get_top_tickers(n: int) -> list[str]:
     symbols = get_sp500_tickers()
     if not symbols:
@@ -157,29 +156,30 @@ def analyze(df: pd.DataFrame, min_rows: int, rsi_ovr: float, rsi_obh: float) -> 
         '20 SMA': round(sma20_cur, 2),
         '50 SMA': round(sma50_cur, 2),
         'Signal': signal,
-        'Reasons': "; ".join(reasons)
+        'Reasons': '; '.join(reasons)
     }
 
 # -------------------------
 # ▶  Notifications & Logging
 # -------------------------
-WEBHOOK = st.secrets.get('SLACK_WEBHOOK_URL')
-
 def notify_slack(tkr: str, summ: dict, price: float):
-    if WEBHOOK and APP_URL:
+    webhook = st.secrets.get('SLACK_WEBHOOK_URL', '')
+    app_url = st.secrets.get('APP_URL', '')
+    if webhook and app_url:
         qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}"
-        link = f" (<{APP_URL}{qs}|View in App>)"
+        link = f" (<{app_url}{qs}|View in App>)"
     else:
         link = ''
     text = f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}{link}"
-    if WEBHOOK:
-        requests.post(WEBHOOK, json={'text': text})
+    if webhook:
+        requests.post(webhook, json={'text': text})
 
 def notify_email(tkr: str, summ: dict, price: float):
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    if APP_URL:
+    app_url = st.secrets.get('APP_URL', '')
+    if app_url:
         qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}"
-        link = f"\n\nView in app: {APP_URL}{qs}"
+        link = f"\n\nView in app: {app_url}{qs}"
     else:
         link = ''
     body = (f"Ticker: {tkr}\nSignal: {summ['Signal']} @ ${price}\n"
@@ -214,11 +214,13 @@ with st.sidebar:
         rsi_ovr = st.slider('RSI oversold threshold', 0, 100, 30)
         rsi_obh = st.slider('RSI overbought threshold', 0, 100, 70)
 
+        # load any URL query params
         params = st.query_params
         qs_tickers = params.get('tickers', [])
         options = ['1mo','3mo','6mo','1y','2y']
         qs_period = params.get('period', [])
 
+        # defaults from query or sidebar defaults
         if qs_tickers:
             default_list = qs_tickers[0].split(',')
         else:
@@ -228,18 +230,12 @@ with st.sidebar:
         else:
             default_period = '6mo'
 
-        # filter out any URL tickers not in the current universe
-        valid_defaults = [t for t in default_list if t in universe]
-        if len(valid_defaults) < len(default_list):
-            dropped = set(default_list) - set(valid_defaults)
-            st.warning(f"Dropped unknown tickers from URL: {', '.join(dropped)}")
-
-        # initialize session state for notifications
-        st.session_state['tickers'] = valid_defaults or universe[:2]
+        # expose to session_state for notifications
+        st.session_state['tickers'] = default_list
         st.session_state['period'] = default_period
 
         tickers = st.multiselect('Choose tickers', universe,
-                                  default=st.session_state['tickers'],
+                                  default=default_list,
                                   key='tickers')
         period = st.selectbox('Date range', options,
                               index=options.index(default_period),
