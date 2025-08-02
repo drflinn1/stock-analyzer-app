@@ -24,10 +24,12 @@ st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 
 # Validate required secrets
 missing = []
-for key in ['EMAIL_ADDRESS','EMAIL_RECEIVER','SLACK_WEBHOOK_URL']:
+# Slack webhook is optional; email credentials are required
+for key in ['EMAIL_ADDRESS','EMAIL_RECEIVER']:
     if not st.secrets.get(key):
         missing.append(key)
 if missing:
+    st.sidebar.error(f"Missing secrets: {', '.join(missing)}. Please set these in your Streamlit Cloud settings.")
     st.sidebar.error(f"Missing secrets: {', '.join(missing)}. Please set these in your Streamlit Cloud settings.")
 
 # Robinhood API client (if installed)
