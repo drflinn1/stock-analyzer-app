@@ -1,4 +1,3 @@
-```python
 # app.py – Streamlit Web App Version of Stock Analyzer Bot with S&P Scan & Full Ticker Selection
 
 import os
@@ -246,6 +245,7 @@ with st.sidebar:
 # -------------------------
 # ▶  Main Page
 # -------------------------
+# Fix: use st.markdown (not st.stakeholder)
 st.markdown(f"### {'🔴 SIM' if simulate_mode else '🟢 LIVE'} {PAGE_TITLE}")
 if st.button('▶ Run Analysis', use_container_width=True):
     if not tickers:
@@ -305,4 +305,3 @@ if os.path.exists('trade_log.csv'):
     st.download_button("⬇ Download Tax Summary", tax.to_csv(index=False).encode(), "tax_summary.csv")
     st.markdown("### 📈 Portfolio Cumulative Profit Over Time")
     st.line_chart(trades.set_index('Date')['Cum P/L'])
-```
