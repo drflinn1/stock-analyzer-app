@@ -168,7 +168,7 @@ WEBHOOK = st.secrets.get('SLACK_WEBHOOK_URL')
 def notify_slack(tkr: str, summ: dict, price: float):
     if WEBHOOK and APP_URL:
         qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}"
-        link = f" (<{APP_URL}{qs}|View in App>)"
+        link = f" (<{{APP_URL}}{{qs}}|View in App>)"
     else:
         link = ''
     text = f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}{link}"
@@ -186,11 +186,9 @@ def notify_email(tkr: str, summ: dict, price: float):
             f"Reasons: {summ['Reasons']}\nTime: {now}{link}")
     msg = EmailMessage()
     msg.set_content(body)
-    msg['Subject'], msg['From'], msg['To'] = (
-        f"{summ['Signal']} {tkr}",
-        st.secrets['EMAIL_ADDRESS'],
-        st.secrets['EMAIL_RECEIVER']
-    )
+    msg['Subject'] = f"{summ['Signal']} {tkr}"
+    msg['From'] = st.secrets['EMAIL_ADDRESS']
+    msg['To'] = st.secrets['EMAIL_RECEIVER']
     with smtplib.SMTP_SSL('smtp.gmail.com', 465) as s:
         s.login(st.secrets['EMAIL_ADDRESS'], st.secrets['EMAIL_PASSWORD'])
         s.send_message(msg)
@@ -243,13 +241,13 @@ with st.sidebar:
 # -------------------------
 st.markdown(f"### {'🔴 SIM' if simulate_mode else '🟢 LIVE'} {PAGE_TITLE}")
 if st.button('▶ Run Analysis', use_container_width=True):
-    if not tickers:
+    if not st.session_state['tickers']:
         st.warning('Select at least one ticker')
         st.stop()
     results = {}
-    for tkr in tickers:
+    for tkr in st.session_state['tickers']:
         try:
-            df = get_data(tkr, period)
+            df = get_data(tkr, st.session_state['period'])
             summ = analyze(df, min_rows, rsi_ovr, rsi_obh)
             if summ is None:
                 st.warning(f"{tkr}: Not enough data, skipped")
