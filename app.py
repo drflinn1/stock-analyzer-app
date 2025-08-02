@@ -30,7 +30,6 @@ for key in ['EMAIL_ADDRESS','EMAIL_RECEIVER']:
         missing.append(key)
 if missing:
     st.sidebar.error(f"Missing secrets: {', '.join(missing)}. Please set these in your Streamlit Cloud settings.")
-    st.sidebar.error(f"Missing secrets: {', '.join(missing)}. Please set these in your Streamlit Cloud settings.")
 
 # Robinhood API client (if installed)
 try:
@@ -169,7 +168,7 @@ WEBHOOK = st.secrets.get('SLACK_WEBHOOK_URL')
 
 def notify_slack(tkr: str, summ: dict, price: float):
     if WEBHOOK and APP_URL:
-        qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}"
+        qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}" 
         link = f" (<{APP_URL}{qs}|View in App>)"
     else:
         link = ''
@@ -216,7 +215,7 @@ with st.sidebar:
         rsi_ovr = st.slider('RSI oversold threshold', 0, 100, 30)
         rsi_obh = st.slider('RSI overbought threshold', 0, 100, 70)
 
-        params = st.experimental_get_query_params()
+        params = st.query_params
         qs_tickers = params.get('tickers', [])
         options = ['1mo','3mo','6mo','1y','2y']
         qs_period = params.get('period', [])
