@@ -166,17 +166,25 @@ def analyze(df: pd.DataFrame, min_rows: int, rsi_ovr: float, rsi_obh: float) -> 
 WEBHOOK = st.secrets.get('SLACK_WEBHOOK_URL')
 
 def notify_slack(tkr: str, summ: dict, price: float):
+    if WEBHOOK and APP_URL:
+        qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}"
+        link = f" (<{APP_URL}{qs}|View in App>)"
+    else:
+        link = ''
+    text = f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}{link}"
     if WEBHOOK:
-        link = f" (<{APP_URL}?tickers={','.join(st.session_state.get('tickers',[]))}&period={st.session_state.get('period','')}|View in App>)" if APP_URL and st.session_state.get('tickers') else ''
-        text = f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}{link}"
         requests.post(WEBHOOK, json={'text': text})
 
 def notify_email(tkr: str, summ: dict, price: float):
-    msg = EmailMessage()
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    link = f"\n\nView in app: {APP_URL}?tickers={','.join(st.session_state.get('tickers',[]))}&period={st.session_state.get('period','')}" if APP_URL else ''
+    if APP_URL:
+        qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}"
+        link = f"\n\nView in app: {APP_URL}{qs}"
+    else:
+        link = ''
     body = (f"Ticker: {tkr}\nSignal: {summ['Signal']} @ ${price}\n"
             f"Reasons: {summ['Reasons']}\nTime: {now}{link}")
+    msg = EmailMessage()
     msg.set_content(body)
     msg['Subject'], msg['From'], msg['To'] = (
         f"{summ['Signal']} {tkr}",
@@ -206,11 +214,13 @@ with st.sidebar:
         rsi_ovr = st.slider('RSI oversold threshold', 0, 100, 30)
         rsi_obh = st.slider('RSI overbought threshold', 0, 100, 70)
 
+        # load any URL query params
         params = st.experimental_get_query_params()
         qs_tickers = params.get('tickers', [])
         options = ['1mo','3mo','6mo','1y','2y']
         qs_period = params.get('period', [])
 
+        # defaults from query or sidebar defaults
         if qs_tickers:
             default_list = qs_tickers[0].split(',')
         else:
@@ -220,6 +230,7 @@ with st.sidebar:
         else:
             default_period = '6mo'
 
+        # expose to session_state for notifications
         st.session_state['tickers'] = default_list
         st.session_state['period'] = default_period
 
@@ -233,7 +244,7 @@ with st.sidebar:
 # -------------------------
 # ▶  Main Page
 # -------------------------
-st.stakeholder.markdown(f"### {'🔴 SIM' if simulate_mode else '🟢 LIVE'} {PAGE_TITLE}")
+st.markdown(f"### {'🔴 SIM' if simulate_mode else '🟢 LIVE'} {PAGE_TITLE}")
 if st.button('▶ Run Analysis', use_container_width=True):
     if not tickers:
         st.warning('Select at least one ticker')
