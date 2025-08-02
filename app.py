@@ -1,3 +1,4 @@
+```python
 # app.py – Streamlit Web App Version of Stock Analyzer Bot with S&P Scan & Full Ticker Selection
 
 import os
@@ -57,6 +58,7 @@ def get_sp500_tickers() -> list[str]:
             return []
 
 # No caching on this to always get fresh top performers
+@st.cache_data(show_spinner=False)
 def get_top_tickers(n: int) -> list[str]:
     symbols = get_sp500_tickers()
     if not symbols:
@@ -303,3 +305,4 @@ if os.path.exists('trade_log.csv'):
     st.download_button("⬇ Download Tax Summary", tax.to_csv(index=False).encode(), "tax_summary.csv")
     st.markdown("### 📈 Portfolio Cumulative Profit Over Time")
     st.line_chart(trades.set_index('Date')['Cum P/L'])
+```
