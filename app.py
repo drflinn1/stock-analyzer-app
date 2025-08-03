@@ -302,3 +302,4 @@ if os.path.exists('trade_log.csv'):
     st.download_button("⬇ Download Tax Summary", tax.to_csv(index=False).encode(), "tax_summary.csv")
     st.markdown("### 📈 Portfolio Cumulative Profit Over Time")
     st.line_chart(trades.set_index('Date')['Cum P/L'])
+
