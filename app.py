@@ -141,4 +141,64 @@ with st.sidebar.expander('Settings'):
     oversold = st.slider('RSI oversold threshold', 0, 100, 30)
     overbought = st.slider('RSI overbought threshold', 0, 100, 70)
     period = st.selectbox('History window', ['1mo', '3mo', '6mo', '1y'], index=2)
+
+# persist state for notifications
 st.session_state['period'] = period
+st.session_state['scan_n'] = scan_n
+
+# Build universe list
+universe = []
+if use_sp:
+    universe += get_sp500_tickers()
+if use_cr:
+    universe += get_crypto_universe()
+
+# -------------------------
+# ▶  Daily Scan & Execution
+# -------------------------
+def run_daily_scan():
+    results = []
+    for tkr in universe[:st.session_state.scan_n]:
+        df = fetch_data(tkr, st.session_state.period)
+        if df.empty:
+            continue
+        summ = analyze_signal(df, oversold, overbought)
+        price = df['Close'].iloc[-1]
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        results.append({
+            'Ticker': tkr,
+            'Signal': summ['Signal'],
+            'Price': price,
+            'Time': timestamp,
+            'Gain/Loss': 0,
+            'Date': datetime.now().date(),
+            'Cum P/L': 0
+        })
+        if simulate:
+            notify_slack(tkr, summ, price)
+        else:
+            make_live_trade(tkr, summ['Signal'], qty=1)
+
+    trades = pd.DataFrame(results)
+    if trades.empty:
+        st.warning('No valid ticks to trade.')
+        return
+
+    st.subheader(':books: Trade Log')
+    st.dataframe(trades)
+    st.download_button('📥 Download Trade Log', trades.to_csv(index=False).encode(), 'trade_log.csv')
+
+    trades['Cum P/L'] = trades['Gain/Loss'].cumsum()
+    total_pl = trades['Gain/Loss'].sum()
+    st.markdown(f"### 🪙 **Total Portfolio P/L: ${total_pl:.2f}**")
+    tax = trades.groupby('Signal')['Gain/Loss'].sum().reset_index()
+    st.subheader('Tax Summary')
+    st.dataframe(tax)
+    st.download_button('📥 Download Tax Summary', tax.to_csv(index=False).encode(), 'tax_summary.csv')
+
+    st.markdown('### 📈 Portfolio Cumulative Profit Over Time')
+    st.line_chart(trades.set_index('Date')['Cum P/L'])
+
+# Button to trigger the scan
+if st.button('▶ Run Daily Scan'):
+    run_daily_scan()
