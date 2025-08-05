@@ -29,7 +29,6 @@ def notify_slack(tkr: str, summ: dict, price: float):
     """
     Send a formatted notification to Slack if a webhook is configured.
     """
-    # Build the optional link only if both webhook and APP_URL are set
     if WEBHOOK and APP_URL:
         qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}"
         link = f" (<{APP_URL}{qs}|View in App>)"
@@ -44,13 +43,31 @@ def notify_slack(tkr: str, summ: dict, price: float):
     if WEBHOOK:
         requests.post(WEBHOOK, json={'text': text})
 
+# Stub for live trading integration
+def make_live_trade(tkr: str, signal: str, price: float):
+    """
+    Placeholder for live trading via broker API (e.g. Robinhood).
+    """
+    # TODO: integrate real trading logic here
+    return
+
 # -------------------------
 # ▶  Data Fetching & Analysis Helpers
 # -------------------------
 def get_sp500_tickers():
-    # fetch S&P 500 list
-    table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]
-    return table['Symbol'].tolist()
+    """
+    Fetch S&P 500 symbols from Wikipedia, with graceful fallback if parser libs are missing.
+    """
+    try:
+        # pandas may require html5lib or lxml; specify parser
+        table = pd.read_html(
+            'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies',
+            flavor=['lxml', 'html5lib']
+        )[0]
+        return table['Symbol'].tolist()
+    except Exception:
+        st.error("Unable to fetch S&P 500 list (missing html parser). Please install 'lxml' or 'html5lib', or enter tickers manually.")
+        return []
 
 
 def fetch_data(ticker, period='6mo') -> pd.DataFrame:
@@ -66,8 +83,8 @@ def compute_rsi(series, window=14):
     delta = series.diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
-    ma_up = up.ewm(com=window - 1, adjust=False).mean()
-    ma_down = down.ewm(com=window - 1, adjust=False).mean()
+    ma_up = up.ewm(com=window-1, adjust=False).mean()
+    ma_down = down.ewm(com=window-1, adjust=False).mean()
     rs = ma_up / ma_down
     return 100 - (100 / (1 + rs))
 
@@ -115,7 +132,7 @@ with st.sidebar.expander('Analysis Options'):
     oversold = st.slider('RSI oversold threshold', 0, 100, 30)
     overbought = st.slider('RSI overbought threshold', 0, 100, 70)
 
-    # Choose between scanning S&P500 or manual entry
+    # ticker input mode
     if scan_sp500:
         universe = get_sp500_tickers()
         tickers = st.multiselect('Choose tickers', universe, [])
@@ -129,14 +146,18 @@ with st.sidebar.expander('Analysis Options'):
 st.session_state['tickers'] = tickers
 st.session_state['period'] = period
 
+# Main run button
 if st.button('Run Analysis'):
     results = []
     trades = []
+
     for tkr in tickers:
         df = fetch_data(tkr, period)
         if len(df) < min_rows:
-            if show_debug: st.warning(f'Skipping {tkr}: not enough data')
+            if show_debug:
+                st.warning(f'Skipping {tkr}: not enough data ({len(df)} rows)')
             continue
+
         summ = analyze_signal(df, oversold, overbought)
         price = df['Close'].iloc[-1]
         results.append((tkr, summ, price))
@@ -144,12 +165,11 @@ if st.button('Run Analysis'):
         if simulate:
             trades.append({'Ticker': tkr, 'Signal': summ['Signal'], 'Price': price, 'Time': datetime.now()})
         else:
-            # live trading via Robinhood API (placeholder)
             make_live_trade(tkr, summ['Signal'], price)
 
         notify_slack(tkr, summ, price)
 
-    # display charts & summary
+    # Display per‐ticker charts and signals
     for tkr, summ, price in results:
         df = fetch_data(tkr, period)
         fig = go.Figure()
@@ -162,6 +182,7 @@ if st.button('Run Analysis'):
         st.write(f"**{tkr} – {summ['Signal']}**")
         st.json(summ)
 
+    # If in simulate mode, show trade logs & tax summaries
     if trades:
         logs = pd.DataFrame(trades)
         logs['Gain/Loss'] = 0.0  # placeholder
