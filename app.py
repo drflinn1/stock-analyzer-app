@@ -1,4 +1,3 @@
-```python
 # app.py – Streamlit Web App Version of Stock & Crypto Day Trading Bot (Fully Automated)
 
 import os
@@ -203,4 +202,3 @@ def run_daily_scan():
 # Button to trigger
 if st.button('▶ Run Daily Scan'):
     run_daily_scan()
-```
