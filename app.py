@@ -1,5 +1,3 @@
-# app.py – Streamlit Web App Version of Stock & Crypto Day Trading Bot (Fully Automated)
-
 import os
 import time
 from datetime import datetime
