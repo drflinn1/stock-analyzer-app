@@ -18,18 +18,19 @@ from streamlit_autorefresh import st_autorefresh
 # ▶  CONFIG & SECRETS
 # -------------------------
 PAGE_TITLE = "Stock Analyzer Bot (Live Trading + Tax Logs)"
-# Set up page layout
+# Optional public app URL for links
+APP_URL = st.secrets.get('APP_URL', '')
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 
 # Validate required secrets
 missing = []
-for key in ['EMAIL_ADDRESS','EMAIL_RECEIVER','SLACK_WEBHOOK_URL','APP_URL']:
+for key in ['EMAIL_ADDRESS','EMAIL_RECEIVER','SLACK_WEBHOOK_URL']:
     if not st.secrets.get(key):
         missing.append(key)
 if missing:
     st.sidebar.error(f"Missing secrets: {', '.join(missing)}. Please set these in your Streamlit Cloud settings.")
 
-# Optional Robinhood API client
+# Robinhood API client (if installed)
 try:
     from robin_stocks import robinhood as r
 except ImportError:
@@ -55,7 +56,7 @@ def get_sp500_tickers() -> list[str]:
             st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
             return []
 
-# No caching here to always get fresh top performers
+# No caching on this to always get fresh top performers
 def get_top_tickers(n: int) -> list[str]:
     symbols = get_sp500_tickers()
     if not symbols:
@@ -105,7 +106,6 @@ def bollinger_bands(series: pd.Series, window: int = 20, num_std: int = 2):
 def get_data(ticker: str, period: str, retries: int = 3) -> pd.DataFrame:
     for _ in range(retries):
         df = yf.download(ticker, period=period, auto_adjust=False, progress=False)
-        # flatten multi-index if present
         if isinstance(df.columns, pd.MultiIndex):
             try:
                 df = df.xs(ticker, axis=1, level=1)
@@ -149,8 +149,8 @@ def analyze(df: pd.DataFrame, min_rows: int, rsi_ovr: float, rsi_obh: float) -> 
 
     text = "; ".join(reasons).lower()
     signal = 'HOLD'
-    if any(k in text for k in ['buy','bullish']): signal = 'BUY'
-    elif any(k in text for k in ['sell','bearish']): signal = 'SELL'
+    if any(k in text for k in ['buy', 'bullish']): signal = 'BUY'
+    elif any(k in text for k in ['sell', 'bearish']): signal = 'SELL'
 
     return {
         'RSI': round(rsi, 2),
@@ -163,29 +163,20 @@ def analyze(df: pd.DataFrame, min_rows: int, rsi_ovr: float, rsi_obh: float) -> 
 # -------------------------
 # ▶  Notifications & Logging
 # -------------------------
+WEBHOOK = st.secrets.get('SLACK_WEBHOOK_URL')
+
 def notify_slack(tkr: str, summ: dict, price: float):
-    webhook = st.secrets.get('SLACK_WEBHOOK_URL', '')
-    app_url = st.secrets.get('APP_URL', '')
-    if webhook and app_url:
-        qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}"
-        link = f" (<{app_url}{qs}|View in App>)"
-    else:
-        link = ''
-    text = f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}{link}"
-    if webhook:
-        requests.post(webhook, json={'text': text})
+    if WEBHOOK:
+        link = f" (<{APP_URL}|View in App>)" if APP_URL else ''
+        text = f"*{summ['Signal']}* {tkr} @ ${price}
+{summ['Reasons']}{link}"
+        requests.post(WEBHOOK, json={'text': text})
 
 def notify_email(tkr: str, summ: dict, price: float):
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    app_url = st.secrets.get('APP_URL', '')
-    if app_url:
-        qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}"
-        link = f"\n\nView in app: {app_url}{qs}"
-    else:
-        link = ''
-    body = (f"Ticker: {tkr}\nSignal: {summ['Signal']} @ ${price}\n"
-            f"Reasons: {summ['Reasons']}\nTime: {now}{link}")
     msg = EmailMessage()
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    link = f"\n\nView in app: {APP_URL}" if APP_URL else ''
+    body = f"Ticker: {tkr}\nSignal: {summ['Signal']} @ ${price}\nReasons: {summ['Reasons']}\nTime: {now}{link}"
     msg.set_content(body)
     msg['Subject'], msg['From'], msg['To'] = (
         f"{summ['Signal']} {tkr}",
@@ -211,34 +202,14 @@ with st.sidebar:
         top_n = st.slider('Top tickers to scan', 10, 100, 50) if scan_top else None
         universe = get_top_tickers(top_n) if scan_top else get_sp500_tickers()
 
+        # Threshold controls
         min_rows = st.slider('Minimum data rows', 10, 100, 30)
         rsi_ovr = st.slider('RSI oversold threshold', 0, 100, 30)
         rsi_obh = st.slider('RSI overbought threshold', 0, 100, 70)
 
-        # load any URL query params
-        params = st.query_params
-        qs_tickers = params.get('tickers', [])
-        options = ['1mo','3mo','6mo','1y','2y']
-        qs_period = params.get('period', [])
-
-        if qs_tickers:
-            default_list = qs_tickers[0].split(',')
-        else:
-            default_list = universe[:2]
-        if qs_period and qs_period[0] in options:
-            default_period = qs_period[0]
-        else:
-            default_period = '6mo'
-
-        st.session_state['tickers'] = default_list
-        st.session_state['period'] = default_period
-
-        tickers = st.multiselect('Choose tickers', universe,
-                                  default=default_list,
-                                  key='tickers')
-        period = st.selectbox('Date range', options,
-                              index=options.index(default_period),
-                              key='period')
+        default_list = universe[:2]
+        tickers = st.multiselect('Choose tickers', universe, default=default_list, key='tickers')
+        period = st.selectbox('Date range', ['1mo','3mo','6mo','1y','2y'], index=2)
 
 # -------------------------
 # ▶  Main Page
@@ -252,6 +223,8 @@ if st.button('▶ Run Analysis', use_container_width=True):
     for tkr in tickers:
         try:
             df = get_data(tkr, period)
+            if debug_mode:
+                st.write(f"{tkr} rows: {len(df)}")
             summ = analyze(df, min_rows, rsi_ovr, rsi_obh)
             if summ is None:
                 st.warning(f"{tkr}: Not enough data, skipped")
@@ -269,7 +242,7 @@ if st.button('▶ Run Analysis', use_container_width=True):
             fig.add_trace(go.Scatter(x=df.index, y=df.bb_lower, name='BB Lower', line=dict(dash='dot')))
             st.plotly_chart(fig, use_container_width=True)
 
-            badge_map = {'BUY':'🟢','SELL':'🔴','HOLD':'🟡'}
+            badge_map = {'BUY': '🟢', 'SELL': '🔴', 'HOLD': '🟡'}
             st.markdown(f"**{badge_map[summ['Signal']]} {tkr} – {summ['Signal']}**")
             st.json(summ)
             st.divider()
@@ -302,4 +275,3 @@ if os.path.exists('trade_log.csv'):
     st.download_button("⬇ Download Tax Summary", tax.to_csv(index=False).encode(), "tax_summary.csv")
     st.markdown("### 📈 Portfolio Cumulative Profit Over Time")
     st.line_chart(trades.set_index('Date')['Cum P/L'])
-
