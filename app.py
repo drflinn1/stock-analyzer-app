@@ -168,7 +168,7 @@ WEBHOOK = st.secrets.get('SLACK_WEBHOOK_URL')
 def notify_slack(tkr: str, summ: dict, price: float):
     if WEBHOOK:
         link = f" (<{APP_URL}|View in App>)" if APP_URL else ''
-        text = f"*{summ['Signal']}* {tkr} @ ${price}
+                text = f"*{summ['Signal']}* {tkr} @ ${price}
 {summ['Reasons']}{link}"
         requests.post(WEBHOOK, json={'text': text})
 
