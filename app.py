@@ -36,13 +36,11 @@ def notify_slack(tkr: str, summ: dict, price: float):
     else:
         link = ''
 
-    # Compose the Slack message as a single, properly-terminated string
     text = (
         f"*{summ['Signal']}* {tkr} @ ${price}\n"
         f"Reasons: {summ.get('Reasons','')}" + link
     )
 
-    # Post to Slack if webhook is provided
     if WEBHOOK:
         requests.post(WEBHOOK, json={'text': text})
 
@@ -117,10 +115,19 @@ with st.sidebar.expander('Analysis Options'):
     oversold = st.slider('RSI oversold threshold', 0, 100, 30)
     overbought = st.slider('RSI overbought threshold', 0, 100, 70)
 
-    universe = get_sp500_tickers() if scan_sp500 else []
-    default = [] if scan_sp500 else ['AAPL']
-    tickers = st.multiselect('Choose tickers', universe, default)
+    # Choose between scanning S&P500 or manual entry
+    if scan_sp500:
+        universe = get_sp500_tickers()
+        tickers = st.multiselect('Choose tickers', universe, [])
+    else:
+        tickers_str = st.text_input('Enter tickers (comma-separated)', 'AAPL')
+        tickers = [t.strip().upper() for t in tickers_str.split(',') if t.strip()]
+
     period = st.selectbox('Date range', ['1mo','3mo','6mo','1y'], index=2)
+
+# persist state
+st.session_state['tickers'] = tickers
+st.session_state['period'] = period
 
 if st.button('Run Analysis'):
     results = []
@@ -134,7 +141,6 @@ if st.button('Run Analysis'):
         price = df['Close'].iloc[-1]
         results.append((tkr, summ, price))
 
-        # simulate or live trade logic
         if simulate:
             trades.append({'Ticker': tkr, 'Signal': summ['Signal'], 'Price': price, 'Time': datetime.now()})
         else:
@@ -143,7 +149,7 @@ if st.button('Run Analysis'):
 
         notify_slack(tkr, summ, price)
 
-    # display all charts and summary
+    # display charts & summary
     for tkr, summ, price in results:
         df = fetch_data(tkr, period)
         fig = go.Figure()
@@ -156,10 +162,9 @@ if st.button('Run Analysis'):
         st.write(f"**{tkr} – {summ['Signal']}**")
         st.json(summ)
 
-    # show trade log and P/L
     if trades:
         logs = pd.DataFrame(trades)
-        logs['Gain/Loss'] = 0.0  # placeholder for actual gain/loss calc
+        logs['Gain/Loss'] = 0.0  # placeholder
         logs['Date'] = logs['Time'].dt.date
         logs['Cum P/L'] = logs['Gain/Loss'].cumsum()
 
