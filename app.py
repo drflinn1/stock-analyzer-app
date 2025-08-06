@@ -7,6 +7,8 @@ import streamlit as st
 import yfinance as yf
 import robin_stocks as r
 from streamlit_autorefresh import st_autorefresh
+import plotly.express as px
+import requests
 
 # --- Helper: Fetch Equity & Crypto Data ---
 def fetch_data(symbol: str, period: str = "30d", interval: str = "1d") -> pd.DataFrame:
@@ -57,7 +59,7 @@ def analyze_signal(df: pd.DataFrame, overbought: int, oversold: int) -> dict:
 
 # --- Helper: Execute Orders ---
 def place_order(symbol: str, side: str, amount_usd: float):
-    # Handles both equity and crypto
+    """Places buy/sell for equities and crypto using Robinhood API"""
     if symbol.endswith('-USD'):
         price = float(r.crypto.get_crypto_quote(symbol)['mark_price'])
     else:
@@ -74,76 +76,58 @@ def place_order(symbol: str, side: str, amount_usd: float):
         else:
             return r.orders.order_sell_fractional_by_quantity(symbol, qty)
 
-# --- Streamlit App ---
-# Import additional libraries
-import plotly.express as px
-import requests
-
-st.set_page_config(page_title="Equity & Crypto Analyzer", layout="wide")
-st.title("Stock & Crypto Analyzer Bot")
+# --- Streamlit App Setup ---
 st.set_page_config(page_title="Equity & Crypto Analyzer", layout="wide")
 st.title("Stock & Crypto Analyzer Bot")
 
-# Auto-refresh once per day
-st_autorefresh(interval=24*60*60*1000, key='auto_refresh')
+# Auto-refresh every 24h
+st_autorefresh(interval=24*60*60*1000, key='daily_refresh')
 
-# Sidebar: Universe & Settings
+# Sidebar: Universe & Parameters
 st.sidebar.header("Universe")
 equities = st.sidebar.text_area("Equity Tickers (comma-separated)", "AAPL,MSFT,GOOG").upper().replace(' ', '').split(',')
 include_crypto = st.sidebar.checkbox("Include Crypto", value=False)
 crypto_list = []
 if include_crypto:
     crypto_list = st.sidebar.multiselect(
-        "Crypto Tickers (yfinance)", ['BTC-USD','ETH-USD','ADA-USD','SOL-USD'],
-        default=['BTC-USD','ETH-USD']
+        "Crypto Tickers", ['BTC-USD','ETH-USD','ADA-USD','SOL-USD'], default=['BTC-USD','ETH-USD']
     )
 
 st.sidebar.header("Signal Parameters")
-overbought = st.sidebar.slider("RSI Overbought", min_value=50, max_value=90, value=70)
-oversold = st.sidebar.slider("RSI Oversold", min_value=10, max_value=50, value=30)
-trade_dollar = st.sidebar.number_input("USD per Trade", min_value=10, max_value=10000, value=500, step=10)
+overbought = st.sidebar.slider("RSI Overbought", 50, 90, 70)
+oversold = st.sidebar.slider("RSI Oversold", 10, 50, 30)
+trade_amount = st.sidebar.number_input("USD per Trade", min_value=10, max_value=10000, value=500, step=10)
 
-# Main: Run Scan Button
+# Main Execution
 if st.button("► Run Scan & Execute"):
     logs = []
-    # Equities
+
+    # Equities Loop
     for sym in equities:
         df = fetch_data(sym, period="30d", interval="1d")
-        if df.empty:
-            continue
+        if df.empty: continue
         sig = analyze_signal(df, overbought, oversold)
-        price = float(df['Close'].iloc[-1])
-        logs.append({
-            'Ticker': sym,
-            'Signal': sig['action'],
-            'Price': price,
-            'Time': df.index[-1],
-            'RSI': sig['rsi'],
-            'BB_Upper': sig['bb_upper'],
-            'BB_Lower': sig['bb_lower']
-        })
+        price = df['Close'].iloc[-1]
+        logs.append({'Ticker': sym, 'Signal': sig['action'], 'Price': price,
+                     'Time': df.index[-1], 'RSI': sig['rsi'],
+                     'BB_Upper': sig['bb_upper'], 'BB_Lower': sig['bb_lower']})
         if sig['action'] in ['BUY','SELL']:
-            place_order(sym, sig['action'], trade_dollar)
-    # Crypto
+            place_order(sym, sig['action'], trade_amount)
+
+    # Crypto Loop
     if include_crypto:
         for sym in crypto_list:
             dfc = fetch_data(sym, period="7d", interval="1h")
-            if dfc.empty:
-                continue
+            if dfc.empty: continue
             sigc = analyze_signal(dfc, overbought, oversold)
-            pricec = float(dfc['Close'].iloc[-1])
-            logs.append({
-                'Ticker': sym,
-                'Signal': sigc['action'],
-                'Price': pricec,
-                'Time': dfc.index[-1],
-                'RSI': sigc['rsi'],
-                'BB_Upper': sigc['bb_upper'],
-                'BB_Lower': sigc['bb_lower']
-            })
+            pricec = dfc['Close'].iloc[-1]
+            logs.append({'Ticker': sym, 'Signal': sigc['action'], 'Price': pricec,
+                         'Time': dfc.index[-1], 'RSI': sigc['rsi'],
+                         'BB_Upper': sigc['bb_upper'], 'BB_Lower': sigc['bb_lower']})
             if sigc['action'] in ['BUY','SELL']:
-                place_order(sym, sigc['action'], trade_dollar)
-    # Display results
+                place_order(sym, sigc['action'], trade_amount)
+
+    # Display Execution Log
     df_logs = pd.DataFrame(logs)
     st.subheader("Trade Signals & Execution Log")
     st.dataframe(df_logs)
