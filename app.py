@@ -76,6 +76,15 @@ def place_order(symbol: str, side: str, amount_usd: float):
         else:
             return r.orders.order_sell_fractional_by_quantity(symbol, qty)
 
+# --- Robinhood Authentication ---
+# Provide your credentials via Streamlit secrets or environment variables
+RH_USER = st.secrets.get('RH_USER') or os.getenv('RH_USER')
+RH_PASS = st.secrets.get('RH_PASS') or os.getenv('RH_PASS')
+if RH_USER and RH_PASS:
+    r.login(RH_USER, RH_PASS)
+else:
+    st.error("Robinhood credentials not found. Please set RH_USER and RH_PASS in Streamlit secrets.")
+
 # --- Streamlit App Setup ---
 st.set_page_config(page_title="Equity & Crypto Analyzer", layout="wide")
 st.title("Stock & Crypto Analyzer Bot")
