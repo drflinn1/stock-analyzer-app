@@ -94,8 +94,8 @@ if include_crypto:
     )
 
 st.sidebar.header("Signal Parameters")
-overbought = st.sidebar.slider("RSI Overbought", 50, 90, 70)
-oversold = st.sidebar.slider("RSI Oversold", 10, 50, 30)
+overbought = st.sidebar.slider("RSI Overbought", min_value=50, max_value=90, value=70)
+oversold = st.sidebar.slider("RSI Oversold", min_value=10, max_value=50, value=30)
 trade_amount = st.sidebar.number_input("USD per Trade", min_value=10, max_value=10000, value=500, step=10)
 
 # Main Execution
@@ -105,9 +105,10 @@ if st.button("► Run Scan & Execute"):
     # Equities Loop
     for sym in equities:
         df = fetch_data(sym, period="30d", interval="1d")
-        if df.empty: continue
+        if df.empty:
+            continue
         sig = analyze_signal(df, overbought, oversold)
-        price = df['Close'].iloc[-1]
+        price = float(df['Close'].iloc[-1])
         logs.append({'Ticker': sym, 'Signal': sig['action'], 'Price': price,
                      'Time': df.index[-1], 'RSI': sig['rsi'],
                      'BB_Upper': sig['bb_upper'], 'BB_Lower': sig['bb_lower']})
@@ -118,9 +119,10 @@ if st.button("► Run Scan & Execute"):
     if include_crypto:
         for sym in crypto_list:
             dfc = fetch_data(sym, period="7d", interval="1h")
-            if dfc.empty: continue
+            if dfc.empty:
+                continue
             sigc = analyze_signal(dfc, overbought, oversold)
-            pricec = dfc['Close'].iloc[-1]
+            pricec = float(dfc['Close'].iloc[-1])
             logs.append({'Ticker': sym, 'Signal': sigc['action'], 'Price': pricec,
                          'Time': dfc.index[-1], 'RSI': sigc['rsi'],
                          'BB_Upper': sigc['bb_upper'], 'BB_Lower': sigc['bb_lower']})
