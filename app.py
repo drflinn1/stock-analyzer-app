@@ -5,11 +5,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-import robin_stocks as r
-from robin_stocks import authentication
-from streamlit_autorefresh import st_autorefresh
+# Use explicit robinhood submodule for login
+from robin_stocks import robinhood as r
 import plotly.express as px
-import requests
+from streamlit_autorefresh import st_autorefresh
 
 # --- Helper: Fetch Equity & Crypto Data ---
 def fetch_data(symbol: str, period: str = "30d", interval: str = "1d") -> pd.DataFrame:
@@ -30,9 +29,11 @@ def compute_rsi(series: pd.Series, window: int = 14) -> float:
 def compute_bbands(df: pd.DataFrame, window: int = 20, num_std: int = 2) -> dict:
     sma = df['Close'].rolling(window).mean()
     std = df['Close'].rolling(window).std()
-    return {'upper': float(sma.iloc[-1] + num_std * std.iloc[-1]),
-            'lower': float(sma.iloc[-1] - num_std * std.iloc[-1]),
-            'sma': float(sma.iloc[-1])}
+    return {
+        'upper': float(sma.iloc[-1] + num_std * std.iloc[-1]),
+        'lower': float(sma.iloc[-1] - num_std * std.iloc[-1]),
+        'sma': float(sma.iloc[-1])
+    }
 
 # --- Helper: Generate Signal ---
 def analyze_signal(df: pd.DataFrame, overbought: int, oversold: int) -> dict:
@@ -48,34 +49,40 @@ def analyze_signal(df: pd.DataFrame, overbought: int, oversold: int) -> dict:
 
 # --- Helper: Place Orders ---
 def place_order(symbol: str, side: str, amount_usd: float):
-    if symbol.endswith('-USD'):
-        price = float(r.crypto.get_crypto_quote(symbol)['mark_price'])
-    else:
-        price = float(r.orders.get_latest_price(symbol)[0])
-    qty = amount_usd / price
-    if side.lower() == 'buy':
+    try:
         if symbol.endswith('-USD'):
-            return r.crypto.order_buy_crypto_by_quantity(symbol, qty)
+            price = float(r.crypto.get_crypto_quote(symbol)['mark_price'])
         else:
-            return r.orders.order_buy_fractional_by_quantity(symbol, qty)
-    else:
-        if symbol.endswith('-USD'):
-            return r.crypto.order_sell_crypto_by_quantity(symbol, qty)
+            price = float(r.orders.get_latest_price(symbol)[0])
+        qty = amount_usd / price
+        if side.lower() == 'buy':
+            if symbol.endswith('-USD'):
+                return r.crypto.order_buy_crypto_by_quantity(symbol, qty)
+            else:
+                return r.orders.order_buy_fractional_by_quantity(symbol, qty)
         else:
-            return r.orders.order_sell_fractional_by_quantity(symbol, qty)
+            if symbol.endswith('-USD'):
+                return r.crypto.order_sell_crypto_by_quantity(symbol, qty)
+            else:
+                return r.orders.order_sell_fractional_by_quantity(symbol, qty)
+    except Exception as e:
+        st.warning(f"Order placement failed for {symbol}: {e}")
+        return None
 
-# --- Robinhood Authentication ---
+# --- Robinhood Authentication (simulated if missing) ---
 RH_USER = st.secrets.get('ROBINHOOD_USERNAME') or os.getenv('ROBINHOOD_USERNAME')
 RH_PASS = st.secrets.get('ROBINHOOD_PASSWORD') or os.getenv('ROBINHOOD_PASSWORD')
+authenticated = False
 if RH_USER and RH_PASS:
     try:
-        authentication.login(RH_USER, RH_PASS)
+        # Use standard login; skip 2FA interaction in Cloud
+        r.login(RH_USER, RH_PASS)
+        authenticated = True
+        st.sidebar.success("Robinhood authenticated; live orders enabled.")
     except Exception as e:
-        st.error(f"Robinhood login failed: {e}")
-        st.stop()
+        st.sidebar.warning(f"Robinhood login failed: {e}; orders will run in simulation.")
 else:
-    st.error("Robinhood credentials not found. Please set ROBINHOOD_USERNAME and ROBINHOOD_PASSWORD in Streamlit secrets.")
-    st.stop()
+    st.sidebar.info("Robinhood credentials missing; running in simulation mode.")
 
 # --- Streamlit App Setup ---
 st.set_page_config(page_title="Equity & Crypto Analyzer", layout="wide")
@@ -88,8 +95,7 @@ st_autorefresh(interval=24*60*60*1000, key='daily_refresh')
 st.sidebar.header("Universe")
 equities = st.sidebar.text_area("Equity Tickers (comma-separated)", "AAPL,MSFT,GOOG").upper().replace(' ','').split(',')
 include_crypto = st.sidebar.checkbox("Include Crypto")
-crypto_list = (st.sidebar.multiselect("Crypto Tickers", ['BTC-USD','ETH-USD','ADA-USD','SOL-USD'])
-               if include_crypto else [])
+crypto_list = (st.sidebar.multiselect("Crypto Tickers", ['BTC-USD','ETH-USD','ADA-USD','SOL-USD']) if include_crypto else [])
 
 st.sidebar.header("Signal Parameters")
 overbought = st.sidebar.slider("RSI Overbought", 50, 90, 70)
@@ -105,10 +111,16 @@ if st.button("► Run Scan & Execute"):
         if df.empty: continue
         sig = analyze_signal(df, overbought, oversold)
         price = float(df['Close'].iloc[-1])
-        logs.append({'Ticker':sym,'Signal':sig['action'],'Price':price,
-                     'Time':df.index[-1],'RSI':sig['rsi'],
-                     'BB_Upper':sig['bb_upper'],'BB_Lower':sig['bb_lower']})
-        if sig['action'] in ['BUY','SELL']:
+        logs.append({
+            'Ticker': sym,
+            'Signal': sig['action'],
+            'Price': price,
+            'Time': df.index[-1],
+            'RSI': sig['rsi'],
+            'BB_Upper': sig['bb_upper'],
+            'BB_Lower': sig['bb_lower']
+        })
+        if authenticated and sig['action'] in ['BUY', 'SELL']:
             place_order(sym, sig['action'], trade_amount)
     # Crypto
     if include_crypto:
@@ -117,10 +129,16 @@ if st.button("► Run Scan & Execute"):
             if dfc.empty: continue
             sigc = analyze_signal(dfc, overbought, oversold)
             pricec = float(dfc['Close'].iloc[-1])
-            logs.append({'Ticker':sym,'Signal':sigc['action'],'Price':pricec,
-                         'Time':dfc.index[-1],'RSI':sigc['rsi'],
-                         'BB_Upper':sigc['bb_upper'],'BB_Lower':sigc['bb_lower']})
-            if sigc['action'] in ['BUY','SELL']:
+            logs.append({
+                'Ticker': sym,
+                'Signal': sigc['action'],
+                'Price': pricec,
+                'Time': dfc.index[-1],
+                'RSI': sigc['rsi'],
+                'BB_Upper': sigc['bb_upper'],
+                'BB_Lower': sigc['bb_lower']
+            })
+            if authenticated and sigc['action'] in ['BUY', 'SELL']:
                 place_order(sym, sigc['action'], trade_amount)
     # Show Log
     df_logs = pd.DataFrame(logs)
