@@ -10,6 +10,10 @@ from robin_stocks import robinhood as r
 import plotly.express as px
 from streamlit_autorefresh import st_autorefresh
 
+# --- Persistent Logs in Session State ---
+if 'trade_logs' not in st.session_state:
+    st.session_state.trade_logs = []
+
 # --- Helper: Fetch Equity & Crypto Data ---
 def fetch_data(symbol: str, period: str = "30d", interval: str = "1d") -> pd.DataFrame:
     df = yf.download(symbol, period=period, interval=interval, progress=False)
@@ -75,7 +79,6 @@ RH_PASS = st.secrets.get('ROBINHOOD_PASSWORD') or os.getenv('ROBINHOOD_PASSWORD'
 authenticated = False
 if RH_USER and RH_PASS:
     try:
-        # Use standard login; skip 2FA interaction in Cloud
         r.login(RH_USER, RH_PASS)
         authenticated = True
         st.sidebar.success("Robinhood authenticated; live orders enabled.")
@@ -95,15 +98,15 @@ st_autorefresh(interval=24*60*60*1000, key='daily_refresh')
 st.sidebar.header("Universe")
 equities = st.sidebar.text_area("Equity Tickers (comma-separated)", "AAPL,MSFT,GOOG").upper().replace(' ','').split(',')
 include_crypto = st.sidebar.checkbox("Include Crypto")
-crypto_list = (st.sidebar.multiselect("Crypto Tickers", ['BTC-USD','ETH-USD','ADA-USD','SOL-USD']) if include_crypto else [])
+crypto_list = st.sidebar.multiselect("Crypto Tickers", ['BTC-USD','ETH-USD','ADA-USD','SOL-USD']) if include_crypto else []
 
 st.sidebar.header("Signal Parameters")
 overbought = st.sidebar.slider("RSI Overbought", 50, 90, 70)
 oversold = st.sidebar.slider("RSI Oversold", 10, 50, 30)
 trade_amount = st.sidebar.number_input("USD per Trade", 10, 10000, 500, step=10)
 
-# Main Loop
-if st.button("► Run Scan & Execute"):
+# Controls: Run, Clear, Download
+if st.sidebar.button("► Run Scan & Execute"):
     logs = []
     # Equities
     for sym in equities:
@@ -140,7 +143,18 @@ if st.button("► Run Scan & Execute"):
             })
             if authenticated and sigc['action'] in ['BUY', 'SELL']:
                 place_order(sym, sigc['action'], trade_amount)
-    # Show Log
-    df_logs = pd.DataFrame(logs)
+    # Append to session history
+    st.session_state.trade_logs.extend(logs)
+
+if st.sidebar.button("Clear History"):
+    st.session_state.trade_logs = []
+
+# Display and Download
+if st.session_state.trade_logs:
+    df_logs = pd.DataFrame(st.session_state.trade_logs)
     st.subheader("Trade Signals & Execution Log")
     st.dataframe(df_logs)
+    csv = df_logs.to_csv(index=False).encode('utf-8')
+    st.sidebar.download_button("Download Logs CSV", data=csv, file_name="trade_logs.csv")
+else:
+    st.info("No trade history yet. Run a scan to generate logs.")
