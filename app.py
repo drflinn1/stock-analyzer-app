@@ -6,6 +6,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 import robin_stocks as r
+from robin_stocks import authentication
 from streamlit_autorefresh import st_autorefresh
 import plotly.express as px
 import requests
@@ -50,21 +51,25 @@ def place_order(symbol: str, side: str, amount_usd: float):
     if symbol.endswith('-USD'):
         price = float(r.crypto.get_crypto_quote(symbol)['mark_price'])
     else:
-        price = float(r.get_latest_price(symbol)[0])
+        price = float(r.orders.get_latest_price(symbol)[0])
     qty = amount_usd / price
     if side.lower() == 'buy':
-        return (r.crypto.order_buy_crypto_by_quantity(symbol, qty) if symbol.endswith('-USD')
-                else r.orders.order_buy_fractional_by_quantity(symbol, qty))
+        if symbol.endswith('-USD'):
+            return r.crypto.order_buy_crypto_by_quantity(symbol, qty)
+        else:
+            return r.orders.order_buy_fractional_by_quantity(symbol, qty)
     else:
-        return (r.crypto.order_sell_crypto_by_quantity(symbol, qty) if symbol.endswith('-USD')
-                else r.orders.order_sell_fractional_by_quantity(symbol, qty))
+        if symbol.endswith('-USD'):
+            return r.crypto.order_sell_crypto_by_quantity(symbol, qty)
+        else:
+            return r.orders.order_sell_fractional_by_quantity(symbol, qty)
 
 # --- Robinhood Authentication ---
 RH_USER = st.secrets.get('ROBINHOOD_USERNAME') or os.getenv('ROBINHOOD_USERNAME')
 RH_PASS = st.secrets.get('ROBINHOOD_PASSWORD') or os.getenv('ROBINHOOD_PASSWORD')
 if RH_USER and RH_PASS:
     try:
-        r.login(RH_USER, RH_PASS)
+        authentication.login(RH_USER, RH_PASS)
     except Exception as e:
         st.error(f"Robinhood login failed: {e}")
         st.stop()
