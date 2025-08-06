@@ -1,204 +1,149 @@
-# app.py – Streamlit Web App Version of Stock & Crypto Day Trading Bot (Fully Automated)
-
 import os
 import time
 from datetime import datetime
-
 import numpy as np
 import pandas as pd
-import plotly.graph_objs as go
-import requests
 import streamlit as st
 import yfinance as yf
-
-# stub out YFRateLimitError if unavailable
-try:
-    from yfinance.utils import YFRateLimitError
-except ImportError:
-    class YFRateLimitError(Exception):
-        pass
-
+import robin_stocks as r
 from streamlit_autorefresh import st_autorefresh
 
-# -------------------------
-# ▶  CONFIG & SECRETS
-# -------------------------
-PAGE_TITLE = "Stock Analyzer Bot (Automated Equities & Crypto Trading)"
-APP_URL = st.secrets.get('APP_URL', '')
-WEBHOOK = st.secrets.get('SLACK_WEBHOOK_URL', '')
+# --- Helper: Fetch Equity & Crypto Data ---
+def fetch_data(symbol: str, period: str = "30d", interval: str = "1d") -> pd.DataFrame:
+    """
+    Fetches historical data for equities or crypto via yfinance.
+    For crypto use tickers like 'BTC-USD', interval '1h', period '7d'.
+    """
+    df = yf.download(symbol, period=period, interval=interval, progress=False)
+    df.dropna(inplace=True)
+    return df
 
-# -------------------------
-# ▶  Notification Helper
-# -------------------------
-def notify_slack(tkr: str, summ: dict, price: float):
-    # Post summary to Slack with link back to dashboard
-    if WEBHOOK and APP_URL:
-        qs = f"?period={st.session_state.period}&scan_n={st.session_state.get('scan_n',0)}"
-        link = f" (<{APP_URL}{qs}|Dashboard>)"
-    else:
-        link = ''
-    text = f"*{summ['Signal']}* {tkr} @ ${price:.2f}\nReasons: {summ.get('Reasons','')}" + link
-    if WEBHOOK:
-        requests.post(WEBHOOK, json={'text': text})
-
-# Stub for live trading – integrate broker API here
-def make_live_trade(tkr: str, signal: str, qty: float):
-    # TODO: place market order via broker API
-    return
-
-# -------------------------
-# ▶  Universe Helpers
-# -------------------------
-def get_sp500_tickers():
-    try:
-        df = pd.read_html(
-            'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies',
-            flavor=['lxml', 'html5lib']
-        )[0]
-        return df['Symbol'].tolist()
-    except Exception:
-        st.error("⚠️ Failed to fetch S&P 500 list. Ensure lxml/html5lib installed.")
-        return []
-
-def get_crypto_universe():
-    # select liquid USD pairs
-    return ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "LTC-USD"]
-
-# -------------------------
-# ▶  Data & Indicator Helpers
-# -------------------------
-def fetch_data(symbol: str, period: str = '6mo') -> pd.DataFrame:
-    retries = 3
-    for attempt in range(retries):
-        try:
-            df = yf.Ticker(symbol).history(period=period)
-            df['Close'] = df['Close'].astype(float)
-            df['20_SMA'] = df['Close'].rolling(20).mean()
-            df['50_SMA'] = df['Close'].rolling(50).mean()
-            df['RSI'] = compute_rsi(df['Close'])
-            df['BB_upper'], df['BB_lower'] = compute_bollinger(df['Close'])
-            return df.dropna()
-        except YFRateLimitError:
-            time.sleep(2 ** attempt)
-    st.error(f"⚠️ Rate limit fetching {symbol}, skipping.")
-    return pd.DataFrame()
-
-
-def compute_rsi(series: pd.Series, window: int = 14) -> pd.Series:
+# --- Helper: Compute Technical Indicators ---
+def compute_rsi(series: pd.Series, window: int = 14) -> float:
     delta = series.diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
-    ma_up = up.ewm(com=window-1, adjust=False).mean()
-    ma_down = down.ewm(com=window-1, adjust=False).mean()
+    ma_up = up.ewm(com=(window-1), adjust=False).mean()
+    ma_down = down.ewm(com=(window-1), adjust=False).mean()
     rs = ma_up / ma_down
-    return 100 - (100 / (1 + rs))
+    return float(100 - (100 / (1 + rs)).iloc[-1])
 
 
-def compute_bollinger(series: pd.Series, window: int = 20, num_std: int = 2):
-    m = series.rolling(window).mean()
-    s = series.rolling(window).std()
-    return m + num_std * s, m - num_std * s
-
-
-def analyze_signal(df: pd.DataFrame, oversold: int, overbought: int) -> dict:
-    latest = df.iloc[-1]
-    reasons = []
-    if latest['RSI'] < oversold:
-        reasons.append('RSI below oversold')
-    if latest['Close'] < latest['BB_lower']:
-        reasons.append('Below lower BB')
-    sig = 'HOLD'
-    if 'RSI below oversold' in reasons and 'Below lower BB' in reasons:
-        sig = 'BUY'
-    elif latest['RSI'] > overbought and latest['Close'] > latest['BB_upper']:
-        reasons.append('Above upper BB/overbought')
-        sig = 'SELL'
+def compute_bbands(df: pd.DataFrame, window: int = 20, num_std: int = 2) -> dict:
+    sma = df['Close'].rolling(window).mean()
+    std = df['Close'].rolling(window).std()
     return {
-        'Signal': sig,
-        'RSI': round(latest['RSI'], 1),
-        '20_SMA': round(latest['20_SMA'], 2),
-        '50_SMA': round(latest['50_SMA'], 2),
-        'Reasons': '; '.join(reasons)
+        'upper': float(sma.iloc[-1] + num_std * std.iloc[-1]),
+        'lower': float(sma.iloc[-1] - num_std * std.iloc[-1]),
+        'sma': float(sma.iloc[-1])
     }
 
-# -------------------------
-# ▶  Main App
-# -------------------------
-st.set_page_config(page_title=PAGE_TITLE, layout='wide')
-st.title(PAGE_TITLE)
+# --- Helper: Generate Trade Signal ---
+def analyze_signal(df: pd.DataFrame, overbought: int, oversold: int) -> dict:
+    rsi = compute_rsi(df['Close'])
+    bb = compute_bbands(df)
+    price = float(df['Close'].iloc[-1])
+    action = 'HOLD'
+    if rsi > overbought and price >= bb['upper']:
+        action = 'SELL'
+    elif rsi < oversold and price <= bb['lower']:
+        action = 'BUY'
+    return {
+        'action': action,
+        'rsi': round(rsi, 1),
+        'bb_upper': round(bb['upper'], 2),
+        'bb_lower': round(bb['lower'], 2)
+    }
 
-# auto-refresh every 24h to run scheduled scans
-st_autorefresh(interval=24*60*60*1000, key='daily_refresh')
+# --- Helper: Execute Orders ---
+def place_order(symbol: str, side: str, amount_usd: float):
+    # Handles both equity and crypto
+    if symbol.endswith('-USD'):
+        price = float(r.crypto.get_crypto_quote(symbol)['mark_price'])
+    else:
+        price = float(r.get_latest_price(symbol)[0])
+    qty = amount_usd / price
+    if side.lower() == 'buy':
+        if symbol.endswith('-USD'):
+            return r.crypto.order_buy_crypto_by_quantity(symbol, qty, jsonify=False)
+        else:
+            return r.orders.order_buy_fractional_by_quantity(symbol, qty)
+    else:
+        if symbol.endswith('-USD'):
+            return r.crypto.order_sell_crypto_by_quantity(symbol, qty, jsonify=False)
+        else:
+            return r.orders.order_sell_fractional_by_quantity(symbol, qty)
 
-# Sidebar controls
-with st.sidebar.expander('Universe'):
-    use_sp = st.checkbox('Include S&P 500', value=True)
-    use_cr = st.checkbox('Include Crypto', value=True)
-    scan_n = st.number_input('Top N to trade', min_value=1, max_value=50, value=5)
+# --- Streamlit App ---
+# Import additional libraries
+import plotly.express as px
+import requests
 
-with st.sidebar.expander('Settings'):
-    simulate = st.checkbox('Simulate Trading Mode', True)
-    oversold = st.slider('RSI oversold threshold', 0, 100, 30)
-    overbought = st.slider('RSI overbought threshold', 0, 100, 70)
-    period = st.selectbox('History window', ['1mo', '3mo', '6mo', '1y'], index=2)
+st.set_page_config(page_title="Equity & Crypto Analyzer", layout="wide")
+st.title("Stock & Crypto Analyzer Bot")
+st.set_page_config(page_title="Equity & Crypto Analyzer", layout="wide")
+st.title("Stock & Crypto Analyzer Bot")
 
-# persist state for notifications
-st.session_state['period'] = period
-st.session_state['scan_n'] = scan_n
+# Auto-refresh once per day
+st_autorefresh(interval=24*60*60*1000, key='auto_refresh')
 
-# Build universe list
-universe = []
-if use_sp:
-    universe += get_sp500_tickers()
-if use_cr:
-    universe += get_crypto_universe()
+# Sidebar: Universe & Settings
+st.sidebar.header("Universe")
+equities = st.sidebar.text_area("Equity Tickers (comma-separated)", "AAPL,MSFT,GOOG").upper().replace(' ', '').split(',')
+include_crypto = st.sidebar.checkbox("Include Crypto", value=False)
+crypto_list = []
+if include_crypto:
+    crypto_list = st.sidebar.multiselect(
+        "Crypto Tickers (yfinance)", ['BTC-USD','ETH-USD','ADA-USD','SOL-USD'],
+        default=['BTC-USD','ETH-USD']
+    )
 
-# -------------------------
-# ▶  Daily Scan & Execution
-# -------------------------
-def run_daily_scan():
-    results = []
-    for tkr in universe[:st.session_state.scan_n]:
-        df = fetch_data(tkr, st.session_state.period)
+st.sidebar.header("Signal Parameters")
+overbought = st.sidebar.slider("RSI Overbought", min_value=50, max_value=90, value=70)
+oversold = st.sidebar.slider("RSI Oversold", min_value=10, max_value=50, value=30)
+trade_dollar = st.sidebar.number_input("USD per Trade", min_value=10, max_value=10000, value=500, step=10)
+
+# Main: Run Scan Button
+if st.button("► Run Scan & Execute"):
+    logs = []
+    # Equities
+    for sym in equities:
+        df = fetch_data(sym, period="30d", interval="1d")
         if df.empty:
             continue
-        summ = analyze_signal(df, oversold, overbought)
-        price = df['Close'].iloc[-1]
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        results.append({
-            'Ticker': tkr,
-            'Signal': summ['Signal'],
+        sig = analyze_signal(df, overbought, oversold)
+        price = float(df['Close'].iloc[-1])
+        logs.append({
+            'Ticker': sym,
+            'Signal': sig['action'],
             'Price': price,
-            'Time': timestamp,
-            'Gain/Loss': 0,
-            'Date': datetime.now().date(),
-            'Cum P/L': 0
+            'Time': df.index[-1],
+            'RSI': sig['rsi'],
+            'BB_Upper': sig['bb_upper'],
+            'BB_Lower': sig['bb_lower']
         })
-        if simulate:
-            notify_slack(tkr, summ, price)
-        else:
-            make_live_trade(tkr, summ['Signal'], qty=1)
-
-    trades = pd.DataFrame(results)
-    if trades.empty:
-        st.warning('No valid ticks to trade.')
-        return
-
-    st.subheader(':books: Trade Log')
-    st.dataframe(trades)
-    st.download_button('📥 Download Trade Log', trades.to_csv(index=False).encode(), 'trade_log.csv')
-
-    trades['Cum P/L'] = trades['Gain/Loss'].cumsum()
-    total_pl = trades['Gain/Loss'].sum()
-    st.markdown(f"### 🪙 **Total Portfolio P/L: ${total_pl:.2f}**")
-    tax = trades.groupby('Signal')['Gain/Loss'].sum().reset_index()
-    st.subheader('Tax Summary')
-    st.dataframe(tax)
-    st.download_button('📥 Download Tax Summary', tax.to_csv(index=False).encode(), 'tax_summary.csv')
-
-    st.markdown('### 📈 Portfolio Cumulative Profit Over Time')
-    st.line_chart(trades.set_index('Date')['Cum P/L'])
-
-# Button to trigger the scan
-if st.button('▶ Run Daily Scan'):
-    run_daily_scan()
+        if sig['action'] in ['BUY','SELL']:
+            place_order(sym, sig['action'], trade_dollar)
+    # Crypto
+    if include_crypto:
+        for sym in crypto_list:
+            dfc = fetch_data(sym, period="7d", interval="1h")
+            if dfc.empty:
+                continue
+            sigc = analyze_signal(dfc, overbought, oversold)
+            pricec = float(dfc['Close'].iloc[-1])
+            logs.append({
+                'Ticker': sym,
+                'Signal': sigc['action'],
+                'Price': pricec,
+                'Time': dfc.index[-1],
+                'RSI': sigc['rsi'],
+                'BB_Upper': sigc['bb_upper'],
+                'BB_Lower': sigc['bb_lower']
+            })
+            if sigc['action'] in ['BUY','SELL']:
+                place_order(sym, sigc['action'], trade_dollar)
+    # Display results
+    df_logs = pd.DataFrame(logs)
+    st.subheader("Trade Signals & Execution Log")
+    st.dataframe(df_logs)
