@@ -1,89 +1,16 @@
-import os
-import time
-from datetime import datetime
-import numpy as np
-import pandas as pd
-import streamlit as st
-import yfinance as yf
-import robin_stocks as r
-from streamlit_autorefresh import st_autorefresh
-import plotly.express as px
-import requests
-
-# --- Helper: Fetch Equity & Crypto Data ---
-def fetch_data(symbol: str, period: str = "30d", interval: str = "1d") -> pd.DataFrame:
-    """
-    Fetches historical data for equities or crypto via yfinance.
-    For crypto use tickers like 'BTC-USD', interval '1h', period '7d'.
-    """
-    df = yf.download(symbol, period=period, interval=interval, progress=False)
-    df.dropna(inplace=True)
-    return df
-
-# --- Helper: Compute Technical Indicators ---
-def compute_rsi(series: pd.Series, window: int = 14) -> float:
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    ma_up = up.ewm(com=(window-1), adjust=False).mean()
-    ma_down = down.ewm(com=(window-1), adjust=False).mean()
-    rs = ma_up / ma_down
-    return float(100 - (100 / (1 + rs)).iloc[-1])
-
-
-def compute_bbands(df: pd.DataFrame, window: int = 20, num_std: int = 2) -> dict:
-    sma = df['Close'].rolling(window).mean()
-    std = df['Close'].rolling(window).std()
-    return {
-        'upper': float(sma.iloc[-1] + num_std * std.iloc[-1]),
-        'lower': float(sma.iloc[-1] - num_std * std.iloc[-1]),
-        'sma': float(sma.iloc[-1])
-    }
-
-# --- Helper: Generate Trade Signal ---
-def analyze_signal(df: pd.DataFrame, overbought: int, oversold: int) -> dict:
-    rsi = compute_rsi(df['Close'])
-    bb = compute_bbands(df)
-    price = float(df['Close'].iloc[-1])
-    action = 'HOLD'
-    if rsi > overbought and price >= bb['upper']:
-        action = 'SELL'
-    elif rsi < oversold and price <= bb['lower']:
-        action = 'BUY'
-    return {
-        'action': action,
-        'rsi': round(rsi, 1),
-        'bb_upper': round(bb['upper'], 2),
-        'bb_lower': round(bb['lower'], 2)
-    }
-
-# --- Helper: Execute Orders ---
-def place_order(symbol: str, side: str, amount_usd: float):
-    """Places buy/sell for equities and crypto using Robinhood API"""
-    if symbol.endswith('-USD'):
-        price = float(r.crypto.get_crypto_quote(symbol)['mark_price'])
-    else:
-        price = float(r.get_latest_price(symbol)[0])
-    qty = amount_usd / price
-    if side.lower() == 'buy':
-        if symbol.endswith('-USD'):
-            return r.crypto.order_buy_crypto_by_quantity(symbol, qty, jsonify=False)
-        else:
-            return r.orders.order_buy_fractional_by_quantity(symbol, qty)
-    else:
-        if symbol.endswith('-USD'):
-            return r.crypto.order_sell_crypto_by_quantity(symbol, qty, jsonify=False)
-        else:
-            return r.orders.order_sell_fractional_by_quantity(symbol, qty)
-
 # --- Robinhood Authentication ---
 # Use the secret keys exactly as set in Streamlit Cloud
 RH_USER = st.secrets.get('ROBINHOOD_USERNAME') or os.getenv('ROBINHOOD_USERNAME')
 RH_PASS = st.secrets.get('ROBINHOOD_PASSWORD') or os.getenv('ROBINHOOD_PASSWORD')
 if RH_USER and RH_PASS:
-    r.login(RH_USER, RH_PASS)
+    try:
+        r.login(RH_USER, RH_PASS)
+    except Exception as e:
+        st.error(f"Robinhood login failed: {str(e)}")
+        st.stop()
 else:
     st.error("Robinhood credentials not found. Please set ROBINHOOD_USERNAME and ROBINHOOD_PASSWORD in Streamlit secrets.")
+    st.stop()
 
 # --- Streamlit App Setup ---
 st.set_page_config(page_title="Equity & Crypto Analyzer", layout="wide")
