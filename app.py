@@ -77,13 +77,13 @@ def place_order(symbol: str, side: str, amount_usd: float):
             return r.orders.order_sell_fractional_by_quantity(symbol, qty)
 
 # --- Robinhood Authentication ---
-# Provide your credentials via Streamlit secrets or environment variables
-RH_USER = st.secrets.get('RH_USER') or os.getenv('RH_USER')
-RH_PASS = st.secrets.get('RH_PASS') or os.getenv('RH_PASS')
+# Use the secret keys exactly as set in Streamlit Cloud
+RH_USER = st.secrets.get('ROBINHOOD_USERNAME') or os.getenv('ROBINHOOD_USERNAME')
+RH_PASS = st.secrets.get('ROBINHOOD_PASSWORD') or os.getenv('ROBINHOOD_PASSWORD')
 if RH_USER and RH_PASS:
     r.login(RH_USER, RH_PASS)
 else:
-    st.error("Robinhood credentials not found. Please set RH_USER and RH_PASS in Streamlit secrets.")
+    st.error("Robinhood credentials not found. Please set ROBINHOOD_USERNAME and ROBINHOOD_PASSWORD in Streamlit secrets.")
 
 # --- Streamlit App Setup ---
 st.set_page_config(page_title="Equity & Crypto Analyzer", layout="wide")
@@ -114,8 +114,7 @@ if st.button("► Run Scan & Execute"):
     # Equities Loop
     for sym in equities:
         df = fetch_data(sym, period="30d", interval="1d")
-        if df.empty:
-            continue
+        if df.empty: continue
         sig = analyze_signal(df, overbought, oversold)
         price = float(df['Close'].iloc[-1])
         logs.append({'Ticker': sym, 'Signal': sig['action'], 'Price': price,
@@ -128,8 +127,7 @@ if st.button("► Run Scan & Execute"):
     if include_crypto:
         for sym in crypto_list:
             dfc = fetch_data(sym, period="7d", interval="1h")
-            if dfc.empty:
-                continue
+            if dfc.empty: continue
             sigc = analyze_signal(dfc, overbought, oversold)
             pricec = float(dfc['Close'].iloc[-1])
             logs.append({'Ticker': sym, 'Signal': sigc['action'], 'Price': pricec,
