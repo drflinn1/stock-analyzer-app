@@ -1,5 +1,4 @@
 import os
-import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -7,48 +6,42 @@ from robin_stocks import robinhood as r
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
 
-# --- Persistent trade logs ---
+# --- Session state for logs ---
 if 'trade_logs' not in st.session_state:
     st.session_state.trade_logs = []
 
-# --- Helpers ---
-def fetch_data(symbol, period='2d', interval='1d'):
+# --- Helper to fetch percent change ---
+def fetch_pct_change(symbol, period='2d', interval='1d'):
     df = yf.download(symbol, period=period, interval=interval, progress=False)
     df.dropna(inplace=True)
-    return df
-
-def compute_pct_change(df):
-    if df.empty or len(df) < 2:
+    if len(df) < 2:
         return None
-    first_open = df['Open'].iloc[0]
-    last_close = df['Close'].iloc[-1]
-    return float((last_close - first_open) / first_open * 100)
+    return (df['Close'].iloc[-1] - df['Open'].iloc[0]) / df['Open'].iloc[0] * 100
 
-# --- Order placement (live via Robinhood or simulation) ---
-def place_order(symbol, side, amount_usd):
+# --- Place live or simulated orders ---
+def place_order(symbol, side, usd_amount):
     try:
-        # Determine price for equities vs crypto
         if symbol.endswith('-USD'):
             quote = r.crypto.get_crypto_quote(symbol)
             price = float(quote.get('mark_price', 0))
-            qty = amount_usd / price if price else 0
-            if side.lower() == 'buy':
+            qty = usd_amount / price if price else 0
+            if side == 'BUY':
                 return r.crypto.order_buy_crypto_by_quantity(symbol, qty)
             else:
                 return r.crypto.order_sell_crypto_by_quantity(symbol, qty)
         else:
             price_data = r.orders.get_latest_price(symbol)
             price = float(price_data[0]) if price_data else 0
-            qty = amount_usd / price if price else 0
-            if side.lower() == 'buy':
+            qty = usd_amount / price if price else 0
+            if side == 'BUY':
                 return r.orders.order_buy_fractional_by_quantity(symbol, qty)
             else:
                 return r.orders.order_sell_fractional_by_quantity(symbol, qty)
     except Exception as e:
-        st.warning(f"{side.title()} order failed for {symbol}: {e}")
+        st.warning(f"Order {side} {symbol} failed: {e}")
         return None
 
-# --- Robinhood authentication ---
+# --- Authentication via Streamlit secrets or env ---
 RH_USER = st.secrets.get('ROBINHOOD_USERNAME') or os.getenv('ROBINHOOD_USERNAME')
 RH_PASS = st.secrets.get('ROBINHOOD_PASSWORD') or os.getenv('ROBINHOOD_PASSWORD')
 authenticated = False
@@ -56,18 +49,18 @@ if RH_USER and RH_PASS:
     try:
         r.login(RH_USER, RH_PASS)
         authenticated = True
-        st.sidebar.success("Robinhood authenticated – live orders enabled.")
+        st.sidebar.success("Robinhood authenticated; live orders enabled.")
     except Exception:
-        st.sidebar.warning("Robinhood login failed – running in simulation.")
+        st.sidebar.warning("Robinhood login failed; running simulation.")
 else:
-    st.sidebar.info("No Robinhood credentials – simulation mode.")
+    st.sidebar.info("No Robinhood credentials; running simulation.")
 
-# --- Streamlit page setup ---
-st.set_page_config(page_title="Momentum Rebalancer", layout="wide")
+# --- Page setup ---
+st.set_page_config(page_title="Stock & Crypto Momentum Rebalancer", layout="wide")
 st.title("Stock & Crypto Momentum Rebalancer")
 
-# auto-refresh daily
-st_autorefresh(interval=24*60*60*1000, key='daily_refresh')
+# Auto-refresh daily (ms)
+st_autorefresh(interval=24*60*60*1000, key='daily_auto')
 
 # --- Sidebar inputs ---
 st.sidebar.header("Universe")
@@ -75,53 +68,62 @@ equities = st.sidebar.text_area("Equity Tickers (comma-separated)", "AAPL,MSFT,G
 include_crypto = st.sidebar.checkbox("Include Crypto")
 crypto_list = []
 if include_crypto:
-    crypto_list = st.sidebar.multiselect("Crypto Tickers", ['BTC-USD','ETH-USD','ADA-USD','SOL-USD'], default=['BTC-USD','ETH-USD'])
+    crypto_list = st.sidebar.text_area("Crypto Tickers (comma-separated)", "BTC-USD,ETH-USD").upper().replace(' ', '').split(',')
 
-# Combine symbols and determine max picks
-all_symbols = equities + crypto_list
-max_syms = max(len(all_symbols), 1)
-top_n = st.sidebar.number_input("Number of top tickers to pick", min_value=1, max_value=max_syms, value=min(3, max_syms))
-trade_amount = st.sidebar.number_input("USD per position", min_value=1, max_value=100000, value=100)
+all_symbols = [s for s in (equities + crypto_list) if s]
+max_symbols = max(1, len(all_symbols))
+top_n = st.sidebar.number_input("Number of top tickers to pick", min_value=1, max_value=max_symbols, value=min(3, max_symbols))
 
-# --- Actions: Daily scan and full rebalance ---
+# Determine allocation per position
+if authenticated:
+    profile = r.account.load_account_profile() or {}
+    buying_power = float(profile.get('cash', 0))
+else:
+    capital = st.sidebar.number_input("Total capital for simulation (USD)", min_value=1, value=10000)
+    buying_power = float(capital)
+allocation = round(buying_power / top_n, 2)
+st.sidebar.markdown(f"**Allocation per position:** ${allocation}")
+
+# --- Daily scan & rebalance ---
 if st.sidebar.button("► Run Daily Scan & Rebalance"):
-    # Calculate daily percent change for each symbol
-    changes = []
-    for sym in all_symbols:
-        df = fetch_data(sym)
-        pct = compute_pct_change(df)
-        if pct is not None:
-            changes.append({'symbol': sym, 'pct': pct})
-    if not changes:
-        st.sidebar.error("No data available for momentum calculation.")
+    if not all_symbols:
+        st.sidebar.error("Please add at least one ticker to scan.")
     else:
-        # Rank and select top N by momentum
-        df_chg = pd.DataFrame(changes).sort_values('pct', ascending=False)
-        top_syms = df_chg.head(top_n)['symbol'].tolist()
-        new_logs = []
-        # Full rebalance: sell all non-top, buy top picks
+        # compute momentum
+        momentum = []
         for sym in all_symbols:
-            action = 'SELL' if sym not in top_syms else 'BUY'
-            if authenticated:
-                place_order(sym, action, trade_amount)
-            new_logs.append({
-                'Ticker': sym,
-                'Action': action,
-                'PctChange': round(next(x['pct'] for x in changes if x['symbol']==sym), 2),
-                'Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            })
-        st.session_state.trade_logs.extend(new_logs)
+            pct = fetch_pct_change(sym)
+            if pct is not None:
+                momentum.append({'symbol': sym, 'pct': pct})
+        if not momentum:
+            st.sidebar.error("No valid data returned for selected symbols.")
+        else:
+            df = pd.DataFrame(momentum).sort_values('pct', ascending=False)
+            picks = df['symbol'].head(top_n).tolist()
+            new_entries = []
+            # Sell non-picks first
+            for sym in all_symbols:
+                action = 'BUY' if sym in picks else 'SELL'
+                if authenticated:
+                    place_order(sym, action, allocation)
+                new_entries.append({
+                    'Ticker': sym,
+                    'Action': action,
+                    'PctChange': round(next(x['pct'] for x in momentum if x['symbol']==sym), 2),
+                    'Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                })
+            st.session_state.trade_logs.extend(new_entries)
 
 # Clear history
 if st.sidebar.button("Clear History"):
     st.session_state.trade_logs = []
 
-# --- Display logs & download option ---
+# --- Display logs and download option ---
 if st.session_state.trade_logs:
     df_logs = pd.DataFrame(st.session_state.trade_logs)
     st.subheader("Rebalance Log")
     st.dataframe(df_logs)
-    csv_data = df_logs.to_csv(index=False).encode('utf-8')
-    st.download_button("Download Logs CSV", data=csv_data, file_name="momentum_logs.csv")
+    csv = df_logs.to_csv(index=False).encode('utf-8')
+    st.download_button("Download Logs CSV", csv, file_name="momentum_logs.csv")
 else:
     st.info("No history yet. Click 'Run Daily Scan & Rebalance' to execute.")
