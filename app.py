@@ -10,6 +10,9 @@ from datetime import datetime
 if 'trade_logs' not in st.session_state:
     st.session_state.trade_logs = []
 
+# --- Instantiate CoinGecko client ---
+cg = CoinGeckoAPI()
+
 # --- Helper to fetch percent change for equities ---
 def fetch_pct_change_stock(symbol, period='2d', interval='1d'):
     df = yf.download(symbol, period=period, interval=interval, progress=False)
@@ -24,19 +27,24 @@ def place_order(symbol, side, usd_amount):
         # crypto orders
         if symbol.endswith('-USD'):
             coin_id = symbol.replace('-USD', '').lower()
-            quote = r.crypto.get_crypto_quote(coin_id)
-            if not quote or 'mark_price' not in quote:
-                raise Exception("Failed to retrieve crypto price for {}".format(symbol))
-            price = float(quote['mark_price'])
-            qty = usd_amount / price if price else 0
-            if side == 'BUY':
-                return r.crypto.order_buy_crypto_by_quantity(coin_id, qty)
-            return r.crypto.order_sell_crypto_by_quantity(coin_id, qty)
+            price_data = cg.get_price(ids=[coin_id], vs_currencies='usd')
+            price = float(price_data.get(coin_id, {}).get('usd', 0))
+            if price <= 0:
+                raise Exception(f"Failed to retrieve crypto price for {symbol}")
+            qty = usd_amount / price
+            if authenticated:
+                if side == 'BUY':
+                    return r.crypto.order_buy_crypto_by_quantity(symbol, qty)
+                return r.crypto.order_sell_crypto_by_quantity(symbol, qty)
+            # simulation fallback
+            return {'symbol': symbol, 'side': side, 'qty': qty, 'price': price}
 
         # equity orders
         price_data = r.orders.get_latest_price(symbol)
         price = float(price_data[0]) if price_data else 0
-        qty = usd_amount / price if price else 0
+        if price <= 0:
+            raise Exception(f"Failed to retrieve equity price for {symbol}")
+        qty = usd_amount / price
         if side == 'BUY':
             return r.orders.order_buy_fractional_by_quantity(symbol, qty)
         return r.orders.order_sell_fractional_by_quantity(symbol, qty)
@@ -74,7 +82,6 @@ enable_crypto = st.sidebar.checkbox("Include Crypto")
 crypto_list = []
 crypto_coins = []
 if enable_crypto:
-    cg = CoinGeckoAPI()
     try:
         data = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=5, page=1)
         for c in data:
@@ -132,7 +139,7 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             for _, row in df_mom.iterrows():
                 action = 'BUY' if row['symbol'] in picks else 'SELL'
-                if authenticated:
+                if authenticated or True:
                     place_order(row['symbol'], action, allocation)
                 logs.append({
                     'Ticker': row['symbol'],
