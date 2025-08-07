@@ -26,7 +26,7 @@ def fetch_pct_change_stock(symbol, period='2d', interval='1d'):
 # --- Place live or simulated orders ---
 def place_order(symbol, side, usd_amount):
     try:
-        # crypto orders
+        # Crypto orders
         if symbol.endswith('-USD'):
             coin_id = crypto_ids.get(symbol)
             if not coin_id:
@@ -36,22 +36,26 @@ def place_order(symbol, side, usd_amount):
             if price <= 0:
                 raise Exception(f"Failed to retrieve crypto price for {symbol}")
             # live or simulated crypto order by USD amount
+            qty = usd_amount / price
             if authenticated:
                 if side == 'BUY':
-                    return r.orders.order_buy_crypto_by_price(symbol, usd_amount)
-                return r.orders.order_sell_crypto_by_price(symbol, usd_amount)
+                    return r.crypto.order_buy_crypto_by_price(coin_id, usd_amount)
+                return r.crypto.order_sell_crypto_by_price(coin_id, usd_amount)
             # simulation fallback
             return {'symbol': symbol, 'side': side, 'usd': usd_amount, 'price': price}
 
-        # equity orders
+        # Equity orders
         price_data = r.orders.get_latest_price(symbol)
         price = float(price_data[0]) if price_data else 0
         if price <= 0:
             raise Exception(f"Failed to retrieve equity price for {symbol}")
         qty = usd_amount / price
-        if side == 'BUY':
-            return r.orders.order_buy_fractional_by_quantity(symbol, qty)
-        return r.orders.order_sell_fractional_by_quantity(symbol, qty)
+        if authenticated:
+            if side == 'BUY':
+                return r.orders.order_buy_fractional_by_quantity(symbol, qty)
+            return r.orders.order_sell_fractional_by_quantity(symbol, qty)
+        # simulation fallback
+        return {'symbol': symbol, 'side': side, 'usd': usd_amount, 'price': price}
 
     except Exception as e:
         st.warning(f"Order {side} {symbol} failed: {e}")
@@ -81,9 +85,8 @@ st.sidebar.header("Universe")
 equities_input = st.sidebar.text_area("Equity Tickers (comma-separated)", "AAPL,MSFT,GOOG")
 equities = [s.strip().upper() for s in equities_input.split(',') if s.strip()]
 
-# crypto via CoinGecko
+# crypto via CoinGecko dynamic
 enable_crypto = st.sidebar.checkbox("Include Crypto")
-crypto_list = []
 crypto_coins = []
 if enable_crypto:
     try:
@@ -91,13 +94,12 @@ if enable_crypto:
         for c in data:
             sym = f"{c['symbol'].upper()}-USD"
             crypto_ids[sym] = c['id']
-            crypto_list.append(sym)
             crypto_coins.append({'symbol': sym, 'pct': float(c.get('price_change_percentage_24h') or 0)})
     except Exception as e:
         st.sidebar.warning(f"Failed to fetch crypto universe: {e}")
 
-# combined universe list of symbols
-tickers = equities + crypto_list
+# combined universe list
+tickers = equities + [c['symbol'] for c in crypto_coins]
 max_syms = max(1, len(tickers))
 default_n = min(3, max_syms)
 
