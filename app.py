@@ -31,6 +31,7 @@ def place_order(symbol, side, usd_amount):
                 return r.crypto.order_buy_crypto_by_quantity(symbol, qty)
             return r.crypto.order_sell_crypto_by_quantity(symbol, qty)
 
+        # equity
         price_data = r.orders.get_latest_price(symbol)
         price = float(price_data[0]) if price_data else 0
         qty = usd_amount / price if price else 0
@@ -78,10 +79,12 @@ all_symbols = equities + crypto_list
 max_syms = max(1, len(all_symbols))
 defaltn = min(3, max_syms)
 # Ensure default <= max
+```python
 top_n = st.sidebar.number_input(
     "Number of top tickers to pick", min_value=1,
     max_value=max_syms, value=defaltn, step=1
 )
+```python
 
 # Get buying power or simulation capital
 aif authenticated:
