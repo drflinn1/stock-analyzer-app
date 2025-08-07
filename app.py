@@ -27,21 +27,23 @@ def compute_pct_change(df):
 # --- Order placement (live via Robinhood or simulation) ---
 def place_order(symbol, side, amount_usd):
     try:
-        price = None
+        # Determine price for equities vs crypto
         if symbol.endswith('-USD'):
             quote = r.crypto.get_crypto_quote(symbol)
             price = float(quote.get('mark_price', 0))
-        else:
-            price = float(r.orders.get_latest_price(symbol)[0])
-        qty = amount_usd / price if price else 0
-        if side.lower() == 'buy':
-            if symbol.endswith('-USD'):
+            qty = amount_usd / price if price else 0
+            if side.lower() == 'buy':
                 return r.crypto.order_buy_crypto_by_quantity(symbol, qty)
-            return r.orders.order_buy_fractional_by_quantity(symbol, qty)
-        else:
-            if symbol.endswith('-USD'):
+            else:
                 return r.crypto.order_sell_crypto_by_quantity(symbol, qty)
-            return r.orders.order_sell_fractional_by_quantity(symbol, qty)
+        else:
+            price_data = r.orders.get_latest_price(symbol)
+            price = float(price_data[0]) if price_data else 0
+            qty = amount_usd / price if price else 0
+            if side.lower() == 'buy':
+                return r.orders.order_buy_fractional_by_quantity(symbol, qty)
+            else:
+                return r.orders.order_sell_fractional_by_quantity(symbol, qty)
     except Exception as e:
         st.warning(f"{side.title()} order failed for {symbol}: {e}")
         return None
@@ -74,14 +76,16 @@ include_crypto = st.sidebar.checkbox("Include Crypto")
 crypto_list = []
 if include_crypto:
     crypto_list = st.sidebar.multiselect("Crypto Tickers", ['BTC-USD','ETH-USD','ADA-USD','SOL-USD'], default=['BTC-USD','ETH-USD'])
-all_symbols = [s for s in equities + crypto_list if s]
 
-# dynamic number of picks\max_syms = max(len(all_symbols), 1)
+# Combine symbols and determine max picks
+all_symbols = equities + crypto_list
+max_syms = max(len(all_symbols), 1)
 top_n = st.sidebar.number_input("Number of top tickers to pick", min_value=1, max_value=max_syms, value=min(3, max_syms))
 trade_amount = st.sidebar.number_input("USD per position", min_value=1, max_value=100000, value=100)
 
-# --- Actions ---
+# --- Actions: Daily scan and full rebalance ---
 if st.sidebar.button("► Run Daily Scan & Rebalance"):
+    # Calculate daily percent change for each symbol
     changes = []
     for sym in all_symbols:
         df = fetch_data(sym)
@@ -91,10 +95,11 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
     if not changes:
         st.sidebar.error("No data available for momentum calculation.")
     else:
+        # Rank and select top N by momentum
         df_chg = pd.DataFrame(changes).sort_values('pct', ascending=False)
         top_syms = df_chg.head(top_n)['symbol'].tolist()
         new_logs = []
-        # full rebalance: sell all then buy top picks
+        # Full rebalance: sell all non-top, buy top picks
         for sym in all_symbols:
             action = 'SELL' if sym not in top_syms else 'BUY'
             if authenticated:
@@ -107,10 +112,11 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             })
         st.session_state.trade_logs.extend(new_logs)
 
+# Clear history
 if st.sidebar.button("Clear History"):
     st.session_state.trade_logs = []
 
-# --- Display logs & download ---
+# --- Display logs & download option ---
 if st.session_state.trade_logs:
     df_logs = pd.DataFrame(st.session_state.trade_logs)
     st.subheader("Rebalance Log")
