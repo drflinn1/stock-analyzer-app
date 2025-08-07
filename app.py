@@ -5,7 +5,6 @@ import yfinance as yf
 from pycoingecko import CoinGeckoAPI
 from robin_stocks import robinhood as r
 from datetime import datetime
-from streamlit_autorefresh import st_autorefresh
 
 # --- Session state for logs ---
 if 'trade_logs' not in st.session_state:
@@ -17,11 +16,13 @@ def fetch_pct_change(symbol, period='2d', interval='1d'):
     df.dropna(inplace=True)
     if len(df) < 2:
         return None
+    # calculate percent change from open of first day to close of last day
     return (df['Close'].iloc[-1] - df['Open'].iloc[0]) / df['Open'].iloc[0] * 100
 
 # --- Place live or simulated orders ---
 def place_order(symbol, side, usd_amount):
     try:
+        # crypto symbols end with '-USD'
         if symbol.endswith('-USD'):
             quote = r.crypto.get_crypto_quote(symbol)
             price = float(quote.get('mark_price', 0))
@@ -30,6 +31,7 @@ def place_order(symbol, side, usd_amount):
                 return r.crypto.order_buy_crypto_by_quantity(symbol, qty)
             return r.crypto.order_sell_crypto_by_quantity(symbol, qty)
 
+        # equities
         price_data = r.orders.get_latest_price(symbol)
         price = float(price_data[0]) if price_data else 0
         qty = usd_amount / price if price else 0
@@ -61,68 +63,71 @@ st.title("Stock & Crypto Momentum Rebalancer")
 
 # --- Sidebar inputs ---
 st.sidebar.header("Universe")
-# Equities
+# Equities input
 equities_input = st.sidebar.text_area("Equity Tickers (comma-separated)", "AAPL,MSFT,GOOG")
 equities = [s.strip().upper() for s in equities_input.split(',') if s.strip()]
 
-# Crypto inclusion
+# Crypto inclusion fetch from CoinGecko
 include_crypto = st.sidebar.checkbox("Include Crypto")
 crypto_list = []
 if include_crypto:
     cg = CoinGeckoAPI()
-    coins = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=5, page=1)
-    crypto_list = [f"{coin['symbol'].upper()}-USD" for coin in coins]
+    try:
+        coins = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=5, page=1)
+        crypto_list = [f"{coin['symbol'].upper()}-USD" for coin in coins]
+    except Exception as e:
+        st.sidebar.warning(f"Failed to fetch crypto list: {e}")
 
 # Combine universes
-all_symbols = equities + crypto_list
-max_syms = max(1, len(all_symbols))
+tokens = equities + crypto_list
+max_syms = max(1, len(tokens))
 default_n = min(3, max_syms)
-
-# Number input for picks
+# Pick count
 top_n = st.sidebar.number_input(
     "Number of top tickers to pick", min_value=1,
     max_value=max_syms, value=default_n, step=1
 )
 
-# Get buying power or simulation capital
+# Capital
 if authenticated:
     profile = r.account.load_account_profile() or {}
     buying_power = float(profile.get('cash', 0))
 else:
     capital = st.sidebar.number_input("Total capital for simulation (USD)", min_value=1, value=10000)
     buying_power = float(capital)
-
 allocation = round(buying_power / top_n, 2)
 st.sidebar.markdown(f"**Allocation per position:** ${allocation}")
 
 # --- Run daily scan & rebalance ---
-if st.sidebar.button("► Run Daily Scan & Rebalance"):    
-    if not all_symbols:
+if st.sidebar.button("► Run Daily Scan & Rebalance"):
+    if not tokens:
         st.sidebar.error("Please add at least one ticker to scan.")
     else:
-        # Fetch momentum for each symbol
+        # gather momentum
         momentum = []
-        for sym in all_symbols:
+        for sym in tokens:
             pct = fetch_pct_change(sym)
             if pct is not None:
                 momentum.append({'symbol': sym, 'pct': pct})
+
         if not momentum:
             st.sidebar.error("No valid data returned for selected symbols.")
         else:
-            # Sort by percent change descending
-            sorted_mom = sorted(momentum, key=lambda x: x['pct'], reverse=True)
-            picks = [item['symbol'] for item in sorted_mom[:top_n]]
+            # sort via DataFrame to avoid comparison issues
+            df_mom = pd.DataFrame(momentum)
+            df_mom = df_mom.sort_values('pct', ascending=False)
+            picks = df_mom['symbol'].head(top_n).tolist()
 
             entries = []
-            for item in sorted_mom:
-                sym = item['symbol']
+            for _, row in df_mom.iterrows():
+                sym = row['symbol']
                 action = 'BUY' if sym in picks else 'SELL'
                 if authenticated:
                     place_order(sym, action, allocation)
                 entries.append({
                     'Ticker': sym,
                     'Action': action,
-                    'PctChange': round(item['pct'], 2),
+                    'PctChange': round(row['pct'], 2),
                     'Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 })
             st.session_state.trade_logs.extend(entries)
