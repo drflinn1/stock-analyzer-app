@@ -35,13 +35,13 @@ def place_order(symbol, side, usd_amount):
             price = float(price_data.get(coin_id, {}).get('usd', 0))
             if price <= 0:
                 raise Exception(f"Failed to retrieve crypto price for {symbol}")
-            qty = usd_amount / price
+            # live or simulated crypto order by USD amount
             if authenticated:
                 if side == 'BUY':
-                    return r.crypto.order_buy_crypto_by_quantity(symbol, qty)
-                return r.crypto.order_sell_crypto_by_quantity(symbol, qty)
+                    return r.orders.order_buy_crypto_by_price(symbol, usd_amount)
+                return r.orders.order_sell_crypto_by_price(symbol, usd_amount)
             # simulation fallback
-            return {'symbol': symbol, 'side': side, 'qty': qty, 'price': price}
+            return {'symbol': symbol, 'side': side, 'usd': usd_amount, 'price': price}
 
         # equity orders
         price_data = r.orders.get_latest_price(symbol)
