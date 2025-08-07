@@ -1,3 +1,4 @@
+```python
 import os
 import pandas as pd
 import streamlit as st
@@ -28,16 +29,15 @@ def place_order(symbol, side, usd_amount):
             qty = usd_amount / price if price else 0
             if side == 'BUY':
                 return r.crypto.order_buy_crypto_by_quantity(symbol, qty)
-            else:
-                return r.crypto.order_sell_crypto_by_quantity(symbol, qty)
-        else:
-            price_data = r.orders.get_latest_price(symbol)
-            price = float(price_data[0]) if price_data else 0
-            qty = usd_amount / price if price else 0
-            if side == 'BUY':
-                return r.orders.order_buy_fractional_by_quantity(symbol, qty)
-            else:
-                return r.orders.order_sell_fractional_by_quantity(symbol, qty)
+            return r.crypto.order_sell_crypto_by_quantity(symbol, qty)
+
+        price_data = r.orders.get_latest_price(symbol)
+        price = float(price_data[0]) if price_data else 0
+        qty = usd_amount / price if price else 0
+        if side == 'BUY':
+            return r.orders.order_buy_fractional_by_quantity(symbol, qty)
+        return r.orders.order_sell_fractional_by_quantity(symbol, qty)
+
     except Exception as e:
         st.warning(f"Order {side} {symbol} failed: {e}")
         return None
@@ -60,37 +60,46 @@ else:
 st.set_page_config(page_title="Stock & Crypto Momentum Rebalancer", layout="wide")
 st.title("Stock & Crypto Momentum Rebalancer")
 
-# Auto-refresh daily (ms)
+# Auto-refresh daily
 st_autorefresh(interval=24*60*60*1000, key='daily_auto')
 
 # --- Sidebar inputs ---
 st.sidebar.header("Universe")
-equities = st.sidebar.text_area("Equity Tickers (comma-separated)", "AAPL,MSFT,GOOG").upper().replace(' ', '').split(',')
+equities = st.sidebar.text_area("Equity Tickers (comma-separated)", "AAPL,MSFT,GOOG")
+equities = [s.strip().upper() for s in equities.split(',') if s.strip()]
 include_crypto = st.sidebar.checkbox("Include Crypto")
 crypto_list = []
 if include_crypto:
-    crypto_list = st.sidebar.text_area("Crypto Tickers (comma-separated)", "BTC-USD,ETH-USD").upper().replace(' ', '').split(',')
+    cryptos = st.sidebar.text_area("Crypto Tickers (comma-separated)", "BTC-USD,ETH-USD")
+    crypto_list = [s.strip().upper() for s in cryptos.split(',') if s.strip()]
 
-all_symbols = [s for s in (equities + crypto_list) if s]
-max_symbols = max(1, len(all_symbols))
-top_n = st.sidebar.number_input("Number of top tickers to pick", min_value=1, max_value=max_symbols, value=min(3, max_symbols))
+# Combine universes and determine top_n bounds
+all_symbols = equities + crypto_list
+max_syms = max(1, len(all_symbols))
+defaltn = min(3, max_syms)
+# Ensure default <= max
+top_n = st.sidebar.number_input(
+    "Number of top tickers to pick", min_value=1,
+    max_value=max_syms, value=defaltn, step=1
+)
 
-# Determine allocation per position
-if authenticated:
+# Get buying power or simulation capital
+aif authenticated:
     profile = r.account.load_account_profile() or {}
     buying_power = float(profile.get('cash', 0))
 else:
     capital = st.sidebar.number_input("Total capital for simulation (USD)", min_value=1, value=10000)
     buying_power = float(capital)
+
 allocation = round(buying_power / top_n, 2)
 st.sidebar.markdown(f"**Allocation per position:** ${allocation}")
 
-# --- Daily scan & rebalance ---
+# --- Run daily scan & rebalance ---
 if st.sidebar.button("► Run Daily Scan & Rebalance"):
     if not all_symbols:
         st.sidebar.error("Please add at least one ticker to scan.")
     else:
-        # compute momentum percent-change
+        # compute momentum
         momentum = []
         for sym in all_symbols:
             pct = fetch_pct_change(sym)
@@ -100,7 +109,7 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             st.sidebar.error("No valid data returned for selected symbols.")
         else:
             df_mom = pd.DataFrame(momentum).sort_values('pct', ascending=False)
-            picks = df_mom['symbol'].head(top_n).tolist()
+            picks = df_mom.head(top_n)['symbol'].tolist()
             entries = []
             # execute full rebalance
             for sym in all_symbols:
@@ -119,7 +128,7 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
 if st.sidebar.button("Clear History"):
     st.session_state.trade_logs = []
 
-# --- Display logs and download option ---
+# --- Display logs & download ---
 if st.session_state.trade_logs:
     df_logs = pd.DataFrame(st.session_state.trade_logs)
     st.subheader("Rebalance Log")
@@ -128,3 +137,4 @@ if st.session_state.trade_logs:
     st.download_button("Download Logs CSV", csv, file_name="momentum_logs.csv")
 else:
     st.info("No history yet. Click 'Run Daily Scan & Rebalance' to execute.")
+```
