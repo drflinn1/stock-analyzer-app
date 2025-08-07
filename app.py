@@ -20,8 +20,9 @@ def fetch_data(symbol, period='2d', interval='1d'):
 def compute_pct_change(df):
     if df.empty or len(df) < 2:
         return None
-    today = df.iloc[-1]
-    return float((today['Close'] - today['Open']) / df['Open'].iloc[0] * 100)
+    first_open = df['Open'].iloc[0]
+    last_close = df['Close'].iloc[-1]
+    return float((last_close - first_open) / first_open * 100)
 
 # --- Order placement (live via Robinhood or simulation) ---
 def place_order(symbol, side, amount_usd):
@@ -75,8 +76,7 @@ if include_crypto:
     crypto_list = st.sidebar.multiselect("Crypto Tickers", ['BTC-USD','ETH-USD','ADA-USD','SOL-USD'], default=['BTC-USD','ETH-USD'])
 all_symbols = [s for s in equities + crypto_list if s]
 
-# dynamic number of picks
-max_syms = len(all_symbols) if len(all_symbols) >= 1 else 1
+# dynamic number of picks\max_syms = max(len(all_symbols), 1)
 top_n = st.sidebar.number_input("Number of top tickers to pick", min_value=1, max_value=max_syms, value=min(3, max_syms))
 trade_amount = st.sidebar.number_input("USD per position", min_value=1, max_value=100000, value=100)
 
@@ -94,11 +94,9 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         df_chg = pd.DataFrame(changes).sort_values('pct', ascending=False)
         top_syms = df_chg.head(top_n)['symbol'].tolist()
         new_logs = []
-        # full rebalance: sell then buy
+        # full rebalance: sell all then buy top picks
         for sym in all_symbols:
-            action = 'SELL'
-            if sym in top_syms:
-                action = 'BUY'
+            action = 'SELL' if sym not in top_syms else 'BUY'
             if authenticated:
                 place_order(sym, action, trade_amount)
             new_logs.append({
