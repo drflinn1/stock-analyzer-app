@@ -12,6 +12,8 @@ if 'trade_logs' not in st.session_state:
 
 # --- Instantiate CoinGecko client ---
 cg = CoinGeckoAPI()
+# mapping from symbol to CoinGecko id for orders
+crypto_ids = {}
 
 # --- Helper to fetch percent change for equities ---
 def fetch_pct_change_stock(symbol, period='2d', interval='1d'):
@@ -26,7 +28,9 @@ def place_order(symbol, side, usd_amount):
     try:
         # crypto orders
         if symbol.endswith('-USD'):
-            coin_id = symbol.replace('-USD', '').lower()
+            coin_id = crypto_ids.get(symbol)
+            if not coin_id:
+                raise Exception(f"No CoinGecko ID for {symbol}")
             price_data = cg.get_price(ids=[coin_id], vs_currencies='usd')
             price = float(price_data.get(coin_id, {}).get('usd', 0))
             if price <= 0:
@@ -86,8 +90,9 @@ if enable_crypto:
         data = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=5, page=1)
         for c in data:
             sym = f"{c['symbol'].upper()}-USD"
+            crypto_ids[sym] = c['id']
             crypto_list.append(sym)
-            crypto_coins.append({'symbol': sym, 'pct': float(c.get('price_change_percentage_24h', 0) or 0)})
+            crypto_coins.append({'symbol': sym, 'pct': float(c.get('price_change_percentage_24h') or 0)})
     except Exception as e:
         st.sidebar.warning(f"Failed to fetch crypto universe: {e}")
 
@@ -139,8 +144,7 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             for _, row in df_mom.iterrows():
                 action = 'BUY' if row['symbol'] in picks else 'SELL'
-                if authenticated or True:
-                    place_order(row['symbol'], action, allocation)
+                place_order(row['symbol'], action, allocation)
                 logs.append({
                     'Ticker': row['symbol'],
                     'Action': action,
