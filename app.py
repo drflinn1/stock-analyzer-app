@@ -67,22 +67,21 @@ equities = [s.strip().upper() for s in equities_input.split(',') if s.strip()]
 
 # Crypto inclusion
 include_crypto = st.sidebar.checkbox("Include Crypto")
-
-# Fetch default crypto universe dynamically via CoinGecko
 crypto_list = []
 if include_crypto:
     cg = CoinGeckoAPI()
     coins = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=5, page=1)
     crypto_list = [f"{coin['symbol'].upper()}-USD" for coin in coins]
 
-# Combine universes and determine top_n bounds
+# Combine universes
 all_symbols = equities + crypto_list
 max_syms = max(1, len(all_symbols))
-defaltn = min(3, max_syms)
+default_n = min(3, max_syms)
+
 # Number input for picks
 top_n = st.sidebar.number_input(
     "Number of top tickers to pick", min_value=1,
-    max_value=max_syms, value=defaltn, step=1
+    max_value=max_syms, value=default_n, step=1
 )
 
 # Get buying power or simulation capital
@@ -97,10 +96,11 @@ allocation = round(buying_power / top_n, 2)
 st.sidebar.markdown(f"**Allocation per position:** ${allocation}")
 
 # --- Run daily scan & rebalance ---
-if st.sidebar.button("► Run Daily Scan & Rebalance"):
+if st.sidebar.button("► Run Daily Scan & Rebalance"):    
     if not all_symbols:
         st.sidebar.error("Please add at least one ticker to scan.")
     else:
+        # Fetch momentum for each symbol
         momentum = []
         for sym in all_symbols:
             pct = fetch_pct_change(sym)
@@ -109,11 +109,12 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         if not momentum:
             st.sidebar.error("No valid data returned for selected symbols.")
         else:
-            # Sort using built-in sorted to avoid pandas label mismatch
+            # Sort by percent change descending
             sorted_mom = sorted(momentum, key=lambda x: x['pct'], reverse=True)
             picks = [item['symbol'] for item in sorted_mom[:top_n]]
+
             entries = []
-            for item in momentum:
+            for item in sorted_mom:
                 sym = item['symbol']
                 action = 'BUY' if sym in picks else 'SELL'
                 if authenticated:
