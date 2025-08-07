@@ -10,8 +10,8 @@ from datetime import datetime
 if 'trade_logs' not in st.session_state:
     st.session_state.trade_logs = []
 
-# --- Helper to fetch percent change ---
-def fetch_pct_change(symbol, period='2d', interval='1d'):
+# --- Helper to fetch percent change for equities ---
+def fetch_pct_change_stock(symbol, period='2d', interval='1d'):
     df = yf.download(symbol, period=period, interval=interval, progress=False)
     df.dropna(inplace=True)
     if len(df) < 2:
@@ -22,13 +22,13 @@ def fetch_pct_change(symbol, period='2d', interval='1d'):
 def place_order(symbol, side, usd_amount):
     try:
         if symbol.endswith('-USD'):
+            # crypto orders
             quote = r.crypto.get_crypto_quote(symbol)
             price = float(quote.get('mark_price', 0))
             qty = usd_amount / price if price else 0
             if side == 'BUY':
                 return r.crypto.order_buy_crypto_by_quantity(symbol, qty)
             return r.crypto.order_sell_crypto_by_quantity(symbol, qty)
-
         # equities
         price_data = r.orders.get_latest_price(symbol)
         price = float(price_data[0]) if price_data else 0
@@ -36,7 +36,6 @@ def place_order(symbol, side, usd_amount):
         if side == 'BUY':
             return r.orders.order_buy_fractional_by_quantity(symbol, qty)
         return r.orders.order_sell_fractional_by_quantity(symbol, qty)
-
     except Exception as e:
         st.warning(f"Order {side} {symbol} failed: {e}")
         return None
@@ -61,40 +60,43 @@ st.title("Stock & Crypto Momentum Rebalancer")
 
 # --- Sidebar inputs ---
 st.sidebar.header("Universe")
-# Equities
+# equities input
 equities_input = st.sidebar.text_area("Equity Tickers (comma-separated)", "AAPL,MSFT,GOOG")
 equities = [s.strip().upper() for s in equities_input.split(',') if s.strip()]
 
-# Crypto via CoinGecko
+# crypto via CoinGecko
 enable_crypto = st.sidebar.checkbox("Include Crypto")
+crypto_coins = []
 crypto_list = []
 if enable_crypto:
     cg = CoinGeckoAPI()
     try:
-        coins = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=5, page=1)
-        crypto_list = [f"{c['symbol'].upper()}-USD" for c in coins]
+        data = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=5, page=1)
+        for c in data:
+            symbol = c['symbol'].upper() + '-USD'
+            crypto_list.append(symbol)
+            crypto_coins.append({'symbol': symbol, 'pct': float(c.get('price_change_percentage_24h', 0))})
     except Exception as e:
         st.sidebar.warning(f"Failed to fetch crypto universe: {e}")
 
-# Combined universe
+# combined universe list of symbols
 tickers = equities + crypto_list
 max_syms = max(1, len(tickers))
 default_n = min(3, max_syms)
 
-# Number to pick
+# number of top tickers
 top_n = st.sidebar.number_input(
     "Number of top tickers to pick", min_value=1,
     max_value=max_syms, value=default_n, step=1
 )
 
-# Capital allocation
+# capital allocation
 if authenticated:
     profile = r.account.load_account_profile() or {}
     buying_power = float(profile.get('cash', 0))
 else:
     capital = st.sidebar.number_input("Total capital for simulation (USD)", min_value=1, value=10000)
     buying_power = float(capital)
-
 allocation = round(buying_power / top_n, 2)
 st.sidebar.markdown(f"**Allocation per position:** ${allocation}")
 
@@ -104,10 +106,14 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         st.sidebar.error("Please specify at least one ticker.")
     else:
         momentum = []
-        for sym in tickers:
-            pct = fetch_pct_change(sym)
+        # equities momentum
+        for sym in equities:
+            pct = fetch_pct_change_stock(sym)
             if pct is not None:
                 momentum.append({'symbol': sym, 'pct': pct})
+        # crypto momentum
+        for entry in crypto_coins:
+            momentum.append({'symbol': entry['symbol'], 'pct': entry['pct']})
 
         if not momentum:
             st.sidebar.error("No data returned for selected symbols.")
