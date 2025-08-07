@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+from pycoingecko import CoinGeckoAPI
 from robin_stocks import robinhood as r
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
@@ -61,17 +62,24 @@ st.set_page_config(page_title="Stock & Crypto Momentum Rebalancer", layout="wide
 st.title("Stock & Crypto Momentum Rebalancer")
 
 # Auto-refresh daily
-st_autorefresh(interval=24*60*60*1000, key='daily_auto')
+# st_autorefresh(interval=24*60*60*1000, key='daily_auto')
 
 # --- Sidebar inputs ---
 st.sidebar.header("Universe")
-equities = st.sidebar.text_area("Equity Tickers (comma-separated)", "AAPL,MSFT,GOOG")
-equities = [s.strip().upper() for s in equities.split(',') if s.strip()]
+# Equities
+equities_input = st.sidebar.text_area("Equity Tickers (comma-separated)", "AAPL,MSFT,GOOG")
+equities = [s.strip().upper() for s in equities_input.split(',') if s.strip()]
+
+# Crypto inclusion
 include_crypto = st.sidebar.checkbox("Include Crypto")
+
+# Fetch default crypto universe dynamically via CoinGecko
 crypto_list = []
 if include_crypto:
-    cryptos = st.sidebar.text_area("Crypto Tickers (comma-separated)", "BTC-USD,ETH-USD")
-    crypto_list = [s.strip().upper() for s in cryptos.split(',') if s.strip()]
+    cg = CoinGeckoAPI()
+    # Get top 5 by market cap
+    coins = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=5, page=1)
+    crypto_list = [f"{coin['symbol'].upper()}-USD" for coin in coins]
 
 # Combine universes and determine top_n bounds
 all_symbols = equities + crypto_list
