@@ -31,7 +31,7 @@ def place_order(symbol, side, usd_amount):
                 return r.crypto.order_buy_crypto_by_quantity(symbol, qty)
             return r.crypto.order_sell_crypto_by_quantity(symbol, qty)
 
-        # equity
+        # Equity trade
         price_data = r.orders.get_latest_price(symbol)
         price = float(price_data[0]) if price_data else 0
         qty = usd_amount / price if price else 0
@@ -78,16 +78,14 @@ if include_crypto:
 all_symbols = equities + crypto_list
 max_syms = max(1, len(all_symbols))
 defaltn = min(3, max_syms)
-# Ensure default <= max
-```python
+# Number input for picks
 top_n = st.sidebar.number_input(
     "Number of top tickers to pick", min_value=1,
     max_value=max_syms, value=defaltn, step=1
 )
-```python
 
 # Get buying power or simulation capital
-aif authenticated:
+if authenticated:
     profile = r.account.load_account_profile() or {}
     buying_power = float(profile.get('cash', 0))
 else:
@@ -102,7 +100,6 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
     if not all_symbols:
         st.sidebar.error("Please add at least one ticker to scan.")
     else:
-        # compute momentum
         momentum = []
         for sym in all_symbols:
             pct = fetch_pct_change(sym)
@@ -114,7 +111,6 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             df_mom = pd.DataFrame(momentum).sort_values('pct', ascending=False)
             picks = df_mom.head(top_n)['symbol'].tolist()
             entries = []
-            # execute full rebalance
             for sym in all_symbols:
                 action = 'BUY' if sym in picks else 'SELL'
                 if authenticated:
