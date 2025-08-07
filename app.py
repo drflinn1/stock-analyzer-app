@@ -1,4 +1,3 @@
-```python
 import os
 import pandas as pd
 import streamlit as st
@@ -136,4 +135,3 @@ if st.session_state.trade_logs:
     st.download_button("Download Logs CSV", csv, file_name="momentum_logs.csv")
 else:
     st.info("No history yet. Click 'Run Daily Scan & Rebalance' to execute.")
-```
