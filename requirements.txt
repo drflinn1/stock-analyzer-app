@@ -8,4 +8,5 @@ streamlit-autorefresh
 robin_stocks
 lxml
 html5lib
+pycoingecko
 
