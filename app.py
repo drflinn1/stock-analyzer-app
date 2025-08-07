@@ -12,7 +12,7 @@ if 'trade_logs' not in st.session_state:
 
 # --- Instantiate CoinGecko client ---
 cg = CoinGeckoAPI()
-# mapping from symbol to CoinGecko id for orders
+# mapping from symbol to CoinGecko id for price lookup
 crypto_ids = {}
 
 # --- Helper to fetch percent change for equities ---
@@ -24,7 +24,7 @@ def fetch_pct_change_stock(symbol, period='2d', interval='1d'):
     return float((df['Close'].iloc[-1] - df['Open'].iloc[0]) / df['Open'].iloc[0] * 100)
 
 # --- Place live or simulated orders ---
-def place_order(symbol, side, usd_amount):
+def place_order(symbol, side, usd_amount, authenticated):
     try:
         # Crypto orders
         if symbol.endswith('-USD'):
@@ -35,14 +35,16 @@ def place_order(symbol, side, usd_amount):
             price = float(price_data.get(coin_id, {}).get('usd', 0))
             if price <= 0:
                 raise Exception(f"Failed to retrieve crypto price for {symbol}")
-            # live or simulated crypto order by USD amount
             qty = usd_amount / price
             if authenticated:
+                # place live crypto orders via Robinhood crypto API
+                crypto_symbol = symbol.split('-')[0]
                 if side == 'BUY':
-                    return r.crypto.order_buy_crypto_by_price(coin_id, usd_amount)
-                return r.crypto.order_sell_crypto_by_price(coin_id, usd_amount)
+                    return r.crypto.order_buy_crypto_by_price(crypto_symbol, usd_amount)
+                else:
+                    return r.crypto.order_sell_crypto_by_price(crypto_symbol, usd_amount)
             # simulation fallback
-            return {'symbol': symbol, 'side': side, 'usd': usd_amount, 'price': price}
+            return {'symbol': symbol, 'side': side, 'usd': usd_amount, 'price': price, 'qty': qty}
 
         # Equity orders
         price_data = r.orders.get_latest_price(symbol)
@@ -53,9 +55,10 @@ def place_order(symbol, side, usd_amount):
         if authenticated:
             if side == 'BUY':
                 return r.orders.order_buy_fractional_by_quantity(symbol, qty)
-            return r.orders.order_sell_fractional_by_quantity(symbol, qty)
+            else:
+                return r.orders.order_sell_fractional_by_quantity(symbol, qty)
         # simulation fallback
-        return {'symbol': symbol, 'side': side, 'usd': usd_amount, 'price': price}
+        return {'symbol': symbol, 'side': side, 'usd': usd_amount, 'price': price, 'qty': qty}
 
     except Exception as e:
         st.warning(f"Order {side} {symbol} failed: {e}")
@@ -125,12 +128,10 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         st.sidebar.error("Please specify at least one ticker.")
     else:
         momentum = []
-        # equities momentum
         for sym in equities:
             pct = fetch_pct_change_stock(sym)
             if pct is not None:
                 momentum.append({'symbol': sym, 'pct': pct})
-        # crypto momentum
         for entry in crypto_coins:
             momentum.append({'symbol': entry['symbol'], 'pct': entry['pct']})
 
@@ -146,7 +147,7 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             for _, row in df_mom.iterrows():
                 action = 'BUY' if row['symbol'] in picks else 'SELL'
-                place_order(row['symbol'], action, allocation)
+                place_order(row['symbol'], action, allocation, authenticated)
                 logs.append({
                     'Ticker': row['symbol'],
                     'Action': action,
