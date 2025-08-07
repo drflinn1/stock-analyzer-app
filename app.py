@@ -22,7 +22,6 @@ def fetch_pct_change(symbol, period='2d', interval='1d'):
 # --- Place live or simulated orders ---
 def place_order(symbol, side, usd_amount):
     try:
-        # Crypto vs Equity check by ticker suffix
         if symbol.endswith('-USD'):
             quote = r.crypto.get_crypto_quote(symbol)
             price = float(quote.get('mark_price', 0))
@@ -31,7 +30,6 @@ def place_order(symbol, side, usd_amount):
                 return r.crypto.order_buy_crypto_by_quantity(symbol, qty)
             return r.crypto.order_sell_crypto_by_quantity(symbol, qty)
 
-        # Equity trade
         price_data = r.orders.get_latest_price(symbol)
         price = float(price_data[0]) if price_data else 0
         qty = usd_amount / price if price else 0
@@ -61,9 +59,6 @@ else:
 st.set_page_config(page_title="Stock & Crypto Momentum Rebalancer", layout="wide")
 st.title("Stock & Crypto Momentum Rebalancer")
 
-# Auto-refresh daily
-# st_autorefresh(interval=24*60*60*1000, key='daily_auto')
-
 # --- Sidebar inputs ---
 st.sidebar.header("Universe")
 # Equities
@@ -77,7 +72,6 @@ include_crypto = st.sidebar.checkbox("Include Crypto")
 crypto_list = []
 if include_crypto:
     cg = CoinGeckoAPI()
-    # Get top 5 by market cap
     coins = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=5, page=1)
     crypto_list = [f"{coin['symbol'].upper()}-USD" for coin in coins]
 
@@ -115,17 +109,19 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         if not momentum:
             st.sidebar.error("No valid data returned for selected symbols.")
         else:
-            df_mom = pd.DataFrame(momentum).sort_values('pct', ascending=False)
-            picks = df_mom.head(top_n)['symbol'].tolist()
+            # Sort using built-in sorted to avoid pandas label mismatch
+            sorted_mom = sorted(momentum, key=lambda x: x['pct'], reverse=True)
+            picks = [item['symbol'] for item in sorted_mom[:top_n]]
             entries = []
-            for sym in all_symbols:
+            for item in momentum:
+                sym = item['symbol']
                 action = 'BUY' if sym in picks else 'SELL'
                 if authenticated:
                     place_order(sym, action, allocation)
                 entries.append({
                     'Ticker': sym,
                     'Action': action,
-                    'PctChange': round(next(x['pct'] for x in momentum if x['symbol']==sym), 2),
+                    'PctChange': round(item['pct'], 2),
                     'Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 })
             st.session_state.trade_logs.extend(entries)
