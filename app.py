@@ -21,6 +21,7 @@ def fetch_pct_change(symbol, period='2d', interval='1d'):
 # --- Place live or simulated orders ---
 def place_order(symbol, side, usd_amount):
     try:
+        # Crypto vs Equity check by ticker suffix
         if symbol.endswith('-USD'):
             quote = r.crypto.get_crypto_quote(symbol)
             price = float(quote.get('mark_price', 0))
@@ -89,7 +90,7 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
     if not all_symbols:
         st.sidebar.error("Please add at least one ticker to scan.")
     else:
-        # compute momentum
+        # compute momentum percent-change
         momentum = []
         for sym in all_symbols:
             pct = fetch_pct_change(sym)
@@ -98,23 +99,23 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         if not momentum:
             st.sidebar.error("No valid data returned for selected symbols.")
         else:
-            df = pd.DataFrame(momentum).sort_values('pct', ascending=False)
-            picks = df['symbol'].head(top_n).tolist()
-            new_entries = []
-            # Sell non-picks first
+            df_mom = pd.DataFrame(momentum).sort_values('pct', ascending=False)
+            picks = df_mom['symbol'].head(top_n).tolist()
+            entries = []
+            # execute full rebalance
             for sym in all_symbols:
                 action = 'BUY' if sym in picks else 'SELL'
                 if authenticated:
                     place_order(sym, action, allocation)
-                new_entries.append({
+                entries.append({
                     'Ticker': sym,
                     'Action': action,
                     'PctChange': round(next(x['pct'] for x in momentum if x['symbol']==sym), 2),
                     'Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 })
-            st.session_state.trade_logs.extend(new_entries)
+            st.session_state.trade_logs.extend(entries)
 
-# Clear history
+# --- Clear history ---
 if st.sidebar.button("Clear History"):
     st.session_state.trade_logs = []
 
