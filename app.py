@@ -1,4 +1,3 @@
-```python
 import os
 import pandas as pd
 import streamlit as st
@@ -17,7 +16,6 @@ def fetch_pct_change(symbol, period='2d', interval='1d'):
     df.dropna(inplace=True)
     if len(df) < 2:
         return None
-    # ensure float type
     return float((df['Close'].iloc[-1] - df['Open'].iloc[0]) / df['Open'].iloc[0] * 100)
 
 # --- Place live or simulated orders ---
@@ -105,7 +103,6 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
     if not tickers:
         st.sidebar.error("Please specify at least one ticker.")
     else:
-        # compute momentum
         momentum = []
         for sym in tickers:
             pct = fetch_pct_change(sym)
@@ -115,13 +112,10 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         if not momentum:
             st.sidebar.error("No data returned for selected symbols.")
         else:
-            # create DataFrame and sort
             df_mom = pd.DataFrame(momentum)
             df_mom = df_mom.sort_values('pct', ascending=False).reset_index(drop=True)
-            # pick top
             picks = df_mom.loc[:top_n-1, 'symbol'].tolist()
 
-            # execute orders and log
             logs = []
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             for _, row in df_mom.iterrows():
@@ -149,4 +143,3 @@ if st.session_state.trade_logs:
     st.download_button("Download Logs CSV", csv, file_name="momentum_logs.csv")
 else:
     st.info("No history yet. Click 'Run Daily Scan & Rebalance' to execute.")
-```
