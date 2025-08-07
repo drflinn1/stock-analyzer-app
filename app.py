@@ -21,21 +21,26 @@ def fetch_pct_change_stock(symbol, period='2d', interval='1d'):
 # --- Place live or simulated orders ---
 def place_order(symbol, side, usd_amount):
     try:
+        # crypto orders
         if symbol.endswith('-USD'):
-            # crypto orders
-            quote = r.crypto.get_crypto_quote(symbol)
-            price = float(quote.get('mark_price', 0))
+            coin_id = symbol.replace('-USD', '').lower()
+            quote = r.crypto.get_crypto_quote(coin_id)
+            if not quote or 'mark_price' not in quote:
+                raise Exception("Failed to retrieve crypto price for {}".format(symbol))
+            price = float(quote['mark_price'])
             qty = usd_amount / price if price else 0
             if side == 'BUY':
-                return r.crypto.order_buy_crypto_by_quantity(symbol, qty)
-            return r.crypto.order_sell_crypto_by_quantity(symbol, qty)
-        # equities
+                return r.crypto.order_buy_crypto_by_quantity(coin_id, qty)
+            return r.crypto.order_sell_crypto_by_quantity(coin_id, qty)
+
+        # equity orders
         price_data = r.orders.get_latest_price(symbol)
         price = float(price_data[0]) if price_data else 0
         qty = usd_amount / price if price else 0
         if side == 'BUY':
             return r.orders.order_buy_fractional_by_quantity(symbol, qty)
         return r.orders.order_sell_fractional_by_quantity(symbol, qty)
+
     except Exception as e:
         st.warning(f"Order {side} {symbol} failed: {e}")
         return None
@@ -66,16 +71,16 @@ equities = [s.strip().upper() for s in equities_input.split(',') if s.strip()]
 
 # crypto via CoinGecko
 enable_crypto = st.sidebar.checkbox("Include Crypto")
-crypto_coins = []
 crypto_list = []
+crypto_coins = []
 if enable_crypto:
     cg = CoinGeckoAPI()
     try:
         data = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=5, page=1)
         for c in data:
-            symbol = c['symbol'].upper() + '-USD'
-            crypto_list.append(symbol)
-            crypto_coins.append({'symbol': symbol, 'pct': float(c.get('price_change_percentage_24h', 0))})
+            sym = f"{c['symbol'].upper()}-USD"
+            crypto_list.append(sym)
+            crypto_coins.append({'symbol': sym, 'pct': float(c.get('price_change_percentage_24h', 0) or 0)})
     except Exception as e:
         st.sidebar.warning(f"Failed to fetch crypto universe: {e}")
 
@@ -119,7 +124,8 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             st.sidebar.error("No data returned for selected symbols.")
         else:
             df_mom = pd.DataFrame(momentum)
-            df_mom = df_mom.sort_values('pct', ascending=False).reset_index(drop=True)
+            df_mom.sort_values('pct', ascending=False, inplace=True)
+            df_mom.reset_index(drop=True, inplace=True)
             picks = df_mom.loc[:top_n-1, 'symbol'].tolist()
 
             logs = []
