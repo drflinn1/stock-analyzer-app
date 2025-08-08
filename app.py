@@ -95,7 +95,7 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
 
     # Get current positions
     try:
-        holdings = {h['symbol']: float(h['quantity']) for h in robinhood.get_open_stock_positions()}
+        holdings = {h['symbol'].upper(): float(h['quantity']) for h in robinhood.get_open_stock_positions()}
     except:
         holdings = {}
 
@@ -105,22 +105,23 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
     # Rebalance: sell those not in picks, buy those in picks
     for sym in all_symbols:
         action = None
-        if sym in picks and holdings.get(sym, 0) == 0:
+        current_qty = holdings.get(sym, 0)
+        if sym in picks and current_qty == 0:
             action = 'BUY'
-        elif sym not in picks and holdings.get(sym, 0) > 0:
+        elif sym not in picks and current_qty > 0:
             action = 'SELL'
 
-        qty = None
         if action:
-            # compute quantity
+            qty = None
             try:
                 if sym.endswith('-USD'):
                     # crypto order by specifying amount USD
-                    qty = alloc_per_pos
+                    amount = alloc_per_pos
                     if action == 'BUY':
-                        robinhood.order_buy_crypto_by_price(sym.replace('-USD',''), qty)
+                        robinhood.order_buy_crypto_by_price(sym.replace('-USD',''), amount)
                     else:
-                        robinhood.order_sell_crypto_by_price(sym.replace('-USD',''), qty)
+                        robinhood.order_sell_crypto_by_price(sym.replace('-USD',''), amount)
+                    qty = amount
                 else:
                     price = float(yf.Ticker(sym).info['regularMarketPrice'])
                     qty = alloc_per_pos / price
