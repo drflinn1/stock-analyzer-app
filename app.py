@@ -73,7 +73,8 @@ else:
             acct = robinhood.load_account_profile()
             cash = float(acct.get('portfolio_cash', 0) or 0)
             alloc_per_pos = cash / len(all_symbols)
-        except Exception:
+        except Exception as e:
+            st.sidebar.warning(f"Account fetch failed: {e}")
             alloc_per_pos = 0
     else:
         alloc_per_pos = 0
@@ -133,13 +134,13 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         try:
             for p in rh_orders.get_open_stock_positions():
                 holdings[p['symbol'].upper()] = float(p['quantity'])
-        except:
+        except Exception:
             pass
         if include_crypto:
             try:
                 for p in rh_crypto.get_crypto_positions():
                     holdings[p['currency'].upper()] = float(p['quantity'])
-            except:
+            except Exception:
                 pass
 
     log = []
@@ -160,33 +161,49 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             else:
                 price = float(yf.Ticker(sym).info.get('regularMarketPrice') or 0)
             qty = alloc_per_pos / price if price else 0
-        except:
+        except Exception:
             qty = 0
 
         executed = 0
         order_id = ''
         status = 'simulated'
         if live_mode and qty > 0:
-            try:
-                if sym.endswith('-USD'):
+            if sym.endswith('-USD'):
+                # Crypto orders with proper precision
+                try:
                     if buy:
-                        resp = rh_crypto.order_buy_crypto_by_quantity(ticker, round(qty, 8))
+                        resp = rh_crypto.order_buy_crypto_by_quantity(ticker, round(qty, 6))
                     else:
-                        resp = rh_crypto.order_sell_crypto_by_quantity(ticker, round(current_qty, 8))
+                        resp = rh_crypto.order_sell_crypto_by_quantity(ticker, round(current_qty, 6))
+                    st.sidebar.write(f"Crypto order response: {resp}")
                     order_id = resp.get('id', '')
-                    status = resp.get('state', '')
-                    executed = qty if buy else current_qty
-                else:
+                    try:
+                        details = rh_crypto.get_crypto_order_info(order_id)
+                        status = details.get('state', '')
+                        executed = float(details.get('cumulative_quantity') or details.get('filled_quantity') or 0)
+                    except Exception as e:
+                        st.sidebar.warning(f"Failed to fetch crypto order info for {order_id}: {e}")
+                        executed = round(qty, 6) if buy else round(current_qty, 6)
+                except Exception as e:
+                    st.warning(f"Order {action} {sym} failed: {e}")
+            else:
+                # Stock market orders
+                try:
                     if buy:
                         resp = rh_orders.order_buy_market(sym, round(qty, 6))
                     else:
                         resp = rh_orders.order_sell_market(sym, round(current_qty, 6))
+                    st.sidebar.write(f"Stock order response: {resp}")
                     order_id = resp.get('id', '')
-                    details = rh_orders.get_stock_order_info(order_id)
-                    status = details.get('state', '')
-                    executed = float(details.get('cumulative_quantity') or details.get('filled_quantity') or 0)
-            except Exception as e:
-                st.warning(f"Order {action} {sym} failed: {e}")
+                    try:
+                        details = rh_orders.get_stock_order_info(order_id)
+                        status = details.get('state', '')
+                        executed = float(details.get('cumulative_quantity') or details.get('filled_quantity') or 0)
+                    except Exception as e:
+                        st.sidebar.warning(f"Failed to fetch stock order info for {order_id}: {e}")
+                        executed = float(round(qty, 6)) if buy else float(round(current_qty, 6))
+                except Exception as e:
+                    st.warning(f"Order {action} {sym} failed: {e}")
         else:
             executed = qty if buy else current_qty
 
@@ -207,16 +224,21 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
 
     if live_mode:
         st.subheader("Open Orders")
+        # Fetch pending stock and crypto orders
+        open_stock = []
+        open_crypto = []
         try:
-            open_stock = rh_orders.get_all_open_stock_orders()
-            if include_crypto:
-                all_crypto = rh_crypto.get_all_crypto_orders()
-                open_crypto = [o for o in all_crypto if o.get('state') not in ['filled','cancelled']]
-            else:
-                open_crypto = []
-            open_orders = open_stock + open_crypto
+            open_stock = rh_orders.get_all_open_stock_orders() or []
         except Exception as e:
-            open_orders = []
-            st.warning(f"Failed to fetch open orders: {e}")
-        st.write(open_orders)
+            st.warning(f"Failed to fetch open stock orders: {e}")
+        if include_crypto:
+            try:
+                for o in rh_crypto.get_crypto_orders() or []:
+                    if o.get('state') not in ['filled', 'cancelled']:
+                        open_crypto.append(o)
+            except Exception as e:
+                st.warning(f"Failed to fetch open crypto orders: {e}")
+
+        all_open = open_stock + open_crypto
+        st.write(all_open)
         st.write("✔️ If orders appear here, they are pending in Robinhood.")
