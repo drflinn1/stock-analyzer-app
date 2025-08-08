@@ -132,13 +132,13 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         try:
             for p in robinhood.get_open_stock_positions():
                 holdings[p['symbol'].upper()] = float(p['quantity'])
-        except:
+        except Exception:
             pass
         if include_crypto:
             try:
                 for p in robinhood.get_crypto_positions():
                     holdings[p['currency'].upper()] = float(p['quantity'])
-            except:
+            except Exception:
                 pass
 
     # 3) Place or simulate orders, capture responses
@@ -156,7 +156,8 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         # determine quantity
         try:
             if sym.endswith('-USD'):
-                price = cg.get_price(ids=symbol_to_id.get(ticker), vs_currencies='usd').get(symbol_to_id.get(ticker), {}).get('usd')
+                price = cg.get_price(ids=symbol_to_id.get(ticker), vs_currencies='usd')
+                price = price.get(symbol_to_id.get(ticker), {}).get('usd')
                 qty = alloc_per_pos / price if price else 0
             else:
                 price = float(yf.Ticker(sym).info.get('regularMarketPrice') or 0)
@@ -165,25 +166,30 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             qty = 0
 
         executed = 0
-        order_id = None
+        order_id = ''
         status = 'simulated'
-        if live_mode and qty>0:
+        if live_mode and qty > 0:
             try:
+                # Place order
                 if sym.endswith('-USD'):
                     if action == 'BUY':
                         resp = robinhood.order_buy_crypto_by_quantity(ticker, qty)
                     else:
                         resp = robinhood.order_sell_crypto_by_quantity(ticker, current_qty)
+                    order_id = resp.get('id', '')
+                    # Fetch crypto order info
+                    details = robinhood.get_crypto_order_info(order_id)
                 else:
                     if action == 'BUY':
                         resp = robinhood.order_buy_market(sym, qty)
                     else:
                         resp = robinhood.order_sell_market(sym, qty)
-                order_id = resp.get('id')
-                # fetch order status
-                details = robinhood.get_order_info(order_id)
-                status = details.get('state')
-                executed = float(details.get('quantity', 0))
+                    order_id = resp.get('id', '')
+                    # Fetch stock order info
+                    details = robinhood.get_stock_order_info(order_id)
+                status = details.get('state', '')
+                # Determine executed quantity
+                executed = float(details.get('cumulative_quantity', details.get('filled_quantity', 0)))
             except Exception as e:
                 st.warning(f"Order {action} {sym} failed: {e}")
         else:
@@ -193,9 +199,9 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         log.append({
             'Ticker': sym,
             'Action': action,
-            'PctChange': round(pct_changes.get(sym,0),2),
-            'Executed': round(executed,4),
-            'OrderID': order_id or '',
+            'PctChange': round(pct_changes.get(sym, 0), 2),
+            'Executed': round(executed, 4),
+            'OrderID': order_id,
             'Status': status,
             'Time': now_str
         })
@@ -212,11 +218,11 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             open_orders = []
             try:
                 open_orders += robinhood.get_all_open_stock_orders()
-            except:
+            except Exception:
                 pass
             if include_crypto:
                 try:
                     open_orders += robinhood.get_all_open_crypto_orders()
-                except:
+                except Exception:
                     pass
             st.json(open_orders)
