@@ -89,8 +89,15 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         except Exception:
             pct[sym] = np.nan
 
-    df = pd.DataFrame([{'Ticker': s, 'PctChange': pct[s]} for s in all_symbols]).dropna()
-    picks = df.nlargest(top_n, 'PctChange')['Ticker'].tolist() if not df.empty else []
+    df = pd.DataFrame([{'Ticker': s, 'PctChange': pct[s]} for s in all_symbols])
+    # Ensure numeric dtype before ranking to avoid pandas ValueError
+    df['PctChange'] = pd.to_numeric(df['PctChange'], errors='coerce')
+    df = df.dropna(subset=['PctChange'])
+
+    # Use sort_values+head (robust across pandas versions)
+    picks = []
+    if not df.empty:
+        picks = df.sort_values('PctChange', ascending=False).head(top_n)['Ticker'].tolist()
 
     # Load current holdings
     holdings = {}
@@ -145,9 +152,20 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         st.subheader("Open Orders")
         try:
             open_stock = rh_orders.get_all_open_orders() or []
-            open_crypto = rh_crypto.get_all_crypto_orders() if include_crypto else []
+            open_crypto = []
+            if include_crypto:
+                fn = None
+                for name in ("get_all_crypto_orders", "get_all_open_crypto_orders", "get_crypto_orders"):
+                    fn = getattr(rh_crypto, name, None)
+                    if callable(fn):
+                        break
+                if fn:
+                    try:
+                        open_crypto = fn() or []
+                    except Exception:
+                        open_crypto = []
             open_orders = {'stocks': open_stock, 'crypto': open_crypto}
-        except Exception:
+        except Exception as e:
             open_orders = []
-            st.warning("Failed to fetch open orders.")
+            st.warning(f"Failed to fetch open orders: {e}")
         st.write(open_orders)
