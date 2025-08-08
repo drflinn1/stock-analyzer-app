@@ -36,6 +36,7 @@ cg = CoinGeckoAPI()
 include_crypto = st.sidebar.checkbox("Include Crypto")
 if include_crypto:
     coin_list = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=50, page=1)
+    # select top 5 by market cap
     cryptos = [c['symbol'].upper() + '-USD' for c in coin_list[:5]]
 else:
     cryptos = []
@@ -69,13 +70,13 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             # Crypto
             try:
                 cid = sym.replace('-USD','').lower()
-                price_now = cg.get_price(ids=cid, vs_currencies='usd')[cid]['usd']
+                price_now = float(cg.get_price(ids=cid, vs_currencies='usd')[cid]['usd'])
                 hist = cg.get_coin_market_chart_range_by_id(
                     id=cid, vs_currency='usd',
                     from_timestamp=int(yesterday.timestamp()),
                     to_timestamp=int(now.timestamp())
                 )
-                price_y = hist['prices'][0][1]
+                price_y = float(hist['prices'][0][1])
                 pct_changes[sym] = (price_now / price_y - 1) * 100
             except Exception:
                 st.warning(f"Failed to retrieve crypto price for {sym}")
@@ -86,26 +87,29 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
                 df = yf.download(sym,
                                  start=yesterday.strftime('%Y-%m-%d'),
                                  end=now.strftime('%Y-%m-%d'))
-                price_now = df['Close'].iloc[-1]
-                price_y = df['Close'].iloc[0]
+                price_now = float(df['Close'].iloc[-1])
+                price_y = float(df['Close'].iloc[0])
                 pct_changes[sym] = (price_now / price_y - 1) * 100
             except Exception:
                 st.warning(f"Failed to retrieve stock price for {sym}")
                 pct_changes[sym] = np.nan
 
-    # 2) Rank and pick using nlargest (avoids sorting index mismatches)
+    # 2) Build DataFrame and ensure numeric type
     df_mom = pd.DataFrame([{'Ticker': s, 'PctChange': pct_changes.get(s)} for s in all_symbols])
-    df_mom = df_mom[df_mom['PctChange'].notna()]
+    df_mom['PctChange'] = pd.to_numeric(df_mom['PctChange'], errors='coerce')
+    df_mom = df_mom.dropna(subset=['PctChange'])
+
+    # 3) Rank and pick
     picks = df_mom.nlargest(top_n, 'PctChange')['Ticker'].tolist()
 
-    # 3) Fetch holdings
+    # 4) Fetch holdings
     try:
         positions = robinhood.get_open_stock_positions()
         holdings = {p['symbol'].upper(): float(p['quantity']) for p in positions}
     except Exception:
         holdings = {}
 
-    # 4) Place orders and log
+    # 5) Place orders and log
     log = []
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')
     for sym in all_symbols:
@@ -136,7 +140,7 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         except Exception as e:
             st.warning(f"Order {action} {sym} failed: {e}")
 
-    # 5) Show log
+    # 6) Show log
     if log:
         df_log = pd.DataFrame(log)
         st.subheader("Rebalance Log")
