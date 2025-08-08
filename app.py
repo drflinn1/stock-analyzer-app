@@ -8,7 +8,7 @@ import datetime
 
 # --- Authentication ---
 st.sidebar.header("Authentication")
-# Load credentials from secrets or ask user
+# Load credentials from secrets or prompt user
 RH_USER = st.secrets.get("ROBINHOOD_USERNAME") or st.sidebar.text_input("Robinhood Username", type="default")
 RH_PW   = st.secrets.get("ROBINHOOD_PASSWORD") or st.sidebar.text_input("Robinhood Password", type="password")
 
@@ -36,7 +36,6 @@ cg = CoinGeckoAPI()
 include_crypto = st.sidebar.checkbox("Include Crypto")
 if include_crypto:
     coin_list = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=50, page=1)
-    # select top 5 by market cap
     cryptos = [c['symbol'].upper() + '-USD' for c in coin_list[:5]]
 else:
     cryptos = []
@@ -49,7 +48,8 @@ if manual_alloc > 0:
     alloc_per_pos = manual_alloc
 else:
     acct = robinhood.load_account_profile()
-    total_cash = float(acct.get('portfolio_cash', 0) or 0)
+    cash_str = acct.get('portfolio_cash', '0')
+    total_cash = float(cash_str or 0)
     alloc_per_pos = total_cash / len(all_symbols) if all_symbols else 0
 
 st.sidebar.markdown(f"**Allocation per position:** ${alloc_per_pos:.2f}")
@@ -102,32 +102,54 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
     # 3) Rank and pick
     picks = df_mom.nlargest(top_n, 'PctChange')['Ticker'].tolist()
 
-    # 4) Fetch holdings
+    # 4) Fetch stock holdings
     try:
-        positions = robinhood.get_open_stock_positions()
-        holdings = {p['symbol'].upper(): float(p['quantity']) for p in positions}
+        stock_positions = robinhood.get_open_stock_positions()
+        holdings = {p['symbol'].upper(): float(p['quantity']) for p in stock_positions}
     except Exception:
         holdings = {}
+    # 5) Fetch crypto holdings (if included)
+    if include_crypto:
+        try:
+            crypto_positions = robinhood.get_crypto_positions()
+            for p in crypto_positions:
+                sym_name = p['currency'].upper() + '-USD'
+                holdings[sym_name] = float(p['quantity'])
+        except Exception:
+            pass
 
-    # 5) Place orders and log
+    # 6) Place orders and log
     log = []
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')
     for sym in all_symbols:
         current_qty = holdings.get(sym, 0)
-        buy_cond = sym in picks and current_qty == 0
+        buy_cond  = sym in picks and current_qty == 0
         sell_cond = sym not in picks and current_qty > 0
         if not (buy_cond or sell_cond):
             continue
         action = 'BUY' if buy_cond else 'SELL'
         try:
             if sym.endswith('-USD'):
-                amt = alloc_per_pos
                 asset = sym.replace('-USD','').lower()
                 if action == 'BUY':
-                    robinhood.order_buy_crypto_by_price(asset, amt)
+                    # Try price-based order, fallback to quantity
+                    try:
+                        robinhood.order_buy_crypto_by_price(asset, alloc_per_pos)
+                        executed = alloc_per_pos
+                    except AttributeError:
+                        price_now = float(cg.get_price(ids=asset, vs_currencies='usd')[asset]['usd'])
+                        qty = alloc_per_pos / price_now if price_now else 0
+                        robinhood.order_buy_crypto_by_quantity(asset, qty)
+                        executed = qty
                 else:
-                    robinhood.order_sell_crypto_by_price(asset, amt)
-                executed = amt
+                    # Sell entire position
+                    qty_to_sell = current_qty
+                    try:
+                        robinhood.order_sell_crypto_by_price(asset, alloc_per_pos)
+                        executed = alloc_per_pos
+                    except AttributeError:
+                        robinhood.order_sell_crypto_by_quantity(asset, qty_to_sell)
+                        executed = qty_to_sell
             else:
                 price = float(yf.Ticker(sym).info.get('regularMarketPrice', 0) or 0)
                 qty = alloc_per_pos / price if price else 0
@@ -136,11 +158,11 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
                 else:
                     robinhood.order_sell_market(sym, qty)
                 executed = qty
-            log.append({'Ticker': sym, 'Action': action, 'PctChange': pct_changes[sym], 'Time': now_str})
+            log.append({'Ticker': sym, 'Action': action, 'PctChange': pct_changes[sym], 'Executed': executed, 'Time': now_str})
         except Exception as e:
             st.warning(f"Order {action} {sym} failed: {e}")
 
-    # 6) Show log
+    # 7) Show log
     if log:
         df_log = pd.DataFrame(log)
         st.subheader("Rebalance Log")
