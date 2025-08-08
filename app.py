@@ -12,7 +12,7 @@ if 'trade_logs' not in st.session_state:
 
 # --- Instantiate CoinGecko client ---
 cg = CoinGeckoAPI()
-# mapping from symbol to CoinGecko id for price lookup
+# mapping from symbol to CoinGecko ID for price lookup
 crypto_ids = {}
 
 # --- Helper to fetch percent change for equities ---
@@ -24,7 +24,7 @@ def fetch_pct_change_stock(symbol, period='2d', interval='1d'):
     return float((df['Close'].iloc[-1] - df['Open'].iloc[0]) / df['Open'].iloc[0] * 100)
 
 # --- Place live or simulated orders ---
-def place_order(symbol, side, usd_amount, authenticated):
+def place_order(symbol, side, usd_amount, live):
     try:
         # Crypto orders
         if symbol.endswith('-USD'):
@@ -35,16 +35,15 @@ def place_order(symbol, side, usd_amount, authenticated):
             price = float(price_data.get(coin_id, {}).get('usd', 0))
             if price <= 0:
                 raise Exception(f"Failed to retrieve crypto price for {symbol}")
-            qty = usd_amount / price
-            if authenticated:
-                # place live crypto orders via Robinhood crypto API
-                crypto_symbol = symbol.split('-')[0]
+            # Live vs simulation
+            if live:
+                crypto_sym = symbol.split('-')[0].upper()
                 if side == 'BUY':
-                    return r.crypto.order_buy_crypto_by_price(crypto_symbol, usd_amount)
+                    return r.orders.order_buy_crypto_by_price(crypto_sym, str(usd_amount))
                 else:
-                    return r.crypto.order_sell_crypto_by_price(crypto_symbol, usd_amount)
-            # simulation fallback
-            return {'symbol': symbol, 'side': side, 'usd': usd_amount, 'price': price, 'qty': qty}
+                    return r.orders.order_sell_crypto_by_price(crypto_sym, str(usd_amount))
+            qty = usd_amount / price
+            return {'symbol': symbol, 'action': side, 'usd': usd_amount, 'price': price, 'qty': qty}
 
         # Equity orders
         price_data = r.orders.get_latest_price(symbol)
@@ -52,13 +51,12 @@ def place_order(symbol, side, usd_amount, authenticated):
         if price <= 0:
             raise Exception(f"Failed to retrieve equity price for {symbol}")
         qty = usd_amount / price
-        if authenticated:
+        if live:
             if side == 'BUY':
                 return r.orders.order_buy_fractional_by_quantity(symbol, qty)
             else:
                 return r.orders.order_sell_fractional_by_quantity(symbol, qty)
-        # simulation fallback
-        return {'symbol': symbol, 'side': side, 'usd': usd_amount, 'price': price, 'qty': qty}
+        return {'symbol': symbol, 'action': side, 'usd': usd_amount, 'price': price, 'qty': qty}
 
     except Exception as e:
         st.warning(f"Order {side} {symbol} failed: {e}")
@@ -67,28 +65,27 @@ def place_order(symbol, side, usd_amount, authenticated):
 # --- Authentication ---
 RH_USER = st.secrets.get('ROBINHOOD_USERNAME') or os.getenv('ROBINHOOD_USERNAME')
 RH_PASS = st.secrets.get('ROBINHOOD_PASSWORD') or os.getenv('ROBINHOOD_PASSWORD')
-authenticated = False
+live_trading = False
 if RH_USER and RH_PASS:
     try:
         r.login(RH_USER, RH_PASS)
-        authenticated = True
-        st.sidebar.success("Robinhood authenticated; live orders enabled.")
+        live_trading = True
+        st.sidebar.success("✅ Robinhood authenticated — Live orders ENABLED")
     except Exception:
-        st.sidebar.warning("Robinhood login failed; running simulation.")
+        st.sidebar.warning("⚠ Robinhood login failed — Simulation mode")
 else:
-    st.sidebar.info("No Robinhood credentials; running simulation.")
+    st.sidebar.info("ℹ Running in simulation mode (no Robinhood credentials)")
 
 # --- Page setup ---
 st.set_page_config(page_title="Stock & Crypto Momentum Rebalancer", layout="wide")
 st.title("Stock & Crypto Momentum Rebalancer")
 
 # --- Sidebar inputs ---
-st.sidebar.header("Universe")
-# equities input
+st.sidebar.header("Universe & Allocation")
+
 equities_input = st.sidebar.text_area("Equity Tickers (comma-separated)", "AAPL,MSFT,GOOG")
 equities = [s.strip().upper() for s in equities_input.split(',') if s.strip()]
 
-# crypto via CoinGecko dynamic
 enable_crypto = st.sidebar.checkbox("Include Crypto")
 crypto_coins = []
 if enable_crypto:
@@ -101,31 +98,29 @@ if enable_crypto:
     except Exception as e:
         st.sidebar.warning(f"Failed to fetch crypto universe: {e}")
 
-# combined universe list
-tickers = equities + [c['symbol'] for c in crypto_coins]
-max_syms = max(1, len(tickers))
-default_n = min(3, max_syms)
+symbols = equities + [c['symbol'] for c in crypto_coins]
+max_symbols = max(1, len(symbols))
 
-# number of top tickers
-top_n = st.sidebar.number_input(
-    "Number of top tickers to pick", min_value=1,
-    max_value=max_syms, value=default_n, step=1
-)
+def default_allocation():
+    if live_trading:
+        cash = float(r.account.load_account_profile().get('cash', 0))
+    else:
+        cash = st.session_state.get('sim_cash', 10000)
+    return round(cash / max_symbols, 2)
 
-# capital allocation
-if authenticated:
-    profile = r.account.load_account_profile() or {}
-    buying_power = float(profile.get('cash', 0))
-else:
-    capital = st.sidebar.number_input("Total capital for simulation (USD)", min_value=1, value=10000)
-    buying_power = float(capital)
-allocation = round(buying_power / top_n, 2)
+overridden = st.sidebar.number_input("Manual allocation per position (USD, >0 override)", min_value=0, value=0, step=1)
+if not live_trading:
+    sim_cash = st.sidebar.number_input("Simulation capital (USD)", min_value=1, value=10000)
+    st.session_state['sim_cash'] = sim_cash
+allocation = overridden if overridden > 0 else default_allocation()
 st.sidebar.markdown(f"**Allocation per position:** ${allocation}")
 
-# --- Run daily scan & rebalance ---
+top_n = st.sidebar.number_input("Number of tickers to pick", min_value=1, max_value=max_symbols, value=min(3, max_symbols), step=1)
+
+# --- Run scan & rebalance ---
 if st.sidebar.button("► Run Daily Scan & Rebalance"):
-    if not tickers:
-        st.sidebar.error("Please specify at least one ticker.")
+    if not symbols:
+        st.sidebar.error("Define at least one ticker first.")
     else:
         momentum = []
         for sym in equities:
@@ -136,36 +131,27 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             momentum.append({'symbol': entry['symbol'], 'pct': entry['pct']})
 
         if not momentum:
-            st.sidebar.error("No data returned for selected symbols.")
+            st.sidebar.error("No momentum data returned.")
         else:
-            df_mom = pd.DataFrame(momentum)
-            df_mom.sort_values('pct', ascending=False, inplace=True)
-            df_mom.reset_index(drop=True, inplace=True)
-            picks = df_mom.loc[:top_n-1, 'symbol'].tolist()
-
+            df_mom = pd.DataFrame(momentum).sort_values('pct', ascending=False).reset_index(drop=True)
+            picks = df_mom['symbol'].head(top_n).tolist()
             logs = []
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             for _, row in df_mom.iterrows():
                 action = 'BUY' if row['symbol'] in picks else 'SELL'
-                place_order(row['symbol'], action, allocation, authenticated)
-                logs.append({
-                    'Ticker': row['symbol'],
-                    'Action': action,
-                    'PctChange': round(row['pct'], 2),
-                    'Time': now
-                })
+                place_order(row['symbol'], action, allocation, live_trading)
+                logs.append({'Ticker': row['symbol'], 'Action': action, 'PctChange': round(row['pct'], 2), 'Time': now})
             st.session_state.trade_logs.extend(logs)
 
-# --- History controls ---
+# --- Clear history ---
 if st.sidebar.button("Clear History"):
     st.session_state.trade_logs = []
 
-# --- Display & download ---
+# --- Log display & download ---
 if st.session_state.trade_logs:
     df_logs = pd.DataFrame(st.session_state.trade_logs)
     st.subheader("Rebalance Log")
     st.dataframe(df_logs)
-    csv = df_logs.to_csv(index=False).encode()
-    st.download_button("Download Logs CSV", csv, file_name="momentum_logs.csv")
+    st.download_button("Download Logs CSV", df_logs.to_csv(index=False).encode(), file_name="momentum_logs.csv")
 else:
-    st.info("No history yet. Click 'Run Daily Scan & Rebalance' to execute.")
+    st.info("Click 'Run Daily Scan & Rebalance' to execute")
