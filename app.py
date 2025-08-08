@@ -38,7 +38,7 @@ equity_input = st.sidebar.text_area(
 )
 equities = [t.strip().upper() for t in equity_input.split(',') if t.strip()]
 
-# Fetch top cryptos from CoinGecko if requested\st.sidebar.write("")
+# Fetch top cryptos from CoinGecko if requested
 include_crypto = st.sidebar.checkbox("Include Crypto", value=False)
 symbol_to_id = {}
 cryptos = []
@@ -141,7 +141,7 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             except:
                 pass
 
-    # 3) Place or simulate orders
+    # 3) Place or simulate orders, capture responses
     log = []
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')
     for sym in all_symbols:
@@ -165,39 +165,58 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             qty = 0
 
         executed = 0
+        order_id = None
+        status = 'simulated'
         if live_mode and qty>0:
             try:
                 if sym.endswith('-USD'):
                     if action == 'BUY':
-                        robinhood.order_buy_crypto_by_quantity(ticker, qty)
-                        executed = qty
+                        resp = robinhood.order_buy_crypto_by_quantity(ticker, qty)
                     else:
-                        robinhood.order_sell_crypto_by_quantity(ticker, current_qty)
-                        executed = current_qty
+                        resp = robinhood.order_sell_crypto_by_quantity(ticker, current_qty)
                 else:
                     if action == 'BUY':
-                        robinhood.order_buy_market(sym, qty)
+                        resp = robinhood.order_buy_market(sym, qty)
                     else:
-                        robinhood.order_sell_market(sym, qty)
-                    executed = qty
+                        resp = robinhood.order_sell_market(sym, qty)
+                order_id = resp.get('id')
+                # fetch order status
+                details = robinhood.get_order_info(order_id)
+                status = details.get('state')
+                executed = float(details.get('quantity', 0))
             except Exception as e:
                 st.warning(f"Order {action} {sym} failed: {e}")
         else:
             # simulation
             executed = qty if buy else current_qty
-            st.info(f"Simulated {action} {sym} qty={executed:.4f}")
 
         log.append({
             'Ticker': sym,
             'Action': action,
-            'PctChange': pct_changes.get(sym, 0),
-            'Executed': executed,
+            'PctChange': round(pct_changes.get(sym,0),2),
+            'Executed': round(executed,4),
+            'OrderID': order_id or '',
+            'Status': status,
             'Time': now_str
         })
 
-    # 4) Display log
+    # 4) Display log and open orders
     if log:
         df_log = pd.DataFrame(log)
         st.subheader("Rebalance Log")
         st.table(df_log)
         st.download_button("Download Logs CSV", df_log.to_csv(index=False), file_name='trade_logs.csv')
+
+        if live_mode:
+            st.subheader("Open Orders")
+            open_orders = []
+            try:
+                open_orders += robinhood.get_all_open_stock_orders()
+            except:
+                pass
+            if include_crypto:
+                try:
+                    open_orders += robinhood.get_all_open_crypto_orders()
+                except:
+                    pass
+            st.json(open_orders)
