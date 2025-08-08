@@ -12,12 +12,14 @@ import datetime
 st.sidebar.header("Authentication & Mode")
 live_mode = st.sidebar.checkbox("Enable Live Trading (use with caution)", value=False)
 if live_mode:
+    # Ensure credentials are set
     try:
         user = st.secrets["ROBINHOOD_USERNAME"]
         pw = st.secrets["ROBINHOOD_PASSWORD"]
     except KeyError:
         st.sidebar.error("Missing ROBINHOOD_USERNAME or ROBINHOOD_PASSWORD in secrets.")
         st.stop()
+    # Login
     try:
         robinhood.login(username=user, password=pw)
         st.sidebar.success("Robinhood authenticated — Live orders ENABLED")
@@ -35,12 +37,16 @@ include_crypto = st.sidebar.checkbox("Include Crypto", value=False)
 symbol_to_id, cryptos = {}, []
 if include_crypto:
     cg = CoinGeckoAPI()
+    # Fetch top 5 coins and filter by tradable pairs
     markets = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=5)
+    tradable = {p['currency_pair'].upper() for p in rh_crypto.get_crypto_currency_pairs()}
     for c in markets:
-        sym = c['symbol'].upper()
-        symbol_to_id[sym] = c['id']
-        cryptos.append(f"{sym}-USD")
+        pair = f"{c['symbol'].upper()}-USD"
+        if pair in tradable:
+            symbol_to_id[c['symbol'].upper()] = c['id']
+            cryptos.append(pair)
 all_symbols = equities + cryptos
+
 manual = st.sidebar.number_input(
     "Manual allocation per position (USD, >0 override)",
     min_value=0.0, value=0.0, step=0.01, format="%.2f"
@@ -51,7 +57,7 @@ if manual > 0:
     alloc = manual
 elif live_mode and all_symbols:
     acct = robinhood.load_account_profile()
-    cash = float(acct.get('portfolio_cash', 0) or 0)
+    cash = float(acct.get('portfolio_cash') or 0)
     alloc = cash / len(all_symbols)
 else:
     alloc = 0
@@ -78,7 +84,7 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
     for sym in all_symbols:
         try:
             if sym.endswith('-USD'):
-                cid = symbol_to_id[sym.replace('-USD','')]
+                cid = symbol_to_id.get(sym.replace('-USD',''))
                 data = cg.get_coin_market_chart_range_by_id(
                     cid, 'usd', int(prev.timestamp()), int(now.timestamp())
                 )
@@ -94,14 +100,12 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             pct[sym] = np.nan
 
     df = pd.DataFrame([{'Ticker': s, 'PctChange': pct[s]} for s in all_symbols]).dropna()
-    picks = []
     if not df.empty:
-        try:
-            picks = df.nlargest(top_n, 'PctChange')['Ticker'].tolist()
-        except Exception:
-            picks = df.sort_values('PctChange', ascending=False).head(top_n)['Ticker'].tolist()
+        picks = df.nlargest(top_n, 'PctChange')['Ticker'].tolist()
+    else:
+        picks = []
 
-    # Load holdings for live mode
+    # Load current holdings
     holdings = {}
     if live_mode:
         for pos in rh_orders.get_open_stock_positions() or []:
@@ -110,7 +114,7 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             for pos in rh_crypto.get_crypto_positions() or []:
                 holdings[pos['currency'].upper()] = float(pos['quantity'])
 
-    # Perform trades
+    # Perform trades and log
     log = []
     for sym in all_symbols:
         base = sym.replace('-USD','')
@@ -120,29 +124,26 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         if not (buy or sell):
             continue
         action = 'BUY' if buy else 'SELL'
-        executed, oid, status = 0, '', 'simulated'
+        executed, oid, status = 0, '', 'simulated' if not live_mode else 'pending'
         if live_mode:
-            amt_str = f"{alloc:.2f}"  # two decimal precision
             try:
+                price_str = f"{alloc:.2f}"  # round to 2 decimals for price
                 if sym.endswith('-USD'):
                     if buy:
-                        resp = rh_crypto.order_buy_crypto_by_price(base, amt_str)
+                        resp = rh_crypto.order_buy_crypto_by_price(base, price_str)
                     else:
-                        resp = rh_crypto.order_sell_crypto_by_price(base, amt_str)
+                        resp = rh_crypto.order_sell_crypto_by_price(base, price_str)
                 else:
                     if buy:
                         resp = rh_orders.order_buy_fractional_by_price(sym, alloc)
                     else:
                         resp = rh_orders.order_sell_fractional_by_price(sym, alloc)
-                st.sidebar.write(f"Order response: {resp}")
+                # Capture response
                 oid = resp.get('id', '')
-                executed = float(
-                    resp.get('cumulative_quantity') or
-                    resp.get('executed_quantity') or
-                    resp.get('amount') or 0
-                )
-                status = resp.get('state', '')
+                executed = float(resp.get('cumulative_quantity') or resp.get('executed_quantity') or 0)
+                status = resp.get('state', '') or status
             except Exception as e:
+                status = f"failed: {e}"
                 st.warning(f"Order {action} {sym} failed: {e}")
         log.append({
             'Ticker': sym,
@@ -163,7 +164,10 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
     # Pending orders
     if live_mode:
         st.subheader("Open Orders")
-        open_st = rh_orders.get_all_open_stock_orders() or []
-        open_cr = rh_crypto.get_all_open_crypto_orders() if include_crypto else []
-        st.write(open_st + open_cr)
+        try:
+            open_orders = rh_orders.get_all_open_orders()
+        except Exception:
+            open_orders = []
+            st.warning("Failed to fetch open orders.")
+        st.write(open_orders)
         st.write("✔️ Pending orders are shown above.")
