@@ -1,3 +1,4 @@
+```python
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,31 +7,41 @@ from robin_stocks import robinhood
 from pycoingecko import CoinGeckoAPI
 import datetime
 
-# Authenticate to Robinhood
+# --- Authentication ---
+st.sidebar.header("Authentication")
+# Try to load from secrets, otherwise ask the user
+tmp_user = st.secrets.get("ROBINHOOD_USERNAME")
+tmp_pw   = st.secrets.get("ROBINHOOD_PASSWORD")
+if not tmp_user or not tmp_pw:
+    RH_USER = st.sidebar.text_input("Robinhood Username", value="", type="default")
+    RH_PW   = st.sidebar.text_input("Robinhood Password", value="", type="password")
+else:
+    RH_USER = tmp_user
+    RH_PW   = tmp_pw
+
+# Ensure we have credentials
+if not RH_USER or not RH_PW:
+    st.sidebar.error("Robinhood credentials required to proceed.")
+    st.stop()
+
+# Log in
 try:
-    RH_USER = st.secrets.get('RH_USERNAME')
-    RH_PW = st.secrets.get('RH_PASSWORD')
-    if not RH_USER or not RH_PW:
-        raise KeyError('RH_USERNAME or RH_PASSWORD not set in secrets')
     robinhood.login(username=RH_USER, password=RH_PW)
     st.sidebar.success("Robinhood authenticated — Live orders ENABLED")
-except KeyError as ke:
-    st.sidebar.error(f"Missing secret: {ke}")
-    st.stop()
 except Exception as e:
     st.sidebar.error(f"Robinhood login failed: {e}")
     st.stop()
 
-# Sidebar: Universe & Allocation
+# --- Sidebar: Universe & Allocation ---
 st.sidebar.header("Universe & Allocation")
-# Equity tickers input
+# Equity Input
 equity_input = st.sidebar.text_area(
     "Equity Tickers (comma-separated)",
     value="AAPL,MSFT,GOOG"
 )
 equities = [t.strip().upper() for t in equity_input.split(',') if t.strip()]
 
-# Crypto toggle and dynamic universe fetch
+# Crypto Universe Fetch
 cg = CoinGeckoAPI()
 include_crypto = st.sidebar.checkbox("Include Crypto")
 if include_crypto:
@@ -49,33 +60,35 @@ manual_alloc = st.sidebar.number_input(
 if manual_alloc > 0:
     alloc_per_pos = manual_alloc
 else:
-    total_cash = float(robinhood.load_account_profile()['portfolio_cash'])
-    num = len(all_symbols)
-    alloc_per_pos = total_cash / num if num else 0
+    acct = robinhood.load_account_profile()
+    total_cash = float(acct.get('portfolio_cash',0) or 0)
+    n = len(all_symbols)
+    alloc_per_pos = total_cash / n if n else 0
 
-st.sidebar.markdown(f"Allocation per position: ${alloc_per_pos:.2f}")
+st.sidebar.markdown(f"**Allocation per position:** ${alloc_per_pos:.2f}")
 
-# Number to pick
+# How many to pick
 top_n = st.sidebar.number_input(
     "Number of tickers to pick", min_value=1, max_value=len(all_symbols), value=3, step=1
 )
 
-# Main: Title
+# --- Main App ---
 st.title("Stock & Crypto Momentum Rebalancer")
 
-# Run button
+# Run button triggers rebalance
 if st.sidebar.button("► Run Daily Scan & Rebalance"):
-    # Fetch prices and compute percent changes
+    # 1) compute daily momentum
     pct_changes = {}
     now = datetime.datetime.now()
     yesterday = now - datetime.timedelta(days=1)
     for sym in all_symbols:
+        # Crypto
         if sym.endswith('-USD'):
             try:
-                coin_id = sym.replace('-USD','').lower()
-                price_now = cg.get_price(ids=coin_id, vs_currencies='usd')[coin_id]['usd']
+                cid = sym.replace('-USD','').lower()
+                price_now = cg.get_price(ids=cid, vs_currencies='usd')[cid]['usd']
                 hist = cg.get_coin_market_chart_range_by_id(
-                    id=coin_id, vs_currency='usd',
+                    id=cid, vs_currency='usd',
                     from_timestamp=int(yesterday.timestamp()),
                     to_timestamp=int(now.timestamp())
                 )
@@ -84,60 +97,64 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             except Exception:
                 st.warning(f"Failed to retrieve crypto price for {sym}")
                 pct_changes[sym] = None
+        # Stock
         else:
             try:
-                df = yf.download(sym, start=yesterday.strftime('%Y-%m-%d'), end=now.strftime('%Y-%m-%d'))
+                df = yf.download(sym,
+                                 start=yesterday.strftime('%Y-%m-%d'),
+                                 end=now.strftime('%Y-%m-%d'))
                 price_now = df['Close'].iloc[-1]
-                price_y = df['Close'].iloc[0]
+                price_y   = df['Close'].iloc[0]
                 pct_changes[sym] = (price_now/price_y - 1) * 100
             except Exception:
                 st.warning(f"Failed to retrieve stock price for {sym}")
                 pct_changes[sym] = None
 
-    df_mom = pd.DataFrame([{'Ticker': sym, 'PctChange': pct_changes[sym]} for sym in all_symbols])
-    df_mom = df_mom.dropna().sort_values('PctChange', ascending=False)
-    picks = df_mom.head(top_n)['Ticker'].tolist()
+    # 2) rank and pick
+df_mom = pd.DataFrame([{'Ticker': s, 'PctChange': pct_changes.get(s)} for s in all_symbols])
+df_mom = df_mom.dropna().sort_values('PctChange', ascending=False)
+picks  = df_mom.head(top_n)['Ticker'].tolist()
 
+    # 3) fetch holdings
+try:
+    positions = robinhood.get_open_stock_positions()
+    holdings = {p['symbol'].upper(): float(p['quantity']) for p in positions}
+except Exception:
+    holdings = {}
+
+    # 4) place orders and log
+log = []
+now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+for sym in all_symbols:
+    current_qty = holdings.get(sym, 0)
+    action = 'BUY' if sym in picks and current_qty == 0 else 'SELL' if sym not in picks and current_qty > 0 else None
+    if not action:
+        continue
     try:
-        positions = robinhood.get_open_stock_positions()
-        holdings = {h['symbol'].upper(): float(h['quantity']) for h in positions}
-    except Exception:
-        holdings = {}
+        if sym.endswith('-USD'):
+            amt = alloc_per_pos
+            asset = sym.replace('-USD','').lower()
+            if action=='BUY':
+                robinhood.order_buy_crypto_by_price(asset, amt)
+            else:
+                robinhood.order_sell_crypto_by_price(asset, amt)
+            executed = amt
+        else:
+            price = float(yf.Ticker(sym).info['regularMarketPrice'])
+            qty   = alloc_per_pos/price
+            if action=='BUY':
+                robinhood.order_buy_market(sym, qty)
+            else:
+                robinhood.order_sell_market(sym, qty)
+            executed = qty
+        log.append({'Ticker':sym,'Action':action,'PctChange':pct_changes[sym],'Time':now_str})
+    except Exception as e:
+        st.warning(f"Order {action} {sym} failed: {e}")
 
-    log = []
-    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-    for sym in all_symbols:
-        action = None
-        current_qty = holdings.get(sym, 0)
-        if sym in picks and current_qty == 0:
-            action = 'BUY'
-        elif sym not in picks and current_qty > 0:
-            action = 'SELL'
-
-        if action:
-            try:
-                if sym.endswith('-USD'):
-                    amount = alloc_per_pos
-                    asset = sym.replace('-USD','').lower()
-                    if action == 'BUY':
-                        robinhood.order_buy_crypto_by_price(asset, amount)
-                    else:
-                        robinhood.order_sell_crypto_by_price(asset, amount)
-                    executed_qty = amount
-                else:
-                    price = float(yf.Ticker(sym).info['regularMarketPrice'])
-                    qty = alloc_per_pos / price
-                    if action == 'BUY':
-                        robinhood.order_buy_market(sym, qty)
-                    else:
-                        robinhood.order_sell_market(sym, qty)
-                    executed_qty = qty
-                log.append({'Ticker': sym, 'Action': action, 'PctChange': pct_changes[sym], 'Time': timestamp})
-            except Exception as e:
-                st.warning(f"Order {action} {sym} failed: {e}")
-
+# 5) show log
+if log:
     df_log = pd.DataFrame(log)
     st.subheader("Rebalance Log")
     st.table(df_log)
     st.download_button("Download Logs CSV", df_log.to_csv(index=False), file_name='trade_logs.csv')
+```
