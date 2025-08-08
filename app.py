@@ -5,6 +5,7 @@ import yfinance as yf
 from robin_stocks import robinhood
 from pycoingecko import CoinGeckoAPI
 import datetime
+import time
 
 # --- Authentication & Mode ---
 st.sidebar.header("Authentication & Mode")
@@ -168,6 +169,7 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         executed = 0
         order_id = ''
         status = 'simulated'
+        details = {}
         if live_mode and qty > 0:
             try:
                 # Place order
@@ -176,20 +178,21 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
                         resp = robinhood.order_buy_crypto_by_quantity(ticker, qty)
                     else:
                         resp = robinhood.order_sell_crypto_by_quantity(ticker, current_qty)
+                    st.write("Crypto order response:", resp)
                     order_id = resp.get('id', '')
-                    # Fetch crypto order info
+                    time.sleep(2)  # wait for API to register
                     details = robinhood.get_crypto_order_info(order_id)
                 else:
                     if action == 'BUY':
                         resp = robinhood.order_buy_market(sym, qty)
                     else:
                         resp = robinhood.order_sell_market(sym, qty)
+                    st.write("Stock order response:", resp)
                     order_id = resp.get('id', '')
-                    # Fetch stock order info
+                    time.sleep(2)  # wait for API to register
                     details = robinhood.get_stock_order_info(order_id)
                 status = details.get('state', '')
-                # Determine executed quantity
-                executed = float(details.get('cumulative_quantity', details.get('filled_quantity', 0)))
+                executed = float(details.get('cumulative_quantity') or details.get('filled_quantity') or 0)
             except Exception as e:
                 st.warning(f"Order {action} {sym} failed: {e}")
         else:
@@ -215,14 +218,12 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
 
         if live_mode:
             st.subheader("Open Orders")
-            open_orders = []
             try:
-                open_orders += robinhood.get_all_open_stock_orders()
-            except Exception:
-                pass
-            if include_crypto:
-                try:
-                    open_orders += robinhood.get_all_open_crypto_orders()
-                except Exception:
-                    pass
-            st.json(open_orders)
+                open_stock = robinhood.get_all_open_stock_orders()
+                open_crypto = robinhood.get_all_open_crypto_orders() if include_crypto else []
+                open_orders = open_stock + open_crypto
+            except Exception as e:
+                open_orders = []
+                st.warning(f"Failed to fetch open orders: {e}")
+            st.write(open_orders)
+            st.write("✔️ If orders appear here, they are pending in Robinhood.")
