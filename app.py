@@ -3,242 +3,119 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from robin_stocks import robinhood
-from robin_stocks.robinhood import crypto as rh_crypto
 from robin_stocks.robinhood import orders as rh_orders
+from robin_stocks.robinhood import crypto as rh_crypto
 from pycoingecko import CoinGeckoAPI
 import datetime
-import time
 
 # --- Authentication & Mode ---
 st.sidebar.header("Authentication & Mode")
-# Live trading toggle
 live_mode = st.sidebar.checkbox("Enable Live Trading (use with caution)", value=False)
-
 if live_mode:
     try:
-        RH_USER = st.secrets["ROBINHOOD_USERNAME"]
-        RH_PW   = st.secrets["ROBINHOOD_PASSWORD"]
+        user = st.secrets["ROBINHOOD_USERNAME"]
+        pw = st.secrets["ROBINHOOD_PASSWORD"]
     except KeyError:
-        st.sidebar.error(
-            "Missing secret keys ROBINHOOD_USERNAME and/or ROBINHOOD_PASSWORD in Streamlit Cloud settings."
-        )
+        st.sidebar.error("Missing ROBINHOOD_USERNAME or ROBINHOOD_PASSWORD in secrets.")
         st.stop()
     try:
-        robinhood.login(username=RH_USER, password=RH_PW)
+        robinhood.login(username=user, password=pw)
         st.sidebar.success("Robinhood authenticated — Live orders ENABLED")
     except Exception as e:
         st.sidebar.error(f"Robinhood login failed: {e}")
         st.stop()
 else:
-    st.sidebar.info("Simulation mode — no live orders will be placed.")
+    st.sidebar.info("Simulation mode — no live orders placed.")
 
 # --- Sidebar: Universe & Allocation ---
 st.sidebar.header("Universe & Allocation")
-
-equity_input = st.sidebar.text_area(
-    "Equity Tickers (comma-separated)",
-    value="AAPL,MSFT,GOOG"
-)
+equity_input = st.sidebar.text_area("Equity Tickers (comma-separated)", "AAPL,MSFT,GOOG")
 equities = [t.strip().upper() for t in equity_input.split(',') if t.strip()]
-
 include_crypto = st.sidebar.checkbox("Include Crypto", value=False)
-symbol_to_id = {}
-cryptos = []
+symbol_to_id, cryptos = {}, []
 if include_crypto:
     cg = CoinGeckoAPI()
-    try:
-        markets = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=5, page=1)
-        for c in markets:
-            sym = c['symbol'].upper()
-            cid = c['id']
-            symbol_to_id[sym] = cid
-            cryptos.append(f"{sym}-USD")
-    except Exception as e:
-        st.sidebar.warning(f"Crypto universe fetch failed: {e}")
-        cryptos = []
-
+    markets = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=5)
+    for c in markets:
+        sym = c['symbol'].upper()
+        symbol_to_id[sym] = c['id']
+        cryptos.append(f"{sym}-USD")
 all_symbols = equities + cryptos
-
-manual_alloc = st.sidebar.number_input(
-    "Manual allocation per position (USD, >0 override)",
-    min_value=0.0,
-    value=0.0,
-    step=1.0
-)
-if manual_alloc > 0 and all_symbols:
-    alloc_per_pos = manual_alloc
+manual = st.sidebar.number_input("Manual allocation per position (USD, >0 override)", min_value=0.0, value=0.0)
+if manual > 0:
+    alloc = manual
+elif live_mode and all_symbols:
+    acct = robinhood.load_account_profile()
+    cash = float(acct.get('portfolio_cash',0) or 0)
+    alloc = cash / len(all_symbols)
 else:
-    if live_mode and all_symbols:
-        try:
-            acct = robinhood.load_account_profile()
-            cash = float(acct.get('portfolio_cash', 0) or 0)
-            alloc_per_pos = cash / len(all_symbols)
-        except Exception as e:
-            st.sidebar.warning(f"Account fetch failed: {e}")
-            alloc_per_pos = 0
-    else:
-        alloc_per_pos = 0
-st.sidebar.markdown(f"**Allocation per position:** ${alloc_per_pos:.2f}")
+    alloc = 0
+st.sidebar.markdown(f"**Allocation per position:** ${alloc:.2f}")
+top_n = st.sidebar.number_input("Number of tickers to pick", min_value=1, max_value=len(all_symbols) or 1, value=min(3,len(all_symbols)), step=1)
 
-top_n = st.sidebar.number_input(
-    "Number of tickers to pick",
-    min_value=1,
-    max_value=len(all_symbols) if all_symbols else 1,
-    value=min(3, len(all_symbols)),
-    step=1
-)
-
-# --- Main App ---
 st.title("Stock & Crypto Momentum Rebalancer")
-
 if st.sidebar.button("► Run Daily Scan & Rebalance"):
-    pct_changes = {}
     now = datetime.datetime.now()
-    yesterday = now - datetime.timedelta(days=1)
-
-    # Fetch momentum
+    prev = now - datetime.timedelta(days=1)
+    pct = {}
     for sym in all_symbols:
         try:
             if sym.endswith('-USD'):
-                ticker = sym.replace('-USD','')
-                cid = symbol_to_id.get(ticker)
-                data = cg.get_coin_market_chart_range_by_id(
-                    id=cid,
-                    vs_currency='usd',
-                    from_timestamp=int(yesterday.timestamp()),
-                    to_timestamp=int(now.timestamp())
-                )
-                price_list = data.get('prices', [])
-                price_prev, price_now = price_list[0][1], price_list[-1][1]
+                cid = symbol_to_id[sym.replace('-USD','')]
+                data = cg.get_coin_market_chart_range_by_id(cid,'usd',int(prev.timestamp()),int(now.timestamp()))
+                p0, p1 = data['prices'][0][1], data['prices'][-1][1]
             else:
-                df = yf.download(sym, start=yesterday.strftime('%Y-%m-%d'), end=(now + datetime.timedelta(days=1)).strftime('%Y-%m-%d'))
-                price_prev, price_now = df['Close'].iloc[0], df['Close'].iloc[-1]
-            pct_changes[sym] = (price_now / price_prev - 1) * 100
-        except Exception as e:
-            pct_changes[sym] = np.nan
-            st.warning(f"Failed to retrieve price for {sym}: {e}")
-
-    df_mom = pd.DataFrame([{'Ticker': s, 'PctChange': pct_changes.get(s)} for s in all_symbols])
-    df_mom.dropna(subset=['PctChange'], inplace=True)
-    df_mom['PctChange'] = pd.to_numeric(df_mom['PctChange'], errors='coerce')
-
-    if df_mom.empty:
-        st.error("No valid momentum data.")
-        st.stop()
-
-    picks = df_mom.nlargest(top_n, 'PctChange')['Ticker'].tolist()
-
-    # Retrieve current holdings
+                df = yf.download(sym,start=prev.strftime('%Y-%m-%d'),end=(now+datetime.timedelta(days=1)).strftime('%Y-%m-%d'))
+                p0, p1 = df['Close'].iloc[0], df['Close'].iloc[-1]
+            pct[sym] = (p1/p0 -1)*100
+        except:
+            pct[sym] = np.nan
+    df = pd.DataFrame([{'Ticker':s,'PctChange':pct[s]} for s in all_symbols]).dropna()
+    picks = df.nlargest(top_n,'PctChange')['Ticker'].tolist() if not df.empty else []
     holdings = {}
     if live_mode:
-        try:
-            for p in rh_orders.get_open_stock_positions():
-                holdings[p['symbol'].upper()] = float(p['quantity'])
-        except Exception:
-            pass
+        for pos in rh_orders.get_open_stock_positions() or []:
+            holdings[pos['symbol'].upper()] = float(pos['quantity'])
         if include_crypto:
-            try:
-                for p in rh_crypto.get_crypto_positions():
-                    holdings[p['currency'].upper()] = float(p['quantity'])
-            except Exception:
-                pass
-
+            for pos in rh_crypto.get_crypto_positions() or []:
+                holdings[pos['currency'].upper()] = float(pos['quantity'])
     log = []
-    now_str = now.strftime('%Y-%m-%d %H:%M:%S')
     for sym in all_symbols:
-        ticker = sym.replace('-USD','')
-        current_qty = holdings.get(ticker, 0)
-        buy = sym in picks and current_qty == 0
-        sell = sym not in picks and current_qty > 0
-        if not (buy or sell):
-            continue
+        cur = sym.replace('-USD','')
+        qty_cur = holdings.get(cur,0)
+        buy = sym in picks and qty_cur==0
+        sell = sym not in picks and qty_cur>0
+        if not (buy or sell): continue
         action = 'BUY' if buy else 'SELL'
-
-        # Calculate quantity
-        try:
-            if sym.endswith('-USD'):
-                price = cg.get_price(ids=symbol_to_id.get(ticker), vs_currencies='usd')[ticker.lower()]
-            else:
-                price = float(yf.Ticker(sym).info.get('regularMarketPrice') or 0)
-            qty = alloc_per_pos / price if price else 0
-        except Exception:
-            qty = 0
-
-        executed = 0
-        order_id = ''
-        status = 'simulated'
-        if live_mode and qty > 0:
-            if sym.endswith('-USD'):
-                # Crypto orders with proper precision
-                try:
+        # Place order
+        executed, oid, status = 0, '', 'simulated'
+        if live_mode:
+            try:
+                if sym.endswith('-USD'):
                     if buy:
-                        resp = rh_crypto.order_buy_crypto_by_quantity(ticker, round(qty, 6))
+                        resp = rh_crypto.order_buy_crypto_by_price(cur, alloc)
                     else:
-                        resp = rh_crypto.order_sell_crypto_by_quantity(ticker, round(current_qty, 6))
-                    st.sidebar.write(f"Crypto order response: {resp}")
-                    order_id = resp.get('id', '')
-                    try:
-                        details = rh_crypto.get_crypto_order_info(order_id)
-                        status = details.get('state', '')
-                        executed = float(details.get('cumulative_quantity') or details.get('filled_quantity') or 0)
-                    except Exception as e:
-                        st.sidebar.warning(f"Failed to fetch crypto order info for {order_id}: {e}")
-                        executed = round(qty, 6) if buy else round(current_qty, 6)
-                except Exception as e:
-                    st.warning(f"Order {action} {sym} failed: {e}")
-            else:
-                # Stock market orders
-                try:
+                        resp = rh_crypto.order_sell_crypto_by_price(cur, alloc)
+                else:
                     if buy:
-                        resp = rh_orders.order_buy_market(sym, round(qty, 6))
+                        resp = rh_orders.order_buy_fractional_by_price(sym, alloc)
                     else:
-                        resp = rh_orders.order_sell_market(sym, round(current_qty, 6))
-                    st.sidebar.write(f"Stock order response: {resp}")
-                    order_id = resp.get('id', '')
-                    try:
-                        details = rh_orders.get_stock_order_info(order_id)
-                        status = details.get('state', '')
-                        executed = float(details.get('cumulative_quantity') or details.get('filled_quantity') or 0)
-                    except Exception as e:
-                        st.sidebar.warning(f"Failed to fetch stock order info for {order_id}: {e}")
-                        executed = float(round(qty, 6)) if buy else float(round(current_qty, 6))
-                except Exception as e:
-                    st.warning(f"Order {action} {sym} failed: {e}")
-        else:
-            executed = qty if buy else current_qty
-
-        log.append({
-            'Ticker': sym,
-            'Action': action,
-            'PctChange': round(pct_changes.get(sym, 0), 2),
-            'Executed': round(executed, 4),
-            'OrderID': order_id,
-            'Status': status,
-            'Time': now_str
-        })
-
+                        resp = rh_orders.order_sell_fractional_by_price(sym, alloc)
+                st.sidebar.write(f"Order response: {resp}")
+                oid = resp.get('id','')
+                executed = float(resp.get('cumulative_quantity') or resp.get('executed_quantity',0) or resp.get('amount',0))
+                status = resp.get('state','')
+            except Exception as e:
+                st.warning(f"Order {action} {sym} failed: {e}")
+        log.append({'Ticker':sym,'Action':action,'PctChange':round(pct.get(sym,0),2),
+                    'Executed':round(executed,4),'OrderID':oid,'Status':status,'Time':now.strftime('%Y-%m-%d %H:%M:%S')})
     df_log = pd.DataFrame(log)
     st.subheader("Rebalance Log")
     st.table(df_log)
     st.download_button("Download Logs CSV", df_log.to_csv(index=False), file_name='trade_logs.csv')
-
     if live_mode:
         st.subheader("Open Orders")
-        # Fetch pending stock and crypto orders
-        open_stock = []
-        open_crypto = []
-        try:
-            open_stock = rh_orders.get_all_open_stock_orders() or []
-        except Exception as e:
-            st.warning(f"Failed to fetch open stock orders: {e}")
-        if include_crypto:
-            try:
-                for o in rh_crypto.get_crypto_orders() or []:
-                    if o.get('state') not in ['filled', 'cancelled']:
-                        open_crypto.append(o)
-            except Exception as e:
-                st.warning(f"Failed to fetch open crypto orders: {e}")
-
-        all_open = open_stock + open_crypto
-        st.write(all_open)
-        st.write("✔️ If orders appear here, they are pending in Robinhood.")
+        open_st = rh_orders.get_all_open_stock_orders() or []
+        open_cr = rh_crypto.get_all_open_crypto_orders() if include_crypto else []
+        st.write(open_st + open_cr)
+        st.write("✔️ Pending orders are shown above.")
