@@ -1,4 +1,3 @@
-```python
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -66,25 +65,26 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         if sym.endswith('-USD'):
             # crypto via CoinGecko
             try:
-                price_now = cg.get_price(ids=sym.split('-')[0].lower(), vs_currencies='usd')[sym.split('-')[0].lower()]['usd']
+                coin_id = sym.replace('-USD','').lower()
+                price_now = cg.get_price(ids=coin_id, vs_currencies='usd')[coin_id]['usd']
                 hist = cg.get_coin_market_chart_range_by_id(
-                    id=sym.split('-')[0].lower(), vs_currency='usd',
+                    id=coin_id, vs_currency='usd',
                     from_timestamp=int(yesterday.timestamp()),
                     to_timestamp=int(now.timestamp())
                 )
                 price_y = hist['prices'][0][1]
                 pct_changes[sym] = (price_now/price_y - 1) * 100
-            except Exception as e:
+            except Exception:
                 st.warning(f"Failed to retrieve crypto price for {sym}")
                 pct_changes[sym] = None
         else:
             # stocks
             try:
                 df = yf.download(sym, start=yesterday.strftime('%Y-%m-%d'), end=now.strftime('%Y-%m-%d'))
-                price_now = df['Close'][-1]
-                price_y = df['Close'][0]
+                price_now = df['Close'].iloc[-1]
+                price_y = df['Close'].iloc[0]
                 pct_changes[sym] = (price_now/price_y - 1) * 100
-            except Exception as e:
+            except Exception:
                 st.warning(f"Failed to retrieve stock price for {sym}")
                 pct_changes[sym] = None
 
@@ -95,8 +95,9 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
 
     # Get current positions
     try:
-        holdings = {h['symbol'].upper(): float(h['quantity']) for h in robinhood.get_open_stock_positions()}
-    except:
+        positions = robinhood.get_open_stock_positions()
+        holdings = {h['symbol'].upper(): float(h['quantity']) for h in positions}
+    except Exception:
         holdings = {}
 
     log = []
@@ -112,16 +113,16 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             action = 'SELL'
 
         if action:
-            qty = None
             try:
                 if sym.endswith('-USD'):
                     # crypto order by specifying amount USD
                     amount = alloc_per_pos
+                    asset = sym.replace('-USD','').lower()
                     if action == 'BUY':
-                        robinhood.order_buy_crypto_by_price(sym.replace('-USD',''), amount)
+                        robinhood.order_buy_crypto_by_price(asset, amount)
                     else:
-                        robinhood.order_sell_crypto_by_price(sym.replace('-USD',''), amount)
-                    qty = amount
+                        robinhood.order_sell_crypto_by_price(asset, amount)
+                    executed_qty = amount
                 else:
                     price = float(yf.Ticker(sym).info['regularMarketPrice'])
                     qty = alloc_per_pos / price
@@ -129,12 +130,13 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
                         robinhood.order_buy_market(sym, qty)
                     else:
                         robinhood.order_sell_market(sym, qty)
+                    executed_qty = qty
+                log.append({'Ticker': sym, 'Action': action, 'PctChange': pct_changes[sym], 'Time': timestamp})
             except Exception as e:
                 st.warning(f"Order {action} {sym} failed: {e}")
-            log.append({'Ticker': sym, 'Action': action, 'PctChange': pct_changes[sym], 'Time': timestamp})
 
+    # Display results
     df_log = pd.DataFrame(log)
     st.subheader("Rebalance Log")
     st.table(df_log)
     st.download_button("Download Logs CSV", df_log.to_csv(index=False), file_name='trade_logs.csv')
-```
