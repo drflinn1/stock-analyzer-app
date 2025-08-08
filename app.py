@@ -95,6 +95,7 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
     now = datetime.datetime.now()
     yesterday = now - datetime.timedelta(days=1)
 
+    # Fetch momentum
     for sym in all_symbols:
         try:
             if sym.endswith('-USD'):
@@ -126,18 +127,19 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
 
     picks = df_mom.nlargest(top_n, 'PctChange')['Ticker'].tolist()
 
+    # Retrieve current holdings
     holdings = {}
     if live_mode:
         try:
             for p in rh_orders.get_open_stock_positions():
                 holdings[p['symbol'].upper()] = float(p['quantity'])
-        except Exception:
+        except:
             pass
         if include_crypto:
             try:
                 for p in rh_crypto.get_crypto_positions():
                     holdings[p['currency'].upper()] = float(p['quantity'])
-            except Exception:
+            except:
                 pass
 
     log = []
@@ -151,19 +153,19 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             continue
         action = 'BUY' if buy else 'SELL'
 
+        # Calculate quantity
         try:
             if sym.endswith('-USD'):
                 price = cg.get_price(ids=symbol_to_id.get(ticker), vs_currencies='usd')[ticker.lower()]
             else:
                 price = float(yf.Ticker(sym).info.get('regularMarketPrice') or 0)
             qty = alloc_per_pos / price if price else 0
-        except Exception:
+        except:
             qty = 0
 
         executed = 0
         order_id = ''
         status = 'simulated'
-        details = {}
         if live_mode and qty > 0:
             try:
                 if sym.endswith('-USD'):
@@ -172,18 +174,17 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
                     else:
                         resp = rh_crypto.order_sell_crypto_by_quantity(ticker, round(current_qty, 8))
                     order_id = resp.get('id', '')
-                    time.sleep(2)
-                    details = rh_crypto.get_crypto_order(order_id)
+                    status = resp.get('state', '')
+                    executed = qty if buy else current_qty
                 else:
                     if buy:
                         resp = rh_orders.order_buy_market(sym, round(qty, 6))
                     else:
                         resp = rh_orders.order_sell_market(sym, round(current_qty, 6))
                     order_id = resp.get('id', '')
-                    time.sleep(2)
                     details = rh_orders.get_stock_order_info(order_id)
-                status = details.get('state', '')
-                executed = float(details.get('cumulative_quantity') or details.get('filled_quantity') or 0)
+                    status = details.get('state', '')
+                    executed = float(details.get('cumulative_quantity') or details.get('filled_quantity') or 0)
             except Exception as e:
                 st.warning(f"Order {action} {sym} failed: {e}")
         else:
@@ -208,7 +209,11 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         st.subheader("Open Orders")
         try:
             open_stock = rh_orders.get_all_open_stock_orders()
-            open_crypto = rh_crypto.get_all_open_crypto_orders() if include_crypto else []
+            if include_crypto:
+                all_crypto = rh_crypto.get_all_crypto_orders()
+                open_crypto = [o for o in all_crypto if o.get('state') not in ['filled','cancelled']]
+            else:
+                open_crypto = []
             open_orders = open_stock + open_crypto
         except Exception as e:
             open_orders = []
