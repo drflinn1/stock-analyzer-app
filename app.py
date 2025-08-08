@@ -1,158 +1,139 @@
-import os
-import pandas as pd
+```python
 import streamlit as st
+import pandas as pd
+import numpy as np
 import yfinance as yf
+from robin_stocks import robinhood
 from pycoingecko import CoinGeckoAPI
-from robin_stocks import robinhood as r
-from datetime import datetime
+import datetime
 
-# --- Session state for logs ---
-if 'trade_logs' not in st.session_state:
-    st.session_state.trade_logs = []
+# Authenticate to Robinhood
+robinhood.login(username=st.secrets['RH_USERNAME'], password=st.secrets['RH_PASSWORD'])
 
-# --- Instantiate CoinGecko client ---
+# Sidebar: Universe & Allocation
+st.sidebar.success("Robinhood authenticated — Live orders ENABLED")
+
+st.sidebar.header("Universe & Allocation")
+# Equity tickers input
+equity_input = st.sidebar.text_area(
+    "Equity Tickers (comma-separated)",
+    value="AAPL,MSFT,GOOG"
+)
+equities = [t.strip().upper() for t in equity_input.split(',') if t.strip()]
+
+# Crypto toggle and dynamic universe fetch
 cg = CoinGeckoAPI()
-# mapping from symbol to CoinGecko ID for price lookup
-crypto_ids = {}
-
-# --- Helper to fetch percent change for equities ---
-def fetch_pct_change_stock(symbol, period='2d', interval='1d'):
-    df = yf.download(symbol, period=period, interval=interval, progress=False)
-    df.dropna(inplace=True)
-    if len(df) < 2:
-        return None
-    return float((df['Close'].iloc[-1] - df['Open'].iloc[0]) / df['Open'].iloc[0] * 100)
-
-# --- Place live or simulated orders ---
-def place_order(symbol, side, usd_amount, live):
-    try:
-        # Crypto orders
-        if symbol.endswith('-USD'):
-            coin_id = crypto_ids.get(symbol)
-            if not coin_id:
-                raise Exception(f"No CoinGecko ID for {symbol}")
-            price_data = cg.get_price(ids=[coin_id], vs_currencies='usd')
-            price = float(price_data.get(coin_id, {}).get('usd', 0))
-            if price <= 0:
-                raise Exception(f"Failed to retrieve crypto price for {symbol}")
-            qty = usd_amount / price
-            # Live vs simulation
-            if live:
-                crypto_sym = symbol.split('-')[0].upper()
-                if side == 'BUY':
-                    # Use quantity-based order since price-based may not be supported
-                    return r.orders.order_buy_crypto_by_quantity(crypto_sym, qty)
-                else:
-                    return r.orders.order_sell_crypto_by_quantity(crypto_sym, qty)
-            return {'symbol': symbol, 'action': side, 'usd': usd_amount, 'price': price, 'qty': qty}
-
-        # Equity orders
-        price_data = r.orders.get_latest_price(symbol)
-        price = float(price_data[0]) if price_data else 0
-        if price <= 0:
-            raise Exception(f"Failed to retrieve equity price for {symbol}")
-        qty = usd_amount / price
-        if live:
-            if side == 'BUY':
-                return r.orders.order_buy_fractional_by_quantity(symbol, qty)
-            else:
-                return r.orders.order_sell_fractional_by_quantity(symbol, qty)
-        return {'symbol': symbol, 'action': side, 'usd': usd_amount, 'price': price, 'qty': qty}
-
-    except Exception as e:
-        st.warning(f"Order {side} {symbol} failed: {e}")
-        return None
-
-# --- Authentication ---
-RH_USER = st.secrets.get('ROBINHOOD_USERNAME') or os.getenv('ROBINHOOD_USERNAME')
-RH_PASS = st.secrets.get('ROBINHOOD_PASSWORD') or os.getenv('ROBINHOOD_PASSWORD')
-live_trading = False
-if RH_USER and RH_PASS:
-    try:
-        r.login(RH_USER, RH_PASS)
-        live_trading = True
-        st.sidebar.success("✅ Robinhood authenticated — Live orders ENABLED")
-    except Exception:
-        st.sidebar.warning("⚠ Robinhood login failed — Simulation mode")
+include_crypto = st.sidebar.checkbox("Include Crypto")
+if include_crypto:
+    coin_list = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=50, page=1)
+    # select top 5 symbols
+    cryptos = [c['symbol'].upper() + '-USD' for c in coin_list[:5]]
 else:
-    st.sidebar.info("ℹ Running in simulation mode (no Robinhood credentials)")
+    cryptos = []
 
-# --- Page setup ---
-st.set_page_config(page_title="Stock & Crypto Momentum Rebalancer", layout="wide")
+all_symbols = equities + cryptos
+
+# Allocation override or computed
+manual_alloc = st.sidebar.number_input(
+    "Manual allocation per position (USD, >0 override)",
+    min_value=0.0, value=10.0, step=1.0
+)
+if manual_alloc > 0:
+    alloc_per_pos = manual_alloc
+else:
+    # evenly distribute $1000 among picks
+    total_cash = float(robinhood.load_account_profile()['portfolio_cash'])
+    num = len(all_symbols)
+    alloc_per_pos = total_cash / num if num else 0
+
+st.sidebar.markdown(f"Allocation per position: ${alloc_per_pos:.2f}")
+
+# Number to pick
+top_n = st.sidebar.number_input(
+    "Number of tickers to pick", min_value=1, max_value=len(all_symbols), value=3, step=1
+)
+
+# Main: Title
 st.title("Stock & Crypto Momentum Rebalancer")
 
-# --- Sidebar inputs ---
-st.sidebar.header("Universe & Allocation")
-
-equities_input = st.sidebar.text_area("Equity Tickers (comma-separated)", "AAPL,MSFT,GOOG")
-equities = [s.strip().upper() for s in equities_input.split(',') if s.strip()]
-
-enable_crypto = st.sidebar.checkbox("Include Crypto")
-crypto_coins = []
-if enable_crypto:
-    try:
-        data = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=5, page=1)
-        for c in data:
-            sym = f"{c['symbol'].upper()}-USD"
-            crypto_ids[sym] = c['id']
-            crypto_coins.append({'symbol': sym, 'pct': float(c.get('price_change_percentage_24h') or 0)})
-    except Exception as e:
-        st.sidebar.warning(f"Failed to fetch crypto universe: {e}")
-
-symbols = equities + [c['symbol'] for c in crypto_coins]
-max_symbols = max(1, len(symbols))
-
-def default_allocation():
-    if live_trading:
-        cash = float(r.account.load_account_profile().get('cash', 0))
-    else:
-        cash = st.session_state.get('sim_cash', 10000)
-    return round(cash / max_symbols, 2)
-
-overridden = st.sidebar.number_input("Manual allocation per position (USD, >0 override)", min_value=0, value=0, step=1)
-if not live_trading:
-    sim_cash = st.sidebar.number_input("Simulation capital (USD)", min_value=1, value=10000)
-    st.session_state['sim_cash'] = sim_cash
-allocation = overridden if overridden > 0 else default_allocation()
-st.sidebar.markdown(f"**Allocation per position:** ${allocation}")
-
-top_n = st.sidebar.number_input("Number of tickers to pick", min_value=1, max_value=max_symbols, value=min(3, max_symbols), step=1)
-
-# --- Run scan & rebalance ---
+# Run button
 if st.sidebar.button("► Run Daily Scan & Rebalance"):
-    if not symbols:
-        st.sidebar.error("Define at least one ticker first.")
-    else:
-        momentum = []
-        for sym in equities:
-            pct = fetch_pct_change_stock(sym)
-            if pct is not None:
-                momentum.append({'symbol': sym, 'pct': pct})
-        for entry in crypto_coins:
-            momentum.append({'symbol': entry['symbol'], 'pct': entry['pct']})
-
-        if not momentum:
-            st.sidebar.error("No momentum data returned.")
+    # Fetch prices and compute percent changes
+    pct_changes = {}
+    now = datetime.datetime.now()
+    yesterday = now - datetime.timedelta(days=1)
+    for sym in all_symbols:
+        if sym.endswith('-USD'):
+            # crypto via CoinGecko
+            try:
+                price_now = cg.get_price(ids=sym.split('-')[0].lower(), vs_currencies='usd')[sym.split('-')[0].lower()]['usd']
+                hist = cg.get_coin_market_chart_range_by_id(
+                    id=sym.split('-')[0].lower(), vs_currency='usd',
+                    from_timestamp=int(yesterday.timestamp()),
+                    to_timestamp=int(now.timestamp())
+                )
+                price_y = hist['prices'][0][1]
+                pct_changes[sym] = (price_now/price_y - 1) * 100
+            except Exception as e:
+                st.warning(f"Failed to retrieve crypto price for {sym}")
+                pct_changes[sym] = None
         else:
-            df_mom = pd.DataFrame(momentum).sort_values('pct', ascending=False).reset_index(drop=True)
-            picks = df_mom['symbol'].head(top_n).tolist()
-            logs = []
-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            for _, row in df_mom.iterrows():
-                action = 'BUY' if row['symbol'] in picks else 'SELL'
-                place_order(row['symbol'], action, allocation, live_trading)
-                logs.append({'Ticker': row['symbol'], 'Action': action, 'PctChange': round(row['pct'], 2), 'Time': now})
-            st.session_state.trade_logs.extend(logs)
+            # stocks
+            try:
+                df = yf.download(sym, start=yesterday.strftime('%Y-%m-%d'), end=now.strftime('%Y-%m-%d'))
+                price_now = df['Close'][-1]
+                price_y = df['Close'][0]
+                pct_changes[sym] = (price_now/price_y - 1) * 100
+            except Exception as e:
+                st.warning(f"Failed to retrieve stock price for {sym}")
+                pct_changes[sym] = None
 
-# --- Clear history ---
-if st.sidebar.button("Clear History"):
-    st.session_state.trade_logs = []
+    # Create DataFrame of momentum
+    df_mom = pd.DataFrame([{'Ticker': sym, 'PctChange': pct_changes[sym]} for sym in all_symbols])
+    df_mom = df_mom.dropna().sort_values('PctChange', ascending=False)
+    picks = df_mom.head(top_n)['Ticker'].tolist()
 
-# --- Log display & download ---
-if st.session_state.trade_logs:
-    df_logs = pd.DataFrame(st.session_state.trade_logs)
+    # Get current positions
+    try:
+        holdings = {h['symbol']: float(h['quantity']) for h in robinhood.get_open_stock_positions()}
+    except:
+        holdings = {}
+
+    log = []
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # Rebalance: sell those not in picks, buy those in picks
+    for sym in all_symbols:
+        action = None
+        if sym in picks and holdings.get(sym, 0) == 0:
+            action = 'BUY'
+        elif sym not in picks and holdings.get(sym, 0) > 0:
+            action = 'SELL'
+
+        qty = None
+        if action:
+            # compute quantity
+            try:
+                if sym.endswith('-USD'):
+                    # crypto order by specifying amount USD
+                    qty = alloc_per_pos
+                    if action == 'BUY':
+                        robinhood.order_buy_crypto_by_price(sym.replace('-USD',''), qty)
+                    else:
+                        robinhood.order_sell_crypto_by_price(sym.replace('-USD',''), qty)
+                else:
+                    price = float(yf.Ticker(sym).info['regularMarketPrice'])
+                    qty = alloc_per_pos / price
+                    if action == 'BUY':
+                        robinhood.order_buy_market(sym, qty)
+                    else:
+                        robinhood.order_sell_market(sym, qty)
+            except Exception as e:
+                st.warning(f"Order {action} {sym} failed: {e}")
+            log.append({'Ticker': sym, 'Action': action, 'PctChange': pct_changes[sym], 'Time': timestamp})
+
+    df_log = pd.DataFrame(log)
     st.subheader("Rebalance Log")
-    st.dataframe(df_logs)
-    st.download_button("Download Logs CSV", df_logs.to_csv(index=False).encode(), file_name="momentum_logs.csv")
-else:
-    st.info("Click 'Run Daily Scan & Rebalance' to execute")
+    st.table(df_log)
+    st.download_button("Download Logs CSV", df_log.to_csv(index=False), file_name='trade_logs.csv')
+```
