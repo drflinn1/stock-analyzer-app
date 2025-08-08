@@ -1,4 +1,3 @@
-```python
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -41,7 +40,6 @@ if include_crypto:
     for c in markets:
         symbol = c['symbol'].upper()
         pair = f"{symbol}-USD"
-        # assume all common coins tradable
         symbol_to_id[symbol] = c['id']
         cryptos.append(pair)
 all_symbols = equities + cryptos
@@ -97,10 +95,8 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
     # Load current holdings
     holdings = {}
     if live_mode:
-        # stocks holdings
         for pos in rh_orders.get_open_stock_positions() or []:
             holdings[pos['symbol'].upper()] = float(pos['quantity'])
-        # crypto holdings
         if include_crypto:
             for pos in rh_crypto.get_crypto_positions() or []:
                 holdings[pos['currency'].upper()] = float(pos['quantity'])
@@ -119,19 +115,12 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         status = 'simulated' if not live_mode else 'pending'
         if live_mode:
             try:
+                price = alloc
                 if sym.endswith('-USD'):
-                    price = alloc
-                    if buy:
-                        resp = rh_crypto.order_buy_crypto_by_price(base, price)
-                    else:
-                        resp = rh_crypto.order_sell_crypto_by_price(base, price)
+                    resp = rh_crypto.order_buy_crypto_by_price(base, price) if buy else rh_crypto.order_sell_crypto_by_price(base, price)
                 else:
-                    price = alloc
-                    if buy:
-                        resp = rh_orders.order_buy_fractional_by_price(sym, price)
-                    else:
-                        resp = rh_orders.order_sell_fractional_by_price(sym, price)
-                oid = resp.get('id','')
+                    resp = rh_orders.order_buy_fractional_by_price(sym, price) if buy else rh_orders.order_sell_fractional_by_price(sym, price)
+                oid = resp.get('id', '')
                 executed = float(resp.get('cumulative_quantity') or resp.get('executed_quantity') or 0)
                 status = resp.get('state') or status
             except Exception as e:
@@ -156,11 +145,9 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         st.subheader("Open Orders")
         try:
             open_stock = rh_orders.get_all_open_orders() or []
-            open_crypto = []
-            if include_crypto:
-                open_crypto = rh_crypto.get_all_crypto_orders() or []
+            open_crypto = rh_crypto.get_all_crypto_orders() if include_crypto else []
             open_orders = {'stocks': open_stock, 'crypto': open_crypto}
         except Exception:
             open_orders = []
             st.warning("Failed to fetch open orders.")
-        st.write(open_orders
+        st.write(open_orders)
