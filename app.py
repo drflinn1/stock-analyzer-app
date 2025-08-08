@@ -7,11 +7,21 @@ from pycoingecko import CoinGeckoAPI
 import datetime
 
 # Authenticate to Robinhood
-robinhood.login(username=st.secrets['RH_USERNAME'], password=st.secrets['RH_PASSWORD'])
+try:
+    RH_USER = st.secrets.get('RH_USERNAME')
+    RH_PW = st.secrets.get('RH_PASSWORD')
+    if not RH_USER or not RH_PW:
+        raise KeyError('RH_USERNAME or RH_PASSWORD not set in secrets')
+    robinhood.login(username=RH_USER, password=RH_PW)
+    st.sidebar.success("Robinhood authenticated — Live orders ENABLED")
+except KeyError as ke:
+    st.sidebar.error(f"Missing secret: {ke}")
+    st.stop()
+except Exception as e:
+    st.sidebar.error(f"Robinhood login failed: {e}")
+    st.stop()
 
 # Sidebar: Universe & Allocation
-st.sidebar.success("Robinhood authenticated — Live orders ENABLED")
-
 st.sidebar.header("Universe & Allocation")
 # Equity tickers input
 equity_input = st.sidebar.text_area(
@@ -25,7 +35,6 @@ cg = CoinGeckoAPI()
 include_crypto = st.sidebar.checkbox("Include Crypto")
 if include_crypto:
     coin_list = cg.get_coins_markets(vs_currency='usd', order='market_cap_desc', per_page=50, page=1)
-    # select top 5 symbols
     cryptos = [c['symbol'].upper() + '-USD' for c in coin_list[:5]]
 else:
     cryptos = []
@@ -40,7 +49,6 @@ manual_alloc = st.sidebar.number_input(
 if manual_alloc > 0:
     alloc_per_pos = manual_alloc
 else:
-    # evenly distribute $1000 among picks
     total_cash = float(robinhood.load_account_profile()['portfolio_cash'])
     num = len(all_symbols)
     alloc_per_pos = total_cash / num if num else 0
@@ -63,7 +71,6 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
     yesterday = now - datetime.timedelta(days=1)
     for sym in all_symbols:
         if sym.endswith('-USD'):
-            # crypto via CoinGecko
             try:
                 coin_id = sym.replace('-USD','').lower()
                 price_now = cg.get_price(ids=coin_id, vs_currencies='usd')[coin_id]['usd']
@@ -78,7 +85,6 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
                 st.warning(f"Failed to retrieve crypto price for {sym}")
                 pct_changes[sym] = None
         else:
-            # stocks
             try:
                 df = yf.download(sym, start=yesterday.strftime('%Y-%m-%d'), end=now.strftime('%Y-%m-%d'))
                 price_now = df['Close'].iloc[-1]
@@ -88,12 +94,10 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
                 st.warning(f"Failed to retrieve stock price for {sym}")
                 pct_changes[sym] = None
 
-    # Create DataFrame of momentum
     df_mom = pd.DataFrame([{'Ticker': sym, 'PctChange': pct_changes[sym]} for sym in all_symbols])
     df_mom = df_mom.dropna().sort_values('PctChange', ascending=False)
     picks = df_mom.head(top_n)['Ticker'].tolist()
 
-    # Get current positions
     try:
         positions = robinhood.get_open_stock_positions()
         holdings = {h['symbol'].upper(): float(h['quantity']) for h in positions}
@@ -103,7 +107,6 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
     log = []
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    # Rebalance: sell those not in picks, buy those in picks
     for sym in all_symbols:
         action = None
         current_qty = holdings.get(sym, 0)
@@ -115,7 +118,6 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
         if action:
             try:
                 if sym.endswith('-USD'):
-                    # crypto order by specifying amount USD
                     amount = alloc_per_pos
                     asset = sym.replace('-USD','').lower()
                     if action == 'BUY':
@@ -135,7 +137,6 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
             except Exception as e:
                 st.warning(f"Order {action} {sym} failed: {e}")
 
-    # Display results
     df_log = pd.DataFrame(log)
     st.subheader("Rebalance Log")
     st.table(df_log)
