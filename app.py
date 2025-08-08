@@ -79,7 +79,7 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
                 pct_changes[sym] = (price_now / price_y - 1) * 100
             except Exception:
                 st.warning(f"Failed to retrieve crypto price for {sym}")
-                pct_changes[sym] = None
+                pct_changes[sym] = np.nan
         else:
             # Stock
             try:
@@ -91,12 +91,12 @@ if st.sidebar.button("► Run Daily Scan & Rebalance"):
                 pct_changes[sym] = (price_now / price_y - 1) * 100
             except Exception:
                 st.warning(f"Failed to retrieve stock price for {sym}")
-                pct_changes[sym] = None
+                pct_changes[sym] = np.nan
 
-    # 2) Rank and pick
+    # 2) Rank and pick using nlargest (avoids sorting index mismatches)
     df_mom = pd.DataFrame([{'Ticker': s, 'PctChange': pct_changes.get(s)} for s in all_symbols])
-    df_mom = df_mom.dropna().sort_values('PctChange', ascending=False)
-    picks = df_mom.head(top_n)['Ticker'].tolist()
+    df_mom = df_mom[df_mom['PctChange'].notna()]
+    picks = df_mom.nlargest(top_n, 'PctChange')['Ticker'].tolist()
 
     # 3) Fetch holdings
     try:
