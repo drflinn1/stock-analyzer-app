@@ -20,7 +20,7 @@
 #     runner script invoking the same functions. We ship the app with clear, pure
 #     functions so this is straightforward when you’re ready.
 
-VERSION = "0.8.0 (2025-08-12)"
+VERSION = "0.8.1 (2025-08-12)"
 
 import inspect
 import json
@@ -116,7 +116,8 @@ include_crypto = st.sidebar.checkbox("Include Crypto (Robinhood‑tradable)", va
 alloc_mode = st.sidebar.selectbox("Allocation mode", ["Fixed $ per trade", "Proportional across winners"], index=0)
 fixed_per_trade = st.sidebar.number_input("Fixed $ per BUY/SELL", min_value=1.0, value=5.0, step=0.5)
 prop_total_budget = st.sidebar.number_input("Total BUY budget (proportional)", min_value=1.0, value=15.0, step=1.0)
-min_per_order = st.sidebar.number_input("Minimum $ per order", min_value=1.0, value=1.0, step=0.5)
+min_per_order = st.sidebar.number_input("Minimum $ per order", min_value=1.0, value=2.0, step=0.5)
+UI_MIN_PER_ORDER = float(min_per_order)
 
 n_picks = st.sidebar.number_input("Top N to hold", min_value=1, value=3, step=1)
 
@@ -268,40 +269,74 @@ def symbol_to_rh_crypto(sym: str) -> str:
     return sym.split("-")[0] if "-" in sym else sym
 
 
-def place_stock_order(symbol: str, side: str, dollars: float, live: bool) -> Tuple[str, float, str]:
-    dollars = float(max(0.0, dollars))
-    if dollars < 0.01:
+def normalize_dollars(dollars: float, min_amt: float) -> float:
+    d = max(float(dollars), float(min_amt))
+    # round *up* to the nearest cent to avoid falling under exchange/RH ticks
+    cents = int(np.ceil(d * 100.0 - 1e-9))
+    return cents / 100.0
+
+
+def place_stock_order(symbol: str, side: str, dollars: float, live: bool, min_order: float) -> Tuple[str, float, str]:
+    """Place a fractional stock order by dollars with retry if the notional is too small.
+    Returns: (status, executed_amount, order_id)
+    """
+    base = normalize_dollars(dollars, min_order)
+    if base < 0.01:
         return ("skipped (too small)", 0.0, "")
     if not live:
         return ("simulated", 0.0, "")
-    try:
-        res = rh_orders.order_buy_fractional_by_price(symbol, dollars) if side.upper() == "BUY" else rh_orders.order_sell_fractional_by_price(symbol, dollars)
-        order_id = ""
-        if isinstance(res, dict):
-            order_id = res.get("id", "") or res.get("order_id", "")
-        return ("placed", 0.0, order_id)
-    except Exception as e:
-        return (f"error: {e}", 0.0, "")
+
+    # try up to 3 times, nudging notional up a bit in case of price moves / ticks
+    for attempt in range(3):
+        amt = normalize_dollars(base * (1.02 ** attempt), min_order)
+        try:
+            if side.upper() == "BUY":
+                res = rh_orders.order_buy_fractional_by_price(symbol, amt)
+            else:
+                res = rh_orders.order_sell_fractional_by_price(symbol, amt)
+            oid = ""
+            if isinstance(res, dict):
+                oid = res.get("id", "") or res.get("order_id", "")
+            return ("placed", 0.0, oid)
+        except Exception as e:
+            msg = str(e).lower()
+            if any(k in msg for k in ["too small", "minimum", "tick", "notional"]):
+                continue  # bump and retry
+            return (f"error: {e}", 0.0, "")
+    return ("error: minimum notional too small after retries", 0.0, "")
 
 
-def place_crypto_order(symbol: str, side: str, dollars: float, live: bool) -> Tuple[str, float, str]:
-    dollars = float(max(0.0, dollars))
-    if dollars < 0.01:
+
+def place_crypto_order(symbol: str, side: str, dollars: float, live: bool, min_order: float) -> Tuple[str, float, str]:
+    """Place a crypto order by dollars with retry if the notional is too small."""
+    base = normalize_dollars(dollars, min_order)
+    if base < 0.01:
         return ("skipped (too small)", 0.0, "")
     if not live:
         return ("simulated", 0.0, "")
-    try:
-        buy_candidates  = ["order_buy_crypto_by_price", "order_buy_crypto_by_dollar", "order_buy_crypto_by_dollars", "buy_crypto_by_price"]
-        sell_candidates = ["order_sell_crypto_by_price", "order_sell_crypto_by_dollar", "order_sell_crypto_by_dollars", "sell_crypto_by_price"]
-        res = _call_first_available([rh_crypto, rh], buy_candidates if side.upper() == "BUY" else sell_candidates, symbol, dollars)
-        order_id = ""
-        if isinstance(res, dict):
-            order_id = res.get("id", "") or res.get("order_id", "")
-        return ("placed", 0.0, order_id)
-    except Exception as e:
-        return (f"error: {e}", 0.0, "")
+
+    buy_candidates  = ["order_buy_crypto_by_price", "order_buy_crypto_by_dollar", "order_buy_crypto_by_dollars", "buy_crypto_by_price"]
+    sell_candidates = ["order_sell_crypto_by_price", "order_sell_crypto_by_dollar", "order_sell_crypto_by_dollars", "sell_crypto_by_price"]
+
+    for attempt in range(3):
+        amt = normalize_dollars(base * (1.02 ** attempt), min_order)
+        try:
+            fnames = buy_candidates if side.upper() == "BUY" else sell_candidates
+            res = _call_first_available([rh_crypto, rh], fnames, symbol, amt)
+            oid = ""
+            if isinstance(res, dict):
+                oid = res.get("id", "") or res.get("order_id", "")
+            return ("placed", 0.0, oid)
+        except Exception as e:
+            msg = str(e).lower()
+            if any(k in msg for k in ["too small", "minimum", "tick", "notional"]):
+                continue
+            return (f"error: {e}", 0.0, "")
+    return ("error: minimum notional too small after retries", 0.0, "")
 
 
+# ---------------------------------
+# Holdings / SELL logic
 # ---------------------------------
 # Holdings / SELL logic
 # ---------------------------------
@@ -407,9 +442,9 @@ if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
             dollars = float(info.get("value", 0.0))
             if dollars >= min_per_order:
                 if info.get("type") == "crypto":
-                    status, executed, oid = place_crypto_order(symbol_to_rh_crypto(t_upper), "SELL", dollars, live_trading and login_ok)
+                    status, executed, oid = place_crypto_order(symbol_to_rh_crypto(t_upper), "SELL", dollars, live_trading and login_ok, UI_MIN_PER_ORDER)
                 else:
-                    status, executed, oid = place_stock_order(t_upper, "SELL", dollars, live_trading and login_ok)
+                    status, executed, oid = place_stock_order(t_upper, "SELL", dollars, live_trading and login_ok, UI_MIN_PER_ORDER)
                 sell_rows.append({
                     "Ticker": t_upper,
                     "Action": "SELL",
@@ -431,9 +466,9 @@ if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
             continue
         is_crypto = t.endswith("-USD")
         if is_crypto:
-            status, executed, oid = place_crypto_order(symbol_to_rh_crypto(t), "BUY", dollars, live_trading and login_ok)
+            status, executed, oid = place_crypto_order(symbol_to_rh_crypto(t), "BUY", dollars, live_trading and login_ok, UI_MIN_PER_ORDER)
         else:
-            status, executed, oid = place_stock_order(t, "BUY", dollars, live_trading and login_ok)
+            status, executed, oid = place_stock_order(t, "BUY", dollars, live_trading and login_ok, UI_MIN_PER_ORDER)
         buy_rows.append({
             "Ticker": t,
             "Action": "BUY",
