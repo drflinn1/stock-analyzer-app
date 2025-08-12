@@ -211,6 +211,25 @@ def combine_and_rank(equities: List[str], include_crypto_flag: bool, top_n: int)
 # Trading Helpers
 # -----------------------------
 
+def _call_first_available(objs, names, *args, **kwargs):
+    """Try calling the first attribute present on any object in objs.
+    Returns the function call result; raises AttributeError if none found.
+    This helps us stay compatible across robin_stocks versions where
+    crypto order helpers may be named slightly differently.
+    """
+    for obj in objs:
+        if obj is None:
+            continue
+        for name in names:
+            fn = getattr(obj, name, None)
+            if callable(fn):
+                return fn(*args, **kwargs)
+    raise AttributeError(f"No available function among {names}")
+
+# -----------------------------
+# Trading Helpers (continued)
+# -----------------------------
+
 def symbol_to_rh_crypto(sym: str) -> str:
     """Convert yfinance crypto pair like 'ETH-USD' to Robinhood symbol 'ETH'."""
     return sym.split("-")[0] if "-" in sym else sym
@@ -252,10 +271,24 @@ def place_crypto_order(symbol: str, side: str, dollars: float, live: bool) -> Tu
 
     try:
         res = None
+        # Maintain compatibility with different robin_stocks versions
+        buy_candidates = [
+            "order_buy_crypto_by_price",
+            "order_buy_crypto_by_dollar",
+            "order_buy_crypto_by_dollars",
+            "buy_crypto_by_price",
+        ]
+        sell_candidates = [
+            "order_sell_crypto_by_price",
+            "order_sell_crypto_by_dollar",
+            "order_sell_crypto_by_dollars",
+            "sell_crypto_by_price",
+        ]
         if side.upper() == "BUY":
-            res = rh_crypto.order_buy_crypto_by_dollar(symbol, dollars)
+            res = _call_first_available([rh_crypto, rh], buy_candidates, symbol, dollars)
         else:
-            res = rh_crypto.order_sell_crypto_by_dollar(symbol, dollars)
+            res = _call_first_available([rh_crypto, rh], sell_candidates, symbol, dollars)
+
         order_id = ""
         try:
             if isinstance(res, dict):
