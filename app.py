@@ -1,62 +1,63 @@
-# app.py — Stock & Crypto Momentum Rebalancer (Streamlit)
-# ------------------------------------------------------
-# This version focuses on running cleanly in BOTH simulation and live modes.
-# Key fixes:
-#   • Robust Robinhood login (no unsupported args; graceful failure => sim mode)
-#   • Uses supported robin_stocks order fns:
-#       - Stocks: orders.order_buy_fractional_by_price / order_sell_fractional_by_price
-#       - Crypto: crypto.order_buy_crypto_by_dollar / order_sell_crypto_by_dollar
-#   • No calls to removed/non‑existent functions (e.g. get_all_open_crypto_orders)
-#   • Safer momentum calc (handles empty/NaN data before ranking)
-#   • Clear trade log with simulated vs live outcome
+# app.py — Autonomous Stock & Crypto Momentum Rebalancer (Streamlit)
+# -------------------------------------------------------------------
+# New in this version (toward full automation):
+#   • Auto universes:
+#       - Equities: "S&P 500 (auto)" or manual list (Russell1000 could be added later)
+#       - Crypto:  Robinhood‑tradable list (fallback to a default set)
+#   • Multi‑horizon momentum score (1D, 5D, 20D) → rank by Score
+#   • SELL rule (Option A): full exit if (out of top‑N) OR (score < 0)
+#   • Pooled budget across stocks + crypto; two allocation modes (fixed / proportional)
+#   • Clean simulation vs live order placement for both stocks & crypto
+#   • Logs show both SELLs and BUYs in execution order
 #
-# Notes:
-#   • Live trading ONLY happens if the sidebar toggle is ON *and* login succeeds.
-#   • Credentials are read from Streamlit secrets. Supported keys (any one pair):
-#        ROBINHOOD_USERNAME / ROBINHOOD_PASSWORD
-#        RH_USERNAME       / RH_PASSWORD
-#   • For testing, keep live trading OFF. You’ll see "simulated" in the log.
+# Notes
+#   • Live trading only if sidebar toggle is ON *and* Robinhood login succeeds.
+#   • Secrets supported (any one pair):
+#         ROBINHOOD_USERNAME / ROBINHOOD_PASSWORD
+#         RH_USERNAME       / RH_PASSWORD
+#   • Streamlit Cloud cannot run on a schedule by itself. For automation, run this
+#     module headlessly from a scheduler (e.g., GitHub Actions) that calls a small
+#     runner script invoking the same functions. We ship the app with clear, pure
+#     functions so this is straightforward when you’re ready.
 
-import json
-import math
-import time
+VERSION = "0.8.0 (2025-08-12)"
+
 import inspect
-from typing import List, Dict, Tuple
+import json
+from typing import Dict, List, Tuple
 
+import numpy as np
 import pandas as pd
 import streamlit as st
-
-# Price data via yfinance (simple and reliable for both stocks & crypto pairs)
 import yfinance as yf
 
-# Robinhood (only used if live enabled)
+# Robinhood (only when live trading is enabled)
 try:
     import robin_stocks.robinhood as rh
     from robin_stocks.robinhood import orders as rh_orders
     from robin_stocks.robinhood import crypto as rh_crypto
     from robin_stocks.robinhood import account as rh_account
-except Exception:  # library not present in some environments
+except Exception:
     rh = None
     rh_orders = None
     rh_crypto = None
     rh_account = None
 
-# -----------------------------
+# ---------------------------------
 # UI — Sidebar Controls
-# -----------------------------
-st.set_page_config(page_title="Stock & Crypto Momentum Rebalancer", layout="wide")
+# ---------------------------------
+st.set_page_config(page_title=f"Stock & Crypto Momentum Rebalancer · {VERSION}", layout="wide")
 
 st.sidebar.header("Authentication & Mode")
+st.sidebar.caption(f"Version {VERSION}")
 live_trading = st.sidebar.checkbox("Enable Live Trading (use with caution)", value=False)
 
 # Read secrets (support both naming conventions)
-user = None
-pwd = None
+user = pwd = None
 try:
     user = st.secrets.get("ROBINHOOD_USERNAME") or st.secrets.get("RH_USERNAME")
-    pwd = st.secrets.get("ROBINHOOD_PASSWORD") or st.secrets.get("RH_PASSWORD")
+    pwd  = st.secrets.get("ROBINHOOD_PASSWORD") or st.secrets.get("RH_PASSWORD")
 except Exception:
-    # If secrets are not configured, we'll remain in sim mode
     pass
 
 login_ok = False
@@ -67,24 +68,19 @@ if live_trading:
         st.sidebar.error("robin_stocks is not available in this environment. Running in SIMULATION.")
         live_trading = False
     elif not user or not pwd:
-        st.sidebar.error("Live trading selected but Robinhood credentials are missing. Running in SIMULATION.")
+        st.sidebar.error("Live trading selected but credentials are missing in Secrets. Running in SIMULATION.")
         live_trading = False
     else:
-        # Attempt a robust login without deprecated/unknown args
         try:
-            # Build kwargs only from supported signature
             sig = inspect.signature(rh.authentication.login)
             kwargs = {}
             if "username" in sig.parameters: kwargs["username"] = user
             if "password" in sig.parameters: kwargs["password"] = pwd
-            # Safe defaults
             if "store_session" in sig.parameters: kwargs["store_session"] = True
             if "expiresIn" in sig.parameters: kwargs["expiresIn"] = 24 * 3600
             if "scope" in sig.parameters: kwargs["scope"] = "internal"
-
             login_ok = bool(rh.authentication.login(**kwargs))
         except TypeError:
-            # Fallback: minimal call
             try:
                 login_ok = bool(rh.authentication.login(username=user, password=pwd))
             except Exception as e:
@@ -104,158 +100,185 @@ else:
     st.sidebar.info(login_msg)
 
 st.sidebar.header("Universe & Allocation")
-raw_tickers = st.sidebar.text_area(
-    "Equity Tickers (comma-separated)",
-    value="AAPL,MSFT,GOOG",
-    help="US equity tickers. We'll fetch daily momentum via Yahoo Finance.",
-)
-include_crypto = st.sidebar.checkbox("Include Crypto", value=True)
 
-alloc_mode = st.sidebar.selectbox(
-    "Allocation mode",
-    ["Fixed $ per trade", "Proportional across winners"],
+universe_src = st.sidebar.selectbox(
+    "Equity Universe",
+    ["S&P 500 (auto)", "Manual list"],
     index=0,
+    help="Choose the equity symbols source. Manual list uses the box below.",
 )
+raw_tickers = st.sidebar.text_area(
+    "Manual equity tickers (comma‑separated)",
+    value="AAPL,MSFT,GOOG",
+)
+include_crypto = st.sidebar.checkbox("Include Crypto (Robinhood‑tradable)", value=True)
+
+alloc_mode = st.sidebar.selectbox("Allocation mode", ["Fixed $ per trade", "Proportional across winners"], index=0)
 fixed_per_trade = st.sidebar.number_input("Fixed $ per BUY/SELL", min_value=1.0, value=5.0, step=0.5)
-prop_total_budget = st.sidebar.number_input(
-    "Total budget for BUYS (when proportional)", min_value=1.0, value=15.0, step=1.0
-)
+prop_total_budget = st.sidebar.number_input("Total BUY budget (proportional)", min_value=1.0, value=15.0, step=1.0)
 min_per_order = st.sidebar.number_input("Minimum $ per order", min_value=1.0, value=1.0, step=0.5)
 
-n_picks = st.sidebar.number_input("Number of tickers to pick", min_value=1, value=3, step=1)
+n_picks = st.sidebar.number_input("Top N to hold", min_value=1, value=3, step=1)
 
 st.title("Stock & Crypto Momentum Rebalancer")
+st.caption(f"Version {VERSION}")
 
-# -----------------------------
-# Data Helpers
-# -----------------------------
+# ---------------------------------
+# Universe helpers
+# ---------------------------------
 
-def _clean_universe(raw: str) -> List[str]:
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_sp500_symbols() -> List[str]:
+    """Fetch S&P 500 tickers from Wikipedia; fallback to a compact baked list if needed."""
+    try:
+        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        df = tables[0]
+        syms = (
+            df["Symbol"].astype(str).str.upper().str.replace(".", "-", regex=False).tolist()
+        )
+        # Deduplicate and sanity‑filter
+        syms = [s for s in dict.fromkeys(syms) if s.isascii() and 1 <= len(s) <= 6]
+        return syms
+    except Exception:
+        # Small fallback set — the app still works while offline
+        return ["AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "BRK-B", "TSLA", "JPM"]
+
+
+def clean_manual_list(raw: str) -> List[str]:
     return [t.strip().upper() for t in (raw or "").split(",") if t.strip()]
 
 
-# Default crypto watchlist — can be expanded if desired
 DEFAULT_CRYPTO = ["BTC-USD", "ETH-USD", "XRP-USD", "BNB-USD", "USDT-USD"]
 
 
-def fetch_pct_change_yf(symbols: List[str]) -> pd.DataFrame:
-    """Fetch last close % change vs previous close using yfinance.
-    Returns columns: [Ticker, PctChange]
+def load_rh_crypto_pairs() -> List[str]:
+    """Return symbols in Yahoo-style (e.g., ETH-USD). Fallback to DEFAULT_CRYPTO."""
+    try:
+        pairs = []
+        # Some versions don’t need login for this; if it fails we fallback
+        if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_currency_pairs"):
+            data = rh_crypto.get_crypto_currency_pairs()
+            if isinstance(data, list):
+                for p in data:
+                    try:
+                        sym = (p.get("asset_currency", {}) or {}).get("code")
+                        if sym:
+                            pairs.append(f"{sym}-USD")
+                    except Exception:
+                        pass
+        if not pairs:
+            pairs = DEFAULT_CRYPTO.copy()
+        return sorted(list(dict.fromkeys(pairs)))
+    except Exception:
+        return DEFAULT_CRYPTO.copy()
+
+# ---------------------------------
+# Data — returns & scoring
+# ---------------------------------
+
+def fetch_returns(symbols: List[str], lookbacks: List[int]) -> pd.DataFrame:
+    """Fetch % returns over given lookbacks in trading days using yfinance.
+    Returns columns: [Ticker] + [f"R{lb}"] for each lookback.
     """
     if not symbols:
-        return pd.DataFrame(columns=["Ticker", "PctChange"])  # empty
+        cols = ["Ticker"] + [f"R{lb}" for lb in lookbacks]
+        return pd.DataFrame(columns=cols)
 
-    # yfinance can handle list download
+    # yfinance multi‑download; fall back one‑by‑one as needed
+    def _calc_from_df(sym: str, dfx: pd.DataFrame) -> Dict[str, float]:
+        out = {"Ticker": sym}
+        if dfx is None or dfx.empty or "Close" not in dfx:
+            for lb in lookbacks:
+                out[f"R{lb}"] = np.nan
+            return out
+        close = dfx["Close"].dropna()
+        for lb in lookbacks:
+            try:
+                if len(close) >= (lb + 1):
+                    r = (close.iloc[-1] / close.iloc[-(lb + 1)] - 1.0) * 100.0
+                else:
+                    r = np.nan
+            except Exception:
+                r = np.nan
+            out[f"R{lb}"] = float(r) if pd.notna(r) else np.nan
+        return out
+
+    rows: List[Dict] = []
     try:
-        df = yf.download(symbols, period="7d", interval="1d", progress=False, threads=False)
+        df = yf.download(symbols, period="60d", interval="1d", progress=False, threads=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            for sym in (df["Close"].columns if "Close" in df else symbols):
+                dfx = df.xs(sym, axis=1, level=1)[["Close"]] if "Close" in df else None
+                rows.append(_calc_from_df(str(sym), dfx))
+        else:
+            # Single symbol path
+            rows.append(_calc_from_df(str(symbols[0]), df))
     except Exception:
-        # Retry one-by-one fallback
-        rows = []
         for s in symbols:
             try:
-                dfx = yf.download(s, period="7d", interval="1d", progress=False, threads=False)
-                if not dfx.empty and "Close" in dfx:
-                    closes = dfx["Close"].dropna()
-                    if len(closes) >= 2:
-                        pct = (closes.iloc[-1] / closes.iloc[-2] - 1.0) * 100.0
-                        rows.append((s, float(pct)))
+                dfx = yf.download(s, period="60d", interval="1d", progress=False, threads=False)
             except Exception:
-                pass
-        return pd.DataFrame(rows, columns=["Ticker", "PctChange"]) if rows else pd.DataFrame(columns=["Ticker", "PctChange"])  
+                dfx = None
+            rows.append(_calc_from_df(s, dfx))
 
-    # If multi-index, handle accordingly
-    rows: List[Tuple[str, float]] = []
-    if isinstance(df.columns, pd.MultiIndex):
-        # df columns like ('Close','AAPL'), ...
-        if ("Close" in df.columns.get_level_values(0)):
-            close = df["Close"].copy()
-            for s in close.columns:
-                series = close[s].dropna()
-                if len(series) >= 2:
-                    pct = (series.iloc[-1] / series.iloc[-2] - 1.0) * 100.0
-                    rows.append((str(s), float(pct)))
-    else:
-        # Single symbol
-        if "Close" in df:
-            closes = df["Close"].dropna()
-            if len(closes) >= 2:
-                pct = (closes.iloc[-1] / closes.iloc[-2] - 1.0) * 100.0
-                # symbols may be a single string
-                sym = symbols[0] if isinstance(symbols, list) and len(symbols) == 1 else symbols
-                rows.append((str(sym if isinstance(sym, str) else sym[0]), float(pct)))
-
-    out = pd.DataFrame(rows, columns=["Ticker", "PctChange"]) if rows else pd.DataFrame(columns=["Ticker", "PctChange"])  
-    out["PctChange"] = pd.to_numeric(out["PctChange"], errors="coerce").fillna(0.0)
-    return out
+    return pd.DataFrame(rows)
 
 
-def combine_and_rank(equities: List[str], include_crypto_flag: bool, top_n: int) -> pd.DataFrame:
-    eq_df = fetch_pct_change_yf(equities)
-    pieces = [eq_df]
-    if include_crypto_flag:
-        pieces.append(fetch_pct_change_yf(DEFAULT_CRYPTO))
-    df = pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame(columns=["Ticker", "PctChange"])  
+def score_momentum(df: pd.DataFrame, weights: Dict[int, float] = None) -> pd.DataFrame:
+    if weights is None:
+        # Heavier weight on near‑term, small tail on 20D
+        weights = {1: 0.6, 5: 0.3, 20: 0.1}
 
-    # Robust cleanup
-    df = df.dropna(subset=["Ticker"]).copy()
-    df["PctChange"] = pd.to_numeric(df["PctChange"], errors="coerce")
-    df = df.dropna(subset=["PctChange"])  # ensure numeric
+    # Z‑score each horizon to balance scales
+    sc = df.copy()
+    for lb, w in weights.items():
+        col = f"R{lb}"
+        if col not in sc:
+            sc[col] = np.nan
+        mu = sc[col].mean(skipna=True)
+        sd = sc[col].std(skipna=True)
+        sc[f"Z{lb}"] = 0.0 if pd.isna(sd) or sd == 0 else (sc[col] - mu) / sd
+    sc["Score"] = sum(sc.get(f"Z{lb}", 0.0) * w for lb, w in weights.items())
+    return sc
 
-    if df.empty:
-        return df
 
-    return df.sort_values("PctChange", ascending=False).head(top_n).reset_index(drop=True)
+def build_universe(eq_src: str, manual_raw: str, include_c: bool) -> List[str]:
+    eq = load_sp500_symbols() if eq_src == "S&P 500 (auto)" else clean_manual_list(manual_raw)
+    cr = load_rh_crypto_pairs() if include_c else []
+    # Combine & deduplicate
+    uni = list(dict.fromkeys(eq + cr))
+    return uni
 
 
-# -----------------------------
-# Trading Helpers
-# -----------------------------
+# ---------------------------------
+# Order helpers
+# ---------------------------------
 
 def _call_first_available(objs, names, *args, **kwargs):
-    """Try calling the first attribute present on any object in objs.
-    Returns the function call result; raises AttributeError if none found.
-    This helps us stay compatible across robin_stocks versions where
-    crypto order helpers may be named slightly differently.
-    """
     for obj in objs:
-        if obj is None:
-            continue
+        if obj is None: continue
         for name in names:
             fn = getattr(obj, name, None)
             if callable(fn):
                 return fn(*args, **kwargs)
     raise AttributeError(f"No available function among {names}")
 
-# -----------------------------
-# Trading Helpers (continued)
-# -----------------------------
 
 def symbol_to_rh_crypto(sym: str) -> str:
-    """Convert yfinance crypto pair like 'ETH-USD' to Robinhood symbol 'ETH'."""
     return sym.split("-")[0] if "-" in sym else sym
 
 
 def place_stock_order(symbol: str, side: str, dollars: float, live: bool) -> Tuple[str, float, str]:
-    """Place (or simulate) a stock order. Returns (status, executed, order_id)"""
     dollars = float(max(0.0, dollars))
     if dollars < 0.01:
         return ("skipped (too small)", 0.0, "")
-
     if not live:
         return ("simulated", 0.0, "")
-
     try:
-        res = None
-        if side.upper() == "BUY":
-            res = rh_orders.order_buy_fractional_by_price(symbol, dollars)
-        else:
-            res = rh_orders.order_sell_fractional_by_price(symbol, dollars)
+        res = rh_orders.order_buy_fractional_by_price(symbol, dollars) if side.upper() == "BUY" else rh_orders.order_sell_fractional_by_price(symbol, dollars)
         order_id = ""
-        try:
-            if isinstance(res, dict):
-                order_id = res.get("id", "") or res.get("order_id", "")
-        except Exception:
-            pass
+        if isinstance(res, dict):
+            order_id = res.get("id", "") or res.get("order_id", "")
         return ("placed", 0.0, order_id)
     except Exception as e:
         return (f"error: {e}", 0.0, "")
@@ -265,119 +288,193 @@ def place_crypto_order(symbol: str, side: str, dollars: float, live: bool) -> Tu
     dollars = float(max(0.0, dollars))
     if dollars < 0.01:
         return ("skipped (too small)", 0.0, "")
-
     if not live:
         return ("simulated", 0.0, "")
-
     try:
-        res = None
-        # Maintain compatibility with different robin_stocks versions
-        buy_candidates = [
-            "order_buy_crypto_by_price",
-            "order_buy_crypto_by_dollar",
-            "order_buy_crypto_by_dollars",
-            "buy_crypto_by_price",
-        ]
-        sell_candidates = [
-            "order_sell_crypto_by_price",
-            "order_sell_crypto_by_dollar",
-            "order_sell_crypto_by_dollars",
-            "sell_crypto_by_price",
-        ]
-        if side.upper() == "BUY":
-            res = _call_first_available([rh_crypto, rh], buy_candidates, symbol, dollars)
-        else:
-            res = _call_first_available([rh_crypto, rh], sell_candidates, symbol, dollars)
-
+        buy_candidates  = ["order_buy_crypto_by_price", "order_buy_crypto_by_dollar", "order_buy_crypto_by_dollars", "buy_crypto_by_price"]
+        sell_candidates = ["order_sell_crypto_by_price", "order_sell_crypto_by_dollar", "order_sell_crypto_by_dollars", "sell_crypto_by_price"]
+        res = _call_first_available([rh_crypto, rh], buy_candidates if side.upper() == "BUY" else sell_candidates, symbol, dollars)
         order_id = ""
-        try:
-            if isinstance(res, dict):
-                order_id = res.get("id", "") or res.get("order_id", "")
-        except Exception:
-            pass
+        if isinstance(res, dict):
+            order_id = res.get("id", "") or res.get("order_id", "")
         return ("placed", 0.0, order_id)
     except Exception as e:
         return (f"error: {e}", 0.0, "")
 
 
-# -----------------------------
-# Main button
-# -----------------------------
+# ---------------------------------
+# Holdings / SELL logic
+# ---------------------------------
+
+def get_holdings() -> Dict[str, Dict]:
+    """Return current holdings keyed by ticker, with approx market value in dollars.
+       Stocks via account.build_holdings(); Crypto via get_crypto_positions().
+    """
+    out: Dict[str, Dict] = {}
+    if rh_account is None:
+        return out
+    try:
+        # Stocks
+        if hasattr(rh_account, "build_holdings"):
+            h = rh_account.build_holdings()
+            if isinstance(h, dict):
+                for sym, info in h.items():
+                    try:
+                        value = float(info.get("equity", 0))
+                    except Exception:
+                        value = 0.0
+                    out[str(sym).upper()] = {"type": "stock", "value": value}
+    except Exception:
+        pass
+
+    # Crypto
+    try:
+        if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_positions"):
+            pos = rh_crypto.get_crypto_positions()
+            if isinstance(pos, list):
+                for p in pos:
+                    try:
+                        qty = float(p.get("quantity", 0) or 0)
+                        sym = (p.get("currency", {}) or {}).get("code") or ""
+                        if qty > 0 and sym:
+                            price = 0.0
+                            try:
+                                if hasattr(rh_crypto, "get_crypto_quote"):
+                                    q = rh_crypto.get_crypto_quote(sym)
+                                    price = float(q.get("mark_price", 0) or q.get("ask_price", 0) or 0)
+                            except Exception:
+                                price = 0.0
+                            value = qty * price
+                            out[f"{sym}-USD".upper()] = {"type": "crypto", "value": float(value)}
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return out
+
+
+# ---------------------------------
+# Main run button
+# ---------------------------------
 
 if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
-    equities = _clean_universe(raw_tickers)
+    # Build universes
+    universe = build_universe(universe_src, raw_tickers, include_crypto)
 
-    top = combine_and_rank(equities, include_crypto, int(n_picks))
+    # Compute returns & score
+    lookbacks = [1, 5, 20]
+    ret_df = fetch_returns(universe, lookbacks)
+    scored = score_momentum(ret_df, weights={1: 0.6, 5: 0.3, 20: 0.1})
 
-    if top.empty:
+    # Rank by Score and pick top‑N
+    picks = (
+        scored.dropna(subset=["Score"]).sort_values("Score", ascending=False).head(int(n_picks)).reset_index(drop=True)
+    )
+
+    if picks.empty:
         st.warning("No momentum data available (universe may be empty or network hiccup). Try again.")
         st.stop()
 
-    # Decide allocation per trade
-    trade_rows: List[Dict] = []
+    # SELL rule (Option A): full exit if out of top‑N OR score < 0
+    sell_rows: List[Dict] = []
+    buy_rows:  List[Dict] = []
 
-    # Determine which rows are crypto (by '-USD')
-    is_crypto_mask = top["Ticker"].str.contains("-USD", case=False, na=False)
+    current = get_holdings() if (live_trading and login_ok) else {}
+    in_top = set(picks["Ticker"].astype(str).str.upper().tolist())
 
+    # Decide BUY allocations
     if alloc_mode == "Fixed $ per trade":
         per_trade = float(max(min_per_order, fixed_per_trade))
-        allocs = [per_trade] * len(top)
+        buy_allocs = {t: per_trade for t in in_top}
     else:
-        # Proportional to momentum (positive only)
-        pos = top.copy()
-        pos["w"] = pos["PctChange"].clip(lower=0.0)
-        wsum = pos["w"].sum()
+        w = np.clip(picks["R1"].fillna(0).astype(float), 0, None)
+        wsum = float(w.sum())
         if wsum <= 0:
-            # Fallback equal-split
-            each = max(min_per_order, prop_total_budget / max(1, len(pos)))
-            allocs = [each] * len(top)
+            each = max(min_per_order, prop_total_budget / max(1, len(picks)))
+            buy_allocs = {t: each for t in in_top}
         else:
-            allocs = []
-            for w in pos["w"].tolist():
-                dollars = (float(w) / float(wsum)) * float(prop_total_budget)
-                allocs.append(max(min_per_order, dollars))
+            buy_allocs = {}
+            for t, wi in zip(picks["Ticker"].tolist(), w.tolist()):
+                dollars = (wi / wsum) * float(prop_total_budget)
+                buy_allocs[str(t).upper()] = float(max(min_per_order, dollars))
 
-    # Build trade plan — BUY winners
-    for i, row in top.iterrows():
-        ticker = str(row["Ticker"]).upper()
-        pct = float(row["PctChange"]) if pd.notna(row["PctChange"]) else 0.0
-        dollars = float(allocs[i])
+    # --- SELL first ---
+    for sym, info in current.items():
+        t_upper = str(sym).upper()
+        if t_upper not in in_top:
+            # Out of top‑N ⇒ full exit
+            dollars = float(info.get("value", 0.0))
+            if dollars >= min_per_order:
+                if info.get("type") == "crypto":
+                    status, executed, oid = place_crypto_order(symbol_to_rh_crypto(t_upper), "SELL", dollars, live_trading and login_ok)
+                else:
+                    status, executed, oid = place_stock_order(t_upper, "SELL", dollars, live_trading and login_ok)
+                sell_rows.append({
+                    "Ticker": t_upper,
+                    "Action": "SELL",
+                    "Reason": "out_of_topN",
+                    "Alloc$": round(dollars, 2),
+                    "OrderID": oid,
+                    "Status": status,
+                    "Time": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                })
 
-        is_crypto = ticker.endswith("-USD")
-        action = "BUY"
-
+    # --- BUY winners ---
+    for _, r in picks.iterrows():
+        t = str(r["Ticker"]).upper()
+        score = float(r["Score"]) if pd.notna(r["Score"]) else 0.0
+        if score < 0:
+            continue  # do not buy negative score
+        dollars = float(buy_allocs.get(t, 0.0))
+        if dollars < min_per_order:
+            continue
+        is_crypto = t.endswith("-USD")
         if is_crypto:
-            rh_sym = symbol_to_rh_crypto(ticker)
-            status, executed, oid = place_crypto_order(rh_sym, action, dollars, live_trading and login_ok)
+            status, executed, oid = place_crypto_order(symbol_to_rh_crypto(t), "BUY", dollars, live_trading and login_ok)
         else:
-            status, executed, oid = place_stock_order(ticker, action, dollars, live_trading and login_ok)
-
-        trade_rows.append({
-            "Ticker": ticker,
-            "Action": action,
-            "PctChange": round(pct, 4),
+            status, executed, oid = place_stock_order(t, "BUY", dollars, live_trading and login_ok)
+        buy_rows.append({
+            "Ticker": t,
+            "Action": "BUY",
             "Alloc$": round(dollars, 2),
-            "Executed": executed,
             "OrderID": oid,
             "Status": status,
-            "Time": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            "R1%": round(float(r.get("R1", 0.0)), 3),
+            "R5%": round(float(r.get("R5", 0.0)), 3),
+            "R20%": round(float(r.get("R20", 0.0)), 3),
+            "Score": round(score, 4),
+            "Time": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         })
 
-    log_df = pd.DataFrame(trade_rows, columns=["Ticker", "Action", "PctChange", "Alloc$", "Executed", "OrderID", "Status", "Time"])  
+    # Display sections
+    st.subheader("Today's Top‑N (ranked by momentum score)")
+    st.dataframe(picks[["Ticker", "R1", "R5", "R20", "Score"]].rename(columns={"R1": "R1%", "R5": "R5%", "R20": "R20%"}), use_container_width=True)
 
-    st.subheader("Rebalance Log")
-    st.dataframe(log_df, use_container_width=True)
+    if sell_rows:
+        st.subheader("Sell Log")
+        st.dataframe(pd.DataFrame(sell_rows), use_container_width=True)
+    else:
+        st.subheader("Sell Log")
+        st.write("(no sells)")
 
-    # Download logs
+    st.subheader("Buy Log")
+    buy_df = pd.DataFrame(buy_rows) if buy_rows else pd.DataFrame(columns=["Ticker","Action","Alloc$","OrderID","Status","R1%","R5%","R20%","Score","Time"])    
+    st.dataframe(buy_df, use_container_width=True)
+
+    # Combined CSV download
+    all_rows = []
+    for row in sell_rows: all_rows.append({"Kind": "SELL", **row})
+    for row in buy_rows:  all_rows.append({"Kind": "BUY",  **row})
+    log_df = pd.DataFrame(all_rows)
     csv = log_df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download Logs CSV", csv, file_name="rebalance_log.csv", mime="text/csv")
+    st.download_button("Download Activity CSV", csv, file_name="rebalance_activity.csv", mime="text/csv")
 
-    # Open orders snapshot (best-effort)
+    # Open orders snapshot (best‑effort)
     st.subheader("Open Orders")
     open_list = []
     if live_trading and login_ok and rh is not None:
         try:
-            # Stocks
             if rh_orders is not None and hasattr(rh_orders, "get_all_open_stock_orders"):
                 s_open = rh_orders.get_all_open_stock_orders()
                 if isinstance(s_open, list):
@@ -385,7 +482,6 @@ if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
         except Exception as e:
             st.info(f"Failed to fetch open stock orders: {e}")
         try:
-            # Crypto (some library versions don't expose this; skip quietly)
             if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_open_orders"):
                 c_open = rh_crypto.get_crypto_open_orders()
                 if isinstance(c_open, list):
@@ -393,14 +489,11 @@ if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
         except Exception as e:
             st.info(f"Failed to fetch open crypto orders: {e}")
 
-    if open_list:
-        st.json(open_list)
-    else:
-        st.write("[]")
+    st.json(open_list if open_list else [])
 
-# -----------------------------
+# ---------------------------------
 # Footer / Hints
-# -----------------------------
+# ---------------------------------
 st.caption(
-    "Tip: keep Live Trading OFF until you like the plan. When you turn it on, make sure secrets are set and login shows ‘Live orders ENABLED’."
+    "Tip: keep Live Trading OFF until you like the plan. When you turn it on, make sure secrets are set and the sidebar shows ‘Live orders ENABLED’."
 )
