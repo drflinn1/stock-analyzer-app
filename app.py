@@ -20,7 +20,7 @@
 #     runner script invoking the same functions. We ship the app with clear, pure
 #     functions so this is straightforward when you’re ready.
 
-VERSION = "0.8.1 (2025-08-12)"
+VERSION = "0.8.2 (2025-08-12)"
 
 import inspect
 import json
@@ -507,25 +507,45 @@ if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
 
     # Open orders snapshot (best‑effort)
     st.subheader("Open Orders")
-    open_list = []
-    if live_trading and login_ok and rh is not None:
-        try:
-            if rh_orders is not None and hasattr(rh_orders, "get_all_open_stock_orders"):
-                s_open = rh_orders.get_all_open_stock_orders()
-                if isinstance(s_open, list):
-                    open_list.extend([{"type": "stock", **(o if isinstance(o, dict) else {"raw": str(o)})} for o in s_open])
-        except Exception as e:
-            st.info(f"Failed to fetch open stock orders: {e}")
-        try:
-            if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_open_orders"):
-                c_open = rh_crypto.get_crypto_open_orders()
-                if isinstance(c_open, list):
-                    open_list.extend([{"type": "crypto", **(o if isinstance(o, dict) else {"raw": str(o)})} for o in c_open])
-        except Exception as e:
-            st.info(f"Failed to fetch open crypto orders: {e}")
+open_list = []
+if live_trading and login_ok and rh is not None:
+    try:
+        if rh_orders is not None and hasattr(rh_orders, "get_all_open_stock_orders"):
+            s_open = rh_orders.get_all_open_stock_orders()
+            if isinstance(s_open, list):
+                open_list.extend([{"type": "stock", **(o if isinstance(o, dict) else {"raw": str(o)})} for o in s_open])
+    except Exception as e:
+        st.info(f"Failed to fetch open stock orders: {e}")
+    try:
+        if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_open_orders"):
+            c_open = rh_crypto.get_crypto_open_orders()
+            if isinstance(c_open, list):
+                open_list.extend([{"type": "crypto", **(o if isinstance(o, dict) else {"raw": str(o)})} for o in c_open])
+    except Exception as e:
+        st.info(f"Failed to fetch open crypto orders: {e}")
 
-    st.json(open_list if open_list else [])
-
+# Compact table (hide raw JSON by default)
+if open_list:
+    rows = []
+    for o in open_list:
+        if not isinstance(o, dict):
+            continue
+        typ = o.get("type", "")
+        side = o.get("side") or o.get("direction") or ""
+        sym = o.get("symbol") or o.get("chain_symbol") or o.get("currency_pair_id") or o.get("currency_pair") or o.get("pair") or ""
+        state = o.get("state") or o.get("status") or ""
+        created = o.get("created_at") or o.get("last_transaction_at") or o.get("submitted_at") or ""
+        oid = o.get("id") or o.get("order_id") or ""
+        notional = o.get("notional") or o.get("average_price") or o.get("price") or o.get("quantity") or ""
+        rows.append({"Type": typ, "Side": side, "Symbol": sym, "Notional/Qty": notional, "State": state, "Created": created, "OrderID": oid})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    else:
+        st.write("[]")
+    with st.expander("Show raw API response"):
+        st.json(open_list)
+else:
+    st.write("[]")
 # ---------------------------------
 # Footer / Hints
 # ---------------------------------
