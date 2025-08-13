@@ -9,6 +9,8 @@
 #   • Pooled budget across stocks + crypto; two allocation modes (fixed / proportional)
 #   • Clean simulation vs live order placement for both stocks & crypto
 #   • Logs show both SELLs and BUYs in execution order
+#   • v0.8.5: fix duplicate holdings bug; optional LIMIT orders for crypto (and experimental for stocks);
+#            hide raw open‑orders JSON behind expander; minor robustness around minimum notionals.
 #
 # Notes
 #   • Live trading only if sidebar toggle is ON *and* Robinhood login succeeds.
@@ -20,7 +22,7 @@
 #     runner script invoking the same functions. We ship the app with clear, pure
 #     functions so this is straightforward when you’re ready.
 
-VERSION = "0.8.4 (2025-08-13)"
+VERSION = "0.8.5 (2025-08-13)"
 
 import inspect
 import json
@@ -37,11 +39,13 @@ try:
     from robin_stocks.robinhood import orders as rh_orders
     from robin_stocks.robinhood import crypto as rh_crypto
     from robin_stocks.robinhood import account as rh_account
+    from robin_stocks.robinhood import stocks as rh_stocks
 except Exception:
     rh = None
     rh_orders = None
     rh_crypto = None
     rh_account = None
+    rh_stocks = None
 
 # ---------------------------------
 # UI — Sidebar Controls
@@ -120,6 +124,14 @@ min_per_order = st.sidebar.number_input("Minimum $ per order", min_value=1.0, va
 UI_MIN_PER_ORDER = float(min_per_order)
 
 n_picks = st.sidebar.number_input("Top N to hold", min_value=1, value=3, step=1)
+
+st.sidebar.divider()
+use_crypto_limits = st.sidebar.checkbox("Use LIMIT orders for crypto", value=True,
+                                        help="Attempts maker‑style buys/sells using a small price buffer; falls back to market if unsupported.")
+crypto_limit_bps = st.sidebar.slider("Crypto limit price buffer (bps)", min_value=5, max_value=100, value=20, step=5)
+use_stock_limits = st.sidebar.checkbox("Use LIMIT orders for stocks (experimental)", value=False,
+                                       help="Best‑effort: computes qty from $ and quotes; falls back to fractional market if unsupported.")
+stock_limit_bps = st.sidebar.slider("Stock limit price buffer (bps)", min_value=5, max_value=150, value=25, step=5)
 
 st.title("Stock & Crypto Momentum Rebalancer")
 st.caption(f"Version {VERSION}")
@@ -271,6 +283,7 @@ def rh_to_yahoo_stock(sym: str) -> str:
         return s.replace(".", "-")
     return s
 
+
 def _call_first_available(objs, names, *args, **kwargs):
     for obj in objs:
         if obj is None: continue
@@ -292,8 +305,31 @@ def normalize_dollars(dollars: float, min_amt: float) -> float:
     return cents / 100.0
 
 
-def place_stock_order(symbol: str, side: str, dollars: float, live: bool, min_order: float) -> Tuple[str, float, str]:
-    """Place a fractional stock order by dollars with retry if the notional is too small.
+def _get_stock_last_price(sym: str) -> float:
+    # Try Robinhood fast quote first, fallback to yfinance fast_info
+    try:
+        if rh_stocks is not None and hasattr(rh_stocks, "get_latest_price"):
+            px = rh_stocks.get_latest_price(yahoo_to_rh_stock(sym), includeExtendedHours=True)
+            if isinstance(px, list) and px:
+                return float(px[0])
+    except Exception:
+        pass
+    try:
+        t = yf.Ticker(sym)
+        if hasattr(t, "fast_info") and getattr(t, "fast_info") is not None:
+            fi = t.fast_info
+            p = fi.get("last_price") or fi.get("last_close") or fi.get("last_price")
+            if p:
+                return float(p)
+    except Exception:
+        pass
+    return 0.0
+
+
+def place_stock_order(symbol: str, side: str, dollars: float, live: bool, min_order: float,
+                      use_limit: bool = False, limit_bps: int = 25) -> Tuple[str, float, str]:
+    """Place a stock order.
+    Default uses Robinhood fractional market-by-dollars. If use_limit=True, best‑effort limit using qty.
     Returns: (status, executed_amount, order_id)
     """
     base = normalize_dollars(dollars, min_order)
@@ -304,7 +340,38 @@ def place_stock_order(symbol: str, side: str, dollars: float, live: bool, min_or
 
     rh_symbol = yahoo_to_rh_stock(symbol)
 
-    # try up to 3 times, nudging notional up a bit in case of price moves / ticks
+    # Experimental LIMIT path — compute quantity from notional
+    if use_limit and rh_orders is not None:
+        try:
+            px = _get_stock_last_price(symbol)
+            if px and px > 0:
+                qty = max(base / px, 0.0001)
+                # Robinhood typically allows up to 6 decimals for fractional qty
+                qty = float(np.round(qty, 6))
+                buff = float(limit_bps) / 10000.0
+                if side.upper() == "BUY":
+                    limit_price = float(np.round(px * (1 + buff), 4))
+                    fnames = [
+                        "order_buy_fractional_limit",  # if available
+                        "order_buy_limit",
+                    ]
+                    res = _call_first_available([rh_orders], fnames, rh_symbol, qty, limit_price)
+                else:
+                    limit_price = float(np.round(px * (1 - buff), 4))
+                    fnames = [
+                        "order_sell_fractional_limit",
+                        "order_sell_limit",
+                    ]
+                    res = _call_first_available([rh_orders], fnames, rh_symbol, qty, limit_price)
+                oid = ""
+                if isinstance(res, dict):
+                    oid = res.get("id", "") or res.get("order_id", "")
+                return ("placed", 0.0, oid)
+        except Exception:
+            # fall through to market-by-dollars
+            pass
+
+    # Market‑by‑dollars with retry (most reliable for fractionals)
     for attempt in range(3):
         amt = normalize_dollars(base * (1.02 ** attempt), min_order)
         try:
@@ -325,13 +392,62 @@ def place_stock_order(symbol: str, side: str, dollars: float, live: bool, min_or
 
 
 
-def place_crypto_order(symbol: str, side: str, dollars: float, live: bool, min_order: float) -> Tuple[str, float, str]:
-    """Place a crypto order by dollars with retry if the notional is too small."""
+def _get_crypto_last_price(sym_no_usd: str) -> float:
+    try:
+        if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_quote"):
+            q = rh_crypto.get_crypto_quote(sym_no_usd)
+            # prefer mid if available
+            ask = float(q.get("ask_price", 0) or 0)
+            bid = float(q.get("bid_price", 0) or 0)
+            if ask and bid:
+                return (ask + bid) / 2.0
+            return float(q.get("mark_price", 0) or ask or bid or 0)
+    except Exception:
+        pass
+    try:
+        t = yf.Ticker(f"{sym_no_usd}-USD")
+        fi = getattr(t, "fast_info", None) or {}
+        p = fi.get("last_price") or fi.get("last_close")
+        if p:
+            return float(p)
+    except Exception:
+        pass
+    return 0.0
+
+
+def place_crypto_order(symbol: str, side: str, dollars: float, live: bool, min_order: float,
+                       use_limit: bool = True, limit_bps: int = 20) -> Tuple[str, float, str]:
+    """Place a crypto order by dollars with retry; if use_limit, compute qty & use limit endpoints when available."""
     base = normalize_dollars(dollars, min_order)
     if base < 0.01:
         return ("skipped (too small)", 0.0, "")
     if not live:
         return ("simulated", 0.0, "")
+
+    sym = symbol_to_rh_crypto(symbol)
+
+    if use_limit and rh_orders is not None:
+        try:
+            px = _get_crypto_last_price(sym)
+            if px and px > 0:
+                qty = max(base / px, 0.00000001)
+                qty = float(np.round(qty, 8))
+                buff = float(limit_bps) / 10000.0
+                if side.upper() == "BUY":
+                    limit_price = float(np.round(px * (1 + buff), 2))
+                    fnames = ["order_buy_crypto_limit"]
+                    res = _call_first_available([rh_orders], fnames, sym, qty, limit_price)
+                else:
+                    limit_price = float(np.round(px * (1 - buff), 2))
+                    fnames = ["order_sell_crypto_limit"]
+                    res = _call_first_available([rh_orders], fnames, sym, qty, limit_price)
+                oid = ""
+                if isinstance(res, dict):
+                    oid = res.get("id", "") or res.get("order_id", "")
+                return ("placed", 0.0, oid)
+        except Exception:
+            # fall back to market-by-dollars
+            pass
 
     buy_candidates  = ["order_buy_crypto_by_price", "order_buy_crypto_by_dollar", "order_buy_crypto_by_dollars", "buy_crypto_by_price"]
     sell_candidates = ["order_sell_crypto_by_price", "order_sell_crypto_by_dollar", "order_sell_crypto_by_dollars", "sell_crypto_by_price"]
@@ -340,7 +456,7 @@ def place_crypto_order(symbol: str, side: str, dollars: float, live: bool, min_o
         amt = normalize_dollars(base * (1.02 ** attempt), min_order)
         try:
             fnames = buy_candidates if side.upper() == "BUY" else sell_candidates
-            res = _call_first_available([rh_crypto, rh], fnames, symbol, amt)
+            res = _call_first_available([rh_crypto, rh], fnames, sym, amt)
             oid = ""
             if isinstance(res, dict):
                 oid = res.get("id", "") or res.get("order_id", "")
@@ -356,29 +472,32 @@ def place_crypto_order(symbol: str, side: str, dollars: float, live: bool, min_o
 # ---------------------------------
 # Holdings / SELL logic
 # ---------------------------------
-# Holdings / SELL logic
-# ---------------------------------
 
 def get_holdings() -> Dict[str, Dict]:
-    """Return current holdings keyed by ticker, with approx market value in dollars.
+    """Return current holdings keyed by ticker, with approx market value and qty.
        Stocks via account.build_holdings(); Crypto via get_crypto_positions().
        Stock symbols are normalized to Yahoo style (BRK-B) so they compare to picks correctly.
     """
     out: Dict[str, Dict] = {}
     if rh_account is None:
         return out
+
+    # Stocks
     try:
-        # Stocks
         if hasattr(rh_account, "build_holdings"):
             h = rh_account.build_holdings()
             if isinstance(h, dict):
                 for sym, info in h.items():
                     try:
-                        value = float(info.get("equity", 0))
+                        value = float(info.get("equity", 0) or 0)
                     except Exception:
                         value = 0.0
+                    try:
+                        qty = float(info.get("quantity", 0) or 0)
+                    except Exception:
+                        qty = 0.0
                     norm = rh_to_yahoo_stock(str(sym))
-                    out[norm] = {"type": "stock", "value": value}
+                    out[norm] = {"type": "stock", "value": value, "qty": qty}
     except Exception:
         pass
 
@@ -400,46 +519,7 @@ def get_holdings() -> Dict[str, Dict]:
                             except Exception:
                                 price = 0.0
                             value = qty * price
-                            out[f"{sym}-USD".upper()] = {"type": "crypto", "value": float(value)}
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-
-    return out
-    try:
-        # Stocks
-        if hasattr(rh_account, "build_holdings"):
-            h = rh_account.build_holdings()
-            if isinstance(h, dict):
-                for sym, info in h.items():
-                    try:
-                        value = float(info.get("equity", 0))
-                    except Exception:
-                        value = 0.0
-                    out[str(sym).upper()] = {"type": "stock", "value": value}
-    except Exception:
-        pass
-
-    # Crypto
-    try:
-        if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_positions"):
-            pos = rh_crypto.get_crypto_positions()
-            if isinstance(pos, list):
-                for p in pos:
-                    try:
-                        qty = float(p.get("quantity", 0) or 0)
-                        sym = (p.get("currency", {}) or {}).get("code") or ""
-                        if qty > 0 and sym:
-                            price = 0.0
-                            try:
-                                if hasattr(rh_crypto, "get_crypto_quote"):
-                                    q = rh_crypto.get_crypto_quote(sym)
-                                    price = float(q.get("mark_price", 0) or q.get("ask_price", 0) or 0)
-                            except Exception:
-                                price = 0.0
-                            value = qty * price
-                            out[f"{sym}-USD".upper()] = {"type": "crypto", "value": float(value)}
+                            out[f"{sym}-USD".upper()] = {"type": "crypto", "value": float(value), "qty": qty}
                     except Exception:
                         pass
     except Exception:
@@ -511,9 +591,11 @@ if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
             dollars = float(info.get("value", 0.0))
             if dollars >= min_per_order:
                 if info.get("type") == "crypto":
-                    status, executed, oid = place_crypto_order(symbol_to_rh_crypto(t_upper), "SELL", dollars, live_trading and login_ok, UI_MIN_PER_ORDER)
+                    status, executed, oid = place_crypto_order(symbol_to_rh_crypto(t_upper), "SELL", dollars, live_trading and login_ok, UI_MIN_PER_ORDER,
+                                                                use_limit=use_crypto_limits, limit_bps=crypto_limit_bps)
                 else:
-                    status, executed, oid = place_stock_order(t_upper, "SELL", dollars, live_trading and login_ok, UI_MIN_PER_ORDER)
+                    status, executed, oid = place_stock_order(t_upper, "SELL", dollars, live_trading and login_ok, UI_MIN_PER_ORDER,
+                                                               use_limit=use_stock_limits, limit_bps=stock_limit_bps)
                 sell_rows.append({
                     "Ticker": t_upper,
                     "Action": "SELL",
@@ -535,9 +617,11 @@ if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
             continue
         is_crypto = t.endswith("-USD")
         if is_crypto:
-            status, executed, oid = place_crypto_order(symbol_to_rh_crypto(t), "BUY", dollars, live_trading and login_ok, UI_MIN_PER_ORDER)
+            status, executed, oid = place_crypto_order(symbol_to_rh_crypto(t), "BUY", dollars, live_trading and login_ok, UI_MIN_PER_ORDER,
+                                                       use_limit=use_crypto_limits, limit_bps=crypto_limit_bps)
         else:
-            status, executed, oid = place_stock_order(t, "BUY", dollars, live_trading and login_ok, UI_MIN_PER_ORDER)
+            status, executed, oid = place_stock_order(t, "BUY", dollars, live_trading and login_ok, UI_MIN_PER_ORDER,
+                                                      use_limit=use_stock_limits, limit_bps=stock_limit_bps)
         buy_rows.append({
             "Ticker": t,
             "Action": "BUY",
