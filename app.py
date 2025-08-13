@@ -20,7 +20,7 @@
 #     runner script invoking the same functions. We ship the app with clear, pure
 #     functions so this is straightforward when you’re ready.
 
-VERSION = "0.8.2 (2025-08-12)"
+VERSION = "0.8.3 (2025-08-13)"
 
 import inspect
 import json
@@ -435,10 +435,20 @@ if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
                 buy_allocs[str(t).upper()] = float(max(min_per_order, dollars))
 
     # --- SELL first ---
+    # Build a lookup of scores for *all* symbols we scored
+    try:
+        score_map = {str(t).upper(): (float(s) if pd.notna(s) else 0.0)
+                     for t, s in zip(scored["Ticker"].astype(str), scored["Score"])}
+    except Exception:
+        score_map = {}
+
     for sym, info in current.items():
         t_upper = str(sym).upper()
-        if t_upper not in in_top:
-            # Out of top‑N ⇒ full exit
+        sym_score = float(score_map.get(t_upper, 0.0))
+        out_of_top = t_upper not in in_top
+        neg_score  = sym_score < 0
+        if out_of_top or neg_score:
+            # Full exit if (out of top‑N) OR (score < 0)
             dollars = float(info.get("value", 0.0))
             if dollars >= min_per_order:
                 if info.get("type") == "crypto":
@@ -448,7 +458,7 @@ if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
                 sell_rows.append({
                     "Ticker": t_upper,
                     "Action": "SELL",
-                    "Reason": "out_of_topN",
+                    "Reason": "negative_score" if neg_score and not out_of_top else ("out_of_topN" if out_of_top else "negative_score"),
                     "Alloc$": round(dollars, 2),
                     "OrderID": oid,
                     "Status": status,
