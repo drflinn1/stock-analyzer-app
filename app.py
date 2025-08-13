@@ -20,7 +20,7 @@
 #     runner script invoking the same functions. We ship the app with clear, pure
 #     functions so this is straightforward when you’re ready.
 
-VERSION = "0.8.3 (2025-08-13)"
+VERSION = "0.8.4 (2025-08-13)"
 
 import inspect
 import json
@@ -255,6 +255,22 @@ def build_universe(eq_src: str, manual_raw: str, include_c: bool) -> List[str]:
 # Order helpers
 # ---------------------------------
 
+def yahoo_to_rh_stock(sym: str) -> str:
+    """Convert Yahoo-style tickers (e.g., BRK-B) to Robinhood style (BRK.B)."""
+    s = str(sym or "").upper().strip()
+    # Avoid touching crypto pairs like BTC-USD
+    if s.endswith("-USD"):
+        return s
+    return s.replace("-", ".")
+
+
+def rh_to_yahoo_stock(sym: str) -> str:
+    """Convert Robinhood stock symbols (BRK.B) to Yahoo style (BRK-B)."""
+    s = str(sym or "").upper().strip()
+    if "." in s:
+        return s.replace(".", "-")
+    return s
+
 def _call_first_available(objs, names, *args, **kwargs):
     for obj in objs:
         if obj is None: continue
@@ -286,14 +302,16 @@ def place_stock_order(symbol: str, side: str, dollars: float, live: bool, min_or
     if not live:
         return ("simulated", 0.0, "")
 
+    rh_symbol = yahoo_to_rh_stock(symbol)
+
     # try up to 3 times, nudging notional up a bit in case of price moves / ticks
     for attempt in range(3):
         amt = normalize_dollars(base * (1.02 ** attempt), min_order)
         try:
             if side.upper() == "BUY":
-                res = rh_orders.order_buy_fractional_by_price(symbol, amt)
+                res = rh_orders.order_buy_fractional_by_price(rh_symbol, amt)
             else:
-                res = rh_orders.order_sell_fractional_by_price(symbol, amt)
+                res = rh_orders.order_sell_fractional_by_price(rh_symbol, amt)
             oid = ""
             if isinstance(res, dict):
                 oid = res.get("id", "") or res.get("order_id", "")
@@ -344,10 +362,51 @@ def place_crypto_order(symbol: str, side: str, dollars: float, live: bool, min_o
 def get_holdings() -> Dict[str, Dict]:
     """Return current holdings keyed by ticker, with approx market value in dollars.
        Stocks via account.build_holdings(); Crypto via get_crypto_positions().
+       Stock symbols are normalized to Yahoo style (BRK-B) so they compare to picks correctly.
     """
     out: Dict[str, Dict] = {}
     if rh_account is None:
         return out
+    try:
+        # Stocks
+        if hasattr(rh_account, "build_holdings"):
+            h = rh_account.build_holdings()
+            if isinstance(h, dict):
+                for sym, info in h.items():
+                    try:
+                        value = float(info.get("equity", 0))
+                    except Exception:
+                        value = 0.0
+                    norm = rh_to_yahoo_stock(str(sym))
+                    out[norm] = {"type": "stock", "value": value}
+    except Exception:
+        pass
+
+    # Crypto
+    try:
+        if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_positions"):
+            pos = rh_crypto.get_crypto_positions()
+            if isinstance(pos, list):
+                for p in pos:
+                    try:
+                        qty = float(p.get("quantity", 0) or 0)
+                        sym = (p.get("currency", {}) or {}).get("code") or ""
+                        if qty > 0 and sym:
+                            price = 0.0
+                            try:
+                                if hasattr(rh_crypto, "get_crypto_quote"):
+                                    q = rh_crypto.get_crypto_quote(sym)
+                                    price = float(q.get("mark_price", 0) or q.get("ask_price", 0) or 0)
+                            except Exception:
+                                price = 0.0
+                            value = qty * price
+                            out[f"{sym}-USD".upper()] = {"type": "crypto", "value": float(value)}
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return out
     try:
         # Stocks
         if hasattr(rh_account, "build_holdings"):
