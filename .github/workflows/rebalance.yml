@@ -1,4 +1,4 @@
-name: Rebalance
+name: Daily Rebalance (headless)
 
 on:
   workflow_dispatch: {}
