@@ -23,7 +23,7 @@
 #     runner script invoking the same functions. We ship the app with clear, pure
 #     functions so this is straightforward when you’re ready.
 
-VERSION = "0.8.6 (2025-08-13)"
+VERSION = "0.8.6a (2025-08-13)"
 
 import inspect
 import json
@@ -150,19 +150,48 @@ st.caption(f"Version {VERSION}")
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def load_sp500_symbols() -> List[str]:
-    """Fetch S&P 500 tickers from Wikipedia; fallback to a compact baked list if needed."""
+    """Fetch S&P 500 tickers with multiple fallbacks that do **not** require lxml.
+    1) Try Wikipedia via read_html (if lxml/html5lib available).
+    2) Try a known CSV mirror on GitHub (raw CSV works without lxml).
+    3) Fallback to a compact baked list so the app remains usable offline.
+    """
+    # 1) Wikipedia (best effort)
     try:
         tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        df = tables[0]
-        syms = (
-            df["Symbol"].astype(str).str.upper().str.replace(".", "-", regex=False).tolist()
-        )
-        # Deduplicate and sanity‑filter
-        syms = [s for s in dict.fromkeys(syms) if s.isascii() and 1 <= len(s) <= 6]
-        return syms
+        if isinstance(tables, list) and len(tables):
+            df = tables[0]
+            syms = (
+                df["Symbol"].astype(str).str.upper().str.replace(".", "-", regex=False).tolist()
+            )
+            syms = [s for s in dict.fromkeys(syms) if s.isascii() and 1 <= len(s) <= 6]
+            if syms:
+                return syms
     except Exception:
-        # Small fallback set — the app still works while offline
-        return ["AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "BRK-B", "TSLA", "JPM"]
+        pass
+
+    # 2) GitHub raw CSV mirrors (no lxml dependency). Try a couple of well-known mirrors.
+    csv_urls = [
+        "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv",
+        "https://raw.githubusercontent.com/datasets/s-and-p-500/main/data/constituents.csv",
+    ]
+    for url in csv_urls:
+        try:
+            df = pd.read_csv(url)
+            col = None
+            for c in ["Symbol", "Ticker", "symbol", "ticker"]:
+                if c in df.columns:
+                    col = c
+                    break
+            if col is not None:
+                syms = df[col].astype(str).str.upper().str.replace(".", "-", regex=False).tolist()
+                syms = [s for s in dict.fromkeys(syms) if s.isascii() and 1 <= len(s) <= 6]
+                if syms:
+                    return syms
+        except Exception:
+            continue
+
+    # 3) Small baked fallback set — the app still works while offline
+    return ["AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "BRK-B", "TSLA", "JPM"]
 
 
 def clean_manual_list(raw: str) -> List[str]:
@@ -746,47 +775,106 @@ def run_once(*,
     st.download_button("Download Activity CSV", csv, file_name="rebalance_activity.csv", mime="text/csv")
 
     # Open orders snapshot (best‑effort)
-    st.subheader("Open Orders")
-    open_list = []
-    if live_trading and login_ok and rh is not None:
+st.subheader("Open Orders")
+open_list = []
+if live_trading and login_ok and rh is not None:
+    # --- helpers to recover missing symbols from RH payloads ---
+    @st.cache_data(ttl=300, show_spinner=False)
+    def _crypto_pair_maps():
+        id2sym, sym2id = {}, {}
         try:
-            if rh_orders is not None and hasattr(rh_orders, "get_all_open_stock_orders"):
-                s_open = rh_orders.get_all_open_stock_orders()
-                if isinstance(s_open, list):
-                    open_list.extend([{"type": "stock", **(o if isinstance(o, dict) else {"raw": str(o)})} for o in s_open])
-        except Exception as e:
-            st.info(f"Failed to fetch open stock orders: {e}")
-        try:
-            if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_open_orders"):
-                c_open = rh_crypto.get_crypto_open_orders()
-                if isinstance(c_open, list):
-                    open_list.extend([{"type": "crypto", **(o if isinstance(o, dict) else {"raw": str(o)})} for o in c_open])
-        except Exception as e:
-            st.info(f"Failed to fetch open crypto orders: {e}")
+            if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_currency_pairs"):
+                pairs = rh_crypto.get_crypto_currency_pairs()
+                if isinstance(pairs, list):
+                    for p in pairs:
+                        pid = p.get("id") or p.get("uuid") or p.get("currency_pair_id")
+                        base = (p.get("asset_currency") or {}).get("code") or p.get("symbol") or ""
+                        quote = (p.get("quote_currency") or {}).get("code") or "USD"
+                        if base:
+                            sym = f"{base}-{quote}"
+                            if pid:
+                                id2sym[pid] = sym
+                            sym2id[sym] = pid or ""
+        except Exception:
+            pass
+        return id2sym, sym2id
 
-    # Compact table (hide raw JSON by default)
-    if open_list:
-        rows = []
-        for o in open_list:
-            if not isinstance(o, dict):
-                continue
-            typ = o.get("type", "")
-            side = o.get("side") or o.get("direction") or ""
-            sym = o.get("symbol") or o.get("chain_symbol") or o.get("currency_pair_id") or o.get("currency_pair") or o.get("pair") or ""
-            state = o.get("state") or o.get("status") or ""
-            created = o.get("created_at") or o.get("last_transaction_at") or o.get("submitted_at") or ""
-            oid = o.get("id") or o.get("order_id") or ""
-            notional = o.get("notional") or o.get("average_price") or o.get("price") or o.get("quantity") or ""
-            rows.append({"Type": typ, "Side": side, "Symbol": sym, "Notional/Qty": notional, "State": state, "Created": created, "OrderID": oid})
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
-        else:
-            st.write("[]")
-        with st.expander("Show raw API response"):
-            st.json(open_list)
+    def _stock_symbol_from_instrument(url: str) -> str:
+        """Try several robin_stocks helpers to turn an instrument URL into a Yahoo-style symbol."""
+        try:
+            if rh_stocks is not None:
+                for nm in ["get_instrument_by_url", "get_instruments_by_url"]:
+                    fn = getattr(rh_stocks, nm, None)
+                    if callable(fn):
+                        inst = fn(url)
+                        if isinstance(inst, dict):
+                            sym = inst.get("symbol") or ""
+                            if sym:
+                                return rh_to_yahoo_stock(sym)
+        except Exception:
+            pass
+        try:
+            # Some library versions expose a convenience on the package root
+            fn = getattr(rh, "get_symbol_by_url", None)
+            if callable(fn):
+                sym = fn(url)
+                if sym:
+                    return rh_to_yahoo_stock(sym)
+        except Exception:
+            pass
+        return ""
+
+    id2sym, _ = _crypto_pair_maps()
+
+    try:
+        if rh_orders is not None and hasattr(rh_orders, "get_all_open_stock_orders"):
+            s_open = rh_orders.get_all_open_stock_orders()
+            if isinstance(s_open, list):
+                open_list.extend([{"type": "stock", **(o if isinstance(o, dict) else {"raw": str(o)})} for o in s_open])
+    except Exception as e:
+        st.info(f"Failed to fetch open stock orders: {e}")
+    try:
+        if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_open_orders"):
+            c_open = rh_crypto.get_crypto_open_orders()
+            if isinstance(c_open, list):
+                open_list.extend([{"type": "crypto", **(o if isinstance(o, dict) else {"raw": str(o)})} for o in c_open])
+    except Exception as e:
+        st.info(f"Failed to fetch open crypto orders: {e}")
+
+# Compact table (hide raw JSON by default)
+if open_list:
+    rows = []
+    for o in open_list:
+        if not isinstance(o, dict):
+            continue
+        typ = o.get("type", "")
+        side = o.get("side") or o.get("direction") or ""
+        # symbol recovery logic
+        sym = o.get("symbol") or o.get("chain_symbol") or ""
+        if not sym:
+            inst = o.get("instrument")
+            if inst:
+                sym = _stock_symbol_from_instrument(inst)
+        if not sym:
+            cp = o.get("currency_pair_id") or o.get("currency_pair") or o.get("pair")
+            if cp:
+                sym = id2sym.get(cp, str(cp))
+        # normalize crypto like ETHUSD -> ETH-USD
+        if isinstance(sym, str) and sym.endswith("USD") and "-" not in sym:
+            sym = sym.replace("USD", "-USD")
+        state = o.get("state") or o.get("status") or ""
+        created = o.get("created_at") or o.get("last_transaction_at") or o.get("submitted_at") or ""
+        oid = o.get("id") or o.get("order_id") or ""
+        notional = o.get("notional") or o.get("price") or o.get("average_price") or o.get("quantity") or ""
+        rows.append({"Type": typ, "Side": side, "Symbol": sym, "Notional/Qty": notional, "State": state, "Created": created, "OrderID": oid})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
     else:
         st.write("[]")
-
+    with st.expander("Show raw API response"):
+        st.json(open_list)
+else:
+    st.write("[]")
 
 # ---------------------------------
 # Button / Auto‑run wiring
