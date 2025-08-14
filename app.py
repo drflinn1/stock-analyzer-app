@@ -23,7 +23,7 @@
 #     runner script invoking the same functions. We ship the app with clear, pure
 #     functions so this is straightforward when you’re ready.
 
-VERSION = "0.8.6b (2025-08-13)"
+VERSION = "0.8.6c (2025-08-13)"
 
 import inspect
 import json
@@ -844,8 +844,8 @@ def render_open_orders(live_trading: bool, login_ok: bool) -> None:
             st.info(f"Failed to fetch open crypto orders: {e}")
 
     # Compact table (hide raw JSON by default)
+    rows = []
     if open_list:
-        rows = []
         for o in open_list:
             if not isinstance(o, dict):
                 continue
@@ -878,14 +878,10 @@ def render_open_orders(live_trading: bool, login_ok: bool) -> None:
             st.dataframe(pd.DataFrame(rows), use_container_width=True)
         else:
             st.write("[]")
-        with st.expander("Show raw API response"):
-            st.json(open_list)
     else:
         st.write("[]")
     with st.expander("Show raw API response"):
         st.json(open_list)
-else:
-    st.write("[]")
 
 # ---------------------------------
 # Button / Auto‑run wiring
