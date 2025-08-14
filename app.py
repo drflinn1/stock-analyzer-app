@@ -23,7 +23,7 @@
 #     runner script invoking the same functions. We ship the app with clear, pure
 #     functions so this is straightforward when you’re ready.
 
-VERSION = "0.8.6a (2025-08-13)"
+VERSION = "0.8.6b (2025-08-13)"
 
 import inspect
 import json
@@ -775,100 +775,111 @@ def run_once(*,
     st.download_button("Download Activity CSV", csv, file_name="rebalance_activity.csv", mime="text/csv")
 
     # Open orders snapshot (best‑effort)
-st.subheader("Open Orders")
-open_list = []
-if live_trading and login_ok and rh is not None:
-    # --- helpers to recover missing symbols from RH payloads ---
-    @st.cache_data(ttl=300, show_spinner=False)
-    def _crypto_pair_maps():
-        id2sym, sym2id = {}, {}
+# Moved into a function so it renders **after** the main run logic.
+def render_open_orders(live_trading: bool, login_ok: bool) -> None:
+    st.subheader("Open Orders")
+    open_list = []
+    if live_trading and login_ok and rh is not None:
+        # --- helpers to recover missing symbols from RH payloads ---
+        @st.cache_data(ttl=300, show_spinner=False)
+        def _crypto_pair_maps():
+            id2sym, sym2id = {}, {}
+            try:
+                if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_currency_pairs"):
+                    pairs = rh_crypto.get_crypto_currency_pairs()
+                    if isinstance(pairs, list):
+                        for p in pairs:
+                            pid = p.get("id") or p.get("uuid") or p.get("currency_pair_id")
+                            base = (p.get("asset_currency") or {}).get("code") or p.get("symbol") or ""
+                            quote = (p.get("quote_currency") or {}).get("code") or "USD"
+                            if base:
+                                sym = f"{base}-{quote}"
+                                if pid:
+                                    id2sym[pid] = sym
+                                sym2id[sym] = pid or ""
+            except Exception:
+                pass
+            return id2sym, sym2id
+
+        def _stock_symbol_from_instrument(url: str) -> str:
+            """Try several robin_stocks helpers to turn an instrument URL into a Yahoo-style symbol."""
+            try:
+                if rh_stocks is not None:
+                    for nm in ["get_instrument_by_url", "get_instruments_by_url"]:
+                        fn = getattr(rh_stocks, nm, None)
+                        if callable(fn):
+                            inst = fn(url)
+                            if isinstance(inst, dict):
+                                sym = inst.get("symbol") or ""
+                                if sym:
+                                    return rh_to_yahoo_stock(sym)
+            except Exception:
+                pass
+            try:
+                # Some library versions expose a convenience on the package root
+                fn = getattr(rh, "get_symbol_by_url", None)
+                if callable(fn):
+                    sym = fn(url)
+                    if sym:
+                        return rh_to_yahoo_stock(sym)
+            except Exception:
+                pass
+            return ""
+
+        id2sym, _ = _crypto_pair_maps()
+
         try:
-            if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_currency_pairs"):
-                pairs = rh_crypto.get_crypto_currency_pairs()
-                if isinstance(pairs, list):
-                    for p in pairs:
-                        pid = p.get("id") or p.get("uuid") or p.get("currency_pair_id")
-                        base = (p.get("asset_currency") or {}).get("code") or p.get("symbol") or ""
-                        quote = (p.get("quote_currency") or {}).get("code") or "USD"
-                        if base:
-                            sym = f"{base}-{quote}"
-                            if pid:
-                                id2sym[pid] = sym
-                            sym2id[sym] = pid or ""
-        except Exception:
-            pass
-        return id2sym, sym2id
-
-    def _stock_symbol_from_instrument(url: str) -> str:
-        """Try several robin_stocks helpers to turn an instrument URL into a Yahoo-style symbol."""
+            if rh_orders is not None and hasattr(rh_orders, "get_all_open_stock_orders"):
+                s_open = rh_orders.get_all_open_stock_orders()
+                if isinstance(s_open, list):
+                    open_list.extend([{"type": "stock", **(o if isinstance(o, dict) else {"raw": str(o)})} for o in s_open])
+        except Exception as e:
+            st.info(f"Failed to fetch open stock orders: {e}")
         try:
-            if rh_stocks is not None:
-                for nm in ["get_instrument_by_url", "get_instruments_by_url"]:
-                    fn = getattr(rh_stocks, nm, None)
-                    if callable(fn):
-                        inst = fn(url)
-                        if isinstance(inst, dict):
-                            sym = inst.get("symbol") or ""
-                            if sym:
-                                return rh_to_yahoo_stock(sym)
-        except Exception:
-            pass
-        try:
-            # Some library versions expose a convenience on the package root
-            fn = getattr(rh, "get_symbol_by_url", None)
-            if callable(fn):
-                sym = fn(url)
-                if sym:
-                    return rh_to_yahoo_stock(sym)
-        except Exception:
-            pass
-        return ""
+            if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_open_orders"):
+                c_open = rh_crypto.get_crypto_open_orders()
+                if isinstance(c_open, list):
+                    open_list.extend([{"type": "crypto", **(o if isinstance(o, dict) else {"raw": str(o)})} for o in c_open])
+        except Exception as e:
+            st.info(f"Failed to fetch open crypto orders: {e}")
 
-    id2sym, _ = _crypto_pair_maps()
-
-    try:
-        if rh_orders is not None and hasattr(rh_orders, "get_all_open_stock_orders"):
-            s_open = rh_orders.get_all_open_stock_orders()
-            if isinstance(s_open, list):
-                open_list.extend([{"type": "stock", **(o if isinstance(o, dict) else {"raw": str(o)})} for o in s_open])
-    except Exception as e:
-        st.info(f"Failed to fetch open stock orders: {e}")
-    try:
-        if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_open_orders"):
-            c_open = rh_crypto.get_crypto_open_orders()
-            if isinstance(c_open, list):
-                open_list.extend([{"type": "crypto", **(o if isinstance(o, dict) else {"raw": str(o)})} for o in c_open])
-    except Exception as e:
-        st.info(f"Failed to fetch open crypto orders: {e}")
-
-# Compact table (hide raw JSON by default)
-if open_list:
-    rows = []
-    for o in open_list:
-        if not isinstance(o, dict):
-            continue
-        typ = o.get("type", "")
-        side = o.get("side") or o.get("direction") or ""
-        # symbol recovery logic
-        sym = o.get("symbol") or o.get("chain_symbol") or ""
-        if not sym:
-            inst = o.get("instrument")
-            if inst:
-                sym = _stock_symbol_from_instrument(inst)
-        if not sym:
-            cp = o.get("currency_pair_id") or o.get("currency_pair") or o.get("pair")
-            if cp:
-                sym = id2sym.get(cp, str(cp))
-        # normalize crypto like ETHUSD -> ETH-USD
-        if isinstance(sym, str) and sym.endswith("USD") and "-" not in sym:
-            sym = sym.replace("USD", "-USD")
-        state = o.get("state") or o.get("status") or ""
-        created = o.get("created_at") or o.get("last_transaction_at") or o.get("submitted_at") or ""
-        oid = o.get("id") or o.get("order_id") or ""
-        notional = o.get("notional") or o.get("price") or o.get("average_price") or o.get("quantity") or ""
-        rows.append({"Type": typ, "Side": side, "Symbol": sym, "Notional/Qty": notional, "State": state, "Created": created, "OrderID": oid})
-    if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    # Compact table (hide raw JSON by default)
+    if open_list:
+        rows = []
+        for o in open_list:
+            if not isinstance(o, dict):
+                continue
+            typ = o.get("type", "")
+            side = o.get("side") or o.get("direction") or ""
+            # symbol recovery logic
+            sym = o.get("symbol") or o.get("chain_symbol") or ""
+            if not sym:
+                inst = o.get("instrument")
+                if inst:
+                    sym = _stock_symbol_from_instrument(inst)
+            if not sym:
+                cp = o.get("currency_pair_id") or o.get("currency_pair") or o.get("pair")
+                if cp:
+                    # need id2sym from above scope if available; recompute if missing
+                    try:
+                        id2sym, _ = _crypto_pair_maps()
+                    except Exception:
+                        id2sym = {}
+                    sym = id2sym.get(cp, str(cp))
+            # normalize crypto like ETHUSD -> ETH-USD
+            if isinstance(sym, str) and sym.endswith("USD") and "-" not in sym:
+                sym = sym.replace("USD", "-USD")
+            state = o.get("state") or o.get("status") or ""
+            created = o.get("created_at") or o.get("last_transaction_at") or o.get("submitted_at") or ""
+            oid = o.get("id") or o.get("order_id") or ""
+            notional = o.get("notional") or o.get("price") or o.get("average_price") or o.get("quantity") or ""
+            rows.append({"Type": typ, "Side": side, "Symbol": sym, "Notional/Qty": notional, "State": state, "Created": created, "OrderID": oid})
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        else:
+            st.write("[]")
+        with st.expander("Show raw API response"):
+            st.json(open_list)
     else:
         st.write("[]")
     with st.expander("Show raw API response"):
@@ -925,6 +936,9 @@ if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
         bp_pct=int(bp_pct),
     )
     ran = True
+
+# Always render Open Orders at the bottom (after any run_once)
+render_open_orders(live_trading, login_ok)
 
 # ---------------------------------
 # Footer / Hints
