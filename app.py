@@ -9,8 +9,9 @@
 #   • Pooled budget across stocks + crypto; two allocation modes (fixed / proportional)
 #   • Clean simulation vs live order placement for both stocks & crypto
 #   • Logs show both SELLs and BUYs in execution order
-#   • v0.8.5: fix duplicate holdings bug; optional LIMIT orders for crypto (and experimental for stocks);
-#            hide raw open‑orders JSON behind expander; minor robustness around minimum notionals.
+#   • v0.8.6: "Full‑Auto (run on load)" option; optional proportional budget sourced from
+#            available Robinhood buying power; factored run_once() so the same logic can be
+#            called from button, auto‑run, or a future headless scheduler; minor robustness.
 #
 # Notes
 #   • Live trading only if sidebar toggle is ON *and* Robinhood login succeeds.
@@ -22,7 +23,7 @@
 #     runner script invoking the same functions. We ship the app with clear, pure
 #     functions so this is straightforward when you’re ready.
 
-VERSION = "0.8.5 (2025-08-13)"
+VERSION = "0.8.6 (2025-08-13)"
 
 import inspect
 import json
@@ -132,6 +133,13 @@ crypto_limit_bps = st.sidebar.slider("Crypto limit price buffer (bps)", min_valu
 use_stock_limits = st.sidebar.checkbox("Use LIMIT orders for stocks (experimental)", value=False,
                                        help="Best‑effort: computes qty from $ and quotes; falls back to fractional market if unsupported.")
 stock_limit_bps = st.sidebar.slider("Stock limit price buffer (bps)", min_value=5, max_value=150, value=25, step=5)
+
+st.sidebar.divider()
+full_auto = st.sidebar.checkbox("Full‑Auto (run on load)", value=False,
+                               help="If ON and logged in, the scan+rebalance runs immediately when the page loads.")
+auto_bp = st.sidebar.checkbox("Auto budget from buying power (for proportional mode)", value=False,
+                             help="If ON, the proportional BUY budget is set to a % of available BP.")
+bp_pct = st.sidebar.slider("Budget % of Buying Power", min_value=5, max_value=100, value=30, step=5)
 
 st.title("Stock & Crypto Momentum Rebalancer")
 st.caption(f"Version {VERSION}")
@@ -470,7 +478,7 @@ def place_crypto_order(symbol: str, side: str, dollars: float, live: bool, min_o
 
 
 # ---------------------------------
-# Holdings / SELL logic
+# Holdings / BUYING POWER / SELL logic
 # ---------------------------------
 
 def get_holdings() -> Dict[str, Dict]:
@@ -528,11 +536,83 @@ def get_holdings() -> Dict[str, Dict]:
     return out
 
 
+def get_buying_power() -> float:
+    """Best‑effort pull of available buying power (stocks and/or crypto)."""
+    bp = 0.0
+    # Equity account
+    try:
+        if rh_account is not None:
+            prof = None
+            for nm in ["load_account_profile", "build_user_profile", "load_phoenix_account"]:
+                fn = getattr(rh_account, nm, None)
+                if callable(fn):
+                    try:
+                        prof = fn()
+                        if prof:
+                            break
+                    except Exception:
+                        continue
+            if isinstance(prof, dict):
+                for key in ["buying_power", "cash", "portfolio_cash", "cash_available_for_withdrawal"]:
+                    try:
+                        val = prof.get(key)
+                        if val is not None and float(val) > 0:
+                            bp = max(bp, float(val))
+                    except Exception:
+                        pass
+                # nested dicts
+                for v in prof.values():
+                    if isinstance(v, dict):
+                        for key in ["buying_power", "cash", "portfolio_cash", "cash_available_for_withdrawal"]:
+                            try:
+                                if key in v and float(v[key]) > 0:
+                                    bp = max(bp, float(v[key]))
+                            except Exception:
+                                pass
+    except Exception:
+        pass
+
+    # Crypto account
+    try:
+        if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_account_info"):
+            cp = rh_crypto.get_crypto_account_info()
+            if isinstance(cp, dict):
+                for key in ["cash", "buying_power", "available_cash"]:
+                    try:
+                        val = cp.get(key)
+                        if val is not None and float(val) > 0:
+                            bp = max(bp, float(val))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return float(max(bp, 0.0))
+
+
 # ---------------------------------
-# Main run button
+# Core run logic (callable from button or auto)
 # ---------------------------------
 
-if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
+def run_once(*,
+             live_trading: bool,
+             login_ok: bool,
+             universe_src: str,
+             raw_tickers: str,
+             include_crypto: bool,
+             alloc_mode: str,
+             fixed_per_trade: float,
+             prop_total_budget: float,
+             min_per_order: float,
+             n_picks: int,
+             use_crypto_limits: bool,
+             crypto_limit_bps: int,
+             use_stock_limits: bool,
+             stock_limit_bps: int,
+             auto_bp: bool,
+             bp_pct: int,
+             ) -> None:
+
     # Build universes
     universe = build_universe(universe_src, raw_tickers, include_crypto)
 
@@ -548,7 +628,7 @@ if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
 
     if picks.empty:
         st.warning("No momentum data available (universe may be empty or network hiccup). Try again.")
-        st.stop()
+        return
 
     # SELL rule (Option A): full exit if out of top‑N OR score < 0
     sell_rows: List[Dict] = []
@@ -562,15 +642,22 @@ if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
         per_trade = float(max(min_per_order, fixed_per_trade))
         buy_allocs = {t: per_trade for t in in_top}
     else:
+        # Optional: scale budget to a % of available Buying Power
+        budget = float(prop_total_budget)
+        if auto_bp and live_trading and login_ok:
+            bp = get_buying_power()
+            if bp and bp > 0:
+                budget = max(min_per_order, round((bp * float(bp_pct) / 100.0), 2))
+                st.sidebar.caption(f"Auto budget: ${budget:,.2f} from BP ≈ ${bp:,.2f}")
         w = np.clip(picks["R1"].fillna(0).astype(float), 0, None)
         wsum = float(w.sum())
         if wsum <= 0:
-            each = max(min_per_order, prop_total_budget / max(1, len(picks)))
+            each = max(min_per_order, budget / max(1, len(picks)))
             buy_allocs = {t: each for t in in_top}
         else:
             buy_allocs = {}
             for t, wi in zip(picks["Ticker"].tolist(), w.tolist()):
-                dollars = (wi / wsum) * float(prop_total_budget)
+                dollars = (wi / wsum) * float(budget)
                 buy_allocs[str(t).upper()] = float(max(min_per_order, dollars))
 
     # --- SELL first ---
@@ -591,10 +678,10 @@ if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
             dollars = float(info.get("value", 0.0))
             if dollars >= min_per_order:
                 if info.get("type") == "crypto":
-                    status, executed, oid = place_crypto_order(symbol_to_rh_crypto(t_upper), "SELL", dollars, live_trading and login_ok, UI_MIN_PER_ORDER,
+                    status, executed, oid = place_crypto_order(symbol_to_rh_crypto(t_upper), "SELL", dollars, live_trading and login_ok, min_per_order,
                                                                 use_limit=use_crypto_limits, limit_bps=crypto_limit_bps)
                 else:
-                    status, executed, oid = place_stock_order(t_upper, "SELL", dollars, live_trading and login_ok, UI_MIN_PER_ORDER,
+                    status, executed, oid = place_stock_order(t_upper, "SELL", dollars, live_trading and login_ok, min_per_order,
                                                                use_limit=use_stock_limits, limit_bps=stock_limit_bps)
                 sell_rows.append({
                     "Ticker": t_upper,
@@ -617,10 +704,10 @@ if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
             continue
         is_crypto = t.endswith("-USD")
         if is_crypto:
-            status, executed, oid = place_crypto_order(symbol_to_rh_crypto(t), "BUY", dollars, live_trading and login_ok, UI_MIN_PER_ORDER,
+            status, executed, oid = place_crypto_order(symbol_to_rh_crypto(t), "BUY", dollars, live_trading and login_ok, min_per_order,
                                                        use_limit=use_crypto_limits, limit_bps=crypto_limit_bps)
         else:
-            status, executed, oid = place_stock_order(t, "BUY", dollars, live_trading and login_ok, UI_MIN_PER_ORDER,
+            status, executed, oid = place_stock_order(t, "BUY", dollars, live_trading and login_ok, min_per_order,
                                                       use_limit=use_stock_limits, limit_bps=stock_limit_bps)
         buy_rows.append({
             "Ticker": t,
@@ -660,48 +747,101 @@ if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
 
     # Open orders snapshot (best‑effort)
     st.subheader("Open Orders")
-open_list = []
-if live_trading and login_ok and rh is not None:
-    try:
-        if rh_orders is not None and hasattr(rh_orders, "get_all_open_stock_orders"):
-            s_open = rh_orders.get_all_open_stock_orders()
-            if isinstance(s_open, list):
-                open_list.extend([{"type": "stock", **(o if isinstance(o, dict) else {"raw": str(o)})} for o in s_open])
-    except Exception as e:
-        st.info(f"Failed to fetch open stock orders: {e}")
-    try:
-        if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_open_orders"):
-            c_open = rh_crypto.get_crypto_open_orders()
-            if isinstance(c_open, list):
-                open_list.extend([{"type": "crypto", **(o if isinstance(o, dict) else {"raw": str(o)})} for o in c_open])
-    except Exception as e:
-        st.info(f"Failed to fetch open crypto orders: {e}")
+    open_list = []
+    if live_trading and login_ok and rh is not None:
+        try:
+            if rh_orders is not None and hasattr(rh_orders, "get_all_open_stock_orders"):
+                s_open = rh_orders.get_all_open_stock_orders()
+                if isinstance(s_open, list):
+                    open_list.extend([{"type": "stock", **(o if isinstance(o, dict) else {"raw": str(o)})} for o in s_open])
+        except Exception as e:
+            st.info(f"Failed to fetch open stock orders: {e}")
+        try:
+            if rh_crypto is not None and hasattr(rh_crypto, "get_crypto_open_orders"):
+                c_open = rh_crypto.get_crypto_open_orders()
+                if isinstance(c_open, list):
+                    open_list.extend([{"type": "crypto", **(o if isinstance(o, dict) else {"raw": str(o)})} for o in c_open])
+        except Exception as e:
+            st.info(f"Failed to fetch open crypto orders: {e}")
 
-# Compact table (hide raw JSON by default)
-if open_list:
-    rows = []
-    for o in open_list:
-        if not isinstance(o, dict):
-            continue
-        typ = o.get("type", "")
-        side = o.get("side") or o.get("direction") or ""
-        sym = o.get("symbol") or o.get("chain_symbol") or o.get("currency_pair_id") or o.get("currency_pair") or o.get("pair") or ""
-        state = o.get("state") or o.get("status") or ""
-        created = o.get("created_at") or o.get("last_transaction_at") or o.get("submitted_at") or ""
-        oid = o.get("id") or o.get("order_id") or ""
-        notional = o.get("notional") or o.get("average_price") or o.get("price") or o.get("quantity") or ""
-        rows.append({"Type": typ, "Side": side, "Symbol": sym, "Notional/Qty": notional, "State": state, "Created": created, "OrderID": oid})
-    if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    # Compact table (hide raw JSON by default)
+    if open_list:
+        rows = []
+        for o in open_list:
+            if not isinstance(o, dict):
+                continue
+            typ = o.get("type", "")
+            side = o.get("side") or o.get("direction") or ""
+            sym = o.get("symbol") or o.get("chain_symbol") or o.get("currency_pair_id") or o.get("currency_pair") or o.get("pair") or ""
+            state = o.get("state") or o.get("status") or ""
+            created = o.get("created_at") or o.get("last_transaction_at") or o.get("submitted_at") or ""
+            oid = o.get("id") or o.get("order_id") or ""
+            notional = o.get("notional") or o.get("average_price") or o.get("price") or o.get("quantity") or ""
+            rows.append({"Type": typ, "Side": side, "Symbol": sym, "Notional/Qty": notional, "State": state, "Created": created, "OrderID": oid})
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        else:
+            st.write("[]")
+        with st.expander("Show raw API response"):
+            st.json(open_list)
     else:
         st.write("[]")
-    with st.expander("Show raw API response"):
-        st.json(open_list)
-else:
-    st.write("[]")
+
+
+# ---------------------------------
+# Button / Auto‑run wiring
+# ---------------------------------
+
+ran = False
+if full_auto:
+    if not st.session_state.get("__full_auto_ran__"):
+        st.session_state["__full_auto_ran__"] = True
+        st.info("Full‑Auto is ON — running now.")
+        run_once(
+            live_trading=live_trading,
+            login_ok=login_ok,
+            universe_src=universe_src,
+            raw_tickers=raw_tickers,
+            include_crypto=include_crypto,
+            alloc_mode=alloc_mode,
+            fixed_per_trade=float(fixed_per_trade),
+            prop_total_budget=float(prop_total_budget),
+            min_per_order=float(min_per_order),
+            n_picks=int(n_picks),
+            use_crypto_limits=bool(use_crypto_limits),
+            crypto_limit_bps=int(crypto_limit_bps),
+            use_stock_limits=bool(use_stock_limits),
+            stock_limit_bps=int(stock_limit_bps),
+            auto_bp=bool(auto_bp),
+            bp_pct=int(bp_pct),
+        )
+        ran = True
+
+if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
+    run_once(
+        live_trading=live_trading,
+        login_ok=login_ok,
+        universe_src=universe_src,
+        raw_tickers=raw_tickers,
+        include_crypto=include_crypto,
+        alloc_mode=alloc_mode,
+        fixed_per_trade=float(fixed_per_trade),
+        prop_total_budget=float(prop_total_budget),
+        min_per_order=float(min_per_order),
+        n_picks=int(n_picks),
+        use_crypto_limits=bool(use_crypto_limits),
+        crypto_limit_bps=int(crypto_limit_bps),
+        use_stock_limits=bool(use_stock_limits),
+        stock_limit_bps=int(stock_limit_bps),
+        auto_bp=bool(auto_bp),
+        bp_pct=int(bp_pct),
+    )
+    ran = True
+
 # ---------------------------------
 # Footer / Hints
 # ---------------------------------
-st.caption(
-    "Tip: keep Live Trading OFF until you like the plan. When you turn it on, make sure secrets are set and the sidebar shows ‘Live orders ENABLED’."
-)
+if not ran:
+    st.caption(
+        "Tip: keep Live Trading OFF until you like the plan. When you turn it on, make sure secrets are set and the sidebar shows ‘Live orders ENABLED’."
+    )
