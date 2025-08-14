@@ -1,0 +1,56 @@
+name: Rebalance (scheduled)
+
+on:
+  workflow_dispatch: {}        # manual trigger for testing
+  schedule:
+    # 13:35 UTC ≈ 9:35am US/Eastern (weekdays). Adjust to taste.
+    - cron: '35 13 * * 1-5'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run headless rebalance
+        env:
+          # --- Robinhood creds (set in Settings → Secrets and variables → Actions) ---
+          ROBINHOOD_USERNAME: ${{ secrets.ROBINHOOD_USERNAME }}
+          ROBINHOOD_PASSWORD: ${{ secrets.ROBINHOOD_PASSWORD }}
+
+          # --- Strategy knobs (override via repo Variables or edit here) ---
+          LIVE_TRADING: ${{ vars.LIVE_TRADING || 'false' }}   # keep 'false' while testing
+          UNIVERSE_SRC: "S&P 500 (auto)"
+          RAW_TICKERS: "AAPL,MSFT,GOOG"
+          INCLUDE_CRYPTO: "true"
+
+          ALLOC_MODE: "Fixed $ per trade"     # or "Proportional across winners"
+          FIXED_PER_TRADE: "5"
+          PROP_TOTAL_BUDGET: "15"
+          MIN_PER_ORDER: "2"
+          N_PICKS: "3"
+
+          USE_CRYPTO_LIMITS: "true"
+          CRYPTO_LIMIT_BPS: "20"
+          USE_STOCK_LIMITS: "false"
+          STOCK_LIMIT_BPS: "25"
+
+          AUTO_BP: "false"
+          BP_PCT: "30"
+
+          MAX_BUY_ORDERS: "12"
+          MAX_BUY_NOTIONAL: "50"
+        run: |
+          python runner.py
