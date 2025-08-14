@@ -1,0 +1,67 @@
+name: Daily Rebalance (headless)
+
+on:
+  workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: "Run without placing orders"
+        type: boolean
+        default: true
+      USE_TOTP:
+        description: "Generate TOTP from RH_TOTP_SECRET"
+        type: boolean
+        default: false
+  schedule:
+    # UTC time; adjust as you like (Mon-Fri at 14:30 UTC here)
+    - cron: "30 14 * * 1-5"
+
+jobs:
+  rebalance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run headless rebalance
+        env:
+          # Credentials (either pair works; both are fine)
+          RH_USERNAME:        ${{ secrets.RH_USERNAME || secrets.ROBINHOOD_USERNAME }}
+          RH_PASSWORD:        ${{ secrets.RH_PASSWORD || secrets.ROBINHOOD_PASSWORD }}
+          RH_TOTP_SECRET:     ${{ secrets.RH_TOTP_SECRET }}
+
+          # Controls
+          DRY_RUN:            ${{ github.event.inputs.DRY_RUN || 'true' }}
+          USE_TOTP:           ${{ github.event.inputs.USE_TOTP || 'false' }}
+          LIVE_TRADING:       "false"   # leave false; DRY_RUN controls behavior
+
+          # Optional knobs (same defaults as the UI)
+          UNIVERSE_SRC:       "S&P 500 (auto)"
+          RAW_TICKERS:        "AAPL,MSFT,GOOG"
+          INCLUDE_CRYPTO:     "true"
+
+          ALLOC_MODE:         "Fixed $ per trade"
+          FIXED_PER_TRADE:    "5"
+          PROP_TOTAL_BUDGET:  "15"
+          MIN_PER_ORDER:      "2"
+          N_PICKS:            "3"
+
+          USE_CRYPTO_LIMITS:  "true"
+          CRYPTO_LIMIT_BPS:   "20"
+          USE_STOCK_LIMITS:   "false"
+          STOCK_LIMIT_BPS:    "25"
+
+          AUTO_BP:            "false"
+          BP_PCT:             "30"
+
+          MAX_BUY_ORDERS:     "12"
+          MAX_BUY_NOTIONAL:   "50"
+        run: python runner.py
