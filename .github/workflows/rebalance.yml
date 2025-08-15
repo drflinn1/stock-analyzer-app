@@ -2,7 +2,7 @@ name: Daily Rebalance (headless)
 
 on:
   schedule:
-    # 17:25 UTC Mon–Fri (≈1:25pm New York during EDT)
+    # 17:25 UTC Mon–Fri (≈ 10:25 AM Pacific during DST)
     - cron: '25 17 * * 1-5'
   workflow_dispatch:
     inputs:
@@ -27,7 +27,6 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 🧠 Step 4: Cache pip downloads to speed up installs
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -47,3 +46,12 @@ jobs:
         run: |
           echo "DRY_RUN=${DRY_RUN:-true}"
           python runner.py --dry-run "${DRY_RUN:-true}"
+
+      - name: Upload signals artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rebalance-signals-${{ github.run_id }}
+          path: artifacts/*
+          if-no-files-found: warn
+          retention-days: 10
