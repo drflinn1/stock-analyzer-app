@@ -1,14 +1,17 @@
 name: Auto-Run Stock Analyzer
 
 on:
-  # Keep manual trigger for testing
+  # Weekdays at 17:25 UTC (≈ 10:25 AM Pacific during DST)
+  schedule:
+    - cron: '25 17 * * 1-5'
+
+  # Manual trigger for testing
   workflow_dispatch:
     inputs:
       dry_run:
         description: 'Do not make external changes (safe test mode)'
         required: false
         default: 'true'
-  # (Optional) add your cron back later once we see it green
 
 concurrency:
   group: auto-run
