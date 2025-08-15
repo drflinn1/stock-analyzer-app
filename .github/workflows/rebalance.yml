@@ -4,7 +4,12 @@ on:
   schedule:
     # 17:25 UTC Mon–Fri (≈ 1:25pm New York during EDT). Change as you like.
     - cron: '25 17 * * 1-5'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Do not make external changes (safe test mode)'
+        required: false
+        default: 'true'
 
 concurrency:
   group: rebalance
@@ -14,14 +19,22 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      # 🚀 Speed up installs on subsequent runs
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: |
@@ -30,30 +43,7 @@ jobs:
 
       - name: Execute headless rebalance
         env:
-          # Robinhood creds — provide either pair; runner will pick up what exists
-          RH_USERNAME: ${{ secrets.RH_USERNAME }}
-          RH_PASSWORD: ${{ secrets.RH_PASSWORD }}
-          ROBINHOOD_USERNAME: ${{ secrets.ROBINHOOD_USERNAME }}
-          ROBINHOOD_PASSWORD: ${{ secrets.ROBINHOOD_PASSWORD }}
-
-          # Safety: SIMULATION unless you flip this to 'true'
-          LIVE_TRADING: 'false'
-
-          # (Optional) Runner tuning — these match your Streamlit defaults
-          UNIVERSE: "S&P 500 (auto)"
-          INCLUDE_CRYPTO: 'true'
-          ALLOC_MODE: "Fixed $ per trade"
-          FIXED_PER_TRADE: '5'
-          PROP_TOTAL_BUDGET: '15'
-          MIN_PER_ORDER: '2'
-          N_PICKS: '3'
-          USE_CRYPTO_LIMITS: 'true'
-          CRYPTO_LIMIT_BPS: '20'
-          USE_STOCK_LIMITS: 'false'
-          STOCK_LIMIT_BPS: '25'
-          AUTO_BP: 'false'
-          BP_PCT: '30'
-          MAX_BUY_ORDERS: '12'
-          MAX_BUY_NOTIONAL: '50'
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
-          python runner.py
+          echo "DRY_RUN=${DRY_RUN:-true}"
+          python runner.py --dry-run "${DRY_RUN:-true}"
