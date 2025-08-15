@@ -1,11 +1,9 @@
 name: Auto-Run Stock Analyzer
 
 on:
-  # Weekdays at 17:25 UTC (≈ 10:25 AM Pacific during DST)
   schedule:
+    # Weekdays at 17:25 UTC (≈ 10:25 AM Pacific during DST)
     - cron: '25 17 * * 1-5'
-
-  # Manual trigger for testing
   workflow_dispatch:
     inputs:
       dry_run:
@@ -48,3 +46,12 @@ jobs:
         run: |
           echo "DRY_RUN=${DRY_RUN:-true}"
           python runner.py --dry-run "${DRY_RUN:-true}"
+
+      - name: Upload signals artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signals-${{ github.run_id }}
+          path: artifacts/*
+          if-no-files-found: warn
+          retention-days: 10
