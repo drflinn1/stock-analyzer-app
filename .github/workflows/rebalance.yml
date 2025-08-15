@@ -2,8 +2,10 @@ name: Daily Rebalance (headless)
 
 on:
   schedule:
-    # 17:25 UTC Mon–Fri (≈ 10:25 AM Pacific during DST)
+    # 17:25 UTC Mon–Fri (≈ 12:25pm New York during EDT). Change as you like.
     - cron: '25 17 * * 1-5'
+
+  # Manual trigger for testing
   workflow_dispatch:
     inputs:
       dry_run:
@@ -39,13 +41,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
+      # ---- Market hours guard (US/Eastern) ----
       - name: Market-hours guard (ET)
         id: market_time
         run: |
           TZ=America/New_York
           now_et=$(TZ=$TZ date +'%Y-%m-%d %H:%M:%S %Z')
           hhmm=$(TZ=$TZ date +'%H%M')
-          dow=$(TZ=$TZ date +%u)
+          dow=$(TZ=$TZ date +%u)  # 1=Mon ... 7=Sun
 
           echo "now_et=$now_et"
           echo "hhmm=$hhmm"
@@ -53,13 +56,14 @@ jobs:
 
           in_window=false
           if [ "$dow" -ge 1 ] && [ "$dow" -le 5 ]; then
+            # allow a few minutes pre-open and post-close for setup/cleanup
             if [ "$hhmm" -ge 0925 ] && [ "$hhmm" -le 1610 ]; then
               in_window=true
             fi
           fi
 
           echo "in_window=$in_window"
-          echo "in_window=$in_window" >> $GITHUB_OUTPUT
+          echo "in_window=$in_window" >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
         if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' }}
@@ -79,11 +83,11 @@ jobs:
         if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: rebalance-signals-${{ github.run_id }}
+          name: signals-${{ github.run_id }}
           path: artifacts/*
           if-no-files-found: warn
           retention-days: 10
 
       - name: Skipped (outside market hours)
-        if: ${{ !( (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' ) }}
+        if: ${{ not( (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' ) }}
         run: echo "Skipping heavy steps: outside US market hours."
