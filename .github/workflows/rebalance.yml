@@ -2,8 +2,9 @@ name: Daily Rebalance (headless)
 
 on:
   schedule:
-    - cron: "45 14 * * 1-5"   # 14:45 UTC, Mon–Fri
-  workflow_dispatch:
+    # 17:25 UTC Mon–Fri (≈ 1:25pm New York during EDT). Change as you like.
+    - cron: '25 17 * * 1-5'
+  workflow_dispatch: {}
 
 concurrency:
   group: rebalance
@@ -14,35 +15,45 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - run: pip install -r requirements.txt
-      - name: Run headless rebalance
-        run: python runner.py
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Execute headless rebalance
         env:
-          # ---- strategy & safety (edit as you like) ----
-          LIVE_TRADING: "false"            # keep false until you're ready
-          UNIVERSE_SRC: "S&P 500 (auto)"
-          RAW_TICKERS: "AAPL,MSFT,GOOG"
-          INCLUDE_CRYPTO: "true"
-          ALLOC_MODE: "Fixed $ per trade"
-          FIXED_PER_TRADE: "5"
-          PROP_TOTAL_BUDGET: "15"
-          MIN_PER_ORDER: "2"
-          N_PICKS: "3"
-          USE_CRYPTO_LIMITS: "true"
-          CRYPTO_LIMIT_BPS: "20"
-          USE_STOCK_LIMITS: "false"
-          STOCK_LIMIT_BPS: "25"
-          AUTO_BP: "false"
-          BP_PCT: "30"
-          MAX_BUY_ORDERS: "12"
-          MAX_BUY_NOTIONAL: "50"
-          # ---- creds (GH Actions secrets) ----
+          # Robinhood creds — provide either pair; runner will pick up what exists
+          RH_USERNAME: ${{ secrets.RH_USERNAME }}
+          RH_PASSWORD: ${{ secrets.RH_PASSWORD }}
           ROBINHOOD_USERNAME: ${{ secrets.ROBINHOOD_USERNAME }}
           ROBINHOOD_PASSWORD: ${{ secrets.ROBINHOOD_PASSWORD }}
-          RH_USERNAME:        ${{ secrets.RH_USERNAME }}
-          RH_PASSWORD:        ${{ secrets.RH_PASSWORD }}
-          RH_TOTP_SECRET:     ${{ secrets.RH_TOTP_SECRET }}
+
+          # Safety: SIMULATION unless you flip this to 'true'
+          LIVE_TRADING: 'false'
+
+          # (Optional) Runner tuning — these match your Streamlit defaults
+          UNIVERSE: "S&P 500 (auto)"
+          INCLUDE_CRYPTO: 'true'
+          ALLOC_MODE: "Fixed $ per trade"
+          FIXED_PER_TRADE: '5'
+          PROP_TOTAL_BUDGET: '15'
+          MIN_PER_ORDER: '2'
+          N_PICKS: '3'
+          USE_CRYPTO_LIMITS: 'true'
+          CRYPTO_LIMIT_BPS: '20'
+          USE_STOCK_LIMITS: 'false'
+          STOCK_LIMIT_BPS: '25'
+          AUTO_BP: 'false'
+          BP_PCT: '30'
+          MAX_BUY_ORDERS: '12'
+          MAX_BUY_NOTIONAL: '50'
+        run: |
+          python runner.py
