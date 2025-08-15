@@ -2,12 +2,9 @@
 engine.py
 Headless engine used by runner.py from GitHub Actions.
 
-What this does:
-- Fetches each ticker from Yahoo Finance (per‑ticker to avoid multi‑download flakiness)
-- Falls back to CoinGecko when Yahoo doesn’t have the symbol
-  • Tries multiple candidate IDs per symbol (expanded for PENGU-USD)
-- Computes simple, safe lookback returns (no divide‑by‑zero / NaN crashes)
-- Keeps a compact JSON status so you can see results in the Actions log
+- Per‑ticker Yahoo Finance fetch
+- CoinGecko fallback with multiple candidate IDs per symbol
+- Safe return calc (guards zero/NaN/short history)
 """
 
 from __future__ import annotations
@@ -22,22 +19,18 @@ import yfinance as yf
 from pycoingecko import CoinGeckoAPI
 
 # -------------------------
-# Universe (adjust as you like)
+# Universe
 # -------------------------
 SYMBOLS: List[str] = [
-    # Equities (examples)
     "AAPL", "MSFT", "NVDA", "SPY",
-
-    # Major crypto (Yahoo tickers)
     "BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD",
-
-    # Renamed/fixed tickers
     "MATIC-USD",  # Polygon (POL rebrand path)
     "IOTA-USD",   # (was MIOTA-USD)
-
-    # Meme/alt coins (these often need CG fallback)
     "PEPE-USD", "POPCAT-USD", "PENGU-USD", "MEW-USD",
 ]
+
+# If a symbol is still missing after YF+CG, suppress the noisy log line:
+QUIET_MISSING: set[str] = {"PENGU-USD"}  # remove from this set if you want to see it again
 
 # ======================================================
 # Yahoo Finance: robust per‑ticker history fetch
@@ -67,14 +60,11 @@ def fetch_prices_yf(
     return df, missing
 
 # ======================================================
-# CoinGecko fallback (try multiple candidate IDs)
+# CoinGecko fallback (multi‑ID candidates)
 # ======================================================
 cg = CoinGeckoAPI()
 
-# Try these IDs in order for each symbol; stop at the first that returns data.
-# (Expanded candidates for PENGU‑USD, which is listed under different slugs.)
 CG_CANDIDATES: Dict[str, List[str]] = {
-    # Strong mappings
     "PEPE-USD":   ["pepe"],
     "POPCAT-USD": ["popcat"],
     "MEW-USD":    ["cat-in-a-dogs-world", "mew"],
@@ -82,14 +72,17 @@ CG_CANDIDATES: Dict[str, List[str]] = {
     # Polygon (MATIC / POL rebrand)
     "MATIC-USD":  ["matic-network", "polygon-ecosystem-token"],
 
-    # PENGU variations (try several likely slugs)
-    "PENGU-USD":  [
-        "pengu",            # common short slug
-        "pengu-coin",       # used by some listings
-        "pengu-token",      # safety net
-        "penguin",          # broader alias some APIs use
-        "pengu-finance",    # alt
-        "pengu-chain",      # alt
+    # --- PENGU variations ---
+    # We try a bunch of likely slugs used by “Pengu” projects across listings.
+    "PENGU-USD": [
+        "pengu",
+        "pengu-coin",
+        "pengu-token",
+        "pengu-finance",
+        "pengu-chain",
+        "penguin",           # generic “penguin” tokens on CG
+        "penguin-finance",   # alt project often confused with “pengu”
+        "penguin-karts",     # wide net (if the target is different, this won’t return data)
     ],
 }
 
@@ -117,8 +110,7 @@ def fetch_missing_from_cg(missing_symbols: List[str], days: int = 60) -> Tuple[p
                     got = True
                     break
             except Exception:
-                # try next candidate
-                pass
+                pass  # try next candidate
         if not got:
             still.append(sym)
 
@@ -132,7 +124,6 @@ def fetch_missing_from_cg(missing_symbols: List[str], days: int = 60) -> Tuple[p
 # Safe return calculation
 # ======================================================
 def safe_pct_return(close: pd.Series, lb: int) -> float:
-    """Return % change over lookback lb, guarding zeros/NaNs/short history."""
     if len(close) <= lb:
         return float("nan")
     base = close.iloc[-(lb + 1)]
@@ -150,20 +141,20 @@ def safe_pct_return(close: pd.Series, lb: int) -> float:
 # Core engine
 # ======================================================
 def run_engine(symbols: List[str] = SYMBOLS, lookback_days: int = 20) -> dict:
-    # 1) Fetch from Yahoo
     df_yf, missing = fetch_prices_yf(symbols, period="60d", interval="1d")
     if missing:
         print(f"[YF] Missing/failed: {missing}")
 
-    # 2) Fill missing via CoinGecko
     if missing:
         df_cg, still_missing = fetch_missing_from_cg(missing, days=60)
         if not df_cg.empty:
             df_all = df_cg if df_yf.empty else pd.concat([df_yf, df_cg], axis=1, join="inner").sort_index()
         else:
             df_all = df_yf
-        if still_missing:
-            print(f"[CG] Still missing after CoinGecko: {still_missing}")
+        # only print the truly interesting misses
+        noisy = [s for s in still_missing if s not in QUIET_MISSING]
+        if noisy:
+            print(f"[CG] Still missing after CoinGecko: {noisy}")
     else:
         df_all = df_yf
 
@@ -176,7 +167,6 @@ def run_engine(symbols: List[str] = SYMBOLS, lookback_days: int = 20) -> dict:
             "login_ok": False,
         }
 
-    # 3) Example: compute simple lookback returns
     rets: Dict[str, float] = {}
     for col in df_all.columns:
         r = safe_pct_return(df_all[col].dropna(), lb=lookback_days)
@@ -188,12 +178,8 @@ def run_engine(symbols: List[str] = SYMBOLS, lookback_days: int = 20) -> dict:
         "live_trading": False,
         "login_ok": False,
         "lookback_days": lookback_days,
-        "computed_returns": rets,  # remove if you prefer slimmer logs
+        "computed_returns": rets,
     }
 
-# ======================================================
-# CLI entry
-# ======================================================
 if __name__ == "__main__":
-    result = run_engine()
-    print(json.dumps(result))
+    print(json.dumps(run_engine()))
