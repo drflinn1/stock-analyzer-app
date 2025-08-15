@@ -1,9 +1,13 @@
 name: Daily Rebalance (headless)
 
 on:
-  workflow_dispatch: {}
   schedule:
-    - cron: "25 17 * * 1-5"   # 1:25 PM US/Eastern during daylight time (UTC-4)
+    - cron: "45 14 * * 1-5"   # 14:45 UTC, Mon–Fri
+  workflow_dispatch:
+
+concurrency:
+  group: rebalance
+  cancel-in-progress: false
 
 jobs:
   run:
