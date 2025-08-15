@@ -2,11 +2,12 @@
 engine.py
 Headless engine used by runner.py from GitHub Actions.
 
-Features:
-- Robust per‑ticker Yahoo Finance fetch (avoids multi-download flakiness)
-- CoinGecko fallback with multiple candidate IDs per symbol (handles MATIC/Pengu)
-- Safe percentage‑return calc (guards zero/NaN/short history)
-- Symbol fixes: POL-USD -> MATIC-USD, MIOTA-USD -> IOTA-USD
+What this does:
+- Fetches each ticker from Yahoo Finance (per‑ticker to avoid multi‑download flakiness)
+- Falls back to CoinGecko when Yahoo doesn’t have the symbol
+  • Tries multiple candidate IDs per symbol (expanded for PENGU-USD)
+- Computes simple, safe lookback returns (no divide‑by‑zero / NaN crashes)
+- Keeps a compact JSON status so you can see results in the Actions log
 """
 
 from __future__ import annotations
@@ -24,17 +25,17 @@ from pycoingecko import CoinGeckoAPI
 # Universe (adjust as you like)
 # -------------------------
 SYMBOLS: List[str] = [
-    # equities (examples)
+    # Equities (examples)
     "AAPL", "MSFT", "NVDA", "SPY",
 
-    # major crypto (Yahoo tickers)
+    # Major crypto (Yahoo tickers)
     "BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD",
 
-    # renamed/fixed tickers
-    "MATIC-USD",  # Polygon (POL rebrand)
-    "IOTA-USD",   # was MIOTA-USD
+    # Renamed/fixed tickers
+    "MATIC-USD",  # Polygon (POL rebrand path)
+    "IOTA-USD",   # (was MIOTA-USD)
 
-    # meme/alt coins (we’ll source via CG if YF misses)
+    # Meme/alt coins (these often need CG fallback)
     "PEPE-USD", "POPCAT-USD", "PENGU-USD", "MEW-USD",
 ]
 
@@ -48,6 +49,7 @@ def fetch_prices_yf(
 ) -> Tuple[pd.DataFrame, List[str]]:
     frames: Dict[str, pd.DataFrame] = {}
     missing: List[str] = []
+
     for s in symbols:
         try:
             hist = yf.Ticker(s).history(period=period, interval=interval, auto_adjust=True)
@@ -70,15 +72,25 @@ def fetch_prices_yf(
 cg = CoinGeckoAPI()
 
 # Try these IDs in order for each symbol; stop at the first that returns data.
+# (Expanded candidates for PENGU‑USD, which is listed under different slugs.)
 CG_CANDIDATES: Dict[str, List[str]] = {
-    # strong mappings:
+    # Strong mappings
     "PEPE-USD":   ["pepe"],
     "POPCAT-USD": ["popcat"],
     "MEW-USD":    ["cat-in-a-dogs-world", "mew"],
 
-    # holdouts we saw:
-    "MATIC-USD":  ["matic-network", "polygon-ecosystem-token"],  # MATIC + POL rebrand path
-    "PENGU-USD":  ["pengu", "pengu-coin"],                       # try both spellings
+    # Polygon (MATIC / POL rebrand)
+    "MATIC-USD":  ["matic-network", "polygon-ecosystem-token"],
+
+    # PENGU variations (try several likely slugs)
+    "PENGU-USD":  [
+        "pengu",            # common short slug
+        "pengu-coin",       # used by some listings
+        "pengu-token",      # safety net
+        "penguin",          # broader alias some APIs use
+        "pengu-finance",    # alt
+        "pengu-chain",      # alt
+    ],
 }
 
 def cg_daily_series(coin_id: str, days: int = 60) -> pd.Series:
@@ -93,6 +105,7 @@ def cg_daily_series(coin_id: str, days: int = 60) -> pd.Series:
 def fetch_missing_from_cg(missing_symbols: List[str], days: int = 60) -> Tuple[pd.DataFrame, List[str]]:
     frames: Dict[str, pd.DataFrame] = {}
     still: List[str] = []
+
     for sym in missing_symbols:
         candidates = CG_CANDIDATES.get(sym, [])
         got = False
