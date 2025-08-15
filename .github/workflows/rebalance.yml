@@ -2,7 +2,7 @@ name: Daily Rebalance (headless)
 
 on:
   schedule:
-    # 17:25 UTC Mon–Fri (≈ 1:25pm New York during EDT). Change as you like.
+    # 17:25 UTC Mon–Fri (≈1:25pm New York during EDT)
     - cron: '25 17 * * 1-5'
   workflow_dispatch:
     inputs:
@@ -27,7 +27,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 🚀 Speed up installs on subsequent runs
+      # 🧠 Step 4: Cache pip downloads to speed up installs
       - name: Cache pip
         uses: actions/cache@v4
         with:
