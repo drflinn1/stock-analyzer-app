@@ -1,9 +1,0 @@
-name: Daily Rebalance (headless)
-on:
-  workflow_dispatch:
-
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "workflow parsed OK"
