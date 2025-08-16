@@ -1,86 +1,26 @@
-name: Daily Rebalance (headless)
+name: Daily Rebalance
 
 on:
-  # Manual trigger for testing/running on demand
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Do not make external changes (safe test mode)'
-        required: false
-        default: 'true'
-      ignore_market_hours:
-        description: 'Run even if outside US market hours (for testing)'
-        required: false
-        default: 'false'
-
-concurrency:
-  group: rebalance
-  cancel-in-progress: false
+  workflow_dispatch:  # ✅ enables manual "Run workflow" button
 
 jobs:
-  run:
+  rebalance:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      # ---- Market hours guard (US/Eastern) ----
-      - name: Market-hours guard (ET)
-        id: market_time
-        run: |
-          TZ=America/New_York
-          now_et=$(TZ=$TZ date +'%Y-%m-%d %H:%M:%S %Z')
-          hhmm=$(TZ=$TZ date +'%H%M')
-          dow=$(TZ=$TZ date +%u)  # 1=Mon ... 7=Sun
-          echo "now_et=$now_et"
-          echo "hhmm=$hhmm"
-          echo "dow=$dow (1=Mon ... 7=Sun)"
-          in_window=false
-          if [ "$dow" -ge 1 ] && [ "$dow" -le 5 ]; then
-            # allow a few minutes pre-open and post-close for setup/cleanup
-            if [ "$hhmm" -ge 0925 ] && [ "$hhmm" -le 1610 ]; then
-              in_window=true
-            fi
-          fi
-          echo "in_window=$in_window"
-          echo "in_window=$in_window" >> "$GITHUB_OUTPUT"
+          python-version: '3.10'
 
       - name: Install dependencies
-        if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' }}
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Execute headless rebalance
-        if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' }}
-        env:
-          DRY_RUN: ${{ github.event.inputs.dry_run }}
+      - name: Run rebalance script
         run: |
-          echo "DRY_RUN=${DRY_RUN:-true}"
-          python runner.py --dry-run "${DRY_RUN:-true}"
-
-      - name: Upload signals artifact
-        if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: signals-${{ github.run_id }}
-          path: artifacts/*
-          if-no-files-found: warn
-          retention-days: 10
-
-      - name: Skipped (outside market hours)
-        if: ${{ ! ( (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' ) }}
-        run: echo "Skipping heavy steps: outside US market hours."
+          python rebalance.py
