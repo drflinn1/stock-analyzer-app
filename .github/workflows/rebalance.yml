@@ -1,7 +1,7 @@
-name: Daily Rebalance
+name: Daily Rebalance (headless)
 
 on:
-  # Manual trigger (shows the “Run workflow” button)
+  # Manual trigger for testing
   workflow_dispatch:
     inputs:
       dry_run:
@@ -12,6 +12,10 @@ on:
         description: 'Run even if outside US market hours (for testing)'
         required: false
         default: 'false'
+
+  # (Optional) Scheduled run — keep commented until you’re ready
+  # schedule:
+  #   - cron: '25 17 * * 1-5'   # 17:25 UTC Mon–Fri
 
 concurrency:
   group: rebalance
