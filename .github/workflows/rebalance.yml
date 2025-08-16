@@ -1,14 +1,7 @@
-# Daily Rebalance (headless) — manual run for now
-# (When you're ready to auto-run, uncomment the schedule block below.)
-
 name: Daily Rebalance (headless)
 
 on:
-  # schedule:
-  #   # 17:25 UTC Mon–Fri (≈ 12:25pm New York during EDT)
-  #   - cron: '25 17 * * 1-5'
-
-  # Manual trigger for testing
+  # Manual trigger for testing/running on demand
   workflow_dispatch:
     inputs:
       dry_run:
@@ -52,11 +45,9 @@ jobs:
           now_et=$(TZ=$TZ date +'%Y-%m-%d %H:%M:%S %Z')
           hhmm=$(TZ=$TZ date +'%H%M')
           dow=$(TZ=$TZ date +%u)  # 1=Mon ... 7=Sun
-
           echo "now_et=$now_et"
           echo "hhmm=$hhmm"
           echo "dow=$dow (1=Mon ... 7=Sun)"
-
           in_window=false
           if [ "$dow" -ge 1 ] && [ "$dow" -le 5 ]; then
             # allow a few minutes pre-open and post-close for setup/cleanup
@@ -64,7 +55,6 @@ jobs:
               in_window=true
             fi
           fi
-
           echo "in_window=$in_window"
           echo "in_window=$in_window" >> "$GITHUB_OUTPUT"
 
@@ -92,5 +82,5 @@ jobs:
           retention-days: 10
 
       - name: Skipped (outside market hours)
-        if: ${{ not( (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' ) }}
+        if: ${{ ! ( (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' ) }}
         run: echo "Skipping heavy steps: outside US market hours."
