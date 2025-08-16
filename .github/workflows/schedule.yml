@@ -48,11 +48,9 @@ jobs:
           now_et=$(TZ=$TZ date +'%Y-%m-%d %H:%M:%S %Z')
           hhmm=$(TZ=$TZ date +'%H%M')
           dow=$(TZ=$TZ date +%u)  # 1=Mon ... 7=Sun
-
           echo "now_et=$now_et"
           echo "hhmm=$hhmm"
           echo "dow=$dow (1=Mon ... 7=Sun)"
-
           in_window=false
           if [ "$dow" -ge 1 ] && [ "$dow" -le 5 ]; then
             # Allow a few minutes pre-open and post-close for setup/cleanup
@@ -60,9 +58,8 @@ jobs:
               in_window=true
             fi
           fi
-
           echo "in_window=$in_window"
-          echo "in_window=$in_window" >> $GITHUB_OUTPUT
+          echo "in_window=$in_window" >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
         if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' }}
@@ -88,5 +85,6 @@ jobs:
           retention-days: 10
 
       - name: Skipped (outside market hours)
-        if: ${{ not( (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' ) }}
+        # Quote the expression so YAML doesn’t treat '!' as a tag
+        if: "${{ !((github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true') }}"
         run: echo "Skipping heavy steps: outside US market hours."
