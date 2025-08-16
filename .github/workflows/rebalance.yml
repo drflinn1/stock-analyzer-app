@@ -1,10 +1,12 @@
-# trigger test run
+# Daily Rebalance (headless) — manual run for now
+# (When you're ready to auto-run, uncomment the schedule block below.)
+
 name: Daily Rebalance (headless)
 
 on:
-  schedule:
-    # 17:25 UTC Mon–Fri (≈ 12:25pm New York during EDT). Change as you like.
-    - cron: '25 17 * * 1-5'
+  # schedule:
+  #   # 17:25 UTC Mon–Fri (≈ 12:25pm New York during EDT)
+  #   - cron: '25 17 * * 1-5'
 
   # Manual trigger for testing
   workflow_dispatch:
@@ -90,6 +92,5 @@ jobs:
           retention-days: 10
 
       - name: Skipped (outside market hours)
-        # Quote the whole expression to avoid YAML interpreting '!' as a tag.
-        if: "${{ !((github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true') }}"
+        if: ${{ not( (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' ) }}
         run: echo "Skipping heavy steps: outside US market hours."
