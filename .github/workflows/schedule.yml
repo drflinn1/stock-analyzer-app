@@ -1,11 +1,7 @@
 name: Auto-Run Stock Analyzer
 
 on:
-  schedule:
-    # Weekdays at 17:25 UTC (≈ 10:25 AM Pacific during DST)
-    - cron: '25 17 * * 1-5'
-
-  # Manual trigger for testing
+  # Keep this so you can always run it manually as a test
   workflow_dispatch:
     inputs:
       dry_run:
@@ -16,6 +12,10 @@ on:
         description: 'Run even if outside US market hours (for testing)'
         required: false
         default: 'false'
+
+  # Weekdays at 17:25 UTC (≈ 12:25 ET during DST)
+  schedule:
+    - cron: '25 17 * * 1-5'
 
 concurrency:
   group: auto-run
@@ -41,20 +41,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # ---- Market hours guard (US/Eastern) ----
       - name: Market-hours guard (ET)
         id: market_time
         run: |
           TZ=America/New_York
           now_et=$(TZ=$TZ date +'%Y-%m-%d %H:%M:%S %Z')
           hhmm=$(TZ=$TZ date +'%H%M')
-          dow=$(TZ=$TZ date +%u)  # 1=Mon ... 7=Sun
+          dow=$(TZ=$TZ date +%u)
           echo "now_et=$now_et"
           echo "hhmm=$hhmm"
           echo "dow=$dow (1=Mon ... 7=Sun)"
           in_window=false
           if [ "$dow" -ge 1 ] && [ "$dow" -le 5 ]; then
-            # Allow a few minutes pre-open and post-close for setup/cleanup
             if [ "$hhmm" -ge 0925 ] && [ "$hhmm" -le 1610 ]; then
               in_window=true
             fi
@@ -86,6 +84,5 @@ jobs:
           retention-days: 10
 
       - name: Skipped (outside market hours)
-        # De Morgan form of "NOT( dispatch+ignore || in_window )"
-        if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.ignore_market_hours != 'true') && steps.market_time.outputs.in_window != 'true' }}
+        if: ${{ not( (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' ) }}
         run: echo "Skipping heavy steps: outside US market hours."
