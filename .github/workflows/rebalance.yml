@@ -1,12 +1,18 @@
-name: Daily Rebalance
+name: Daily Rebalance (headless)
 
 on:
+  # Manual trigger (Run workflow button)
   workflow_dispatch:
     inputs:
       dry_run:
         description: Do not make external changes (safe test mode)
         required: false
         default: "true"
+
+  # Auto-run ~3:55 PM New York year-round
+  schedule:
+    - cron: '55 19 * * 1-5'  # 3:55 PM during EDT (UTC-4)
+    - cron: '55 20 * * 1-5'  # 3:55 PM during EST (UTC-5)
 
 concurrency:
   group: rebalance
@@ -39,7 +45,7 @@ jobs:
 
       - name: Execute headless rebalance
         env:
-          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
         run: |
           echo "DRY_RUN=${DRY_RUN:-true}"
           python runner.py --dry-run "${DRY_RUN:-true}"
