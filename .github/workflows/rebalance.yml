@@ -9,19 +9,10 @@ on:
         required: false
         default: "true"
 
-  # Auto-run schedules
+  # Auto-run ~3:55 PM New York year-round (EDT/EST)
   schedule:
-    # Midday run ~12:00 PM New York
-    - cron: '0 16 * * 1-5'  # 12:00 PM during EDT (UTC-4)
-    - cron: '0 17 * * 1-5'  # 12:00 PM during EST (UTC-5)
-
-    # Pre-close run ~3:55 PM New York
     - cron: '55 19 * * 1-5'  # 3:55 PM during EDT (UTC-4)
     - cron: '55 20 * * 1-5'  # 3:55 PM during EST (UTC-5)
-
-    # Saturday test run ~10:00 AM New York (dry-run by default)
-    - cron: '0 14 * * 6'     # 10:00 AM during EDT (UTC-4)
-    - cron: '0 15 * * 6'     # 10:00 AM during EST (UTC-5)
 
 concurrency:
   group: rebalance
@@ -47,35 +38,29 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
+      # ---- Market hours guard (US/Eastern) ----
       - name: Market-hours guard (ET)
         run: |
           TZ=America/New_York
           now_et=$(TZ=$TZ date +'%Y-%m-%d %H:%M:%S %Z')
           hhmm=$(TZ=$TZ date +'%H%M')
           dow=$(TZ=$TZ date +%u)  # 1=Mon ... 7=Sun
-          event_name="${{ github.event_name }}"
 
           echo "now_et=$now_et"
           echo "hhmm=$hhmm"
           echo "dow=$dow (1=Mon ... 7=Sun)"
-          echo "event_name=$event_name"
 
-          # Weekdays: enforce 09:25–16:10 ET window
-          if [ "$dow" -ge 1 ] && [ "$dow" -le 5 ]; then
-            if [ "$hhmm" -lt 0925 ] || [ "$hhmm" -gt 1610 ]; then
-              echo "Outside 09:25–16:10 ET window (weekday) → exiting 0"
-              exit 0
-            fi
-            echo "Inside market window (weekday) → continuing"
-          else
-            # Weekend: allow only scheduled runs (e.g., Saturday dry-run)
-            if [ "$event_name" = "schedule" ]; then
-              echo "Weekend scheduled test run → continuing (guard bypass)"
-            else
-              echo "Weekend manual run → exiting 0"
-              exit 0
-            fi
+          if [ "$dow" -lt 1 ] || [ "$dow" -gt 5 ]; then
+            echo "Outside weekdays → exiting 0"
+            exit 0
           fi
+
+          if [ "$hhmm" -lt 0925 ] || [ "$hhmm" -gt 1610 ]; then
+            echo "Outside 09:25–16:10 ET window → exiting 0"
+            exit 0
+          fi
+
+          echo "Inside market window → continuing"
 
       - name: Install dependencies
         run: |
@@ -84,12 +69,86 @@ jobs:
 
       - name: Execute headless rebalance
         env:
-          # For schedules, this defaults to "true"; for manual runs you can override in the UI.
+          # default to true when triggered manually without an input
           DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
         run: |
           echo "DRY_RUN=${DRY_RUN:-true}"
           python runner.py --dry-run "${DRY_RUN:-true}"
 
+      # ---------- Build a short summary from the JSON ----------
+      - name: Install jq (for JSON parsing)
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Build run summary
+        id: summary
+        run: |
+          set -e
+          JSON_FILE=$(ls -1 artifacts/*.json | tail -n1)
+          echo "json_file=$JSON_FILE" >> "$GITHUB_OUTPUT"
+
+          # Extract dry_run & top 5 by return (desc)
+          DRY=$(jq -r '.dry_run // true' "$JSON_FILE")
+          TOP=$(jq -r '
+            .computed_returns
+            | to_entries
+            | map({sym:.key, ret:(.value // 0)})
+            | sort_by(-.ret)
+            | .[0:5]
+            | map("*\(.sym)*: \(.ret|tostring)")
+            | join("\n")
+          ' "$JSON_FILE")
+
+          echo "dry=$DRY" >> "$GITHUB_OUTPUT"
+          echo "top<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$TOP" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      # -------------------- Slack notification --------------------
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "No SLACK_WEBHOOK_URL secret set; skipping Slack notification."
+            exit 0
+          fi
+
+          STATUS="${{ job.status }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Escape newlines for JSON
+          TOP_LINES=$(printf "%s" "${{ steps.summary.outputs.top }}" | jq -Rs .)
+
+          # Construct JSON payload
+          read -r -d '' PAYLOAD <<JSON
+          {
+            "text": "*Daily Rebalance* — status: ${STATUS}",
+            "blocks": [
+              { "type": "section",
+                "text": { "type": "mrkdwn",
+                  "text": "*Daily Rebalance*  \n*Status:* ${STATUS}  \n*Dry run:* ${{ steps.summary.outputs.dry }}"
+                }
+              },
+              { "type": "section",
+                "text": { "type": "mrkdwn",
+                  "text": "• *Repo:* <https://github.com/${{ github.repository }}|${{ github.repository }}>  \n• *Run:* <${RUN_URL}|${{ github.run_id }}>"
+                }
+              },
+              { "type": "divider" },
+              { "type": "section",
+                "text": { "type": "mrkdwn",
+                  "text": "*Top movers (by return)*\\n" + ${TOP_LINES}
+                }
+              }
+            ]
+          }
+          JSON
+
+          curl -X POST -H 'Content-type: application/json' \
+            --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
+
+      # --------------- Upload artifacts (unchanged) ---------------
       - name: Upload signals artifact
         uses: actions/upload-artifact@v4
         with:
@@ -97,3 +156,23 @@ jobs:
           path: artifacts/*
           if-no-files-found: warn
           retention-days: 10
+
+      # ------------------ Optional: email (SMTP) ------------------
+      # - name: Send email
+      #   if: always()
+      #   uses: dawidd6/action-send-mail@v3
+      #   with:
+      #     server_address: smtp.gmail.com
+      #     server_port: 465
+      #     username: ${{ secrets.SMTP_USERNAME }}
+      #     password: ${{ secrets.SMTP_PASSWORD }}
+      #     subject: "Daily Rebalance ${{ job.status }} (dry_run=${{ steps.summary.outputs.dry }})"
+      #     to: you@example.com
+      #     from: "Rebalance Bot <bot@yourdomain.com>"
+      #     content_type: text/plain
+      #     body: |
+      #       Repo: https://github.com/${{ github.repository }}
+      #       Run:  https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      #
+      #       Top movers:
+      #       ${{ steps.summary.outputs.top }}
