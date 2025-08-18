@@ -83,3 +83,19 @@ jobs:
           path: artifacts/*
           if-no-files-found: warn
           retention-days: 10
+
+      - name: Build run summary
+        shell: bash
+        run: |
+          echo "## Rebalance run $(date -u +'%Y-%m-%d %H:%M UTC')" >> "$GITHUB_STEP_SUMMARY"
+          if ls artifacts/*.json >/dev/null 2>&1; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Artifacts created:**" >> "$GITHUB_STEP_SUMMARY"
+            for f in artifacts/*.json; do
+              sz=$(wc -c < "$f" | tr -d ' ')
+              echo "- \`$f\` (${sz} bytes)" >> "$GITHUB_STEP_SUMMARY"
+            done
+          else
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "_No JSON artifacts found._" >> "$GITHUB_STEP_SUMMARY"
+          fi
