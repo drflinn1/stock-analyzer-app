@@ -23,6 +23,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    env:
+      # surface email secrets to steps; empty string if not defined so we can safely skip
+      EMAIL_SENDER: ${{ secrets.EMAIL_SENDER || '' }}
+      EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD || '' }}
+      EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER || '' }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -40,9 +46,8 @@ jobs:
 
       # ---- Market hours guard (US/Eastern) ----
       - name: Market-hours guard (ET)
-        shell: bash
+        id: market_time
         run: |
-          set -euo pipefail
           TZ=America/New_York
           now_et=$(TZ=$TZ date +'%Y-%m-%d %H:%M:%S %Z')
           hhmm=$(TZ=$TZ date +'%H%M')
@@ -52,24 +57,25 @@ jobs:
           echo "hhmm=$hhmm"
           echo "dow=$dow (1=Mon ... 7=Sun)"
 
-          if [ "$dow" -lt 1 ] || [ "$dow" -gt 5 ]; then
-            echo "Outside weekdays → exiting 0"
-            exit 0
+          in_window=false
+          if [ "$dow" -ge 1 ] && [ "$dow" -le 5 ]; then
+            # allow a few minutes pre-open and post-close for setup/cleanup
+            if [ "$hhmm" -ge 0925 ] && [ "$hhmm" -le 1610 ]; then
+              in_window=true
+            fi
           fi
 
-          if [ "$hhmm" -lt 0925 ] || [ "$hhmm" -gt 1610 ]; then
-            echo "Outside 09:25–16:10 ET window → exiting 0"
-            exit 0
-          fi
-
-          echo "Inside market window → continuing"
+          echo "in_window=$in_window"
+          echo "in_window=$in_window" >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
+        if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run != '' && steps.market_time.outputs.in_window == 'false') || steps.market_time.outputs.in_window == 'true' }}
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Execute headless rebalance
+        if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run != '' && steps.market_time.outputs.in_window == 'false') || steps.market_time.outputs.in_window == 'true' }}
         env:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
         run: |
@@ -77,6 +83,7 @@ jobs:
           python runner.py --dry-run "${DRY_RUN:-true}"
 
       - name: Upload signals artifact
+        if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run != '' && steps.market_time.outputs.in_window == 'false') || steps.market_time.outputs.in_window == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: signals-${{ github.run_id }}
@@ -84,99 +91,77 @@ jobs:
           if-no-files-found: warn
           retention-days: 10
 
-      # ---- Robust summary even if file is missing/empty ----
       - name: Build run summary
-        id: summary
+        if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run != '' && steps.market_time.outputs.in_window == 'false') || steps.market_time.outputs.in_window == 'true' }}
         shell: bash
         run: |
-          set -euo pipefail
-          CSV=$(ls -1 artifacts/*.csv 2>/dev/null | head -n1 || true)
+          echo "### Daily Rebalance – $GITHUB_RUN_NUMBER" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow:** $GITHUB_WORKFLOW  " >> $GITHUB_STEP_SUMMARY
+          echo "**Run URL:** https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}  " >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Preview of \`signals\` CSV:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```csv' >> $GITHUB_STEP_SUMMARY
+          head -n 12 artifacts/signals-*.csv | sed 's/[[:space:]]*$//' >> $GITHUB_STEP_SUMMARY || echo "No CSV found." >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
-          echo "### Daily Rebalance — results" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          if [[ -z "${CSV}" ]]; then
-            echo "No signals CSV found in artifacts/." >> "$GITHUB_STEP_SUMMARY"
-            echo "no_rows=true" >> "$GITHUB_OUTPUT"
-          elif [[ ! -s "${CSV}" ]] || [[ $(wc -l < "${CSV}") -le 1 ]]; then
-            echo "Signals CSV exists but has no data rows." >> "$GITHUB_STEP_SUMMARY"
-            echo "no_rows=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "no_rows=false" >> "$GITHUB_OUTPUT"
-            echo "**Preview (first 10 rows):**" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            {
-              echo '| symbol | percent_return |'
-              echo '|-------:|---------------:|'
-              tail -n +2 "$CSV" | head -n 10 | awk -F',' '{printf("| %s | %s |\n", $1, $2)}'
-            } >> "$GITHUB_STEP_SUMMARY"
+      # ---------- Email notification (runs even on failure) ----------
+      - name: Notify by email
+        if: ${{ always() }}
+        env:
+          SENDER: ${{ env.EMAIL_SENDER }}
+          APP_PASS: ${{ env.EMAIL_PASSWORD }}
+          TO: ${{ env.EMAIL_RECEIVER }}
+        shell: bash
+        run: |
+          # Skip cleanly if secrets not configured
+          if [ -z "$SENDER" ] || [ -z "$APP_PASS" ] || [ -z "$TO" ]; then
+            echo "Email secrets not set; skipping notification."
+            exit 0
           fi
 
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >> "$GITHUB_STEP_SUMMARY"
+          STATUS="${{ job.status }}"
+          RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          PREVIEW="$(head -n 12 artifacts/signals-*.csv 2>/dev/null || echo 'No CSV found.')"
 
-      # ---- Email notification (handles empty/missing CSV) ----
-      - name: Notify by email
-        if: always()
-        env:
-          EMAIL_SENDER:   ${{ secrets.EMAIL_SENDER }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          REPO_NAME:      ${{ github.repository }}
-        run: |
-          python - << 'PY'
-          import glob, os, csv, smtplib, ssl
+          python - <<'PY'
+          import os, ssl, smtplib
           from email.message import EmailMessage
 
-          sender = os.environ.get("EMAIL_SENDER")
-          pwd    = os.environ.get("EMAIL_PASSWORD")
-          to     = os.environ.get("EMAIL_RECEIVER")
-          run_url= os.environ.get("GITHUB_RUN_URL","")
-          repo   = os.environ.get("REPO_NAME","")
-          commit = os.environ.get("GITHUB_SHA","")[:7]
+          sender = os.environ["SENDER"]
+          app_pass = os.environ["APP_PASS"]
+          to = os.environ["TO"]
 
-          subject = f"[{repo}] Daily Rebalance results ({commit})"
+          status = os.environ.get("STATUS", "UNKNOWN")
+          run_url = os.environ.get("RUN_URL", "")
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          run_num = os.environ.get("GITHUB_RUN_NUMBER", "")
+          workflow = os.environ.get("GITHUB_WORKFLOW", "")
+          preview = os.environ.get("PREVIEW", "")
 
-          lines = []
-          csv_files = glob.glob("artifacts/*.csv")
-          if not csv_files:
-            lines.append("No signals CSV found in artifacts/.")
-          else:
-            csv_path = csv_files[0]
-            try:
-              with open(csv_path, newline="", encoding="utf-8") as f:
-                r = list(csv.DictReader(f))
-              if not r:
-                lines.append("Signals CSV exists but has no data rows.")
-              else:
-                lines.append(f"{len(r)} signals generated. Preview:")
-                for row in r[:5]:
-                  # best effort to find the two columns
-                  sym = row.get("symbol") or row.get("Symbol") or list(row.values())[0]
-                  pr  = row.get("percent_return") or list(row.values())[1]
-                  lines.append(f" • {sym}: {pr}")
-            except Exception as e:
-              lines.append(f"Could not read CSV: {e}")
+          msg = EmailMessage()
+          msg["From"] = sender
+          msg["To"] = to
+          msg["Subject"] = f"[{repo}] {workflow} #{run_num}: {status}"
 
-          if run_url:
-            lines.append("")
-            lines.append(f"Run: {run_url}")
+          body = f"""Run: {workflow} #{run_num}
+Repository: {repo}
+Status: {status}
+URL: {run_url}
 
-          body = "\n".join(lines)
+Preview (signals CSV):
+----------------------
+{preview}
+"""
+          msg.set_content(body)
 
-          if not (sender and pwd and to):
-            print("Email secrets missing; skipping email.")
-          else:
-            msg = EmailMessage()
-            msg["From"] = sender
-            msg["To"] = to
-            msg["Subject"] = subject
-            msg.set_content(body)
-
-            ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as s:
-              s.login(sender, pwd)
-              s.send_message(msg)
-            print("Email sent.")
+          context = ssl.create_default_context()
+          with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as smtp:
+            smtp.login(sender, app_pass)
+            smtp.send_message(msg)
           PY
+
+      - name: Skipped (outside market hours)
+        if: ${{ not( (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run != '' && steps.market_time.outputs.in_window == 'false') || steps.market_time.outputs.in_window == 'true' ) }}
+        run: echo "Skipping heavy steps: outside US market hours."
