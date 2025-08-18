@@ -9,7 +9,7 @@ on:
         required: false
         default: "true"
 
-  # Auto-run ~3:55 PM New York year-round (EDT/EST)
+  # Auto-run ~3:55 PM New York year-round
   schedule:
     - cron: '55 19 * * 1-5'  # 3:55 PM during EDT (UTC-4)
     - cron: '55 20 * * 1-5'  # 3:55 PM during EST (UTC-5)
@@ -50,16 +50,13 @@ jobs:
           echo "hhmm=$hhmm"
           echo "dow=$dow (1=Mon ... 7=Sun)"
 
+          # Only Mon–Fri, and roughly regular US market hours
           if [ "$dow" -lt 1 ] || [ "$dow" -gt 5 ]; then
-            echo "Outside weekdays → exiting 0"
-            exit 0
+            echo "Outside weekdays → exiting 0"; exit 0
           fi
-
           if [ "$hhmm" -lt 0925 ] || [ "$hhmm" -gt 1610 ]; then
-            echo "Outside 09:25–16:10 ET window → exiting 0"
-            exit 0
+            echo "Outside 09:25–16:10 ET window → exiting 0"; exit 0
           fi
-
           echo "Inside market window → continuing"
 
       - name: Install dependencies
@@ -69,86 +66,28 @@ jobs:
 
       - name: Execute headless rebalance
         env:
-          # default to true when triggered manually without an input
           DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
         run: |
           echo "DRY_RUN=${DRY_RUN:-true}"
           python runner.py --dry-run "${DRY_RUN:-true}"
 
-      # ---------- Build a short summary from the JSON ----------
-      - name: Install jq (for JSON parsing)
-        run: sudo apt-get update && sudo apt-get install -y jq
-
+      # Write a brief markdown summary so GitHub’s email has useful context
       - name: Build run summary
-        id: summary
-        run: |
-          set -e
-          JSON_FILE=$(ls -1 artifacts/*.json | tail -n1)
-          echo "json_file=$JSON_FILE" >> "$GITHUB_OUTPUT"
-
-          # Extract dry_run & top 5 by return (desc)
-          DRY=$(jq -r '.dry_run // true' "$JSON_FILE")
-          TOP=$(jq -r '
-            .computed_returns
-            | to_entries
-            | map({sym:.key, ret:(.value // 0)})
-            | sort_by(-.ret)
-            | .[0:5]
-            | map("*\(.sym)*: \(.ret|tostring)")
-            | join("\n")
-          ' "$JSON_FILE")
-
-          echo "dry=$DRY" >> "$GITHUB_OUTPUT"
-          echo "top<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$TOP" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-      # -------------------- Slack notification --------------------
-      - name: Notify Slack
         if: always()
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          if [ -z "$SLACK_WEBHOOK_URL" ]; then
-            echo "No SLACK_WEBHOOK_URL secret set; skipping Slack notification."
-            exit 0
+          echo "## Daily Rebalance summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Event: \`${{ github.event_name }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Branch: \`${{ github.ref_name }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Status: **${{ job.status }}**" >> "$GITHUB_STEP_SUMMARY"
+          latest_csv=$(ls -1 artifacts/*.csv 2>/dev/null | tail -n1 || true)
+          latest_json=$(ls -1 artifacts/*.json 2>/dev/null | tail -n1 || true)
+          if [ -n "$latest_csv" ] || [ -n "$latest_json" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Artifacts generated:" >> "$GITHUB_STEP_SUMMARY"
+            [ -n "$latest_csv" ]  && echo "- \`$latest_csv\`"  >> "$GITHUB_STEP_SUMMARY"
+            [ -n "$latest_json" ] && echo "- \`$latest_json\`" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          STATUS="${{ job.status }}"
-          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-          # Escape newlines for JSON
-          TOP_LINES=$(printf "%s" "${{ steps.summary.outputs.top }}" | jq -Rs .)
-
-          # Construct JSON payload
-          read -r -d '' PAYLOAD <<JSON
-          {
-            "text": "*Daily Rebalance* — status: ${STATUS}",
-            "blocks": [
-              { "type": "section",
-                "text": { "type": "mrkdwn",
-                  "text": "*Daily Rebalance*  \n*Status:* ${STATUS}  \n*Dry run:* ${{ steps.summary.outputs.dry }}"
-                }
-              },
-              { "type": "section",
-                "text": { "type": "mrkdwn",
-                  "text": "• *Repo:* <https://github.com/${{ github.repository }}|${{ github.repository }}>  \n• *Run:* <${RUN_URL}|${{ github.run_id }}>"
-                }
-              },
-              { "type": "divider" },
-              { "type": "section",
-                "text": { "type": "mrkdwn",
-                  "text": "*Top movers (by return)*\\n" + ${TOP_LINES}
-                }
-              }
-            ]
-          }
-          JSON
-
-          curl -X POST -H 'Content-type: application/json' \
-            --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
-
-      # --------------- Upload artifacts (unchanged) ---------------
       - name: Upload signals artifact
         uses: actions/upload-artifact@v4
         with:
@@ -157,22 +96,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 10
 
-      # ------------------ Optional: email (SMTP) ------------------
-      # - name: Send email
-      #   if: always()
-      #   uses: dawidd6/action-send-mail@v3
-      #   with:
-      #     server_address: smtp.gmail.com
-      #     server_port: 465
-      #     username: ${{ secrets.SMTP_USERNAME }}
-      #     password: ${{ secrets.SMTP_PASSWORD }}
-      #     subject: "Daily Rebalance ${{ job.status }} (dry_run=${{ steps.summary.outputs.dry }})"
-      #     to: you@example.com
-      #     from: "Rebalance Bot <bot@yourdomain.com>"
-      #     content_type: text/plain
-      #     body: |
-      #       Repo: https://github.com/${{ github.repository }}
-      #       Run:  https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      #
-      #       Top movers:
-      #       ${{ steps.summary.outputs.top }}
+      # Final line that will also show up in GitHub’s email
+      - name: Post summary status
+        if: always()
+        run: echo "Run completed with status: ${{ job.status }}"
