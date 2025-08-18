@@ -9,10 +9,10 @@ on:
         required: false
         default: "true"
 
-  # Auto-run ~3:55 PM New York year-round
+  # Auto-run ~3:55 PM New York, year-round (EDT & EST)
   schedule:
-    - cron: '55 19 * * 1-5'  # 3:55 PM during EDT (UTC-4)
-    - cron: '55 20 * * 1-5'  # 3:55 PM during EST (UTC-5)
+    - cron: "55 19 * * 1-5"  # 3:55 PM during EDT (UTC-4)
+    - cron: "55 20 * * 1-5"  # 3:55 PM during EST (UTC-5)
 
 concurrency:
   group: rebalance
@@ -38,7 +38,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # ---- Market hours guard (US/Eastern) ----
+      # ---- Market-hours guard (US/Eastern) ----
       - name: Market-hours guard (ET)
         run: |
           TZ=America/New_York
@@ -50,13 +50,18 @@ jobs:
           echo "hhmm=$hhmm"
           echo "dow=$dow (1=Mon ... 7=Sun)"
 
-          # Only Mon–Fri, and roughly regular US market hours
+          # Weekdays only
           if [ "$dow" -lt 1 ] || [ "$dow" -gt 5 ]; then
-            echo "Outside weekdays → exiting 0"; exit 0
+            echo "Outside weekdays → exiting 0"
+            exit 0
           fi
+
+          # 09:25–16:10 ET window
           if [ "$hhmm" -lt 0925 ] || [ "$hhmm" -gt 1610 ]; then
-            echo "Outside 09:25–16:10 ET window → exiting 0"; exit 0
+            echo "Outside 09:25–16:10 ET window → exiting 0"
+            exit 0
           fi
+
           echo "Inside market window → continuing"
 
       - name: Install dependencies
@@ -71,23 +76,6 @@ jobs:
           echo "DRY_RUN=${DRY_RUN:-true}"
           python runner.py --dry-run "${DRY_RUN:-true}"
 
-      # Write a brief markdown summary so GitHub’s email has useful context
-      - name: Build run summary
-        if: always()
-        run: |
-          echo "## Daily Rebalance summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Event: \`${{ github.event_name }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Branch: \`${{ github.ref_name }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Status: **${{ job.status }}**" >> "$GITHUB_STEP_SUMMARY"
-          latest_csv=$(ls -1 artifacts/*.csv 2>/dev/null | tail -n1 || true)
-          latest_json=$(ls -1 artifacts/*.json 2>/dev/null | tail -n1 || true)
-          if [ -n "$latest_csv" ] || [ -n "$latest_json" ]; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "Artifacts generated:" >> "$GITHUB_STEP_SUMMARY"
-            [ -n "$latest_csv" ]  && echo "- \`$latest_csv\`"  >> "$GITHUB_STEP_SUMMARY"
-            [ -n "$latest_json" ] && echo "- \`$latest_json\`" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
       - name: Upload signals artifact
         uses: actions/upload-artifact@v4
         with:
@@ -95,8 +83,3 @@ jobs:
           path: artifacts/*
           if-no-files-found: warn
           retention-days: 10
-
-      # Final line that will also show up in GitHub’s email
-      - name: Post summary status
-        if: always()
-        run: echo "Run completed with status: ${{ job.status }}"
