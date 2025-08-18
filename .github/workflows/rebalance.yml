@@ -1,32 +1,20 @@
 name: Daily Rebalance (headless)
 
 on:
-  # Manual trigger (Run workflow button)
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: Do not make external changes (safe test mode)
-        required: false
-        default: "true"
-
-  # Auto-run ~3:55 PM New York year-round
   schedule:
-    - cron: '55 19 * * 1-5'  # 3:55 PM during EDT (UTC-4)
-    - cron: '55 20 * * 1-5'  # 3:55 PM during EST (UTC-5)
-
-concurrency:
-  group: rebalance
-  cancel-in-progress: false
+    - cron: "0 10 * * 1-5"   # Runs at 10:00 UTC (Mon-Fri)
+  workflow_dispatch:          # Allows manual runs from the Actions tab
 
 jobs:
   rebalance:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repo
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -38,156 +26,63 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # ---- Market hours guard (US/Eastern) ----
-      - name: Market-hours guard (ET)
-        run: |
-          TZ=America/New_York
-          now_et=$(TZ=$TZ date +'%Y-%m-%d %H:%M:%S %Z')
-          hhmm=$(TZ=$TZ date +'%H%M')
-          dow=$(TZ=$TZ date +%u)  # 1=Mon ... 7=Sun
-
-          echo "now_et=$now_et"
-          echo "hhmm=$hhmm"
-          echo "dow=$dow (1=Mon ... 7=Sun)"
-
-          # Only Mon–Fri 09:25–16:10 ET
-          if [ "$dow" -lt 1 ] || [ "$dow" -gt 5 ]; then
-            echo "Outside weekdays → exiting 0"
-            exit 0
-          fi
-          if [ "$hhmm" -lt 0925 ] || [ "$hhmm" -gt 1610 ]; then
-            echo "Outside 09:25–16:10 ET window → exiting 0"
-            exit 0
-          fi
-
-          echo "Inside market window → continuing"
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Execute headless rebalance
-        env:
-          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+      - name: Market hours guard (ET)
         run: |
-          echo "DRY_RUN=${DRY_RUN:-true}"
-          python runner.py --dry-run "${DRY_RUN:-true}"
+          python - <<'EOF'
+          import datetime, pytz, sys
+          eastern = pytz.timezone("US/Eastern")
+          now = datetime.datetime.now(eastern)
+          if now.weekday() >= 5 or now.hour < 9 or now.hour >= 16:
+              print("⏸️ Market closed, skipping rebalance.")
+              sys.exit(0)
+          EOF
+
+      - name: Execute headless rebalance
+        run: python run.py --headless
 
       - name: Upload signals artifact
         uses: actions/upload-artifact@v4
         with:
-          name: signals-${{ github.run_id }}
-          path: artifacts/*
-          if-no-files-found: warn
-          retention-days: 10
+          name: signals
+          path: signals_*.csv
 
       - name: Build run summary
         run: |
-          {
-            echo "### Daily Rebalance – ${{ job.status }}"
-            echo
-            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            echo
-            latest=$(ls -1t artifacts/*.csv 2>/dev/null | head -n1)
-            if [ -n "$latest" ]; then
-              echo "#### Preview of \`$(basename "$latest")\`"
-              echo
-              # show header + first 5 rows as a fenced block
-              echo '```csv'
-              head -n 6 "$latest"
-              echo '```'
-            else
-              echo "_No CSV produced._"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Daily Rebalance - success" >> $GITHUB_STEP_SUMMARY
+          echo "Preview signals artifact:" >> $GITHUB_STEP_SUMMARY
+          ls -lh signals_*.csv | tee -a $GITHUB_STEP_SUMMARY
+          head -n 20 signals_*.csv | tee -a $GITHUB_STEP_SUMMARY
 
-      # ---------------- Email notification ----------------
       - name: Notify by email
-        if: always()   # send on success and failure
-        env:
-          SMTP_HOST:   ${{ secrets.SMTP_HOST }}
-          SMTP_PORT:   ${{ secrets.SMTP_PORT }}
-          SMTP_USER:   ${{ secrets.SMTP_USERNAME }}
-          SMTP_PASS:   ${{ secrets.SMTP_PASSWORD }}
-          EMAIL_FROM:  ${{ secrets.EMAIL_FROM }}
-          EMAIL_TO:    ${{ secrets.EMAIL_TO }}
-          RUN_STATUS:  ${{ job.status }}
-          RUN_URL:     ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python - <<'PY'
-          import os, glob, json, smtplib, mimetypes
-          from email.message import EmailMessage
-          from pathlib import Path
-          import csv
+          python - <<'EOF'
+          import os, smtplib, ssl
 
-          host = os.environ["SMTP_HOST"]
-          port = int(os.environ.get("SMTP_PORT", "587"))
-          user = os.environ["SMTP_USER"]
-          pwd  = os.environ["SMTP_PASS"]
-          sender = os.environ["EMAIL_FROM"]
-          to     = os.environ["EMAIL_TO"]
-          status = os.environ.get("RUN_STATUS", "unknown")
-          run_url= os.environ.get("RUN_URL", "")
+          sender = os.environ.get("EMAIL_SENDER")
+          receiver = os.environ.get("EMAIL_RECEIVER")
+          password = os.environ.get("EMAIL_PASSWORD")
 
-          # Find newest artifacts (csv/json)
-          csvs  = sorted(glob.glob("artifacts/*.csv"))
-          jsons = sorted(glob.glob("artifacts/*.json"))
-          csv_latest  = csvs[-1]  if csvs  else None
-          json_latest = jsons[-1] if jsons else None
+          subject = "Stock Analyzer Daily Report"
+          body = "✅ The daily rebalance job has completed.\n\nCheck GitHub Actions artifacts for results."
 
-          # Build body with short CSV preview
-          lines = [f"Daily Rebalance: {status}",
-                   f"Run: {run_url}",
-                   ""]
-          if csv_latest:
-            lines.append(f"CSV: {Path(csv_latest).name}")
-            try:
-              with open(csv_latest, newline="", encoding="utf-8") as f:
-                r = csv.reader(f)
-                header = next(r, [])
-                rows = [row for _, row in zip(range(5), r)]
-              # simple two-column preview
-              lines.append("")
-              lines.append("symbol, percent_return (first 5)")
-              for row in rows:
-                if len(row) >= 2:
-                  lines.append(f"{row[0]}, {row[1]}")
-            except Exception as e:
-              lines.append(f"(Could not preview CSV: {e})")
+          message = f"Subject: {subject}\n\n{body}"
 
-          if json_latest:
-            try:
-              with open(json_latest, encoding="utf-8") as jf:
-                data = json.load(jf)
-              dry = data.get("dry_run")
-              lines.append("")
-              lines.append(f"dry_run: {dry}")
-            except Exception as e:
-              lines.append(f"(Could not read JSON: {e})")
+          if not all([sender, receiver, password]):
+              raise ValueError("❌ Missing one or more email environment variables")
 
-          body = "\n".join(lines)
+          context = ssl.create_default_context()
+          with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+              server.login(sender, password)
+              server.sendmail(sender, receiver, message)
 
-          msg = EmailMessage()
-          msg["Subject"] = f"[Rebalance] {status}"
-          msg["From"]    = sender
-          msg["To"]      = to
-          msg.set_content(body)
-
-          # Attach newest CSV/JSON
-          for path in filter(None, [csv_latest, json_latest]):
-            ctype, _ = mimetypes.guess_type(path)
-            maintype, subtype = (ctype or "application/octet-stream").split("/", 1)
-            with open(path, "rb") as f:
-              msg.add_attachment(f.read(),
-                                 maintype=maintype,
-                                 subtype=subtype,
-                                 filename=Path(path).name)
-
-          with smtplib.SMTP(host, port) as s:
-            s.starttls()
-            s.login(user, pwd)
-            s.send_message(msg)
-
-          print("Email sent to:", to)
-          PY
+          print("✅ Email sent successfully")
+          EOF
+        env:
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
