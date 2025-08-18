@@ -9,10 +9,19 @@ on:
         required: false
         default: "true"
 
-  # Auto-run ~3:55 PM New York year-round
+  # Auto-run schedules
   schedule:
+    # Midday run ~12:00 PM New York
+    - cron: '0 16 * * 1-5'  # 12:00 PM during EDT (UTC-4)
+    - cron: '0 17 * * 1-5'  # 12:00 PM during EST (UTC-5)
+
+    # Pre-close run ~3:55 PM New York
     - cron: '55 19 * * 1-5'  # 3:55 PM during EDT (UTC-4)
     - cron: '55 20 * * 1-5'  # 3:55 PM during EST (UTC-5)
+
+    # Saturday test run ~10:00 AM New York (dry-run by default)
+    - cron: '0 14 * * 6'     # 10:00 AM during EDT (UTC-4)
+    - cron: '0 15 * * 6'     # 10:00 AM during EST (UTC-5)
 
 concurrency:
   group: rebalance
@@ -38,6 +47,36 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
+      - name: Market-hours guard (ET)
+        run: |
+          TZ=America/New_York
+          now_et=$(TZ=$TZ date +'%Y-%m-%d %H:%M:%S %Z')
+          hhmm=$(TZ=$TZ date +'%H%M')
+          dow=$(TZ=$TZ date +%u)  # 1=Mon ... 7=Sun
+          event_name="${{ github.event_name }}"
+
+          echo "now_et=$now_et"
+          echo "hhmm=$hhmm"
+          echo "dow=$dow (1=Mon ... 7=Sun)"
+          echo "event_name=$event_name"
+
+          # Weekdays: enforce 09:25–16:10 ET window
+          if [ "$dow" -ge 1 ] && [ "$dow" -le 5 ]; then
+            if [ "$hhmm" -lt 0925 ] || [ "$hhmm" -gt 1610 ]; then
+              echo "Outside 09:25–16:10 ET window (weekday) → exiting 0"
+              exit 0
+            fi
+            echo "Inside market window (weekday) → continuing"
+          else
+            # Weekend: allow only scheduled runs (e.g., Saturday dry-run)
+            if [ "$event_name" = "schedule" ]; then
+              echo "Weekend scheduled test run → continuing (guard bypass)"
+            else
+              echo "Weekend manual run → exiting 0"
+              exit 0
+            fi
+          fi
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -45,6 +84,7 @@ jobs:
 
       - name: Execute headless rebalance
         env:
+          # For schedules, this defaults to "true"; for manual runs you can override in the UI.
           DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
         run: |
           echo "DRY_RUN=${DRY_RUN:-true}"
