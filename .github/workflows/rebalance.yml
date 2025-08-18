@@ -9,10 +9,10 @@ on:
         required: false
         default: "true"
 
-  # Auto-run ~3:55 PM New York, year-round (EDT & EST)
+  # Auto-run ~3:55 PM New York year-round
   schedule:
-    - cron: "55 19 * * 1-5"  # 3:55 PM during EDT (UTC-4)
-    - cron: "55 20 * * 1-5"  # 3:55 PM during EST (UTC-5)
+    - cron: '55 19 * * 1-5'  # 3:55 PM during EDT (UTC-4)
+    - cron: '55 20 * * 1-5'  # 3:55 PM during EST (UTC-5)
 
 concurrency:
   group: rebalance
@@ -38,7 +38,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # ---- Market-hours guard (US/Eastern) ----
+      # ---- Market hours guard (US/Eastern) ----
       - name: Market-hours guard (ET)
         run: |
           TZ=America/New_York
@@ -50,13 +50,11 @@ jobs:
           echo "hhmm=$hhmm"
           echo "dow=$dow (1=Mon ... 7=Sun)"
 
-          # Weekdays only
+          # Only Mon–Fri 09:25–16:10 ET
           if [ "$dow" -lt 1 ] || [ "$dow" -gt 5 ]; then
             echo "Outside weekdays → exiting 0"
             exit 0
           fi
-
-          # 09:25–16:10 ET window
           if [ "$hhmm" -lt 0925 ] || [ "$hhmm" -gt 1610 ]; then
             echo "Outside 09:25–16:10 ET window → exiting 0"
             exit 0
@@ -85,17 +83,111 @@ jobs:
           retention-days: 10
 
       - name: Build run summary
-        shell: bash
         run: |
-          echo "## Rebalance run $(date -u +'%Y-%m-%d %H:%M UTC')" >> "$GITHUB_STEP_SUMMARY"
-          if ls artifacts/*.json >/dev/null 2>&1; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "**Artifacts created:**" >> "$GITHUB_STEP_SUMMARY"
-            for f in artifacts/*.json; do
-              sz=$(wc -c < "$f" | tr -d ' ')
-              echo "- \`$f\` (${sz} bytes)" >> "$GITHUB_STEP_SUMMARY"
-            done
-          else
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "_No JSON artifacts found._" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          {
+            echo "### Daily Rebalance – ${{ job.status }}"
+            echo
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            latest=$(ls -1t artifacts/*.csv 2>/dev/null | head -n1)
+            if [ -n "$latest" ]; then
+              echo "#### Preview of \`$(basename "$latest")\`"
+              echo
+              # show header + first 5 rows as a fenced block
+              echo '```csv'
+              head -n 6 "$latest"
+              echo '```'
+            else
+              echo "_No CSV produced._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------- Email notification ----------------
+      - name: Notify by email
+        if: always()   # send on success and failure
+        env:
+          SMTP_HOST:   ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:   ${{ secrets.SMTP_PORT }}
+          SMTP_USER:   ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASS:   ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM:  ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO:    ${{ secrets.EMAIL_TO }}
+          RUN_STATUS:  ${{ job.status }}
+          RUN_URL:     ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          import os, glob, json, smtplib, mimetypes
+          from email.message import EmailMessage
+          from pathlib import Path
+          import csv
+
+          host = os.environ["SMTP_HOST"]
+          port = int(os.environ.get("SMTP_PORT", "587"))
+          user = os.environ["SMTP_USER"]
+          pwd  = os.environ["SMTP_PASS"]
+          sender = os.environ["EMAIL_FROM"]
+          to     = os.environ["EMAIL_TO"]
+          status = os.environ.get("RUN_STATUS", "unknown")
+          run_url= os.environ.get("RUN_URL", "")
+
+          # Find newest artifacts (csv/json)
+          csvs  = sorted(glob.glob("artifacts/*.csv"))
+          jsons = sorted(glob.glob("artifacts/*.json"))
+          csv_latest  = csvs[-1]  if csvs  else None
+          json_latest = jsons[-1] if jsons else None
+
+          # Build body with short CSV preview
+          lines = [f"Daily Rebalance: {status}",
+                   f"Run: {run_url}",
+                   ""]
+          if csv_latest:
+            lines.append(f"CSV: {Path(csv_latest).name}")
+            try:
+              with open(csv_latest, newline="", encoding="utf-8") as f:
+                r = csv.reader(f)
+                header = next(r, [])
+                rows = [row for _, row in zip(range(5), r)]
+              # simple two-column preview
+              lines.append("")
+              lines.append("symbol, percent_return (first 5)")
+              for row in rows:
+                if len(row) >= 2:
+                  lines.append(f"{row[0]}, {row[1]}")
+            except Exception as e:
+              lines.append(f"(Could not preview CSV: {e})")
+
+          if json_latest:
+            try:
+              with open(json_latest, encoding="utf-8") as jf:
+                data = json.load(jf)
+              dry = data.get("dry_run")
+              lines.append("")
+              lines.append(f"dry_run: {dry}")
+            except Exception as e:
+              lines.append(f"(Could not read JSON: {e})")
+
+          body = "\n".join(lines)
+
+          msg = EmailMessage()
+          msg["Subject"] = f"[Rebalance] {status}"
+          msg["From"]    = sender
+          msg["To"]      = to
+          msg.set_content(body)
+
+          # Attach newest CSV/JSON
+          for path in filter(None, [csv_latest, json_latest]):
+            ctype, _ = mimetypes.guess_type(path)
+            maintype, subtype = (ctype or "application/octet-stream").split("/", 1)
+            with open(path, "rb") as f:
+              msg.add_attachment(f.read(),
+                                 maintype=maintype,
+                                 subtype=subtype,
+                                 filename=Path(path).name)
+
+          with smtplib.SMTP(host, port) as s:
+            s.starttls()
+            s.login(user, pwd)
+            s.send_message(msg)
+
+          print("Email sent to:", to)
+          PY
