@@ -1,4 +1,4 @@
-name: Daily Rebalance (headless) — fixed
+name: Daily Rebalance (headless) – fixed
 
 on:
   workflow_dispatch:
@@ -22,84 +22,31 @@ concurrency:
 jobs:
   rebalance:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
+
     steps:
-      - name: Check out repo
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Market-hours guard (ET)
-        id: market_time
-        shell: bash
-        run: |
-          TZ=America/New_York
-          now_et=$(TZ=$TZ date +'%Y-%m-%d %H:%M:%S %Z')
-          hhmm=$(TZ=$TZ date +'%H%M')
-          dow=$(TZ=$TZ date +%u)  # 1=Mon ... 7=Sun
-          echo "now_et=$now_et"
-          echo "hhmm=$hhmm"
-          echo "dow=$dow (1=Mon ... 7=Sun)"
-          in_window=false
-          if [ "$dow" -ge 1 ] && [ "$dow" -le 5 ]; then
-            if [ "$hhmm" -ge 0925 ] && [ "$hhmm" -le 1610 ]; then
-              in_window=true
-            fi
-          fi
-          echo "in_window=$in_window" >> "$GITHUB_OUTPUT"
+          python-version: '3.11'
 
       - name: Install dependencies
-        if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' }}
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Execute headless rebalance
-        if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' }}
-        env:
-          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
         run: |
-          echo "DRY_RUN=${DRY_RUN:-true}"
-          python runner.py --dry-run "${DRY_RUN:-true}"
+          python runner.py \
+            --dry-run=${{ github.event.inputs.dry_run }} \
+            --ignore-market-hours=${{ github.event.inputs.ignore_market_hours }}
 
       - name: Upload signals artifact
-        if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: signals-${{ github.run_id }}
-          path: artifacts/*
-          if-no-files-found: warn
-          retention-days: 10
+          path: signals.json
 
       - name: Build run summary
-        if: always()
-        shell: bash
-        run: |
-          echo "### Daily Rebalance – $GITHUB_RUN_NUMBER" >> "$GITHUB_STEP_SUMMARY"
-          echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> "$GITHUB_STEP_SUMMARY"
-          if ls artifacts/*.csv >/dev/null 2>&1; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "Preview of \`signals\` CSV:" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo '```csv' >> "$GITHUB_STEP_SUMMARY"
-            head -n 10 artifacts/*.csv >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "_No CSV artifact produced._" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: Skipped (outside market hours)
-        if: ${{ not( (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' ) }}
-        run: echo "Skipping heavy steps: outside US market hours."
+        run: python runner.py --summary
