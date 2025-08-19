@@ -1,32 +1,13 @@
 name: Daily Rebalance
 
 on:
-  # Runs every day at 13:00 UTC (06:00 PT / 09:00 ET)
+  workflow_dispatch:   # Allow manual runs
   schedule:
-    - cron: "0 13 * * *"
-
-  # Allow manual runs from the Actions tab
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Do not make external changes (safe test)"
-        required: false
-        default: "false"
-
-concurrency:
-  group: rebalance
-  cancel-in-progress: false
+    - cron: "0 14 * * 1-5"   # Runs every weekday at 14:00 UTC
 
 jobs:
   rebalance:
     runs-on: ubuntu-latest
-
-    # Wire secrets into env (empty string if not provided)
-    env:
-      DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-      EMAIL_SENDER:   ${{ secrets.EMAIL_SENDER   || '' }}
-      EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD || '' }}
-      EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER || '' }}
 
     steps:
       - name: Checkout repo
@@ -48,64 +29,30 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Execute headless rebalance
-        # Your app’s CLI entry point
+      - name: Run rebalance script
         run: |
-          echo "DRY_RUN=${DRY_RUN}"
-          python runner.py
+          echo "Running rebalance..."
+          python scripts/rebalance.py
 
-      - name: Upload signals artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: signals-${{ github.run_id }}
-          path: |
-            signals*.csv
-          if-no-files-found: ignore
-
-      - name: Build run summary
-        if: always()
+      - name: Send daily summary
         run: |
-          echo "## Daily Rebalance – $GITHUB_RUN_NUMBER" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          if ls signals*.csv >/dev/null 2>&1; then
-            echo "Preview of **signals** CSV:" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            head -n 10 signals*.csv | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "_No signals file found._" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: Notify by email (optional)
-        if: ${{ env.EMAIL_SENDER != '' && env.EMAIL_PASSWORD != '' && env.EMAIL_RECEIVER != '' }}
-        run: |
-          python - << 'PYMAIL'
-          import os, smtplib
+          python - <<'EOF'
+          import smtplib, os
           from email.mime.text import MIMEText
 
-          sender   = os.environ["EMAIL_SENDER"]
-          password = os.environ["EMAIL_PASSWORD"]
-          receiver = os.environ["EMAIL_RECEIVER"]
+          smtp_server = "smtp.gmail.com"
+          sender = os.environ.get("EMAIL_SENDER")
+          password = os.environ.get("EMAIL_PASSWORD")
+          recipient = os.environ.get("EMAIL_RECIPIENT")
 
-          subject = f"[Rebalance] Run #{os.environ.get('GITHUB_RUN_NUMBER')} – {os.environ.get('GITHUB_WORKFLOW')}"
-          body = f"""Workflow: {os.environ.get('GITHUB_WORKFLOW')}
-Run #:    {os.environ.get('GITHUB_RUN_NUMBER')}
-Result:   {os.environ.get('JOB_STATUS','(see Actions)')}
-
-Repository: {os.environ.get('GITHUB_REPOSITORY')}
-Run URL:    https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}
-"""
-          msg = MIMEText(body)
+          msg = MIMEText("Daily rebalance completed successfully.")
+          msg["Subject"] = "Daily Rebalance Report"
           msg["From"] = sender
-          msg["To"] = receiver
-          msg["Subject"] = subject
+          msg["To"] = recipient
 
-          # Gmail (app password) SMTP
-          with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-              smtp.login(sender, password)
-              smtp.sendmail(sender, [receiver], msg.as_string())
-          PYMAIL
-        env:
-          JOB_STATUS: ${{ job.status }}
+          with smtplib.SMTP_SSL(smtp_server, 465) as server:
+              server.login(sender, password)
+              server.sendmail(sender, [recipient], msg.as_string())
+          EOF
