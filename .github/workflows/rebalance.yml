@@ -1,26 +1,33 @@
 name: Daily Rebalance (headless)
 
 on:
+  # keep manual runs for testing
   workflow_dispatch:
     inputs:
       dry_run:
-        description: Do not make external changes (safe test mode)
+        description: 'Do not make external changes (safe test mode)'
         required: false
-        default: "true"
-
-  # Auto-run at ~3:55 PM New York in both EDT/EST
+        default: 'true'
+  # run Mon–Fri at 3:55 PM US Eastern (both EDT & EST)
   schedule:
-    - cron: '55 19 * * 1-5'   # 3:55 PM during EDT (UTC-4)
-    - cron: '55 20 * * 1-5'   # 3:55 PM during EST (UTC-5)
+    - cron: '55 19 * * 1-5'   # 19:55 UTC = 3:55 PM EDT (UTC-4)
+    - cron: '55 20 * * 1-5'   # 20:55 UTC = 3:55 PM EST (UTC-5)
 
 concurrency:
   group: rebalance
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   rebalance:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+
+    # For scheduled runs, DRY_RUN defaults to false.
+    # For manual runs, default comes from workflow_dispatch above (true).
+    env:
+      DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) || 'false' }}
 
     steps:
       - name: Check out repo
@@ -29,105 +36,31 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Market-hours guard (ET)
-        shell: bash
-        run: |
-          TZ=America/New_York
-          now_et=$(TZ=$TZ date +'%Y-%m-%d %H:%M:%S %Z')
-          hhmm=$(TZ=$TZ date +'%H%M')
-          dow=$(TZ=$TZ date +%u)  # 1=Mon ... 7=Sun
-          echo "now_et=$now_et"
-          echo "hhmm=$hhmm"
-          echo "dow=$dow (1=Mon ... 7=Sun)"
-          if [ "$dow" -lt 1 ] || [ "$dow" -gt 5 ]; then
-            echo "Outside weekdays → exiting 0"
-            exit 0
-          fi
-          if [ "$hhmm" -lt 0925 ] || [ "$hhmm" -gt 1610 ]; then
-            echo "Outside 09:25–16:10 ET window → exiting 0"
-            exit 0
-          fi
-          echo "Inside market window → continuing"
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Execute headless rebalance
-        env:
-          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
         run: |
-          echo "DRY_RUN=${DRY_RUN:-true}"
-          python runner.py --dry-run "${DRY_RUN:-true}"
+          echo "DRY_RUN=${DRY_RUN}"
+          python run.py --headless $( [[ "${DRY_RUN}" == 'true' ]] && echo "--dry-run" )
 
       - name: Upload signals artifact
         uses: actions/upload-artifact@v4
         with:
           name: signals-${{ github.run_id }}
-          path: artifacts/*
-          if-no-files-found: warn
-          retention-days: 10
+          path: signals-*.csv
 
       - name: Build run summary
-        shell: bash
-        run: |
-          echo "### Daily Rebalance – $GITHUB_RUN_NUMBER" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Workflow: **${{ github.workflow }}**" >> $GITHUB_STEP_SUMMARY
-          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
-          if ls artifacts/*.csv >/dev/null 2>&1; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Preview of *signals* CSV:" >> $GITHUB_STEP_SUMMARY
-            head -n 8 artifacts/*.csv | sed 's/^/`/;s/$/`/' >> $GITHUB_STEP_SUMMARY
-          fi
-
-      - name: Notify by email
         if: always()
-        env:
-          EMAIL_FROM: ${{ vars.EMAIL_FROM || secrets.EMAIL_USERNAME }}
-          EMAIL_TO:   ${{ secrets.EMAIL_TO }}
-          EMAIL_USER: ${{ secrets.EMAIL_USERNAME }}
-          EMAIL_PASS: ${{ secrets.EMAIL_PASSWORD }}
-          RUN_URL:    ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          STATUS:     ${{ job.status }}
         run: |
-          python - <<'PY'
-          import os, smtplib
-          from email.mime.text import MIMEText
-
-          sender = os.environ.get("EMAIL_FROM") or os.environ["EMAIL_USER"]
-          to     = os.environ.get("EMAIL_TO", "")
-          user   = os.environ.get("EMAIL_USER", "")
-          pwd    = os.environ.get("EMAIL_PASS", "")
-          status = os.environ.get("STATUS", "unknown")
-          run_url= os.environ.get("RUN_URL","")
-
-          if not (to and user and pwd):
-              print("Email not configured (missing EMAIL_TO/USERNAME/PASSWORD). Skipping.")
-              raise SystemExit(0)
-
-          subject = f"[Rebalance] {status}"
-          body = f"Daily Rebalance finished with status: {status}\nRun: {run_url}\n"
-
-          msg = MIMEText(body)
-          msg["Subject"] = subject
-          msg["From"] = sender
-          msg["To"] = to
-
-          with smtplib.SMTP("smtp.gmail.com", 587) as s:
-              s.starttls()
-              s.login(user, pwd)
-              s.sendmail(sender, [to], msg.as_string())
-          print("Email sent.")
-          PY
+          echo "### Daily Rebalance – $GITHUB_RUN_NUMBER" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if compgen -G "signals-*.csv" > /dev/null; then
+            echo 'Preview of `signals` CSV:' >> "$GITHUB_STEP_SUMMARY"
+            head -n 6 signals-*.csv | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No signals file found.' >> "$GITHUB_STEP_SUMMARY"
+          fi
