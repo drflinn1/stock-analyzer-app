@@ -60,7 +60,7 @@ jobs:
 
           in_window=false
           if [ "$dow" -ge 1 ] && [ "$dow" -le 5 ]; then
-            # allow a few minutes pre-open and post-close for setup/cleanup
+            # allow a few minutes pre-open and post-close
             if [ "$hhmm" -ge 0925 ] && [ "$hhmm" -le 1610 ]; then
               in_window=true
             fi
@@ -109,56 +109,6 @@ jobs:
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "_No CSV artifact produced._" >> "$GITHUB_STEP_SUMMARY"
           fi
-
-      # ---------- Email notification (optional) ----------
-      # Skips automatically if EMAIL_* secrets are not set.
-      - name: Notify by email
-        if: always()
-        env:
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          RUN_ID: ${{ github.run_id }}
-          REPO: ${{ github.repository }}
-          STATUS: ${{ job.status }}
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os, smtplib, ssl
-          from email.message import EmailMessage
-
-          user = os.environ.get("EMAIL_USER") or ""
-          pwd  = os.environ.get("EMAIL_PASSWORD") or ""
-          rcpt = os.environ.get("EMAIL_RECEIVER") or ""
-          if not (user and pwd and rcpt):
-              print("Email secrets missing; skipping mail.")
-              raise SystemExit(0)
-
-          run_url = os.environ.get("RUN_URL", "")
-          run_id  = os.environ.get("RUN_ID", "")
-          repo    = os.environ.get("REPO", "")
-          status  = os.environ.get("STATUS", "unknown").upper()
-
-          msg = EmailMessage()
-          msg["From"] = user
-          msg["To"] = rcpt
-          msg["Subject"] = f"[{repo}] Rebalance #{run_id}: {status}"
-
-          body = f"""Daily Rebalance result: {status}
-
-          Repository : {repo}
-          Run URL    : {run_url}
-
-          (This email was sent automatically by GitHub Actions.)
-          """
-          msg.set_content(body)
-
-          with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as s:
-              s.login(user, pwd)
-              s.send_message(msg)
-          print("Email sent.")
-          PY
 
       - name: Skipped (outside market hours)
         if: ${{ not( (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' ) }}
