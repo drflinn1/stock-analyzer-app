@@ -1,66 +1,111 @@
-name: Daily Rebalance (headless)
+name: Daily Rebalance
 
 on:
-  # keep manual runs for testing
+  # Runs every day at 13:00 UTC (06:00 PT / 09:00 ET)
+  schedule:
+    - cron: "0 13 * * *"
+
+  # Allow manual runs from the Actions tab
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Do not make external changes (safe test mode)'
+        description: "Do not make external changes (safe test)"
         required: false
-        default: 'true'
-  # run Mon–Fri at 3:55 PM US Eastern (both EDT & EST)
-  schedule:
-    - cron: '55 19 * * 1-5'   # 19:55 UTC = 3:55 PM EDT (UTC-4)
-    - cron: '55 20 * * 1-5'   # 20:55 UTC = 3:55 PM EST (UTC-5)
+        default: "false"
 
 concurrency:
   group: rebalance
   cancel-in-progress: false
 
-permissions:
-  contents: read
-
 jobs:
   rebalance:
     runs-on: ubuntu-latest
 
-    # For scheduled runs, DRY_RUN defaults to false.
-    # For manual runs, default comes from workflow_dispatch above (true).
+    # Wire secrets into env (empty string if not provided)
     env:
-      DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) || 'false' }}
+      DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      EMAIL_SENDER:   ${{ secrets.EMAIL_SENDER   || '' }}
+      EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD || '' }}
+      EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER || '' }}
 
     steps:
-      - name: Check out repo
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.10"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Execute headless rebalance
+        # Your app’s CLI entry point
         run: |
           echo "DRY_RUN=${DRY_RUN}"
-          python run.py --headless $( [[ "${DRY_RUN}" == 'true' ]] && echo "--dry-run" )
+          python runner.py
 
       - name: Upload signals artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: signals-${{ github.run_id }}
-          path: signals-*.csv
+          path: |
+            signals*.csv
+          if-no-files-found: ignore
 
       - name: Build run summary
         if: always()
         run: |
-          echo "### Daily Rebalance – $GITHUB_RUN_NUMBER" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Daily Rebalance – $GITHUB_RUN_NUMBER" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          if compgen -G "signals-*.csv" > /dev/null; then
-            echo 'Preview of `signals` CSV:' >> "$GITHUB_STEP_SUMMARY"
-            head -n 6 signals-*.csv | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY"
+          if ls signals*.csv >/dev/null 2>&1; then
+            echo "Preview of **signals** CSV:" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            head -n 10 signals*.csv | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY"
           else
-            echo 'No signals file found.' >> "$GITHUB_STEP_SUMMARY"
+            echo "_No signals file found._" >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Notify by email (optional)
+        if: ${{ env.EMAIL_SENDER != '' && env.EMAIL_PASSWORD != '' && env.EMAIL_RECEIVER != '' }}
+        run: |
+          python - << 'PYMAIL'
+          import os, smtplib
+          from email.mime.text import MIMEText
+
+          sender   = os.environ["EMAIL_SENDER"]
+          password = os.environ["EMAIL_PASSWORD"]
+          receiver = os.environ["EMAIL_RECEIVER"]
+
+          subject = f"[Rebalance] Run #{os.environ.get('GITHUB_RUN_NUMBER')} – {os.environ.get('GITHUB_WORKFLOW')}"
+          body = f"""Workflow: {os.environ.get('GITHUB_WORKFLOW')}
+Run #:    {os.environ.get('GITHUB_RUN_NUMBER')}
+Result:   {os.environ.get('JOB_STATUS','(see Actions)')}
+
+Repository: {os.environ.get('GITHUB_REPOSITORY')}
+Run URL:    https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}
+"""
+          msg = MIMEText(body)
+          msg["From"] = sender
+          msg["To"] = receiver
+          msg["Subject"] = subject
+
+          # Gmail (app password) SMTP
+          with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+              smtp.login(sender, password)
+              smtp.sendmail(sender, [receiver], msg.as_string())
+          PYMAIL
+        env:
+          JOB_STATUS: ${{ job.status }}
