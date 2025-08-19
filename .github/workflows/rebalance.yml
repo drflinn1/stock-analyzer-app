@@ -1,43 +1,24 @@
-name: Daily Rebalance
+name: Rebalance
 
 on:
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Do not make external changes (safe test mode)"
-        required: false
-        default: "true"
-      ignore_market_hours:
-        description: "Run even if outside US market hours (for testing)"
-        required: false
-        default: "false"
-
   schedule:
-    # 3:55 PM during EDT (UTC-4)
-    - cron: "55 19 * * 1-5"
-    # 3:55 PM during EST (UTC-5)
-    - cron: "55 20 * * 1-5"
-
-concurrency:
-  group: rebalance
-  cancel-in-progress: false
+    - cron: "0 13 * * 1-5" # 5AM PT weekdays
 
 jobs:
   rebalance:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
     steps:
-      - name: Check out repo
-        uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
       - name: Cache pip
-        uses: actions/cache@v4
+        uses: actions/cache@v3
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
@@ -50,44 +31,23 @@ jobs:
           pip install -r requirements.txt
 
       - name: Decide dry-run
-        id: flags
-        shell: bash
+        id: decide_dry_run
         run: |
-          # Default to true for workflow_dispatch when unset
-          DRY_RUN_INPUT="${{ github.event.inputs.dry_run }}"
-          if [ -z "$DRY_RUN_INPUT" ]; then DRY_RUN_INPUT="true"; fi
-          echo "dry_run=$DRY_RUN_INPUT" >> "$GITHUB_OUTPUT"
-          echo "DRY_RUN=$DRY_RUN_INPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "is_dry_run=false" >> $GITHUB_OUTPUT
+          else
+            echo "is_dry_run=true" >> $GITHUB_OUTPUT
+          fi
 
       - name: Run rebalance script
-        env:
-          DRY_RUN: ${{ steps.flags.outputs.dry_run }}
+        working-directory: ${{ github.workspace }}
         run: |
           echo "Running rebalance..."
-          # call the existing runner.py in the repo root
-          if [ "${DRY_RUN}" = "true" ]; then
-            python runner.py --headless --dry-run || exit 2
-          else
-            python runner.py --headless || exit 2
-          fi
+          python runner.py --dry-run "${{ steps.decide_dry_run.outputs.is_dry_run }}"
 
-      - name: Upload signals artifact
+      - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
-          name: signals-${{ github.run_id }}
-          path: |
-            signals-*.csv
-          if-no-files-found: warn
-
-      - name: Build run summary
-        if: always()
-        run: |
-          echo "### Daily Rebalance — $GITHUB_RUN_NUMBER" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if ls signals-*.csv >/dev/null 2>&1; then
-            echo "Produced signals CSV files:" >> $GITHUB_STEP_SUMMARY
-            ls -1 signals-*.csv | sed 's/^/- `&`/' >> $GITHUB_STEP_SUMMARY
-          else
-            echo "_No signals file found._" >> $GITHUB_STEP_SUMMARY
-          fi
+          name: rebalance-logs
+          path: logs/
