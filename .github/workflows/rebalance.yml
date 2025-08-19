@@ -1,22 +1,17 @@
 name: Daily Rebalance (headless)
 
 on:
-  # Manual trigger (Run workflow button)
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Do not make external changes (safe test mode)'
+        description: Do not make external changes (safe test mode)
         required: false
         default: "true"
-      ignore_market_hours:
-        description: 'Run even if outside US market hours (for testing)'
-        required: false
-        default: "false"
 
-  # Auto-run ~3:55 PM New York year-round
+  # Auto-run at ~3:55 PM New York in both EDT/EST
   schedule:
-    - cron: '55 19 * * 1-5'  # 3:55 PM during EDT (UTC-4)
-    - cron: '55 20 * * 1-5'  # 3:55 PM during EST (UTC-5)
+    - cron: '55 19 * * 1-5'   # 3:55 PM during EDT (UTC-4)
+    - cron: '55 20 * * 1-5'   # 3:55 PM during EST (UTC-5)
 
 concurrency:
   group: rebalance
@@ -44,39 +39,32 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # ---- Market hours guard (US/Eastern) ----
       - name: Market-hours guard (ET)
-        id: market_time
         shell: bash
         run: |
           TZ=America/New_York
           now_et=$(TZ=$TZ date +'%Y-%m-%d %H:%M:%S %Z')
           hhmm=$(TZ=$TZ date +'%H%M')
           dow=$(TZ=$TZ date +%u)  # 1=Mon ... 7=Sun
-
           echo "now_et=$now_et"
           echo "hhmm=$hhmm"
           echo "dow=$dow (1=Mon ... 7=Sun)"
-
-          in_window=false
-          if [ "$dow" -ge 1 ] && [ "$dow" -le 5 ]; then
-            # allow a few minutes pre-open and post-close
-            if [ "$hhmm" -ge 0925 ] && [ "$hhmm" -le 1610 ]; then
-              in_window=true
-            fi
+          if [ "$dow" -lt 1 ] || [ "$dow" -gt 5 ]; then
+            echo "Outside weekdays → exiting 0"
+            exit 0
           fi
-
-          echo "in_window=$in_window"
-          echo "in_window=$in_window" >> "$GITHUB_OUTPUT"
+          if [ "$hhmm" -lt 0925 ] || [ "$hhmm" -gt 1610 ]; then
+            echo "Outside 09:25–16:10 ET window → exiting 0"
+            exit 0
+          fi
+          echo "Inside market window → continuing"
 
       - name: Install dependencies
-        if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' }}
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Execute headless rebalance
-        if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' }}
         env:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
         run: |
@@ -84,7 +72,6 @@ jobs:
           python runner.py --dry-run "${DRY_RUN:-true}"
 
       - name: Upload signals artifact
-        if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: signals-${{ github.run_id }}
@@ -93,23 +80,54 @@ jobs:
           retention-days: 10
 
       - name: Build run summary
-        if: always()
         shell: bash
         run: |
-          echo "### Daily Rebalance – $GITHUB_RUN_NUMBER" >> "$GITHUB_STEP_SUMMARY"
-          echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Daily Rebalance – $GITHUB_RUN_NUMBER" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Workflow: **${{ github.workflow }}**" >> $GITHUB_STEP_SUMMARY
+          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
           if ls artifacts/*.csv >/dev/null 2>&1; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "Preview of \`signals\` CSV:" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo '```csv' >> "$GITHUB_STEP_SUMMARY"
-            head -n 10 artifacts/*.csv >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "_No CSV artifact produced._" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Preview of *signals* CSV:" >> $GITHUB_STEP_SUMMARY
+            head -n 8 artifacts/*.csv | sed 's/^/`/;s/$/`/' >> $GITHUB_STEP_SUMMARY
           fi
 
-      - name: Skipped (outside market hours)
-        if: ${{ not( (github.event_name == 'workflow_dispatch' && github.event.inputs.ignore_market_hours == 'true') || steps.market_time.outputs.in_window == 'true' ) }}
-        run: echo "Skipping heavy steps: outside US market hours."
+      - name: Notify by email
+        if: always()
+        env:
+          EMAIL_FROM: ${{ vars.EMAIL_FROM || secrets.EMAIL_USERNAME }}
+          EMAIL_TO:   ${{ secrets.EMAIL_TO }}
+          EMAIL_USER: ${{ secrets.EMAIL_USERNAME }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASSWORD }}
+          RUN_URL:    ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STATUS:     ${{ job.status }}
+        run: |
+          python - <<'PY'
+          import os, smtplib
+          from email.mime.text import MIMEText
+
+          sender = os.environ.get("EMAIL_FROM") or os.environ["EMAIL_USER"]
+          to     = os.environ.get("EMAIL_TO", "")
+          user   = os.environ.get("EMAIL_USER", "")
+          pwd    = os.environ.get("EMAIL_PASS", "")
+          status = os.environ.get("STATUS", "unknown")
+          run_url= os.environ.get("RUN_URL","")
+
+          if not (to and user and pwd):
+              print("Email not configured (missing EMAIL_TO/USERNAME/PASSWORD). Skipping.")
+              raise SystemExit(0)
+
+          subject = f"[Rebalance] {status}"
+          body = f"Daily Rebalance finished with status: {status}\nRun: {run_url}\n"
+
+          msg = MIMEText(body)
+          msg["Subject"] = subject
+          msg["From"] = sender
+          msg["To"] = to
+
+          with smtplib.SMTP("smtp.gmail.com", 587) as s:
+              s.starttls()
+              s.login(user, pwd)
+              s.sendmail(sender, [to], msg.as_string())
+          print("Email sent.")
+          PY
