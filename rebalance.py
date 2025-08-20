@@ -1,62 +1,130 @@
-#!/usr/bin/env python3
-import argparse
-import json
-import os
-from datetime import datetime, timezone
+# rebalance.py
+"""
+Generates simple BUY/SELL/HOLD signals and a run summary.
+Safe to run in CI. Respects DRY_RUN and IGNORE_MARKET_HOURS env vars.
 
-def parse_bool(s: str) -> bool:
-    if s is None:
+Outputs:
+  - rebalance.log  (human-readable log)
+  - signals.json   (structured output for later steps)
+  - summary.md     (one-line markdown for GitHub job summary)
+"""
+
+import os, json, sys, datetime as dt
+from typing import List, Dict
+
+# ---------- Config ----------
+# Edit this list or load from a file if you prefer.
+UNIVERSE = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"]
+
+LOOKBACK = 220         # trading days to download
+FAST = 50              # fast SMA window
+SLOW = 200             # slow SMA window
+
+# ---------- Env flags ----------
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+IGNORE_MKT = os.getenv("IGNORE_MARKET_HOURS", "false").lower() == "true"
+
+# ---------- Helpers ----------
+def now_utc_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+def us_market_open_now() -> bool:
+    """Very simple gate: Mon–Fri 13:30–20:00 UTC (9:30–16:00 ET).
+    Good enough for CI guard; use a market-hours lib if you need holidays."""
+    if IGNORE_MKT:
+        return True
+    now = dt.datetime.now(dt.timezone.utc)
+    if now.weekday() >= 5:  # Sat/Sun
         return False
-    s = s.strip().lower()
-    return s in {"1", "true", "yes", "y", "on"}
+    t = now.time()
+    return (dt.time(13, 30) <= t <= dt.time(20, 0))
+
+def write(path: str, content: str):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+def log(msg: str):
+    stamp = f"[{now_utc_iso()}] "
+    print(stamp + msg)
+    with open("rebalance.log", "a", encoding="utf-8") as f:
+        f.write(stamp + msg + "\n")
+
+# ---------- Main logic ----------
+def compute_signals(tickers: List[str]) -> List[Dict]:
+    import pandas as pd
+    import yfinance as yf
+
+    out = []
+    for t in tickers:
+        try:
+            df = yf.download(t, period=f"{LOOKBACK}d", interval="1d", auto_adjust=True, progress=False)
+            if df.empty or len(df) < SLOW:
+                log(f"{t}: insufficient data ({len(df)} bars)")
+                continue
+
+            close = df["Close"]
+            sma_fast = close.rolling(FAST).mean().iloc[-1]
+            sma_slow = close.rolling(SLOW).mean().iloc[-1]
+            price = float(close.iloc[-1])
+
+            if pd.isna(sma_fast) or pd.isna(sma_slow):
+                log(f"{t}: SMA nan (fast={sma_fast}, slow={sma_slow})")
+                continue
+
+            if sma_fast > sma_slow:
+                action = "BUY"
+            elif sma_fast < sma_slow:
+                action = "SELL"
+            else:
+                action = "HOLD"
+
+            out.append({
+                "symbol": t,
+                "price": round(price, 4),
+                "fast_sma": round(float(sma_fast), 4),
+                "slow_sma": round(float(sma_slow), 4),
+                "signal": action
+            })
+        except Exception as e:
+            log(f"{t}: error {e!r}")
+    return out
 
 def main():
-    parser = argparse.ArgumentParser(description="Headless daily rebalance runner")
-    parser.add_argument("--dry-run", required=False, default="true",
-                        help="true/false; if true, do not make external changes")
-    parser.add_argument("--ignore-market-hours", required=False, default="false",
-                        help="true/false; if true, allow running outside US market hours")
-    args = parser.parse_args()
+    log(f"Start: dry_run={DRY_RUN}, ignore_market_hours={IGNORE_MKT}")
 
-    dry_run = parse_bool(args.dry_run)
-    ignore_hours = parse_bool(args.ignore_market_hours)
+    if not us_market_open_now():
+        log("Market is closed. Exiting early (set IGNORE_MARKET_HOURS=true to override).")
+        summary = "Market closed — skipped."
+        write("signals.json", json.dumps({
+            "generated_at": now_utc_iso(),
+            "dry_run": DRY_RUN,
+            "ignore_market_hours": IGNORE_MKT,
+            "signals": [],
+            "summary": summary
+        }, indent=2))
+        write("summary.md", summary)
+        return 0
 
-    # ---- placeholder business logic ---------------------------------------
-    # Put your actual signal generation here. For now, we emit no-op signals
-    # so the workflow is healthy and schedulable.
-    signals = []  # e.g. [{"ticker":"AAPL","action":"BUY","weight":0.10}, ...]
-    note = "No signals generated (placeholder script)."
-    # ------------------------------------------------------------------------
+    signals = compute_signals(UNIVERSE)
 
-    # Write a small log the workflow can upload
-    with open("rebalance.log", "a", encoding="utf-8") as lf:
-        lf.write(f"[{datetime.now(timezone.utc).isoformat()}] dry_run={dry_run}, "
-                 f"ignore_market_hours={ignore_hours}\n")
-        lf.write(note + "\n")
+    # Optional: turn signals into “orders” here if you add broker integration.
+    # For now, just summarize.
+    buys = sum(1 for s in signals if s["signal"] == "BUY")
+    sells = sum(1 for s in signals if s["signal"] == "SELL")
 
-    # Emit a stable machine-readable artifact
-    payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "dry_run": dry_run,
-        "ignore_market_hours": ignore_hours,
+    summary = f"{len(signals)} signals → BUY: {buys}, SELL: {sells} (DRY_RUN={DRY_RUN})"
+    log(summary)
+
+    write("signals.json", json.dumps({
+        "generated_at": now_utc_iso(),
+        "dry_run": DRY_RUN,
+        "ignore_market_hours": IGNORE_MKT,
         "signals": signals,
-        "summary": note,
-    }
-    with open("signals.json", "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+        "summary": summary
+    }, indent=2))
+    write("summary.md", summary)
 
-    # Append to the job summary if available
-    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary_path:
-        with open(summary_path, "a", encoding="utf-8") as sf:
-            sf.write("## Rebalance summary\n")
-            sf.write(f"- Dry run: **{dry_run}**\n")
-            sf.write(f"- Ignore market hours: **{ignore_hours}**\n")
-            sf.write(f"- Signals generated: **{len(signals)}**\n")
-            sf.write("\n_No signals generated (placeholder)._ \n")
-
-    print("Rebalance completed.")
     return 0
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
