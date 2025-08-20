@@ -4,67 +4,83 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Do not make external changes (safe test mode)"
-        required: false
-        default: "true"
+        description: "Do not place real orders (safe test mode)"
+        type: choice
+        options: [true, false]
+        default: true
       ignore_market_hours:
         description: "Run even if outside US market hours (for testing)"
-        required: false
-        default: "false"
+        type: choice
+        options: [false, true]
+        default: false
   schedule:
-    # 3:55 PM New York time on business days (two rules to handle EST/EDT)
-    - cron: '55 19 * * 1-5'   # 3:55 PM during EDT (UTC-4)
-    - cron: '55 20 * * 1-5'   # 3:55 PM during EST (UTC-5)
+    # Weekdays at 13:35 UTC (~09:35 ET). Adjust as you like, times are in UTC.
+    - cron: "35 13 * * 1-5"
 
-concurrency:
-  group: rebalance
-  cancel-in-progress: false
+permissions:
+  contents: read
 
 jobs:
   rebalance:
+    # Avoid running on forks, just in case
+    if: github.repository_owner == 'drflinn1'
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: write
+    timeout-minutes: 15
+    concurrency:
+      group: rebalance-${{ github.ref }}
+      cancel-in-progress: true
 
     steps:
-      - name: Checkout repo
+      - name: Check out repo
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install yfinance pandas
+          fi
 
-      # (Optional) give a quick line in the job summary about how we're running
-      - name: Decide dry-run
-        id: decide
+      - name: Decide dry-run flags
+        id: flags
         run: |
-          echo "DRY_RUN=${{ github.event.inputs.dry_run || 'true' }}" >> "$GITHUB_ENV"
-          echo "ignore_market_hours=${{ github.event.inputs.ignore_market_hours || 'false' }}" >> "$GITHUB_ENV"
-          echo "### Rebalance run" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **dry_run**: ${{ github.event.inputs.dry_run || 'true' }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **ignore_market_hours**: ${{ github.event.inputs.ignore_market_hours || 'false' }}" >> "$GITHUB_STEP_SUMMARY"
+          # Use workflow inputs when present; default otherwise.
+          echo "DRY_RUN=${{ github.event.inputs.dry_run || 'true' }}" >> $GITHUB_ENV
+          echo "IGNORE_MARKET_HOURS=${{ github.event.inputs.ignore_market_hours || 'false' }}" >> $GITHUB_ENV
+          echo "Using DRY_RUN=$DRY_RUN IGNORE_MARKET_HOURS=$IGNORE_MARKET_HOURS"
 
       - name: Run rebalance script
-        run: |
-          echo "Running rebalance..."
-          python rebalance.py \
-            --dry-run "${{ env.DRY_RUN }}" \
-            --ignore-market-hours "${{ env.ignore_market_hours }}"
+        run: python rebalance.py
 
-      - name: Upload results artifact
-        if: always()
+      - name: Upload signals artifact
         uses: actions/upload-artifact@v4
         with:
           name: signals
-          if-no-files-found: warn
           path: |
             signals.json
             rebalance.log
+            summary.md
+          retention-days: 14
+
+      - name: Build run summary
+        run: |
+          echo "### Rebalance summary" >> $GITHUB_STEP_SUMMARY
+          if [ -f summary.md ]; then
+            cat summary.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No summary generated." >> $GITHUB_STEP_SUMMARY
+          fi
