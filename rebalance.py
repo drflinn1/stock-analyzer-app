@@ -9,11 +9,10 @@ Outputs:
   - summary.md     (one-line markdown for GitHub job summary)
 """
 
-import os, json, sys, datetime as dt
+import os, json, sys, math, datetime as dt
 from typing import List, Dict
 
 # ---------- Config ----------
-# Edit this list or load from a file if you prefer.
 UNIVERSE = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"]
 
 LOOKBACK = 220         # trading days to download
@@ -54,37 +53,48 @@ def compute_signals(tickers: List[str]) -> List[Dict]:
     import pandas as pd
     import yfinance as yf
 
-    out = []
+    out: List[Dict] = []
     for t in tickers:
         try:
-            df = yf.download(t, period=f"{LOOKBACK}d", interval="1d", auto_adjust=True, progress=False)
-            if df.empty or len(df) < SLOW:
+            df = yf.download(
+                t,
+                period=f"{LOOKBACK}d",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+            )
+
+            if df.empty or len(df) < max(FAST, SLOW):
                 log(f"{t}: insufficient data ({len(df)} bars)")
                 continue
 
             close = df["Close"]
-            sma_fast = close.rolling(FAST).mean().iloc[-1]
-            sma_slow = close.rolling(SLOW).mean().iloc[-1]
-            price = float(close.iloc[-1])
 
-            if pd.isna(sma_fast) or pd.isna(sma_slow):
-                log(f"{t}: SMA nan (fast={sma_fast}, slow={sma_slow})")
+            # Compute windows and extract LAST value as a real float
+            sma_fast_val = float(close.rolling(FAST).mean().iloc[-1])
+            sma_slow_val = float(close.rolling(SLOW).mean().iloc[-1])
+            price_val    = float(close.iloc[-1])
+
+            # Guard against NaNs
+            if any(math.isnan(x) for x in (sma_fast_val, sma_slow_val, price_val)):
+                log(f"{t}: SMA/price NaN (fast={sma_fast_val}, slow={sma_slow_val}, price={price_val})")
                 continue
 
-            if sma_fast > sma_slow:
+            if sma_fast_val > sma_slow_val:
                 action = "BUY"
-            elif sma_fast < sma_slow:
+            elif sma_fast_val < sma_slow_val:
                 action = "SELL"
             else:
                 action = "HOLD"
 
             out.append({
                 "symbol": t,
-                "price": round(price, 4),
-                "fast_sma": round(float(sma_fast), 4),
-                "slow_sma": round(float(sma_slow), 4),
-                "signal": action
+                "price": round(price_val, 4),
+                "fast_sma": round(sma_fast_val, 4),
+                "slow_sma": round(sma_slow_val, 4),
+                "signal": action,
             })
+
         except Exception as e:
             log(f"{t}: error {e!r}")
     return out
@@ -107,12 +117,10 @@ def main():
 
     signals = compute_signals(UNIVERSE)
 
-    # Optional: turn signals into “orders” here if you add broker integration.
-    # For now, just summarize.
     buys = sum(1 for s in signals if s["signal"] == "BUY")
     sells = sum(1 for s in signals if s["signal"] == "SELL")
 
-    summary = f"{len(signals)} signals → BUY: {buys}, SELL: {sells} (DRY_RUN={DRY_RUN})"
+    summary = f"{len(signals)} signals -> BUY: {buys}, SELL: {sells} (DRY_RUN={DRY_RUN})"
     log(summary)
 
     write("signals.json", json.dumps({
