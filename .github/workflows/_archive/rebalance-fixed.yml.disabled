@@ -1,0 +1,52 @@
+name: Daily Rebalance (headless) – fixed
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Do not make external changes (safe test mode)'
+        required: false
+        default: "true"
+      ignore_market_hours:
+        description: 'Run even if outside US market hours (for testing)'
+        required: false
+        default: "false"
+  schedule:
+    - cron: '55 19 * * 1-5'  # 3:55 PM during EDT (UTC-4)
+    - cron: '55 20 * * 1-5'  # 3:55 PM during EST (UTC-5)
+
+concurrency:
+  group: rebalance
+  cancel-in-progress: false
+
+jobs:
+  rebalance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Execute headless rebalance
+        run: |
+          python runner.py \
+            --dry-run=${{ github.event.inputs.dry_run }} \
+            --ignore-market-hours=${{ github.event.inputs.ignore_market_hours }}
+
+      - name: Upload signals artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: signals-${{ github.run_id }}
+          path: signals.json
+
+      - name: Build run summary
+        run: python runner.py --summary

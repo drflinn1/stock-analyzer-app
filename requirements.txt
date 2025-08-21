@@ -7,5 +7,6 @@ python-dotenv
 streamlit-autorefresh
 robin_stocks
 lxml
-beautifulsoup4
-requests
+html5lib
+pycoingecko
+pyotp
