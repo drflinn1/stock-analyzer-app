@@ -1,4 +1,5 @@
 # app.py – Streamlit Web App Version of Stock Analyzer Bot with S&P Scan & Full Ticker Selection
+# VERSION = "0.8.8 (2025-08-21)"
 
 import os
 import time
@@ -15,41 +16,29 @@ import yfinance as yf
 from email.message import EmailMessage
 from streamlit_autorefresh import st_autorefresh
 
-VERSION = "0.8.7 (2025-08-14)"
-
 # -------------------------
 # ▶  CONFIG & SECRETS
 # -------------------------
 PAGE_TITLE = "Stock Analyzer Bot (Live Trading + Tax Logs)"
+APP_URL = st.secrets.get("APP_URL", "")
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 
-# Trading mode comes from secrets (so you don't have to toggle secrets each time)
-# Put TRADING_MODE = "simulate" or "live" in Streamlit secrets.
-TRADING_MODE = st.secrets.get("TRADING_MODE", "simulate").strip().lower()
-
-# Optional public app URL for links in Slack/email
-APP_URL = st.secrets.get("APP_URL", "")
-
-# Validate optional-but-useful secrets (email/slack)
+# Validate (optional) secrets — we only warn; app still runs fine in simulate mode.
 missing = []
-for key in ["EMAIL_ADDRESS", "EMAIL_PASSWORD", "EMAIL_RECEIVER"]:
-    if not st.secrets.get(key):
+for key in ["EMAIL_ADDRESS", "EMAIL_RECEIVER", "SLACK_WEBHOOK_URL"]:
+    if key not in st.secrets or not st.secrets.get(key):
         missing.append(key)
 if missing:
     st.sidebar.info(
-        "Email notifications are optional. Missing secrets: "
+        "Optional notifications are disabled. Missing secrets: "
         + ", ".join(missing)
-        + " (set in Streamlit Cloud → App → Settings → Secrets)."
     )
 
-WEBHOOK = st.secrets.get("SLACK_WEBHOOK_URL", "")
-
-# Robinhood client is optional; if lib missing or TRADING_MODE != 'live', we stay simulated
+# Robinhood client is optional
 try:
-    from robin_stocks import robinhood as r
-except ImportError:
-    r = None  # library not installed; app will still run in simulate mode
-
+    from robin_stocks import robinhood as r  # noqa: F401
+except Exception:
+    r = None
 
 # -------------------------
 # ▶  Helper to fetch S&P 500 & Top Movers
@@ -59,32 +48,33 @@ def get_sp500_tickers() -> List[str]:
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     try:
         df_list = pd.read_html(url, flavor="bs4", attrs={"class": "wikitable"})
-        return df_list[0]["Symbol"].tolist()
+        return sorted(df_list[0]["Symbol"].astype(str).str.strip().unique().tolist())
     except Exception:
-        # Fallback parser if bs4 not wired to read_html
+        # fallback soup scrape
         try:
-            from bs4 import BeautifulSoup  # optional import here
-            resp = requests.get(url, timeout=10)
+            from bs4 import BeautifulSoup  # lazy import
+            resp = requests.get(url, timeout=20)
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
             table = soup.find("table", {"class": "wikitable"})
-            return [
+            syms = [
                 row.find_all("td")[0].text.strip()
                 for row in table.find_all("tr")[1:]
             ]
+            return sorted(list({s for s in syms if s}))
         except Exception as e:
             st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
             return []
 
 
 def get_top_tickers(n: int) -> List[str]:
-    """No caching here so top movers are fresh."""
+    """Return top n performers by 1‑day change from S&P universe."""
     symbols = get_sp500_tickers()
     if not symbols:
         return []
+    # try bulk download first
     try:
         df = yf.download(symbols, period="2d", progress=False)["Close"]
-        # df can be Series if one symbol
         if isinstance(df, pd.Series):
             changes = df.pct_change().iloc[-1:].to_frame().T
         else:
@@ -93,7 +83,7 @@ def get_top_tickers(n: int) -> List[str]:
             changes.dropna().sort_values(ascending=False).head(n).index.tolist()
         )
     except Exception:
-        # slower fallback if the multi-download chokes
+        # slow fallback
         perf = {}
         for sym in symbols:
             try:
@@ -102,15 +92,13 @@ def get_top_tickers(n: int) -> List[str]:
                     perf[sym] = float(tmp.pct_change().iloc[-1])
             except Exception:
                 continue
-        return sorted(perf, key=lambda k: perf[k], reverse=True)[:n]
-
+        return [k for k, _ in sorted(perf.items(), key=lambda kv: kv[1], reverse=True)[:n]]
 
 # -------------------------
-# ▶  Analysis Helpers
+# ▶  Indicators
 # -------------------------
 def simple_sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window).mean()
-
 
 def simple_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -121,15 +109,13 @@ def simple_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-
 def bollinger_bands(series: pd.Series, window: int = 20, num_std: int = 2):
     sma = simple_sma(series, window)
     std = series.rolling(window).std()
     return sma, sma + num_std * std, sma - num_std * std
 
-
 # -------------------------
-# ▶  Data Fetch & Indicators
+# ▶  Data & Analysis
 # -------------------------
 @st.cache_data(show_spinner=False)
 def get_data(ticker: str, period: str, retries: int = 3) -> pd.DataFrame:
@@ -151,14 +137,8 @@ def get_data(ticker: str, period: str, retries: int = 3) -> pd.DataFrame:
         time.sleep(1)
     raise ValueError(f"No data fetched for {ticker}")
 
-
-# -------------------------
-# ▶  Signals & Thresholds
-# -------------------------
 @st.cache_data(show_spinner=False)
-def analyze(
-    df: pd.DataFrame, min_rows: int, rsi_ovr: float, rsi_obh: float
-) -> Optional[Dict]:
+def analyze(df: pd.DataFrame, min_rows: int, rsi_ovr: float, rsi_obh: float) -> Optional[Dict]:
     if not isinstance(df, pd.DataFrame) or len(df) < min_rows:
         return None
     cur, prev = df.iloc[-1], df.iloc[-2]
@@ -195,32 +175,31 @@ def analyze(
         "Reasons": "; ".join(reasons),
     }
 
-
 # -------------------------
 # ▶  Notifications
 # -------------------------
-def notify_slack(tkr: str, summ: Dict, price: float):
-    if not WEBHOOK:
-        return
-    if APP_URL:
-        qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}"
-        link = f" (<{APP_URL}{qs}|View in App>)"
-    else:
-        link = ""
-    text = f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}{link}"
-    try:
-        requests.post(WEBHOOK, json={"text": text}, timeout=5)
-    except Exception:
-        pass
+WEBHOOK = st.secrets.get("SLACK_WEBHOOK_URL")
 
+def notify_slack(tkr: str, summ: Dict, price: float):
+    if WEBHOOK:
+        if APP_URL:
+            qs = f"?tickers={','.join(st.session_state.get('tickers', []))}&period={st.session_state.get('period', '')}"
+            link = f" (<{APP_URL}{qs}|View in App>)"
+        else:
+            link = ""
+        text = f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}{link}"
+        try:
+            requests.post(WEBHOOK, json={"text": text}, timeout=10)
+        except Exception:
+            pass
 
 def notify_email(tkr: str, summ: Dict, price: float):
-    # Optional; requires EMAIL_* secrets
-    if not (st.secrets.get("EMAIL_ADDRESS") and st.secrets.get("EMAIL_PASSWORD") and st.secrets.get("EMAIL_RECEIVER")):
+    required = ["EMAIL_ADDRESS", "EMAIL_PASSWORD", "EMAIL_RECEIVER"]
+    if not all(st.secrets.get(k) for k in required):
         return
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if APP_URL:
-        qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}"
+        qs = f"?tickers={','.join(st.session_state.get('tickers', []))}&period={st.session_state.get('period', '')}"
         link = f"\n\nView in app: {APP_URL}{qs}"
     else:
         link = ""
@@ -234,97 +213,76 @@ def notify_email(tkr: str, summ: Dict, price: float):
     msg["From"] = st.secrets["EMAIL_ADDRESS"]
     msg["To"] = st.secrets["EMAIL_RECEIVER"]
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as s:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
             s.login(st.secrets["EMAIL_ADDRESS"], st.secrets["EMAIL_PASSWORD"])
             s.send_message(msg)
     except Exception:
         pass
 
-
 # -------------------------
 # ▶  Sidebar UI & Controls
 # -------------------------
 with st.sidebar:
-    st.markdown('## ⚙️ Settings')
-    with st.expander('General', expanded=True):
-        simulate_mode = st.checkbox('Simulate Trading Mode', True)
-        debug_mode = st.checkbox('Show debug logs', False)
-        st_autorefresh(interval=3600000, limit=None, key='hour_refresh')
+    st.markdown("## ⚙️ Settings")
+    with st.expander("General", expanded=True):
+        simulate_mode = st.checkbox("Simulate Trading Mode", True)
+        debug_mode = st.checkbox("Show debug logs", False)
+        # light auto-refresh once per hour
+        st_autorefresh(interval=3_600_000, limit=None, key="hour_refresh")
 
-    with st.expander('Analysis Options', expanded=True):
-        scan_top = st.checkbox('Scan top N performers', False)
-        top_n = st.slider('Top tickers to scan', 10, 100, 50) if scan_top else None
+    with st.expander("Analysis Options", expanded=True):
+        scan_top = st.checkbox("Scan top N performers", False)
+        top_n = st.slider("Top tickers to scan", 10, 100, 50) if scan_top else None
         universe = get_top_tickers(top_n) if scan_top else get_sp500_tickers()
 
-        min_rows = st.slider('Minimum data rows', 10, 100, 30)
-        rsi_ovr = st.slider('RSI oversold threshold', 0, 100, 30)
-        rsi_obh = st.slider('RSI overbought threshold', 0, 100, 70)
+        min_rows = st.slider("Minimum data rows", 10, 100, 30)
+        rsi_ovr = st.slider("RSI oversold threshold", 0, 100, 30)
+        rsi_obh = st.slider("RSI overbought threshold", 0, 100, 70)
 
-        # --- Query params (new API) ---
-        qp = st.query_params  # replaces st.experimental_get_query_params()
+        # --- NEW: use modern query param API & safe defaults ---
+        params = st.query_params  # <-- replaces st.experimental_get_query_params()
 
-        # qp values may be str or list depending on version – normalize safely
-        def _first(val):
-            if isinstance(val, list):
-                return val[0] if val else ''
-            return val or ''
+        qs_tickers = params.get("tickers")
+        qs_period = params.get("period")
 
-        qs_tickers_raw = _first(qp.get('tickers'))
-        qs_period_raw  = _first(qp.get('period'))
+        options = ["1mo", "3mo", "6mo", "1y", "2y"]
 
-        options = ['1mo', '3mo', '6mo', '1y', '2y']
-
-        # defaults from query or sidebar defaults
-        if qs_tickers_raw:
-            default_list = [t.strip() for t in qs_tickers_raw.split(',') if t.strip()]
+        if qs_tickers:
+            default_list = str(qs_tickers).split(",")
         else:
-            default_list = universe[:2]
+            default_list = universe[:2] if universe else []
 
-        default_period = qs_period_raw if qs_period_raw in options else '6mo'
+        if qs_period and str(qs_period) in options:
+            default_period = str(qs_period)
+        else:
+            default_period = "6mo"
 
-        # --- Widgets (no pre-setting session_state keys to avoid warning) ---
+        # SAFE DEFAULTS: only use defaults that are present in universe
+        valid_defaults = [t for t in default_list if t in universe]
+
+        # Important: don't preset st.session_state['tickers'] / ['period']
+        # before building widgets (avoids the Streamlit warning).
         tickers = st.multiselect(
-            'Choose tickers',
+            "Choose tickers",
             universe,
-            default=default_list
+            default=valid_defaults if valid_defaults else [],
+            key="tickers",
         )
         period = st.selectbox(
-            'Date range',
+            "Date range",
             options,
-            index=options.index(default_period)
+            index=options.index(default_period),
+            key="period",
         )
-
-        # Keep URL & session state in sync AFTER widgets are created
-        try:
-            st.query_params.update({
-                'tickers': ','.join(tickers) if tickers else '',
-                'period': period
-            })
-        except Exception:
-            # older Streamlit versions may not support update(); ignore silently
-            pass
-
-        st.session_state['tickers'] = tickers
-        st.session_state['period'] = period
-
 
 # -------------------------
 # ▶  Main Page
 # -------------------------
-mode_badge = "🔴 SIM" if simulate_mode else "🟢 LIVE"
-st.markdown(f"### {mode_badge} {PAGE_TITLE}")
-
+st.markdown(f"### {'🔴 SIM' if simulate_mode else '🟢 LIVE'} {PAGE_TITLE}")
 if st.button("▶ Run Analysis", use_container_width=True):
     if not tickers:
         st.warning("Select at least one ticker")
         st.stop()
-
-    # If we're not in simulate, but Robinhood isn't configured, fall back to simulate
-    live_enabled = (not simulate_mode) and (TRADING_MODE == "live") and (r is not None)
-
-    if not live_enabled and not simulate_mode and r is None:
-        st.info("Robinhood library not installed or trading disabled; running in simulate mode.")
-
     results: Dict[str, Dict] = {}
     for tkr in tickers:
         try:
@@ -333,11 +291,13 @@ if st.button("▶ Run Analysis", use_container_width=True):
             if summ is None:
                 st.warning(f"{tkr}: Not enough data, skipped")
                 continue
-
             results[tkr] = summ
-            price = float(df.Close.iloc[-1])
 
             # Notifications (optional)
+            try:
+                price = float(df.Close.iloc[-1])
+            except Exception:
+                price = float("nan")
             notify_email(tkr, summ, price)
             notify_slack(tkr, summ, price)
 
@@ -349,25 +309,20 @@ if st.button("▶ Run Analysis", use_container_width=True):
             fig.add_trace(go.Scatter(x=df.index, y=df.sma_50, name="50 SMA"))
             fig.add_trace(
                 go.Scatter(
-                    x=df.index,
-                    y=df.bb_upper,
-                    name="BB Upper",
-                    line=dict(dash="dot"),
+                    x=df.index, y=df.bb_upper, name="BB Upper", line=dict(dash="dot")
                 )
             )
             fig.add_trace(
                 go.Scatter(
-                    x=df.index,
-                    y=df.bb_lower,
-                    name="BB Lower",
-                    line=dict(dash="dot"),
+                    x=df.index, y=df.bb_lower, name="BB Lower", line=dict(dash="dot")
                 )
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            badge_map = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}
-            st.markdown(f"**{badge_map[summ['Signal']]} {tkr} – {summ['Signal']}**")
-            st.json(summ)
+            badge = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}[summ["Signal"]]
+            st.markdown(f"**{badge} {tkr} – {summ['Signal']}**")
+            if debug_mode:
+                st.json(summ)
             st.divider()
         except Exception as e:
             st.error(f"{tkr} failed: {e}")
@@ -402,10 +357,7 @@ if os.path.exists("trade_log.csv"):
     st.subheader("Tax Summary")
     st.dataframe(tax)
     st.download_button(
-        "⬇ Download Tax Summary",
-        tax.to_csv(index=False).encode(),
-        "tax_summary.csv",
+        "⬇ Download Tax Summary", tax.to_csv(index=False).encode(), "tax_summary.csv"
     )
     st.markdown("### 📈 Portfolio Cumulative Profit Over Time")
     st.line_chart(trades.set_index("Date")["Cum P/L"])
-
