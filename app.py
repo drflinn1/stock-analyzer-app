@@ -245,49 +245,68 @@ def notify_email(tkr: str, summ: Dict, price: float):
 # ▶  Sidebar UI & Controls
 # -------------------------
 with st.sidebar:
-    st.markdown("## ⚙️ Settings")
-    with st.expander("General", expanded=True):
-        # Default from secrets: live => unchecked simulate; simulate => checked
-        simulate_default = TRADING_MODE != "live"
-        simulate_mode = st.checkbox("Simulate Trading Mode", value=simulate_default)
-        debug_mode = st.checkbox("Show debug logs", False)
-        st_autorefresh(interval=3_600_000, limit=None, key="hour_refresh")
+    st.markdown('## ⚙️ Settings')
+    with st.expander('General', expanded=True):
+        simulate_mode = st.checkbox('Simulate Trading Mode', True)
+        debug_mode = st.checkbox('Show debug logs', False)
+        st_autorefresh(interval=3600000, limit=None, key='hour_refresh')
 
-    with st.expander("Analysis Options", expanded=True):
-        scan_top = st.checkbox("Scan top N performers", False)
-        top_n = st.slider("Top tickers to scan", 10, 100, 50) if scan_top else None
+    with st.expander('Analysis Options', expanded=True):
+        scan_top = st.checkbox('Scan top N performers', False)
+        top_n = st.slider('Top tickers to scan', 10, 100, 50) if scan_top else None
         universe = get_top_tickers(top_n) if scan_top else get_sp500_tickers()
 
-        min_rows = st.slider("Minimum data rows", 10, 100, 30)
-        rsi_ovr = st.slider("RSI oversold threshold", 0, 100, 30)
-        rsi_obh = st.slider("RSI overbought threshold", 0, 100, 70)
+        min_rows = st.slider('Minimum data rows', 10, 100, 30)
+        rsi_ovr = st.slider('RSI oversold threshold', 0, 100, 30)
+        rsi_obh = st.slider('RSI overbought threshold', 0, 100, 70)
 
-        # Load any URL query params
-        params = st.experimental_get_query_params()
-        qs_tickers = params.get("tickers", [])
-        options = ["1mo", "3mo", "6mo", "1y", "2y"]
-        qs_period = params.get("period", [])
+        # --- Query params (new API) ---
+        qp = st.query_params  # replaces st.experimental_get_query_params()
 
-        # Defaults
-        if qs_tickers:
-            default_list = [t for t in qs_tickers[0].split(",") if t]
+        # qp values may be str or list depending on version – normalize safely
+        def _first(val):
+            if isinstance(val, list):
+                return val[0] if val else ''
+            return val or ''
+
+        qs_tickers_raw = _first(qp.get('tickers'))
+        qs_period_raw  = _first(qp.get('period'))
+
+        options = ['1mo', '3mo', '6mo', '1y', '2y']
+
+        # defaults from query or sidebar defaults
+        if qs_tickers_raw:
+            default_list = [t.strip() for t in qs_tickers_raw.split(',') if t.strip()]
         else:
             default_list = universe[:2]
-        if qs_period and qs_period[0] in options:
-            default_period = qs_period[0]
-        else:
-            default_period = "6mo"
 
-        # Expose to session_state for notifications
-        st.session_state["tickers"] = default_list
-        st.session_state["period"] = default_period
+        default_period = qs_period_raw if qs_period_raw in options else '6mo'
 
+        # --- Widgets (no pre-setting session_state keys to avoid warning) ---
         tickers = st.multiselect(
-            "Choose tickers", universe, default=default_list, key="tickers"
+            'Choose tickers',
+            universe,
+            default=default_list
         )
         period = st.selectbox(
-            "Date range", options, index=options.index(default_period), key="period"
+            'Date range',
+            options,
+            index=options.index(default_period)
         )
+
+        # Keep URL & session state in sync AFTER widgets are created
+        try:
+            st.query_params.update({
+                'tickers': ','.join(tickers) if tickers else '',
+                'period': period
+            })
+        except Exception:
+            # older Streamlit versions may not support update(); ignore silently
+            pass
+
+        st.session_state['tickers'] = tickers
+        st.session_state['period'] = period
+
 
 # -------------------------
 # ▶  Main Page
@@ -389,3 +408,4 @@ if os.path.exists("trade_log.csv"):
     )
     st.markdown("### 📈 Portfolio Cumulative Profit Over Time")
     st.line_chart(trades.set_index("Date")["Cum P/L"])
+
