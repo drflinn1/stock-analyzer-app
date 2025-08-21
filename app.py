@@ -1,182 +1,391 @@
-# app.py — Stock & Crypto Momentum Rebalancer (Streamlit UI)
-# Slim UI that delegates heavy work to engine.py
+# app.py – Streamlit Web App Version of Stock Analyzer Bot with S&P Scan & Full Ticker Selection
+
+import os
+import time
+from datetime import datetime
+from typing import List, Optional, Dict
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objs as go
+import requests
+import smtplib
+import streamlit as st
+import yfinance as yf
+from email.message import EmailMessage
+from streamlit_autorefresh import st_autorefresh
 
 VERSION = "0.8.7 (2025-08-14)"
 
-from datetime import datetime
-import pandas as pd
-import streamlit as st
+# -------------------------
+# ▶  CONFIG & SECRETS
+# -------------------------
+PAGE_TITLE = "Stock Analyzer Bot (Live Trading + Tax Logs)"
+st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 
-# domain logic
-import engine as eng
+# Trading mode comes from secrets (so you don't have to toggle secrets each time)
+# Put TRADING_MODE = "simulate" or "live" in Streamlit secrets.
+TRADING_MODE = st.secrets.get("TRADING_MODE", "simulate").strip().lower()
 
-# Robinhood import (login happens here only)
-try:
-    import robin_stocks.robinhood as rh
-except Exception:
-    rh = None
+# Optional public app URL for links in Slack/email
+APP_URL = st.secrets.get("APP_URL", "")
 
-st.set_page_config(page_title=f"Rebalancer · {VERSION}", layout="wide")
-
-# ---- Sidebar: auth ----
-st.sidebar.header("Authentication & Mode")
-st.sidebar.caption(f"Version {VERSION}")
-live_trading = st.sidebar.checkbox("Enable Live Trading (use with caution)", value=False)
-
-# Read secrets
-user = pwd = None
-try:
-    user = st.secrets.get("ROBINHOOD_USERNAME") or st.secrets.get("RH_USERNAME")
-    pwd  = st.secrets.get("ROBINHOOD_PASSWORD") or st.secrets.get("RH_PASSWORD")
-except Exception:
-    pass
-
-login_ok = False
-login_msg = "Simulation mode — no live orders placed."
-if live_trading:
-    if rh is None:
-        st.sidebar.error("robin_stocks is not available. Running in SIMULATION.")
-        live_trading = False
-    elif not user or not pwd:
-        st.sidebar.error("Live trading selected but credentials missing in Secrets.")
-        live_trading = False
-    else:
-        try:
-            # compatible call across library versions
-            login_ok = bool(rh.authentication.login(username=user, password=pwd, store_session=True, expiresIn=24*3600, scope="internal"))
-        except Exception:
-            try:
-                login_ok = bool(rh.authentication.login(username=user, password=pwd))
-            except Exception as e:
-                st.sidebar.warning(f"Robinhood login failed: {e}.")
-                login_ok = False
-        if login_ok:
-            st.sidebar.success("Robinhood authenticated — Live orders ENABLED")
-            login_msg = "Live orders ENABLED"
-        else:
-            st.sidebar.warning("Login failed — running in SIMULATION.")
-            live_trading = False
-else:
-    st.sidebar.info(login_msg)
-
-# ---- Sidebar: universe & allocation ----
-st.sidebar.header("Universe & Allocation")
-universe_src = st.sidebar.selectbox("Equity Universe", ["S&P 500 (auto)", "Manual list"], index=0)
-raw_tickers  = st.sidebar.text_area("Manual equity tickers (comma-separated)", value="AAPL,MSFT,GOOG")
-include_crypto = st.sidebar.checkbox("Include Crypto (Robinhood-tradable)", value=True)
-
-alloc_mode = st.sidebar.selectbox("Allocation mode", ["Fixed $ per trade", "Proportional across winners"], index=0)
-fixed_per_trade   = st.sidebar.number_input("Fixed $ per BUY/SELL", min_value=1.0, value=5.0, step=0.5)
-prop_total_budget = st.sidebar.number_input("Total BUY budget (proportional)", min_value=1.0, value=15.0, step=1.0)
-min_per_order     = st.sidebar.number_input("Minimum $ per order", min_value=1.0, value=2.0, step=0.5)
-n_picks           = st.sidebar.number_input("Top N to hold", min_value=1, value=3, step=1)
-
-st.sidebar.divider()
-use_crypto_limits = st.sidebar.checkbox("Use LIMIT orders for crypto", value=True)
-crypto_limit_bps  = st.sidebar.slider("Crypto limit price buffer (bps)", min_value=5, max_value=100, value=20, step=5)
-use_stock_limits  = st.sidebar.checkbox("Use LIMIT orders for stocks (experimental)", value=False)
-stock_limit_bps   = st.sidebar.slider("Stock limit price buffer (bps)", min_value=5, max_value=150, value=25, step=5)
-
-st.sidebar.divider()
-st.sidebar.subheader("Risk & Safety")
-max_buy_orders   = st.sidebar.number_input("Max BUY orders per run", min_value=1, value=12, step=1)
-max_buy_notional = st.sidebar.number_input("Max BUY notional per run ($)", min_value=10.0, value=50.0, step=5.0)
-auto_cancel_stale= st.sidebar.checkbox("Auto-cancel stale open orders", value=True)
-stale_minutes    = st.sidebar.number_input("Stale = older than (minutes)", min_value=1, value=20, step=1)
-cancel_now       = st.sidebar.button("Cancel ALL open orders now")
-
-st.sidebar.divider()
-full_auto = st.sidebar.checkbox("Full-Auto (run on load)", value=False)
-auto_bp   = st.sidebar.checkbox("Auto budget from buying power (for proportional mode)", value=False)
-bp_pct    = st.sidebar.slider("Budget % of Buying Power", min_value=5, max_value=100, value=30, step=5)
-
-# ---- Title ----
-st.title("Stock & Crypto Momentum Rebalancer")
-st.caption(f"Version {VERSION}")
-
-def do_run():
-    return eng.run_once(
-        live_trading=live_trading,
-        login_ok=login_ok,
-        universe_src=universe_src,
-        raw_tickers=raw_tickers,
-        include_crypto=include_crypto,
-        alloc_mode=alloc_mode,
-        fixed_per_trade=float(fixed_per_trade),
-        prop_total_budget=float(prop_total_budget),
-        min_per_order=float(min_per_order),
-        n_picks=int(n_picks),
-        use_crypto_limits=bool(use_crypto_limits),
-        crypto_limit_bps=int(crypto_limit_bps),
-        use_stock_limits=bool(use_stock_limits),
-        stock_limit_bps=int(stock_limit_bps),
-        auto_bp=bool(auto_bp),
-        bp_pct=int(bp_pct),
-        max_buy_orders=int(max_buy_orders),          # <-- safety caps wired in both paths
-        max_buy_notional=float(max_buy_notional),    # <-- safety caps wired in both paths
+# Validate optional-but-useful secrets (email/slack)
+missing = []
+for key in ["EMAIL_ADDRESS", "EMAIL_PASSWORD", "EMAIL_RECEIVER"]:
+    if not st.secrets.get(key):
+        missing.append(key)
+if missing:
+    st.sidebar.info(
+        "Email notifications are optional. Missing secrets: "
+        + ", ".join(missing)
+        + " (set in Streamlit Cloud → App → Settings → Secrets)."
     )
 
-ran = False
+WEBHOOK = st.secrets.get("SLACK_WEBHOOK_URL", "")
 
-# Full-Auto path
-if full_auto and not st.session_state.get("__full_auto_ran__"):
-    st.session_state["__full_auto_ran__"] = True
-    st.info("Full-Auto is ON — running now.")
-    result = do_run()
-    ran = True
-    # render
-    picks = result.get("picks", pd.DataFrame())
-    if picks is None: picks = pd.DataFrame()
-    if not picks.empty:
-        st.subheader("Today's Top-N (ranked by momentum score)")
-        st.dataframe(picks[["Ticker","R1","R5","R20","Score"]].rename(columns={"R1":"R1%","R5":"R5%","R20":"R20%"}), use_container_width=True)
+# Robinhood client is optional; if lib missing or TRADING_MODE != 'live', we stay simulated
+try:
+    from robin_stocks import robinhood as r
+except ImportError:
+    r = None  # library not installed; app will still run in simulate mode
+
+
+# -------------------------
+# ▶  Helper to fetch S&P 500 & Top Movers
+# -------------------------
+@st.cache_data(show_spinner=False)
+def get_sp500_tickers() -> List[str]:
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    try:
+        df_list = pd.read_html(url, flavor="bs4", attrs={"class": "wikitable"})
+        return df_list[0]["Symbol"].tolist()
+    except Exception:
+        # Fallback parser if bs4 not wired to read_html
+        try:
+            from bs4 import BeautifulSoup  # optional import here
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            table = soup.find("table", {"class": "wikitable"})
+            return [
+                row.find_all("td")[0].text.strip()
+                for row in table.find_all("tr")[1:]
+            ]
+        except Exception as e:
+            st.sidebar.warning(f"Failed to fetch S&P 500 list: {e}")
+            return []
+
+
+def get_top_tickers(n: int) -> List[str]:
+    """No caching here so top movers are fresh."""
+    symbols = get_sp500_tickers()
+    if not symbols:
+        return []
+    try:
+        df = yf.download(symbols, period="2d", progress=False)["Close"]
+        # df can be Series if one symbol
+        if isinstance(df, pd.Series):
+            changes = df.pct_change().iloc[-1:].to_frame().T
+        else:
+            changes = df.pct_change().iloc[-1]
+        return (
+            changes.dropna().sort_values(ascending=False).head(n).index.tolist()
+        )
+    except Exception:
+        # slower fallback if the multi-download chokes
+        perf = {}
+        for sym in symbols:
+            try:
+                tmp = yf.download(sym, period="2d", progress=False)["Close"]
+                if len(tmp) >= 2:
+                    perf[sym] = float(tmp.pct_change().iloc[-1])
+            except Exception:
+                continue
+        return sorted(perf, key=lambda k: perf[k], reverse=True)[:n]
+
+
+# -------------------------
+# ▶  Analysis Helpers
+# -------------------------
+def simple_sma(series: pd.Series, window: int) -> pd.Series:
+    return series.rolling(window).mean()
+
+
+def simple_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def bollinger_bands(series: pd.Series, window: int = 20, num_std: int = 2):
+    sma = simple_sma(series, window)
+    std = series.rolling(window).std()
+    return sma, sma + num_std * std, sma - num_std * std
+
+
+# -------------------------
+# ▶  Data Fetch & Indicators
+# -------------------------
+@st.cache_data(show_spinner=False)
+def get_data(ticker: str, period: str, retries: int = 3) -> pd.DataFrame:
+    for _ in range(retries):
+        df = yf.download(ticker, period=period, auto_adjust=False, progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            try:
+                df = df.xs(ticker, axis=1, level=1)
+            except Exception:
+                df = df.iloc[:, df.columns.get_level_values(1) == ticker]
+                df.columns = df.columns.get_level_values(0)
+        if not df.empty:
+            close = df["Close"].squeeze()
+            sma20, upper, lower = bollinger_bands(close)
+            df["sma_20"], df["bb_upper"], df["bb_lower"] = sma20, upper, lower
+            df["sma_50"] = simple_sma(close, 50)
+            df["rsi"] = simple_rsi(close)
+            return df.dropna()
+        time.sleep(1)
+    raise ValueError(f"No data fetched for {ticker}")
+
+
+# -------------------------
+# ▶  Signals & Thresholds
+# -------------------------
+@st.cache_data(show_spinner=False)
+def analyze(
+    df: pd.DataFrame, min_rows: int, rsi_ovr: float, rsi_obh: float
+) -> Optional[Dict]:
+    if not isinstance(df, pd.DataFrame) or len(df) < min_rows:
+        return None
+    cur, prev = df.iloc[-1], df.iloc[-2]
+    rsi = float(cur["rsi"])
+    sma20_cur, sma50_cur = float(cur["sma_20"]), float(cur["sma_50"])
+    price = float(cur["Close"])
+
+    reasons = []
+    if rsi < rsi_ovr:
+        reasons.append(f"RSI below {rsi_ovr} (oversold)")
+    if rsi > rsi_obh:
+        reasons.append(f"RSI above {rsi_obh} (overbought)")
+    if prev["sma_20"] < prev["sma_50"] <= sma20_cur:
+        reasons.append("20 SMA crossed above 50 SMA (bullish)")
+    if prev["sma_20"] > prev["sma_50"] >= sma20_cur:
+        reasons.append("20 SMA crossed below 50 SMA (bearish)")
+    if price < float(cur["bb_lower"]):
+        reasons.append("Price below lower BB")
+    if price > float(cur["bb_upper"]):
+        reasons.append("Price above upper BB")
+
+    text = "; ".join(reasons).lower()
+    signal = "HOLD"
+    if any(k in text for k in ["buy", "bullish"]):
+        signal = "BUY"
+    elif any(k in text for k in ["sell", "bearish"]):
+        signal = "SELL"
+
+    return {
+        "RSI": round(rsi, 2),
+        "20 SMA": round(sma20_cur, 2),
+        "50 SMA": round(sma50_cur, 2),
+        "Signal": signal,
+        "Reasons": "; ".join(reasons),
+    }
+
+
+# -------------------------
+# ▶  Notifications
+# -------------------------
+def notify_slack(tkr: str, summ: Dict, price: float):
+    if not WEBHOOK:
+        return
+    if APP_URL:
+        qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}"
+        link = f" (<{APP_URL}{qs}|View in App>)"
     else:
-        st.warning("No momentum data available.")
-    st.subheader("Sell Log")
-    srows = result.get("sell_rows", [])
-    st.dataframe(pd.DataFrame(srows)) if srows else st.write("(no sells)")
-    st.subheader("Buy Log")
-    brows = result.get("buy_rows", [])
-    st.dataframe(pd.DataFrame(brows)) if brows else st.write("(none)")
-    # auto-budget note
-    if result.get("auto_budget"):
-        st.sidebar.caption(f"Auto budget: ${result.get('budget_used',0):,.2f} from BP ≈ ${result.get('bp_seen',0):,.2f}")
+        link = ""
+    text = f"*{summ['Signal']}* {tkr} @ ${price}\n{summ['Reasons']}{link}"
+    try:
+        requests.post(WEBHOOK, json={"text": text}, timeout=5)
+    except Exception:
+        pass
 
-# Button path
-if st.button("▶ Run Daily Scan & Rebalance", type="primary"):
-    result = do_run()
-    ran = True
-    picks = result.get("picks", pd.DataFrame())
-    if not picks.empty:
-        st.subheader("Today's Top-N (ranked by momentum score)")
-        st.dataframe(picks[["Ticker","R1","R5","R20","Score"]].rename(columns={"R1":"R1%","R5":"R5%","R20":"R20%"}), use_container_width=True)
+
+def notify_email(tkr: str, summ: Dict, price: float):
+    # Optional; requires EMAIL_* secrets
+    if not (st.secrets.get("EMAIL_ADDRESS") and st.secrets.get("EMAIL_PASSWORD") and st.secrets.get("EMAIL_RECEIVER")):
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if APP_URL:
+        qs = f"?tickers={','.join(st.session_state['tickers'])}&period={st.session_state['period']}"
+        link = f"\n\nView in app: {APP_URL}{qs}"
     else:
-        st.warning("No momentum data available.")
-    st.subheader("Sell Log")
-    srows = result.get("sell_rows", [])
-    st.dataframe(pd.DataFrame(srows)) if srows else st.write("(no sells)")
-    st.subheader("Buy Log")
-    brows = result.get("buy_rows", [])
-    st.dataframe(pd.DataFrame(brows)) if brows else st.write("(none)")
-    if result.get("auto_budget"):
-        st.sidebar.caption(f"Auto budget: ${result.get('budget_used',0):,.2f} from BP ≈ ${result.get('bp_seen',0):,.2f}")
+        link = ""
+    body = (
+        f"Ticker: {tkr}\nSignal: {summ['Signal']} @ ${price}\n"
+        f"Reasons: {summ['Reasons']}\nTime: {now}{link}"
+    )
+    msg = EmailMessage()
+    msg.set_content(body)
+    msg["Subject"] = f"{summ['Signal']} {tkr}"
+    msg["From"] = st.secrets["EMAIL_ADDRESS"]
+    msg["To"] = st.secrets["EMAIL_RECEIVER"]
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as s:
+            s.login(st.secrets["EMAIL_ADDRESS"], st.secrets["EMAIL_PASSWORD"])
+            s.send_message(msg)
+    except Exception:
+        pass
 
-# Auto-cancel stale & manual cancel
-if auto_cancel_stale:
-    n_cancelled = eng.cancel_open_orders(live_trading=live_trading, login_ok=login_ok, older_than_minutes=int(stale_minutes))
-    if n_cancelled > 0:
-        st.info(f"Auto-cancelled {n_cancelled} stale open orders (>{int(stale_minutes)} min).")
-if cancel_now:
-    n = eng.cancel_open_orders(live_trading=live_trading, login_ok=login_ok, cancel_all=True)
-    st.success(f"Attempted to cancel {n} open orders.")
 
-# Open orders (always shown)
-st.subheader("Open Orders")
-rows = eng.open_orders_table(live_trading, login_ok)
-st.dataframe(pd.DataFrame(rows), use_container_width=True) if rows else st.write("[]")
-with st.expander("Show raw API response"):
-    st.json(eng.get_open_orders_raw(live_trading, login_ok))
+# -------------------------
+# ▶  Sidebar UI & Controls
+# -------------------------
+with st.sidebar:
+    st.markdown("## ⚙️ Settings")
+    with st.expander("General", expanded=True):
+        # Default from secrets: live => unchecked simulate; simulate => checked
+        simulate_default = TRADING_MODE != "live"
+        simulate_mode = st.checkbox("Simulate Trading Mode", value=simulate_default)
+        debug_mode = st.checkbox("Show debug logs", False)
+        st_autorefresh(interval=3_600_000, limit=None, key="hour_refresh")
 
-# Footer tip
-if not ran:
-    st.caption("Tip: keep Live Trading OFF until you like the plan. When you turn it on, make sure secrets are set and the sidebar shows ‘Live orders ENABLED’.")
+    with st.expander("Analysis Options", expanded=True):
+        scan_top = st.checkbox("Scan top N performers", False)
+        top_n = st.slider("Top tickers to scan", 10, 100, 50) if scan_top else None
+        universe = get_top_tickers(top_n) if scan_top else get_sp500_tickers()
+
+        min_rows = st.slider("Minimum data rows", 10, 100, 30)
+        rsi_ovr = st.slider("RSI oversold threshold", 0, 100, 30)
+        rsi_obh = st.slider("RSI overbought threshold", 0, 100, 70)
+
+        # Load any URL query params
+        params = st.experimental_get_query_params()
+        qs_tickers = params.get("tickers", [])
+        options = ["1mo", "3mo", "6mo", "1y", "2y"]
+        qs_period = params.get("period", [])
+
+        # Defaults
+        if qs_tickers:
+            default_list = [t for t in qs_tickers[0].split(",") if t]
+        else:
+            default_list = universe[:2]
+        if qs_period and qs_period[0] in options:
+            default_period = qs_period[0]
+        else:
+            default_period = "6mo"
+
+        # Expose to session_state for notifications
+        st.session_state["tickers"] = default_list
+        st.session_state["period"] = default_period
+
+        tickers = st.multiselect(
+            "Choose tickers", universe, default=default_list, key="tickers"
+        )
+        period = st.selectbox(
+            "Date range", options, index=options.index(default_period), key="period"
+        )
+
+# -------------------------
+# ▶  Main Page
+# -------------------------
+mode_badge = "🔴 SIM" if simulate_mode else "🟢 LIVE"
+st.markdown(f"### {mode_badge} {PAGE_TITLE}")
+
+if st.button("▶ Run Analysis", use_container_width=True):
+    if not tickers:
+        st.warning("Select at least one ticker")
+        st.stop()
+
+    # If we're not in simulate, but Robinhood isn't configured, fall back to simulate
+    live_enabled = (not simulate_mode) and (TRADING_MODE == "live") and (r is not None)
+
+    if not live_enabled and not simulate_mode and r is None:
+        st.info("Robinhood library not installed or trading disabled; running in simulate mode.")
+
+    results: Dict[str, Dict] = {}
+    for tkr in tickers:
+        try:
+            df = get_data(tkr, period)
+            summ = analyze(df, min_rows, rsi_ovr, rsi_obh)
+            if summ is None:
+                st.warning(f"{tkr}: Not enough data, skipped")
+                continue
+
+            results[tkr] = summ
+            price = float(df.Close.iloc[-1])
+
+            # Notifications (optional)
+            notify_email(tkr, summ, price)
+            notify_slack(tkr, summ, price)
+
+            # Chart
+            st.markdown(f"#### 📈 {tkr} Price Chart")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df.index, y=df.Close, name="Close"))
+            fig.add_trace(go.Scatter(x=df.index, y=df.sma_20, name="20 SMA"))
+            fig.add_trace(go.Scatter(x=df.index, y=df.sma_50, name="50 SMA"))
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df.bb_upper,
+                    name="BB Upper",
+                    line=dict(dash="dot"),
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df.bb_lower,
+                    name="BB Lower",
+                    line=dict(dash="dot"),
+                )
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            badge_map = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}
+            st.markdown(f"**{badge_map[summ['Signal']]} {tkr} – {summ['Signal']}**")
+            st.json(summ)
+            st.divider()
+        except Exception as e:
+            st.error(f"{tkr} failed: {e}")
+
+    if results:
+        res_df = pd.DataFrame(results).T
+        st.download_button(
+            "⬇ Download CSV",
+            res_df.to_csv().encode(),
+            "stock_analysis_results.csv",
+        )
+        st.dataframe(res_df)
+        st.markdown("### 📊 Summary of Trade Signals")
+        signal_map = {"BUY": 1, "SELL": -1, "HOLD": 0}
+        st.bar_chart(pd.Series({k: signal_map[v["Signal"]] for k, v in results.items()}))
+
+# -------------------------
+# ▶  Logs & Tax Summary (persistent)
+# -------------------------
+if os.path.exists("trade_log.csv"):
+    trades = pd.read_csv("trade_log.csv")
+    st.subheader("🧾 Trade Log")
+    st.dataframe(trades)
+    st.download_button(
+        "⬇ Download Trade Log", trades.to_csv(index=False).encode(), "trade_log.csv"
+    )
+
+    trades["Cum P/L"] = trades["Gain/Loss"].cumsum()
+    total_pl = trades["Gain/Loss"].sum()
+    st.markdown(f"## 💰 **Total Portfolio P/L: ${total_pl:.2f}**")
+    tax = trades.groupby("Tax Category")["Gain/Loss"].sum().reset_index()
+    st.subheader("Tax Summary")
+    st.dataframe(tax)
+    st.download_button(
+        "⬇ Download Tax Summary",
+        tax.to_csv(index=False).encode(),
+        "tax_summary.csv",
+    )
+    st.markdown("### 📈 Portfolio Cumulative Profit Over Time")
+    st.line_chart(trades.set_index("Date")["Cum P/L"])
