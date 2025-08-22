@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -100,3 +101,16 @@ if st.session_state.get('analysis_done') and st.session_state['data'] is not Non
     )
 else:
     st.info("Set your inputs and click **Run Analyse** to generate results.")
+
+
+# -------------------------------
+# Requirements for deployment (create requirements.txt with these lines)
+# -------------------------------
+# streamlit==1.36.0
+# yfinance==0.2.40
+# pandas==2.2.2
+# numpy==1.26.4
+# ta==0.11.0
+
+# (Optional) runtime.txt:
+# python-3.11
