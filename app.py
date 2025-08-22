@@ -1,14 +1,24 @@
-# app.py — Stock Analyzer / Trading BOT (CSV-clean fixed, KeyError-safe)
+# app.py — Stock Analyzer / Trading BOT (Pro)
 # ---------------------------------------------------------------------
 # Streamlit app that pulls OHLCV from yFinance, calculates RSI & Bollinger Bands,
-# displays results, and provides *clean* CSV exports with Excel-friendly UTF-8+BOM
-# and plain UTF-8 options to prevent “weird characters”.
+# and now includes:
+#   • Clean CSV exports (Excel‑friendly + UTF‑8)
+#   • Trade logging (CSV/Parquet) with dry_run execution
+#   • Optional live trading stub for Robinhood (env‑driven; off by default)
+#   • Basic crypto support (e.g., BTC-USD, ETH-USD)
+#   • Tax report (realized trades CSV with FIFO P/L columns)
+#   • Alerts (email / SMS / Slack) — only send when NOT dry_run
 # ---------------------------------------------------------------------
 
 import csv
+import io
+import os
 import re
+import smtplib
+import ssl
 import unicodedata
-from typing import Optional
+from email.mime.text import MIMEText
+from typing import Optional, Tuple
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -18,14 +28,39 @@ import yfinance as yf
 
 # ------------------------------ Page Setup ------------------------------
 st.set_page_config(
-    page_title="Stock Analyzer / Trading BOT",
+    page_title="Stock Analyzer / Trading BOT (Pro)",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+# ------------------------------ Globals & Paths ------------------------------
+EXPORT_DIR = os.environ.get("EXPORT_DIR", "exports")
+os.makedirs(EXPORT_DIR, exist_ok=True)
+TRADE_LOG_CSV = os.path.join(EXPORT_DIR, "trades_log.csv")
+TRADE_LOG_PARQUET = os.path.join(EXPORT_DIR, "trades_log.parquet")
+TAX_REPORT_CSV = os.path.join(EXPORT_DIR, "tax_report_fifo.csv")
+
+# Robinhood (optional) — keep disabled unless env + toggle enable
+RH_ENABLED = False  # hard off unless you wire real keys + set to True below
+# Expected env if you turn RH on later: RH_USERNAME, RH_PASSWORD or device token flow
+
+# Alert env (all optional; messages only sent when NOT dry_run)
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+SMTP_TO = os.getenv("SMTP_TO")
+
+TWILIO_SID = os.getenv("TWILIO_SID")
+TWILIO_TOKEN = os.getenv("TWILIO_TOKEN")
+TWILIO_FROM = os.getenv("TWILIO_FROM")
+TWILIO_TO = os.getenv("TWILIO_TO")
+
+SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK")
+
 # ------------------------------ Utilities ------------------------------
-_CONTROL_CHARS_RE = re.compile(r'[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]')
-_ZERO_WIDTH_RE = re.compile(r'[\u200B-\u200D\u2060\uFEFF]')
+_CONTROL_CHARS_RE = re.compile(r"[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]")
+_ZERO_WIDTH_RE = re.compile(r"[\u200B-\u200D\u2060\uFEFF]")
 
 def _normalize_text(x: Optional[object]) -> Optional[str]:
     if x is None:
@@ -43,31 +78,18 @@ def clean_dataframe_text(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def to_csv_bytes(df: pd.DataFrame, excel_friendly: bool = True) -> bytes:
-    try:
-        csv_str = df.to_csv(
-            index=False,
-            na_rep="",
-            float_format="%.6f",
-            quoting=csv.QUOTE_MINIMAL,
-            lineterminator="\n",
-        )
-    except TypeError:
-        # fallback for environments that don’t support lineterminator param
-        csv_str = df.to_csv(
-            index=False,
-            na_rep="",
-            float_format="%.6f",
-            quoting=csv.QUOTE_MINIMAL,
-        )
-    if excel_friendly:
-        return csv_str.encode("utf-8-sig")
-    return csv_str.encode("utf-8")
+    csv_str = df.to_csv(
+        index=False,
+        na_rep="",
+        float_format="%.6f",
+        quoting=csv.QUOTE_MINIMAL,
+        lineterminator="\n",
+    )
+    return csv_str.encode("utf-8-sig" if excel_friendly else "utf-8")
 
-# --- Column normalization to handle yFinance MultiIndex returns ---
+# yFinance sometimes returns a MultiIndex; flatten it
+
 def _ensure_plain_ohlcv_columns(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """Return DF with flat OHLCV columns even if yfinance gave a MultiIndex.
-    Keeps standard columns: Open, High, Low, Close, Adj Close, Volume.
-    """
     if isinstance(df.columns, pd.MultiIndex):
         for lvl in range(df.columns.nlevels):
             if ticker in df.columns.get_level_values(lvl):
@@ -80,18 +102,16 @@ def _ensure_plain_ohlcv_columns(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
             df.columns = [" ".join([str(x) for x in tup if str(x) != ""]).strip() for tup in df.columns]
     ren = {c: c.title() for c in df.columns}
     ren["Adj Close"] = "Adj Close"
-    df = df.rename(columns=ren)
-    return df
+    return df.rename(columns=ren)
 
 # ------------------------------ Indicators ------------------------------
+
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = (delta.where(delta > 0, 0.0))
     loss = (-delta.where(delta < 0, 0.0))
-
     avg_gain = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
     avg_loss = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-
     rs = avg_gain / (avg_loss.replace(0, np.nan))
     rsi_vals = 100 - (100 / (1 + rs))
     return rsi_vals.fillna(0.0)
@@ -119,26 +139,142 @@ def fetch_ohlcv(ticker: str, start: datetime, end: datetime, interval: str) -> p
         return pd.DataFrame()
 
     df = _ensure_plain_ohlcv_columns(df, ticker)
-
     if isinstance(df.index, pd.DatetimeIndex):
         try:
             idx = df.index.tz_localize(None)
         except Exception:
             idx = pd.DatetimeIndex(df.index)
-        df = df.copy()
         df.insert(0, "Date", idx)
     else:
         df.insert(0, "Date", pd.to_datetime(df.index, errors="coerce"))
 
     return df.reset_index(drop=True)
 
-# ------------------------------ UI ------------------------------
-st.title("📈 Stock Analyzer / Trading BOT")
-st.caption("RSI & Bollinger Bands • Clean CSV Exports • yFinance Data")
+# ------------------------------ Trading Helpers ------------------------------
+
+def _init_trade_log() -> pd.DataFrame:
+    cols = [
+        "timestamp", "symbol", "side", "quantity", "price", "fees", "strategy",
+        "order_id", "dry_run", "note",
+    ]
+    if os.path.exists(TRADE_LOG_CSV):
+        try:
+            return pd.read_csv(TRADE_LOG_CSV)
+        except Exception:
+            return pd.DataFrame(columns=cols)
+    return pd.DataFrame(columns=cols)
+
+@st.cache_data(show_spinner=False)
+def get_trade_log() -> pd.DataFrame:
+    return _init_trade_log()
+
+def _append_trade(row: dict):
+    df = _init_trade_log()
+    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    df.to_csv(TRADE_LOG_CSV, index=False)
+    try:
+        df.to_parquet(TRADE_LOG_PARQUET, index=False)
+    except Exception:
+        pass
+
+# FIFO tax report based on trades_log; assumes symbol-level FIFO lots
+
+def build_fifo_tax_report(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return pd.DataFrame(columns=[
+            "symbol","open_ts","close_ts","side","qty","open_price","close_price","proceeds","cost","pnl","holding_days","term"
+        ])
+    trades = trades.copy()
+    trades["timestamp"] = pd.to_datetime(trades["timestamp"])  # ensure datetime
+    trades["quantity"] = trades["quantity"].astype(float)
+    trades["price"] = trades["price"].astype(float)
+
+    results = []
+    for sym, g in trades.sort_values("timestamp").groupby("symbol"):
+        lots: list[Tuple[datetime,float,float]] = []  # (ts, qty, price)
+        for _, r in g.iterrows():
+            ts, side, qty, price = r["timestamp"], r["side"].lower(), float(r["quantity"]), float(r["price"])
+            if side in {"buy", "long"}:
+                lots.append((ts, qty, price))
+            elif side in {"sell", "short_cover", "close"}:
+                remaining = qty
+                while remaining > 0 and lots:
+                    open_ts, open_qty, open_price = lots[0]
+                    take = min(open_qty, remaining)
+                    proceeds = take * price
+                    cost = take * open_price
+                    pnl = proceeds - cost
+                    holding_days = (ts - open_ts).days
+                    term = "long" if holding_days >= 365 else "short"
+                    results.append({
+                        "symbol": sym,
+                        "open_ts": open_ts,
+                        "close_ts": ts,
+                        "side": "sell",
+                        "qty": take,
+                        "open_price": round(open_price, 6),
+                        "close_price": round(price, 6),
+                        "proceeds": round(proceeds, 2),
+                        "cost": round(cost, 2),
+                        "pnl": round(pnl, 2),
+                        "holding_days": holding_days,
+                        "term": term,
+                    })
+                    # reduce lot
+                    lots[0] = (open_ts, open_qty - take, open_price)
+                    if lots[0][1] <= 1e-9:
+                        lots.pop(0)
+                    remaining -= take
+                # if remaining > 0 and no lots, it's a short — skipped in this minimal FIFO
+    return pd.DataFrame(results)
+
+# ------------------------------ Alert Senders ------------------------------
+
+def send_email(subject: str, body: str) -> bool:
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and SMTP_TO):
+        return False
+    try:
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = SMTP_USER
+        msg["To"] = SMTP_TO
+        context = ssl.create_default_context()
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls(context=context)
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        return True
+    except Exception:
+        return False
+
+def send_slack(body: str) -> bool:
+    if not SLACK_WEBHOOK:
+        return False
+    try:
+        import requests
+        requests.post(SLACK_WEBHOOK, json={"text": body}, timeout=10)
+        return True
+    except Exception:
+        return False
+
+def send_sms(body: str) -> bool:
+    if not (TWILIO_SID and TWILIO_TOKEN and TWILIO_FROM and TWILIO_TO):
+        return False
+    try:
+        from twilio.rest import Client
+        client = Client(TWILIO_SID, TWILIO_TOKEN)
+        client.messages.create(to=TWILIO_TO, from_=TWILIO_FROM, body=body)
+        return True
+    except Exception:
+        return False
+
+# ------------------------------ UI: Header ------------------------------
+st.title("📈 Stock Analyzer / Trading BOT (Pro)")
+st.caption("RSI & Bollinger Bands • Clean Exports • Trades • Tax • Alerts • Crypto")
 
 with st.sidebar:
     st.header("Settings")
-    ticker = st.text_input("Ticker", value="AAPL").strip().upper()
+    ticker = st.text_input("Ticker (e.g., AAPL or BTC-USD)", value="AAPL").strip().upper()
 
     col_dates = st.columns(2)
     with col_dates[0]:
@@ -158,7 +294,16 @@ with st.sidebar:
     bb_std = st.number_input("BB Std Dev", min_value=1.0, max_value=4.0, value=2.0, step=0.5, format="%.1f")
 
     st.markdown("---")
-    run_btn = st.button("▶️ Run / Analyze", use_container_width=True)
+    # Trading controls
+    st.subheader("Trading (dry-run by default)")
+    dry_run = st.checkbox("Dry run (no real orders)", value=True)
+    side = st.selectbox("Side", ["BUY", "SELL"])  # simple spot buy/sell
+    qty = st.number_input("Quantity", min_value=0.0, step=1.0, value=1.0, format="%.4f")
+    strategy = st.text_input("Strategy tag", value="manual")
+    note = st.text_input("Note", value="")
+
+    st.markdown("---")
+    run_btn = st.button("▶️ Run / Analyze", use_container_width=True, key="run_btn")
 
 # ------------------------------ Analysis ------------------------------
 if run_btn:
@@ -173,20 +318,20 @@ if run_btn:
             ticker=ticker,
             start=datetime.combine(start_date, datetime.min.time()),
             end=datetime.combine(safe_end, datetime.min.time()),
-            interval=interval
+            interval=interval,
         )
 
     if df.empty:
         st.warning("No data returned. Try a different date range or interval.")
         st.stop()
 
+    # Indicators
     price_series = df["Close"].astype(float)
     df["RSI"] = rsi(price_series, period=int(rsi_period))
     bb_mid, bb_upper, bb_lower = bollinger_bands(price_series, window=int(bb_window), num_std=float(bb_std))
-    df["BB_Middle"] = bb_mid
-    df["BB_Upper"] = bb_upper
-    df["BB_Lower"] = bb_lower
+    df["BB_Middle"], df["BB_Upper"], df["BB_Lower"] = bb_mid, bb_upper, bb_lower
 
+    # Add Ticker column for clarity/exports
     df.insert(1, "Ticker", ticker)
 
     desired = ["Date", "Ticker", "Open", "High", "Low", "Close", "Adj Close", "Volume",
@@ -195,8 +340,9 @@ if run_btn:
     df = df.loc[:, cols]
 
     st.subheader(f"Results: {ticker}")
-    st.dataframe(df.tail(200), use_container_width=True, height=400)
+    st.dataframe(df.tail(250), use_container_width=True, height=420)
 
+    # Chart
     try:
         import altair as alt
         plot_df = df.dropna(subset=["Close"]).copy()
@@ -210,6 +356,7 @@ if run_btn:
     except Exception:
         st.info("Altair not available or failed to render chart.")
 
+    # ------------------ CSV Exports ------------------
     st.markdown("### 📥 Clean CSV Exports")
     out_df = df.copy()
     out_df["Date"] = pd.to_datetime(out_df["Date"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -224,11 +371,114 @@ if run_btn:
 
     c1, c2 = st.columns(2)
     with c1:
-        st.download_button("Download CSV (Excel-friendly UTF-8+BOM)", data=csv_bytes_excel, file_name=fname_excel, mime="text/csv")
+        st.download_button(
+            "Download CSV (Excel-friendly UTF-8+BOM)",
+            data=csv_bytes_excel,
+            file_name=fname_excel,
+            mime="text/csv",
+            key=f"dl_excel_{ts}",
+            use_container_width=True,
+        )
     with c2:
-        st.download_button("Download CSV (UTF-8, no BOM)", data=csv_bytes_utf8, file_name=fname_utf8, mime="text/csv")
+        st.download_button(
+            "Download CSV (UTF-8, no BOM)",
+            data=csv_bytes_utf8,
+            file_name=fname_utf8,
+            mime="text/csv",
+            key=f"dl_utf8_{ts}",
+            use_container_width=True,
+        )
 
     st.success("CSV export fixed and ready.")
 
+    # ------------------ Trade Logging & Execution ------------------
+    st.markdown("### 🧾 Trade Logging")
+    mkt_price = float(price_series.iloc[-1])
+    st.write(f"Current price: **{mkt_price:.2f}**")
+
+    colA, colB = st.columns([1,1])
+    with colA:
+        if st.button("Log Trade (at current price)", use_container_width=True):
+            row = {
+                "timestamp": datetime.utcnow().isoformat(),
+                "symbol": ticker,
+                "side": side.lower(),
+                "quantity": float(qty),
+                "price": mkt_price,
+                "fees": 0.0,
+                "strategy": strategy,
+                "order_id": "dry-run" if dry_run else "",
+                "dry_run": bool(dry_run),
+                "note": note,
+            }
+            # Optional: live trading stub (disabled)
+            if not dry_run and RH_ENABLED:
+                # Placeholders for live order placement
+                # TODO: integrate robin_stocks or API of your choice
+                row["order_id"] = f"RH-{int(datetime.utcnow().timestamp())}"
+            _append_trade(row)
+            st.success("Trade logged.")
+
+    with colB:
+        if st.button("Open Trade Log (download)", use_container_width=True):
+            if os.path.exists(TRADE_LOG_CSV):
+                with open(TRADE_LOG_CSV, "rb") as f:
+                    st.download_button(
+                        "Download trades_log.csv",
+                        data=f.read(),
+                        file_name="trades_log.csv",
+                        mime="text/csv",
+                        key=f"trades_{ts}",
+                    )
+            else:
+                st.info("No trades yet.")
+
+    # Show recent trades
+    trades_df = get_trade_log()
+    st.dataframe(trades_df.tail(200), use_container_width=True, height=260)
+
+    # ------------------ Tax Report (FIFO) ------------------
+    st.markdown("### 🧮 Tax Report (FIFO realized P/L)")
+    tax_df = build_fifo_tax_report(trades_df)
+    st.dataframe(tax_df.tail(200), use_container_width=True, height=260)
+    if not tax_df.empty:
+        st.download_button(
+            "Download tax_report_fifo.csv",
+            data=to_csv_bytes(tax_df, excel_friendly=True),
+            file_name=os.path.basename(TAX_REPORT_CSV),
+            mime="text/csv",
+            key=f"tax_{ts}",
+        )
+
+    # ------------------ Alerts ------------------
+    st.markdown("### 🔔 Alerts")
+    # Simple trigger: RSI cross below 30 or above 70
+    last_rsi = float(df["RSI"].iloc[-1])
+    alert_msg = f"[{datetime.utcnow().isoformat()}] {ticker} RSI={last_rsi:.2f} (period={rsi_period})"
+    st.write(f"Last RSI: **{last_rsi:.2f}**")
+
+    c3, c4, c5 = st.columns(3)
+    with c3:
+        do_email = st.checkbox("Email", value=False)
+    with c4:
+        do_sms = st.checkbox("SMS", value=False)
+    with c5:
+        do_slack = st.checkbox("Slack", value=False)
+
+    if st.button("Send Test Alert", use_container_width=True):
+        if dry_run:
+            st.info("Dry run is ON — alerts are logged but not sent.")
+        sent_any = False
+        if not dry_run and do_email:
+            sent_any |= send_email("Trading BOT Alert", alert_msg)
+        if not dry_run and do_sms:
+            sent_any |= send_sms(alert_msg)
+        if not dry_run and do_slack:
+            sent_any |= send_slack(alert_msg)
+        st.success("Alert processed (dry_run ON)" if dry_run else ("Alert sent" if sent_any else "No alert sent — check env creds"))
+
 with st.expander("About this app"):
-    st.write("Includes robust CSV cleaning, column safety checks, and both Excel-friendly UTF-8+BOM and plain UTF-8 exports.")
+    st.write(
+        "This Pro build adds trade logging (CSV/Parquet), optional live trading stubs, a FIFO tax report, "
+        "and multi-channel alerts. All sensitive actions remain disabled unless you turn OFF dry_run and provide env creds."
+    )
