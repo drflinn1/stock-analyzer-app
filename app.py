@@ -1,292 +1,271 @@
-# app.py — Stock & Crypto Analyzer (S&P scan + indicators + signals)
+# app.py — Stock Analyzer / Trading BOT (CSV-clean fixed)
+# ---------------------------------------------------------------------
+# Streamlit app that pulls OHLCV from yFinance, calculates RSI & Bollinger Bands,
+# displays results, and provides *clean* CSV exports with Excel‑friendly UTF‑8+BOM
+# and plain UTF‑8 options to prevent “weird characters”.
+# ---------------------------------------------------------------------
 
-import time
-from datetime import datetime
+import csv
+import io
+import re
+import unicodedata
+from typing import Optional
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objs as go
-import requests
 import streamlit as st
 import yfinance as yf
-from bs4 import BeautifulSoup
-from pycoingecko import CoinGeckoAPI
 
-# ---------------------------------------------------------
-# Page setup
-# ---------------------------------------------------------
-st.set_page_config(page_title="Stock Analyzer Bot", layout="wide")
-st.title("📈 Stock Analyzer Bot (Live Trading + Tax Logs)")
 
-# ---------------------------------------------------------
-# Helpers: S&P 500 & Top Movers
-# ---------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def get_sp500_tickers() -> list[str]:
-    """Fetch S&P 500 tickers from Wikipedia (html-table first, bs4 fallback)."""
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    try:
-        df_list = pd.read_html(url, flavor="bs4", attrs={"class": "wikitable"})
-        return df_list[0]["Symbol"].tolist()
-    except Exception:
-        try:
-            resp = requests.get(url, timeout=20)
-            soup = BeautifulSoup(resp.text, "html.parser")
-            table = soup.find("table", {"class": "wikitable"})
-            return [row.find_all("td")[0].text.strip() for row in table.find_all("tr")[1:]]
-        except Exception:
-            return []
+# ------------------------------ Page Setup ------------------------------
+st.set_page_config(
+    page_title="Stock Analyzer / Trading BOT",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-def get_top_tickers(n: int) -> list[str]:
-    """Return top N daily performers from the S&P universe using 2 days of data."""
-    symbols = get_sp500_tickers()
-    if not symbols:
-        return []
-    try:
-        df = yf.download(symbols, period="2d", progress=False)["Close"]
-        if isinstance(df, pd.Series):
-            changes = df.pct_change().iloc[-1:].to_frame().T
-        else:
-            changes = df.pct_change().iloc[-1]
-        return changes.dropna().sort_values(ascending=False).head(n).index.tolist()
-    except Exception:
-        # Slow but safe fallback: one-by-one
-        perf = {}
-        for sym in symbols:
-            try:
-                tmp = yf.download(sym, period="2d", progress=False)["Close"]
-                if len(tmp) >= 2:
-                    perf[sym] = float(tmp.pct_change().iloc[-1])
-            except Exception:
-                continue
-        return sorted(perf, key=lambda k: perf[k], reverse=True)[:n]
 
-# ---------------------------------------------------------
-# Indicators
-# ---------------------------------------------------------
-def simple_sma(series: pd.Series, window: int) -> pd.Series:
-    return series.rolling(window).mean()
+# ------------------------------ Utilities ------------------------------
+# Remove hidden characters and normalize text to avoid "weird symbols" in CSVs
+_CONTROL_CHARS_RE = re.compile(r'[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]')
+_ZERO_WIDTH_RE = re.compile(r'[\u200B-\u200D\u2060\uFEFF]')
 
-def simple_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def bollinger_bands(series: pd.Series, window: int = 20, num_std: int = 2):
-    sma = simple_sma(series, window)
-    std = series.rolling(window).std()
-    return sma, sma + num_std * std, sma - num_std * std
-
-# ---------------------------------------------------------
-# Data fetchers
-# ---------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def get_stock_data(ticker: str, period: str = "6mo") -> pd.DataFrame:
-    df = yf.download(ticker, period=period, auto_adjust=False, progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        try:
-            df = df.xs(ticker, axis=1, level=1)
-        except Exception:
-            df = df.iloc[:, df.columns.get_level_values(1) == ticker]
-            df.columns = df.columns.get_level_values(0)
-    if df is None or df.empty:
-        raise ValueError(f"No data for {ticker}")
-
-    close = df["Close"].squeeze()
-    sma20, bbU, bbL = bollinger_bands(close)
-    df["sma_20"], df["bb_upper"], df["bb_lower"] = sma20, bbU, bbL
-    df["sma_50"] = simple_sma(close, 50)
-    df["rsi"] = simple_rsi(close)
-    return df.dropna()
-
-@st.cache_data(show_spinner=False)
-def get_crypto_history(coin_id: str, vs_currency: str = "usd", days: int = 180) -> pd.DataFrame:
-    cg = CoinGeckoAPI()
-    data = cg.get_coin_market_chart_by_id(id=coin_id, vs_currency=vs_currency, days=days)
-    df = pd.DataFrame(data["prices"], columns=["time", "price"])
-    df["time"] = pd.to_datetime(df["time"], unit="ms")
-    df = df.set_index("time")
-    # make it look like OHLC for indicator reuse
-    df = df.rename(columns={"price": "Close"})
-    df["Open"] = df["High"] = df["Low"] = df["Close"]
-    sma20, bbU, bbL = bollinger_bands(df["Close"])
-    df["sma_20"], df["bb_upper"], df["bb_lower"] = sma20, bbU, bbL
-    df["sma_50"] = simple_sma(df["Close"], 50)
-    df["rsi"] = simple_rsi(df["Close"])
-    return df.dropna()
-
-# ---------------------------------------------------------
-# Signal Engine
-# ---------------------------------------------------------
-def analyze_frame(df: pd.DataFrame, rsi_ovr: float, rsi_obh: float) -> dict:
-    """Return dict with RSI/SMA/Signal/Reasons for the last row of df."""
-    if not isinstance(df, pd.DataFrame) or len(df) < 5:
+def _normalize_text(x: Optional[object]) -> Optional[str]:
+    if x is None:
         return None
-    cur, prev = df.iloc[-1], df.iloc[-2]
-    rsi = float(cur["rsi"])
-    sma20_cur, sma50_cur = float(cur["sma_20"]), float(cur["sma_50"])
-    price = float(cur["Close"])
+    s = unicodedata.normalize("NFKC", str(x))
+    s = _ZERO_WIDTH_RE.sub("", s)
+    s = _CONTROL_CHARS_RE.sub("", s)
+    return s.strip()
 
-    reasons = []
-    if rsi < rsi_ovr:
-        reasons.append(f"RSI below {rsi_ovr} (oversold)")
-    if rsi > rsi_obh:
-        reasons.append(f"RSI above {rsi_obh} (overbought)")
-    if prev["sma_20"] < prev["sma_50"] <= sma20_cur:
-        reasons.append("20 SMA crossed above 50 SMA (bullish)")
-    if prev["sma_20"] > prev["sma_50"] >= sma20_cur:
-        reasons.append("20 SMA crossed below 50 SMA (bearish)")
-    if price < float(cur["bb_lower"]):
-        reasons.append("Price below lower BB")
-    if price > float(cur["bb_upper"]):
-        reasons.append("Price above upper BB")
+def clean_dataframe_text(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean all string-like columns to remove BOM/zero-width/control chars and normalize."""
+    df = df.copy()
+    # Clean column names
+    df.columns = [_normalize_text(c) for c in df.columns]
+    # Clean string-like columns
+    for col in df.select_dtypes(include=["object", "string"]).columns:
+        df[col] = df[col].map(_normalize_text)
+    return df
 
-    text = "; ".join(reasons).lower()
-    signal = "HOLD"
-    if any(k in text for k in ["buy", "bullish", "oversold", "below lower bb"]):
-        signal = "BUY"
-    if any(k in text for k in ["sell", "bearish", "overbought", "above upper bb"]):
-        signal = "SELL"
+def to_csv_bytes(df: pd.DataFrame, excel_friendly: bool = True) -> bytes:
+    """
+    Create CSV bytes with robust defaults:
+      - QUOTE_MINIMAL + \n newlines
+      - Empty string for NaNs
+      - Stable float formatting
+      - UTF-8 with BOM for Excel (excel_friendly=True),
+        or plain UTF-8 (excel_friendly=False)
+    """
+    df = df.copy()
+    csv_str = df.to_csv(
+        index=False,
+        na_rep="",
+        float_format="%.6f",
+        quoting=csv.QUOTE_MINIMAL,
+        line_terminator="\n",
+    )
+    if excel_friendly:
+        # Excel sniffs UTF‑8 reliably when BOM is present
+        return csv_str.encode("utf-8-sig")  # adds BOM
+    return csv_str.encode("utf-8")          # no BOM
 
-    return {
-        "RSI": round(rsi, 2),
-        "20 SMA": round(sma20_cur, 2),
-        "50 SMA": round(sma50_cur, 2),
-        "Signal": signal,
-        "Reasons": "; ".join(reasons),
-    }
 
-# ---------------------------------------------------------
-# Sidebar UI
-# ---------------------------------------------------------
+# ------------------------------ Indicators ------------------------------
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder's RSI (default 14)."""
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0.0))
+    loss = (-delta.where(delta < 0, 0.0))
+
+    avg_gain = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+
+    rs = avg_gain / (avg_loss.replace(0, np.nan))
+    rsi_vals = 100 - (100 / (1 + rs))
+    return rsi_vals.fillna(0.0)
+
+def bollinger_bands(series: pd.Series, window: int = 20, num_std: float = 2.0):
+    """Bollinger Bands: middle (SMA), upper, lower."""
+    mid = series.rolling(window=window, min_periods=window).mean()
+    std = series.rolling(window=window, min_periods=window).std(ddof=0)
+    upper = mid + num_std * std
+    lower = mid - num_std * std
+    return mid, upper, lower
+
+
+# ------------------------------ Data Fetch ------------------------------
+@st.cache_data(show_spinner=False, ttl=60 * 5)
+def fetch_ohlcv(ticker: str, start: datetime, end: datetime, interval: str) -> pd.DataFrame:
+    """
+    Fetch OHLCV data from yFinance.
+    Returns a DataFrame with Date index (tz-naive) and standard columns.
+    """
+    # yfinance sometimes returns tz-aware index; make tz-naive for consistency
+    df = yf.download(
+        tickers=ticker,
+        start=start,
+        end=end + timedelta(days=1),  # make end inclusive
+        interval=interval,
+        auto_adjust=False,
+        progress=False,
+        threads=True,
+    )
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # Ensure column names match expected
+    df = df.rename(columns={
+        "Open": "Open",
+        "High": "High",
+        "Low": "Low",
+        "Close": "Close",
+        "Adj Close": "Adj Close",
+        "Volume": "Volume",
+    })
+
+    # Normalize the index to tz-naive and push to a column
+    if isinstance(df.index, pd.DatetimeIndex):
+        try:
+            idx = df.index.tz_localize(None)
+        except Exception:
+            idx = pd.DatetimeIndex(df.index)
+        df = df.copy()
+        df.insert(0, "Date", idx)
+    else:
+        df.insert(0, "Date", pd.to_datetime(df.index, errors="coerce"))
+
+    return df.reset_index(drop=True)
+
+
+# ------------------------------ UI ------------------------------
+st.title("📈 Stock Analyzer / Trading BOT")
+st.caption("RSI & Bollinger Bands • Clean CSV Exports • yFinance Data")
+
 with st.sidebar:
-    st.markdown("## ⚙️ Settings")
-    with st.expander("General", expanded=True):
-        simulate_mode = st.checkbox("Simulate Trading Mode", True)
-        debug_mode = st.checkbox("Show debug logs", False)
+    st.header("Settings")
 
-    with st.expander("Analysis Options", expanded=True):
-        scan_top = st.checkbox("Scan top N performers", False)
-        top_n = st.slider("Top tickers to scan (stocks)", 5, 50, 10) if scan_top else 0
+    ticker = st.text_input("Ticker", value="AAPL").strip().upper()
 
-        include_crypto = st.checkbox("Include crypto in scan (optional)", False)
-        top_coins = st.slider("Top coins to include", 1, 20, 5) if include_crypto else 0
+    col_dates = st.columns(2)
+    with col_dates[0]:
+        start_date = st.date_input("Start date", value=(datetime.now().date() - timedelta(days=365)))
+    with col_dates[1]:
+        end_date = st.date_input("End date", value=datetime.now().date())
 
-        min_rows = st.slider("Minimum data rows", 10, 100, 30)
-        rsi_ovr = st.slider("RSI oversold threshold", 0, 100, 30)
-        rsi_obh = st.slider("RSI overbought threshold", 0, 100, 70)
+    interval = st.selectbox(
+        "Interval",
+        options=["1d", "1h", "30m", "15m", "5m", "1wk", "1mo"],
+        index=0,
+        help="Supported yFinance intervals"
+    )
 
-        options = ["3mo", "6mo", "1y"]
-        # read query params if present
-        qp = dict(st.query_params)
-        qs_period = qp.get("period", "")
-        default_period = qs_period if qs_period in options else "6mo"
+    st.markdown("---")
+    st.subheader("Indicators")
+    rsi_period = st.number_input("RSI Period", min_value=2, max_value=100, value=14, step=1)
+    bb_window = st.number_input("BB Window", min_value=5, max_value=200, value=20, step=1)
+    bb_std = st.number_input("BB Std Dev", min_value=1.0, max_value=4.0, value=2.0, step=0.5, format="%.1f")
 
-        # build the stock universe
-        if scan_top:
-            universe = get_top_tickers(top_n)
-        else:
-            universe = get_sp500_tickers()
-        if not universe:
-            universe = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN"]
+    st.markdown("---")
+    run_btn = st.button("▶️ Run / Analyze", use_container_width=True)
 
-        qs_tickers = qp.get("tickers", "")
-        if qs_tickers:
-            default_list = qs_tickers.split(",")
-        else:
-            default_list = universe[:2]
 
-        tickers = st.multiselect("Choose tickers", universe, default=default_list)
-        period = st.selectbox("Date range", options, index=options.index(default_period))
-
-# ---------------------------------------------------------
-# Main Run
-# ---------------------------------------------------------
-badge = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}
-st.markdown(f"### {'🔴 SIM' if simulate_mode else '🟢 LIVE'}  Stock Analyzer")
-
-if st.button("▶ Run Analysis", use_container_width=True):
-    if not tickers and not include_crypto:
-        st.warning("Select at least one ticker or enable crypto scan.")
+# ------------------------------ Analysis ------------------------------
+if run_btn:
+    if not ticker:
+        st.error("Please enter a ticker.")
         st.stop()
 
-    results = {}
-    # STOCKS
-    for tkr in tickers:
-        try:
-            df = get_stock_data(tkr, period)
-            if len(df) < min_rows:
-                st.warning(f"{tkr}: Not enough data, skipped.")
-                continue
-            summ = analyze_frame(df, rsi_ovr, rsi_obh)
-            if not summ:
-                continue
-            results[tkr] = summ
+    with st.spinner(f"Fetching data for {ticker}..."):
+        df = fetch_ohlcv(
+            ticker=ticker,
+            start=datetime.combine(start_date, datetime.min.time()),
+            end=datetime.combine(end_date, datetime.min.time()),
+            interval=interval
+        )
 
-            # chart
-            st.markdown(f"#### 📈 {tkr} Price Chart")
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close"))
-            fig.add_trace(go.Scatter(x=df.index, y=df["sma_20"], name="20 SMA"))
-            fig.add_trace(go.Scatter(x=df.index, y=df["sma_50"], name="50 SMA"))
-            fig.add_trace(go.Scatter(x=df.index, y=df["bb_upper"], name="BB Upper", line=dict(dash="dot")))
-            fig.add_trace(go.Scatter(x=df.index, y=df["bb_lower"], name="BB Lower", line=dict(dash="dot")))
-            st.plotly_chart(fig, use_container_width=True)
+    if df.empty:
+        st.warning("No data returned. Try a different date range or interval.")
+        st.stop()
 
-            st.markdown(f"**{badge[summ['Signal']]} {tkr} – {summ['Signal']}**")
-            if debug_mode:
-                st.json(summ)
-            st.divider()
-        except Exception as e:
-            st.error(f"{tkr} failed: {e}")
+    # Calculate indicators
+    price_series = df["Close"].astype(float)
+    df["RSI"] = rsi(price_series, period=int(rsi_period))
+    bb_mid, bb_upper, bb_lower = bollinger_bands(price_series, window=int(bb_window), num_std=float(bb_std))
+    df["BB_Middle"] = bb_mid
+    df["BB_Upper"] = bb_upper
+    df["BB_Lower"] = bb_lower
 
-    # CRYPTO (optional)
-    if include_crypto:
-        try:
-            cg = CoinGeckoAPI()
-            coins = cg.get_coins_markets(vs_currency="usd", order="market_cap_desc", per_page=top_coins, page=1)
-            for coin in coins:
-                coin_id = coin["id"]
-                symbol = coin["symbol"].upper() + "-USD"
-                try:
-                    cdf = get_crypto_history(coin_id, "usd", days=180 if period == "6mo" else 365)
-                    if len(cdf) < min_rows:
-                        st.warning(f"{symbol}: Not enough data, skipped.")
-                        continue
-                    summ = analyze_frame(cdf, rsi_ovr, rsi_obh)
-                    if not summ:
-                        continue
-                    results[symbol] = summ
+    # Add Ticker column for clarity/exports
+    df.insert(1, "Ticker", ticker)
 
-                    st.markdown(f"#### 🪙 {symbol} Price Chart")
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=cdf.index, y=cdf["Close"], name="Close"))
-                    fig.add_trace(go.Scatter(x=cdf.index, y=cdf["sma_20"], name="20 SMA"))
-                    fig.add_trace(go.Scatter(x=cdf.index, y=cdf["sma_50"], name="50 SMA"))
-                    fig.add_trace(go.Scatter(x=cdf.index, y=cdf["bb_upper"], name="BB Upper", line=dict(dash="dot")))
-                    fig.add_trace(go.Scatter(x=cdf.index, y=cdf["bb_lower"], name="BB Lower", line=dict(dash="dot")))
-                    st.plotly_chart(fig, use_container_width=True)
+    # Reorder columns for readability if present
+    desired = ["Date", "Ticker", "Open", "High", "Low", "Close", "Adj Close", "Volume",
+               "RSI", "BB_Middle", "BB_Upper", "BB_Lower"]
+    cols = [c for c in desired if c in df.columns] + [c for c in df.columns if c not in desired]
+    df = df[cols]
 
-                    st.markdown(f"**{badge[summ['Signal']]} {symbol} – {summ['Signal']}**")
-                    if debug_mode:
-                        st.json(summ)
-                    st.divider()
-                except Exception as ce:
-                    st.error(f"{symbol} failed: {ce}")
-        except Exception as e:
-            st.error(f"Crypto scan failed: {e}")
+    # Display
+    st.subheader(f"Results: {ticker}")
+    st.dataframe(df.tail(200), use_container_width=True, height=400)
 
-    # SUMMARY
-    if results:
-        res_df = pd.DataFrame(results).T
-        # badge column
-        res_df.insert(0, "Signal Badge", res_df["Signal"].map(badge))
-        st.markdown("### 📊 Summary of Trade Signals")
-        st.dataframe(res_df, use_container_width=True)
-        st.download_button("⬇ Download CSV", res_df.to_csv().encode(), "stock_analysis_results.csv")
-    else:
-        st.info("No analysable results were produced with the current settings.")
+    # Simple chart (Close + BB)
+    try:
+        import altair as alt
+        plot_df = df.dropna(subset=["Close"]).copy()
+        plot_df["Date"] = pd.to_datetime(plot_df["Date"])
+        base = alt.Chart(plot_df).encode(x="Date:T")
+        close_line = base.mark_line().encode(y=alt.Y("Close:Q", title="Price"))
+        bb_upper_line = base.mark_line(opacity=0.5).encode(y="BB_Upper:Q")
+        bb_middle_line = base.mark_line(opacity=0.5).encode(y="BB_Middle:Q")
+        bb_lower_line = base.mark_line(opacity=0.5).encode(y="BB_Lower:Q")
+        st.altair_chart(close_line + bb_upper_line + bb_middle_line + bb_lower_line, use_container_width=True)
+    except Exception:
+        st.info("Altair not available or failed to render chart; skipping chart.")
+
+    # ---------------- CSV Exports (CLEAN) ----------------
+    st.markdown("### 📥 Clean CSV Exports")
+
+    # Ensure Date is string for consistent CSV output (avoids Excel timezone surprises)
+    out_df = df.copy()
+    out_df["Date"] = pd.to_datetime(out_df["Date"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Clean text columns (remove hidden chars, normalize)
+    clean_df = clean_dataframe_text(out_df)
+
+    # Build file names with timestamp
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname_excel = f"{ticker}_analysis_excel_{ts}.csv"
+    fname_utf8 = f"{ticker}_analysis_utf8_{ts}.csv"
+
+    csv_bytes_excel = to_csv_bytes(clean_df, excel_friendly=True)
+    csv_bytes_utf8 = to_csv_bytes(clean_df, excel_friendly=False)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "Download CSV (Excel‑friendly UTF‑8+BOM)",
+            data=csv_bytes_excel,
+            file_name=fname_excel,
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with c2:
+        st.download_button(
+            "Download CSV (UTF‑8, no BOM)",
+            data=csv_bytes_utf8,
+            file_name=fname_utf8,
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    st.success("CSV export fixed and ready. If you still see odd characters in a specific column, it’s coming from upstream data—now trivially cleaned here.")
+
+
+# ------------------------------ Footer ------------------------------
+with st.expander("About this app"):
+    st.write(
+        "This version includes robust CSV cleaning to avoid hidden Unicode/control characters "
+        "and provides both Excel‑friendly UTF‑8+BOM and plain UTF‑8 exports."
+    )
