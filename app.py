@@ -2,9 +2,15 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import ta
 from datetime import datetime
 from io import BytesIO
+
+# Try importing ta, or fall back gracefully
+try:
+    import ta
+    TA_AVAILABLE = True
+except ImportError:
+    TA_AVAILABLE = False
 
 # -------------------------------
 # Helper functions
@@ -16,6 +22,12 @@ def download_data(ticker, start, end):
     return data
 
 def add_indicators(data):
+    if not TA_AVAILABLE:
+        st.warning("⚠️ The 'ta' library is not installed. Indicators will be skipped.")
+        data['RSI'] = None
+        data['BB_high'] = None
+        data['BB_low'] = None
+        return data
     data['RSI'] = ta.momentum.RSIIndicator(data['Close']).rsi()
     bb = ta.volatility.BollingerBands(data['Close'])
     data['BB_high'] = bb.bollinger_hband()
@@ -23,6 +35,9 @@ def add_indicators(data):
     return data
 
 def generate_signals(data):
+    if not TA_AVAILABLE:
+        data['Signal'] = ""
+        return data
     signals = []
     for i in range(len(data)):
         if data['Close'].iloc[i] < data['BB_low'].iloc[i] and data['RSI'].iloc[i] < 30:
@@ -79,7 +94,11 @@ if st.button("Run Analyse", key="run"):
 if st.session_state.get('analysis_done') and st.session_state['data'] is not None:
     st.subheader(f"Results for {ticker}")
 
-    st.line_chart(st.session_state['data'][['Close', 'BB_high', 'BB_low']])
+    if TA_AVAILABLE:
+        st.line_chart(st.session_state['data'][['Close', 'BB_high', 'BB_low']])
+    else:
+        st.line_chart(st.session_state['data'][['Close']])
+
     st.write(st.session_state['data'].tail())
 
     # CSV Export Button (stable across reruns)
