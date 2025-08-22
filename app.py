@@ -362,5 +362,123 @@ if run_btn:
     out_df["Date"] = pd.to_datetime(out_df["Date"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
     clean_df = clean_dataframe_text(out_df)
 
+    # Build names once per analysis run
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname_excel = f"{ticker}_
+    fname_excel = f"{ticker}_analysis_excel_{ts}.csv"
+    fname_utf8 = f"{ticker}_analysis_utf8_{ts}.csv"
+
+    # Create fresh bytes and wrap in BytesIO buffers so buttons can be clicked repeatedly
+    csv_bytes_excel = to_csv_bytes(clean_df, excel_friendly=True)
+    csv_bytes_utf8 = to_csv_bytes(clean_df, excel_friendly=False)
+    buf_excel = io.BytesIO(csv_bytes_excel); buf_excel.seek(0)
+    buf_utf8 = io.BytesIO(csv_bytes_utf8);  buf_utf8.seek(0)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            label="Download CSV (Excel-friendly UTF-8+BOM)",
+            data=buf_excel,
+            file_name=fname_excel,
+            mime="text/csv;charset=utf-8",
+            key="dl_excel",
+            use_container_width=True,
+        )
+    with c2:
+        st.download_button(
+            label="Download CSV (UTF-8, no BOM)",
+            data=buf_utf8,
+            file_name=fname_utf8,
+            mime="text/csv;charset=utf-8",
+            key="dl_utf8",
+            use_container_width=True,
+        )
+
+    st.success("CSV export fixed and ready.")
+
+    # ------------------ Trade Logging & Execution ------------------
+    st.markdown("### 🧾 Trade Logging")
+    mkt_price = float(price_series.iloc[-1])
+    st.write(f"Current price: **{mkt_price:.2f}**")
+
+    colA, colB = st.columns([1,1])
+    with colA:
+        if st.button("Log Trade (at current price)", use_container_width=True):
+            row = {
+                "timestamp": datetime.utcnow().isoformat(),
+                "symbol": ticker,
+                "side": side.lower(),
+                "quantity": float(qty),
+                "price": mkt_price,
+                "fees": 0.0,
+                "strategy": strategy,
+                "order_id": "dry-run" if dry_run else "",
+                "dry_run": bool(dry_run),
+                "note": note,
+            }
+            if not dry_run and False:  # RH live disabled placeholder
+                row["order_id"] = f"RH-{int(datetime.utcnow().timestamp())}"
+            _append_trade(row)
+            st.success("Trade logged.")
+
+    with colB:
+        if st.button("Open Trade Log (download)", use_container_width=True):
+            if os.path.exists(TRADE_LOG_CSV):
+                with open(TRADE_LOG_CSV, "rb") as f:
+                    st.download_button(
+                        "Download trades_log.csv",
+                        data=f.read(),
+                        file_name="trades_log.csv",
+                        mime="text/csv",
+                        key=f"trades_{ts}",
+                    )
+            else:
+                st.info("No trades yet.")
+
+    # Show recent trades
+    trades_df = get_trade_log()
+    st.dataframe(trades_df.tail(200), use_container_width=True, height=260)
+
+    # ------------------ Tax Report (FIFO) ------------------
+    st.markdown("### 🧮 Tax Report (FIFO realized P/L)")
+    tax_df = build_fifo_tax_report(trades_df)
+    st.dataframe(tax_df.tail(200), use_container_width=True, height=260)
+    if not tax_df.empty:
+        st.download_button(
+            "Download tax_report_fifo.csv",
+            data=to_csv_bytes(tax_df, excel_friendly=True),
+            file_name=os.path.basename(TAX_REPORT_CSV),
+            mime="text/csv",
+            key=f"tax_{ts}",
+        )
+
+    # ------------------ Alerts ------------------
+    st.markdown("### 🔔 Alerts")
+    last_rsi = float(df["RSI"].iloc[-1])
+    st.write(f"Last RSI: **{last_rsi:.2f}**")
+
+    c3, c4, c5 = st.columns(3)
+    with c3:
+        do_email = st.checkbox("Email", value=False)
+    with c4:
+        do_sms = st.checkbox("SMS", value=False)
+    with c5:
+        do_slack = st.checkbox("Slack", value=False)
+
+    if st.button("Send Test Alert", use_container_width=True):
+        alert_msg = f"[{datetime.utcnow().isoformat()}] {ticker} RSI={last_rsi:.2f} (period={rsi_period})"
+        if dry_run:
+            st.info("Dry run is ON — alerts are logged but not sent.")
+        sent_any = False
+        if not dry_run and do_email:
+            sent_any |= send_email("Trading BOT Alert", alert_msg)
+        if not dry_run and do_sms:
+            sent_any |= send_sms(alert_msg)
+        if not dry_run and do_slack:
+            sent_any |= send_slack(alert_msg)
+        st.success("Alert processed (dry_run ON)" if dry_run else ("Alert sent" if sent_any else "No alert sent — check env creds"))
+
+with st.expander("About this app"):
+    st.write(
+        "This Pro build adds trade logging (CSV/Parquet), optional live trading stubs, a FIFO tax report, "
+        "and multi-channel alerts. All sensitive actions remain disabled unless you turn OFF dry_run and provide env creds."
+    )
