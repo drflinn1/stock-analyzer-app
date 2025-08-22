@@ -1,5 +1,5 @@
-# app.py – Streamlit Web App Version of Stock Analyzer Bot with S&P Scan & Full Ticker Selection
-# VERSION = "0.8.8 (2025-08-21)"
+# app.py – Streamlit Web App Version of Stock Analyzer Bot with S&P Scan, Crypto & Full Ticker Selection
+# VERSION = "0.9.0 (2025-08-21)"
 
 import os
 import time
@@ -16,6 +16,12 @@ import yfinance as yf
 from email.message import EmailMessage
 from streamlit_autorefresh import st_autorefresh
 
+# NEW: CoinGecko for crypto universe
+try:
+    from pycoingecko import CoinGeckoAPI
+except Exception:  # pragma: no cover
+    CoinGeckoAPI = None
+
 # -------------------------
 # ▶  CONFIG & SECRETS
 # -------------------------
@@ -23,7 +29,7 @@ PAGE_TITLE = "Stock Analyzer Bot (Live Trading + Tax Logs)"
 APP_URL = st.secrets.get("APP_URL", "")
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 
-# Validate (optional) secrets — we only warn; app still runs fine in simulate mode.
+# Optional secrets (only needed for notifications)
 missing = []
 for key in ["EMAIL_ADDRESS", "EMAIL_RECEIVER", "SLACK_WEBHOOK_URL"]:
     if key not in st.secrets or not st.secrets.get(key):
@@ -34,21 +40,22 @@ if missing:
         + ", ".join(missing)
     )
 
-# Robinhood client is optional
+# Optional Robinhood client (not used in this step, but kept)
 try:
     from robin_stocks import robinhood as r  # noqa: F401
 except Exception:
     r = None
 
 # -------------------------
-# ▶  Helper to fetch S&P 500 & Top Movers
+# ▶  Helper: S&P 500 universe (stocks)
 # -------------------------
 @st.cache_data(show_spinner=False)
 def get_sp500_tickers() -> List[str]:
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     try:
         df_list = pd.read_html(url, flavor="bs4", attrs={"class": "wikitable"})
-        return sorted(df_list[0]["Symbol"].astype(str).str.strip().unique().tolist())
+        syms = df_list[0]["Symbol"].astype(str).str.strip().unique().tolist()
+        return sorted(syms)
     except Exception:
         # fallback soup scrape
         try:
@@ -67,12 +74,11 @@ def get_sp500_tickers() -> List[str]:
             return []
 
 
-def get_top_tickers(n: int) -> List[str]:
-    """Return top n performers by 1‑day change from S&P universe."""
+def get_top_stocks(n: int) -> List[str]:
+    """Top n S&P constituents by 1‑day change."""
     symbols = get_sp500_tickers()
     if not symbols:
         return []
-    # try bulk download first
     try:
         df = yf.download(symbols, period="2d", progress=False)["Close"]
         if isinstance(df, pd.Series):
@@ -83,7 +89,6 @@ def get_top_tickers(n: int) -> List[str]:
             changes.dropna().sort_values(ascending=False).head(n).index.tolist()
         )
     except Exception:
-        # slow fallback
         perf = {}
         for sym in symbols:
             try:
@@ -93,6 +98,42 @@ def get_top_tickers(n: int) -> List[str]:
             except Exception:
                 continue
         return [k for k, _ in sorted(perf.items(), key=lambda kv: kv[1], reverse=True)[:n]]
+
+# -------------------------
+# ▶  Helper: Crypto universe
+# -------------------------
+@st.cache_data(show_spinner=False)
+def get_top_crypto_tickers(n: int) -> List[str]:
+    """
+    Return top-n crypto yfinance symbols like BTC-USD, ETH-USD…
+    Sourced from CoinGecko by market cap. Filters to symbols that actually load in yfinance.
+    """
+    if CoinGeckoAPI is None:
+        st.sidebar.warning("pycoingecko not available; crypto list disabled.")
+        return []
+    try:
+        cg = CoinGeckoAPI()
+        data = cg.get_coins_markets(
+            vs_currency="usd", order="market_cap_desc", per_page=min(max(n, 1), 250), page=1
+        )
+        # Convert CG 'symbol' -> uppercase + '-USD'
+        candidates = [f"{item['symbol'].upper()}-USD" for item in data if item.get("symbol")]
+        # quick filter to things that actually load with yfinance
+        valid = []
+        for sym in candidates:
+            try:
+                df = yf.download(sym, period="1mo", progress=False)["Close"]
+                if not isinstance(df, pd.Series) or df.dropna().empty:
+                    continue
+                valid.append(sym)
+            except Exception:
+                continue
+            if len(valid) >= n:
+                break
+        return valid
+    except Exception as e:
+        st.sidebar.warning(f"Failed to fetch crypto list: {e}")
+        return []
 
 # -------------------------
 # ▶  Indicators
@@ -176,7 +217,7 @@ def analyze(df: pd.DataFrame, min_rows: int, rsi_ovr: float, rsi_obh: float) -> 
     }
 
 # -------------------------
-# ▶  Notifications
+# ▶  Notifications (optional)
 # -------------------------
 WEBHOOK = st.secrets.get("SLACK_WEBHOOK_URL")
 
@@ -227,21 +268,41 @@ with st.sidebar:
     with st.expander("General", expanded=True):
         simulate_mode = st.checkbox("Simulate Trading Mode", True)
         debug_mode = st.checkbox("Show debug logs", False)
-        # light auto-refresh once per hour
         st_autorefresh(interval=3_600_000, limit=None, key="hour_refresh")
 
     with st.expander("Analysis Options", expanded=True):
+        # Choose universe: Stocks / Crypto / Both
+        universe_choice = st.radio(
+            "Universe",
+            ["Stocks", "Crypto", "Both"],
+            index=0,
+            horizontal=True,
+        )
+
         scan_top = st.checkbox("Scan top N performers", False)
         top_n = st.slider("Top tickers to scan", 10, 100, 50) if scan_top else None
-        universe = get_top_tickers(top_n) if scan_top else get_sp500_tickers()
+
+        # Build universe
+        stocks = get_top_stocks(top_n) if (scan_top and universe_choice != "Crypto") else get_sp500_tickers()
+        crypto = get_top_crypto_tickers(top_n if scan_top else 50) if (universe_choice != "Stocks") else []
+
+        if universe_choice == "Stocks":
+            universe = stocks
+        elif universe_choice == "Crypto":
+            universe = crypto
+        else:  # Both
+            if scan_top:
+                half = max(1, top_n // 2)
+                universe = list(dict.fromkeys((get_top_stocks(half) + get_top_crypto_tickers(top_n - half))))
+            else:
+                universe = list(dict.fromkeys((stocks + crypto)))
 
         min_rows = st.slider("Minimum data rows", 10, 100, 30)
         rsi_ovr = st.slider("RSI oversold threshold", 0, 100, 30)
         rsi_obh = st.slider("RSI overbought threshold", 0, 100, 70)
 
-        # --- NEW: use modern query param API & safe defaults ---
-        params = st.query_params  # <-- replaces st.experimental_get_query_params()
-
+        # Query params (modern API)
+        params = st.query_params
         qs_tickers = params.get("tickers")
         qs_period = params.get("period")
 
@@ -257,11 +318,9 @@ with st.sidebar:
         else:
             default_period = "6mo"
 
-        # SAFE DEFAULTS: only use defaults that are present in universe
+        # SAFE DEFAULTS
         valid_defaults = [t for t in default_list if t in universe]
 
-        # Important: don't preset st.session_state['tickers'] / ['period']
-        # before building widgets (avoids the Streamlit warning).
         tickers = st.multiselect(
             "Choose tickers",
             universe,
@@ -293,7 +352,6 @@ if st.button("▶ Run Analysis", use_container_width=True):
                 continue
             results[tkr] = summ
 
-            # Notifications (optional)
             try:
                 price = float(df.Close.iloc[-1])
             except Exception:
@@ -301,7 +359,6 @@ if st.button("▶ Run Analysis", use_container_width=True):
             notify_email(tkr, summ, price)
             notify_slack(tkr, summ, price)
 
-            # Chart
             st.markdown(f"#### 📈 {tkr} Price Chart")
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df.index, y=df.Close, name="Close"))
