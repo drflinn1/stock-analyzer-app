@@ -298,6 +298,7 @@ with st.sidebar:
         period_options = ['1mo', '3mo', '6mo', '1y', '2y']
         stock_universe = get_sp500_tickers()
 
+        # ---------- AUTO MODE ----------
         if scan_top:
             auto_stocks = get_top_stock_tickers(top_n) if top_n > 0 else []
             auto_crypto = get_top_crypto_tickers(crypto_n) if include_crypto and crypto_n > 0 else []
@@ -309,12 +310,15 @@ with st.sidebar:
 
             default_period = (qs_period[0] if (qs_period and qs_period[0] in period_options) else '6mo')
 
+            # In auto mode there is no widget; it's safe to set session_state directly.
             st.session_state['tickers'] = auto_list
             st.session_state['period'] = default_period
+
             tickers = auto_list
             period = default_period
+
+        # ---------- MANUAL MODE ----------
         else:
-            # Manual selection mode
             if qs_tickers:
                 default_list = qs_tickers[0].split(',')
             else:
@@ -327,11 +331,9 @@ with st.sidebar:
             if not safe_defaults and opts:
                 safe_defaults = [opts[0]]
 
+            # Widgets keep st.session_state in sync; DO NOT set session_state after creation.
             tickers = st.multiselect('Choose tickers', opts, default=safe_defaults, key='tickers')
             period = st.selectbox('Date range', period_options, index=period_options.index(default_period), key='period')
-
-            st.session_state['tickers'] = tickers
-            st.session_state['period'] = period
 
 # -------------------------
 # ▶  Main Page
@@ -340,14 +342,17 @@ mode_badge = '🔴 SIM' if st.session_state.get('simulate_mode', simulate_mode) 
 st.markdown(f"### {mode_badge} {PAGE_TITLE}")
 
 if st.button('▶ Run Analysis', use_container_width=True):
-    if not st.session_state.get('tickers'):
+    current_tickers = st.session_state.get('tickers', [])
+    current_period = st.session_state.get('period', '6mo')
+
+    if not current_tickers:
         st.warning('No tickers to analyze. Enable "Scan top N performers" or select tickers manually.')
         st.stop()
 
     results: Dict[str, dict] = {}
-    for tkr in st.session_state['tickers']:
+    for tkr in current_tickers:
         try:
-            df = get_data(tkr, st.session_state['period'])
+            df = get_data(tkr, current_period)
             summ = analyze(df, min_rows, rsi_ovr, rsi_obh)
             if summ is None:
                 st.warning(f"{tkr}: Not enough data, skipped")
