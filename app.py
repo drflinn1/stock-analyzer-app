@@ -43,13 +43,22 @@ def clean_dataframe_text(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def to_csv_bytes(df: pd.DataFrame, excel_friendly: bool = True) -> bytes:
-    csv_str = df.to_csv(
-        index=False,
-        na_rep="",
-        float_format="%.6f",
-        quoting=csv.QUOTE_MINIMAL,
-        line_terminator="\n",
-    )
+    try:
+        csv_str = df.to_csv(
+            index=False,
+            na_rep="",
+            float_format="%.6f",
+            quoting=csv.QUOTE_MINIMAL,
+            lineterminator="\n",
+        )
+    except TypeError:
+        # fallback for environments that don’t support lineterminator param
+        csv_str = df.to_csv(
+            index=False,
+            na_rep="",
+            float_format="%.6f",
+            quoting=csv.QUOTE_MINIMAL,
+        )
     if excel_friendly:
         return csv_str.encode("utf-8-sig")
     return csv_str.encode("utf-8")
@@ -60,7 +69,6 @@ def _ensure_plain_ohlcv_columns(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     Keeps standard columns: Open, High, Low, Close, Adj Close, Volume.
     """
     if isinstance(df.columns, pd.MultiIndex):
-        # Try to select the ticker slice if present as one of the levels
         for lvl in range(df.columns.nlevels):
             if ticker in df.columns.get_level_values(lvl):
                 try:
@@ -68,10 +76,8 @@ def _ensure_plain_ohlcv_columns(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
                     break
                 except Exception:
                     pass
-        # If still MultiIndex, flatten by joining names
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [" ".join([str(x) for x in tup if str(x) != ""]).strip() for tup in df.columns]
-    # Standardize expected names if yfinance altered casing/spacing
     ren = {c: c.title() for c in df.columns}
     ren["Adj Close"] = "Adj Close"
     df = df.rename(columns=ren)
@@ -112,10 +118,8 @@ def fetch_ohlcv(ticker: str, start: datetime, end: datetime, interval: str) -> p
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # Ensure flat OHLCV columns
     df = _ensure_plain_ohlcv_columns(df, ticker)
 
-    # Insert a tz-naive Date column from the index
     if isinstance(df.index, pd.DatetimeIndex):
         try:
             idx = df.index.tz_localize(None)
@@ -142,7 +146,6 @@ with st.sidebar:
     with col_dates[1]:
         end_date = st.date_input("End date", value=datetime.now().date())
 
-    # Auto-fix future end dates
     if end_date > datetime.now().date():
         end_date = datetime.now().date()
 
@@ -164,7 +167,6 @@ if run_btn:
         st.stop()
 
     with st.spinner(f"Fetching data for {ticker}..."):
-        # Guard against future end date
         today = datetime.now().date()
         safe_end = min(end_date, today)
         df = fetch_ohlcv(
@@ -187,10 +189,8 @@ if run_btn:
 
     df.insert(1, "Ticker", ticker)
 
-    # Only include columns that exist to avoid KeyError
     desired = ["Date", "Ticker", "Open", "High", "Low", "Close", "Adj Close", "Volume",
                "RSI", "BB_Middle", "BB_Upper", "BB_Lower"]
-    # Reorder safely even if some columns are missing
     cols = [c for c in desired if c in df.columns] + [c for c in df.columns if c not in desired]
     df = df.loc[:, cols]
 
