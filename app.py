@@ -1,20 +1,13 @@
-# app.py — Stock Analyzer Bot (Stage 2: Indicators + Signals) + UI polish
-# - Compact layout
-# - Sticky header
-# - Signal badges in summary table
-# - Optional S&P Top-N scan and optional crypto scan
+# app.py — Stock Analyzer Bot (Stage 2: Indicators + Signals) + UI polish (no JS)
 
 from __future__ import annotations
 
-import os
 import time
-from datetime import datetime
 from typing import List, Optional, Dict, Any
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objs as go
-import requests
 import streamlit as st
 import yfinance as yf
 
@@ -28,15 +21,11 @@ st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 st.markdown(
     """
     <style>
-      /* compact page */
       .block-container {padding-top: 0.75rem !important; padding-bottom: 0.5rem !important;}
       section[data-testid="stSidebar"] .block-container {padding-top: 0.5rem !important;}
-      /* sticky header bar */
       .sticky-bar {position: sticky; top: 0; z-index: 100; background: var(--background-color);
                    padding: .35rem .5rem .5rem .5rem; border-bottom: 1px solid rgba(128,128,128,.2);}
-      /* small table tweaks */
       div[data-testid="stDataFrame"] div[role="table"] { font-size: 0.90rem; }
-      /* code blocks a bit smaller */
       pre, code { font-size: 0.85rem; }
     </style>
     """,
@@ -48,7 +37,6 @@ st.markdown(
 # -------------------------
 @st.cache_data(show_spinner=False)
 def get_sp500_tickers() -> List[str]:
-    """Return S&P-500 tickers from Wikipedia (cached)."""
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     try:
         df_list = pd.read_html(url)
@@ -75,12 +63,10 @@ def bollinger_bands(series: pd.Series, window: int = 20, num_std: int = 2):
 
 @st.cache_data(show_spinner=False)
 def get_data(ticker: str, period: str, retries: int = 2) -> pd.DataFrame:
-    """Download OHLCV and compute indicators."""
     last_err = None
     for _ in range(retries + 1):
         try:
             df = yf.download(ticker, period=period, auto_adjust=False, progress=False)
-            # If MultiIndex (rare for a single ticker), flatten
             if isinstance(df.columns, pd.MultiIndex):
                 try:
                     df = df.xs(ticker, axis=1, level=1)
@@ -102,7 +88,6 @@ def get_data(ticker: str, period: str, retries: int = 2) -> pd.DataFrame:
     raise ValueError(f"No data fetched for {ticker} ({last_err})")
 
 def analyze_row(df: pd.DataFrame, rsi_ovr: float, rsi_obh: float) -> Dict[str, Any] | None:
-    """Return last-row indicators + signal & reasons."""
     if df is None or len(df) < 5:
         return None
     cur, prev = df.iloc[-1], df.iloc[-2]
@@ -149,7 +134,7 @@ def badge(signal: str) -> str:
     return m.get(signal, signal)
 
 # -------------------------
-# ▶  SIDEBAR (controls)
+# ▶  SIDEBAR
 # -------------------------
 with st.sidebar:
     st.markdown("### Settings")
@@ -159,7 +144,8 @@ with st.sidebar:
         debug_mode = st.checkbox("Show debug logs", False)
 
     with st.expander("Analysis Options", expanded=True):
-        scan_top = st.checkbox("Scan top N performers", False, help="Autoselect Top N S&P-500 movers today.")
+        scan_top = st.checkbox("Scan top N performers", False,
+                               help="Autoselect Top N S&P‑500 movers today.")
         top_n = st.slider("Top tickers to scan (stocks)", 5, 50, 25) if scan_top else None
         include_crypto = st.checkbox("Include crypto in scan (optional)", False)
         top_k_coins = st.slider("Top coins to include", 1, 20, 5) if include_crypto else 0
@@ -168,17 +154,14 @@ with st.sidebar:
         rsi_ovr = st.slider("RSI oversold threshold", 0, 100, 30)
         rsi_obh = st.slider("RSI overbought threshold", 0, 100, 70)
 
-        # Query params (read-only use)
         qs = st.query_params
         period_opts = ["3mo", "6mo", "1y", "2y"]
         default_period = qs.get("period", "6mo")
         if default_period not in period_opts:
             default_period = "6mo"
 
-        # Build universe
         if scan_top:
             base = get_sp500_tickers()
-            # Try to get daily movers (percent change) quickly
             movers = []
             try:
                 df = yf.download(base, period="2d", progress=False)["Close"]
@@ -197,37 +180,30 @@ with st.sidebar:
         default_list = [t for t in default_list.split(",") if t] or universe[:2]
 
         tickers = st.multiselect("Choose tickers", universe, default=default_list, key="tickers")
-        period = st.selectbox("Date range", period_opts, index=period_opts.index(default_period), key="period")
+        period = st.selectbox("Date range", period_opts,
+                              index=period_opts.index(default_period), key="period")
 
-        # Helper text: show which top movers got autoselected
-        if scan_top and movers:
-            st.caption(f"Autoselected (Top Movers): {', '.join(movers[:10])}{'…' if len(movers)>10 else ''}")
+        if scan_top and 'movers' in locals() and movers:
+            st.caption(f"Autoselected (Top Movers): "
+                       f\"{', '.join(movers[:10])}{'…' if len(movers)>10 else ''}\")
 
-# Sync URL (shareable state)
-# We only write when the user clicks Run to avoid constant URL churn.
 def set_query_params():
     st.query_params.tickers = ",".join(tickers) if tickers else ""
     st.query_params.period = period
 
 # -------------------------
-# ▶  MAIN LAYOUT
+# ▶  STICKY HEADER (no JS)
 # -------------------------
-st.markdown(f"""
-<div class="sticky-bar">
-  <h3 style="display:inline;">{'🔴 SIM' if simulate_mode else '🟢 LIVE'} {PAGE_TITLE}</h3>
-  <span style="float:right;">
-    <form action="#" method="get" style="display:inline;">
-      <button type="button" id="run-btn">▶ Run Analysis</button>
-    </form>
-  </span>
-</div>
-<script>
-const btn=document.getElementById('run-btn');
-if(btn){btn.addEventListener('click',()=>{window.parent.postMessage({isRun:true}, '*');});}
-</script>
-""", unsafe_allow_html=True)
+st.markdown(
+    f"""
+    <div class="sticky-bar">
+      <h3 style="display:inline;">{'🔴 SIM' if simulate_mode else '🟢 LIVE'} {PAGE_TITLE}</h3>
+      <span style="float:right; opacity:.75;">Use the <b>Run Analysis</b> button below.</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-# A little JS bridge: Streamlit can’t catch postMessage—so we also render a regular button:
 run_clicked = st.button("▶ Run Analysis", use_container_width=True)
 
 # -------------------------
@@ -240,7 +216,6 @@ if run_clicked:
     if not tickers and not include_crypto:
         st.warning("Select at least one ticker or enable crypto scan.")
     else:
-        # update shareable URL
         set_query_params()
 
         # STOCKS
@@ -250,7 +225,7 @@ if run_clicked:
                 if len(df) < min_rows:
                     errors.append(f"{tkr} skipped (not enough rows)")
                     continue
-                # plot
+
                 st.markdown(f"#### 📈 {tkr} Price Chart")
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close"))
@@ -264,27 +239,25 @@ if run_clicked:
                 if summ:
                     results[tkr] = summ
                     st.markdown(f"**{badge(summ['Signal'])} — {tkr}**")
-                    if debug_mode:
-                        st.json(summ)
                     st.divider()
                 else:
                     errors.append(f"{tkr}: could not compute summary")
             except Exception as e:
                 errors.append(f"{tkr} failed: {e}")
 
-        # CRYPTO (optional, top-k by market cap via pycoingecko if installed)
+        # CRYPTO (optional, best-effort using yfinance synthetic tickers for majors)
         if include_crypto and top_k_coins > 0:
             try:
-                from pycoingecko import CoinGeckoAPI  # type: ignore
+                from pycoingecko import CoinGeckoAPI  # optional
                 cg = CoinGeckoAPI()
-                top = cg.get_coins_markets(vs_currency="usd", order="market_cap_desc", per_page=top_k_coins, page=1)
+                top = cg.get_coins_markets(vs_currency="usd", order="market_cap_desc",
+                                           per_page=top_k_coins, page=1)
                 coin_ids = [c["id"] for c in top][:top_k_coins]
             except Exception:
                 coin_ids = []
 
             for cid in coin_ids:
                 try:
-                    # use yfinance synthetic tickers for some big coins if available, else skip silently
                     yf_symbol = {"bitcoin": "BTC-USD", "ethereum": "ETH-USD"}.get(cid, None)
                     if not yf_symbol:
                         continue
@@ -306,8 +279,6 @@ if run_clicked:
                     if summ:
                         results[yf_symbol] = summ
                         st.markdown(f"**{badge(summ['Signal'])} — {yf_symbol}**")
-                        if debug_mode:
-                            st.json(summ)
                         st.divider()
                 except Exception as e:
                     errors.append(f"{cid} failed: {e}")
@@ -317,9 +288,7 @@ if run_clicked:
 # -------------------------
 if results:
     df_sum = pd.DataFrame(results).T
-    # badge column first
     df_sum.insert(0, "Signal", df_sum["Signal"].map(badge))
-    # display
     st.markdown("### 📊 Summary of Trade Signals")
     st.dataframe(df_sum, use_container_width=True, height=420)
     st.download_button(
