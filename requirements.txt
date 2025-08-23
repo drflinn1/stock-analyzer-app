@@ -11,3 +11,4 @@ html5lib
 pycoingecko
 pyotp
 ta==0.11.0
+ccxt
