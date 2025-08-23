@@ -4,21 +4,24 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Run in dry-run mode? (true/false)'
+        description: "Run in dry-run mode? (true/false)"
         required: true
-        default: 'true'
+        default: "true"
       symbols:
-        description: 'Comma-separated symbols'
+        description: "Comma-separated symbols"
         required: true
-        default: 'AAPL,MSFT,BTC-USD'
+        default: "AAPL,MSFT,BTC-USD"
       start:
-        description: 'Start date (YYYY-MM-DD)'
+        description: "Start date (YYYY-MM-DD)"
         required: true
-        default: '2023-01-01'
+        default: "2023-01-01"
       end:
-        description: 'End date (YYYY-MM-DD, empty = today)'
+        description: "End date (YYYY-MM-DD, empty=today)"
         required: false
-        default: ''
+        default: ""
+  schedule:
+    # 13:35 UTC ≈ 9:35am US/Eastern during Daylight Saving Time
+    - cron: "35 13 * * 1-5"
 
 jobs:
   run:
@@ -31,7 +34,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: pip install -r requirements.txt
