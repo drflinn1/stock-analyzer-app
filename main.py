@@ -120,12 +120,21 @@ def main():
         df = generate_signals(df)
         # Save artifacts
         df.to_csv(os.path.join(outdir, f"{sym}_analysis.csv"))
-        trades = df[df.get('Signal', "") != ""].copy(); trades['Ticker'] = sym
-        trades.to_csv(os.path.join(outdir, f"{sym}_trade_log.csv"))
-        combined.append(trades)
+
+        # tidy trade log: reset index→Date, add Ticker, keep consistent columns
+        t = df[df.get('Signal', "") != ""].copy()
+        t = t.reset_index()  # make Date a column
+        if 'Date' not in t.columns:
+            # yfinance sometimes calls the reset column 'index' — normalize it
+            t.rename(columns={t.columns[0]: 'Date'}, inplace=True)
+        t.insert(1, 'Ticker', sym)
+        keep_cols = [c for c in ['Date', 'Ticker', 'Close', 'RSI', 'BB_high', 'BB_low', 'Signal'] if c in t.columns]
+        t = t[keep_cols]
+        t.to_csv(os.path.join(outdir, f"{sym}_trade_log.csv"), index=False)
+        combined.append(t)
 
         # Execute most recent signal (still dry-run unless flipped)
-        last = trades.tail(1)
+        last = t.tail(1)
         if not last.empty:
             action = last['Signal'].iloc[0]
             side = 'buy' if action.lower() == 'buy' else 'sell'
@@ -142,8 +151,8 @@ def main():
             print(f"[{sym}] no signals in range.")
 
     if any([not t.empty for t in combined]):
-        all_trades = pd.concat([t for t in combined if not t.empty])
-        all_trades.to_csv(os.path.join(outdir, 'combined_trade_log.csv'))
+        all_trades = pd.concat([t for t in combined if not t.empty], ignore_index=True)
+        all_trades.to_csv(os.path.join(outdir, 'combined_trade_log.csv'), index=False)
     print(f"Dry run = {dry_run}. Orders{' NOT' if dry_run else ''} placed. Files saved to {outdir}/")
 
 
