@@ -18,15 +18,12 @@ except ImportError:
 
 def download_data(ticker, start, end):
     data = yf.download(ticker, start=start, end=end, progress=False)
-    # Ensure a clean, single-symbol schema
     if data is None or data.empty:
         return pd.DataFrame()
-    # Drop rows with all-NaN OHLCV
     data = data.dropna(how="all")
     return data
 
 def add_indicators(data):
-    # If no data, return with empty indicator columns so downstream doesn't crash
     if data is None or data.empty:
         return data
 
@@ -37,42 +34,31 @@ def add_indicators(data):
         data['BB_low'] = pd.NA
         return data
 
-    # Ensure 'Close' is a 1D float Series (yfinance can sometimes yield a 2D frame)
     if 'Close' not in data.columns:
         st.error("Downloaded data does not contain a 'Close' column.")
         return data
 
-    close = data['Close']
-    if isinstance(close, pd.DataFrame):
-        close = close.iloc[:, 0]
-    close = pd.to_numeric(close, errors='coerce')
+    close_series = data['Close']
+    if isinstance(close_series, pd.DataFrame):
+        close_series = close_series.iloc[:, 0]
+    close_series = pd.to_numeric(close_series, errors='coerce')
 
-    # If all NaN after coercion, bail gracefully
-    if close.isna().all():
+    data = data.copy()
+    data['Close'] = close_series.astype(float)
+
+    if close_series.isna().all():
         st.error("Price data contains no numeric 'Close' values for the selected range.")
         data['RSI'] = pd.NA
         data['BB_high'] = pd.NA
         data['BB_low'] = pd.NA
         return data
 
-    rsi = ta.momentum.RSIIndicator(close=close).rsi()
-    bb = ta.volatility.BollingerBands(close=close)
+    rsi = ta.momentum.RSIIndicator(close=close_series).rsi()
+    bb = ta.volatility.BollingerBands(close=close_series)
 
     data['RSI'] = rsi
     data['BB_high'] = bb.bollinger_hband()
     data['BB_low'] = bb.bollinger_lband()
-    return data
-    try:
-        rsi_indicator = ta.momentum.RSIIndicator(close=data['Close'].astype(float))
-        data['RSI'] = rsi_indicator.rsi()
-        bb = ta.volatility.BollingerBands(close=data['Close'].astype(float))
-        data['BB_high'] = bb.bollinger_hband()
-        data['BB_low'] = bb.bollinger_lband()
-    except Exception as e:
-        st.error(f"Indicator calculation failed: {e}")
-        data['RSI'] = None
-        data['BB_high'] = None
-        data['BB_low'] = None
     return data
 
 def generate_signals(data):
@@ -82,30 +68,26 @@ def generate_signals(data):
         data['Signal'] = ""
         return data
 
-    signals = []
-    for i in range(len(data)):
-        rsi_v = data['RSI'].iloc[i]
-        bb_low = data['BB_low'].iloc[i]
-        bb_high = data['BB_high'].iloc[i]
-        close_v = data['Close'].iloc[i]
-        if pd.notna(close_v) and pd.notna(bb_low) and pd.notna(rsi_v) and close_v < bb_low and rsi_v < 30:
-            signals.append("Buy")
-        elif pd.notna(close_v) and pd.notna(bb_high) and pd.notna(rsi_v) and close_v > bb_high and rsi_v > 70:
-            signals.append("Sell")
-        else:
-            signals.append("")
-    data['Signal'] = signals
-    return data
+    close_series = data['Close']
+    if isinstance(close_series, pd.DataFrame):
+        close_series = close_series.iloc[:, 0]
+    close_series = pd.to_numeric(close_series, errors='coerce')
+
     signals = []
     for i in range(len(data)):
         try:
-            if data['Close'].iloc[i] < data['BB_low'].iloc[i] and data['RSI'].iloc[i] < 30:
-                signals.append("Buy")
-            elif data['Close'].iloc[i] > data['BB_high'].iloc[i] and data['RSI'].iloc[i] > 70:
-                signals.append("Sell")
-            else:
-                signals.append("")
+            rsi_v = float(data['RSI'].iloc[i]) if pd.notna(data['RSI'].iloc[i]) else None
+            bb_low = float(data['BB_low'].iloc[i]) if pd.notna(data['BB_low'].iloc[i]) else None
+            bb_high = float(data['BB_high'].iloc[i]) if pd.notna(data['BB_high'].iloc[i]) else None
+            close_v = float(close_series.iloc[i]) if pd.notna(close_series.iloc[i]) else None
         except Exception:
+            rsi_v, bb_low, bb_high, close_v = None, None, None, None
+
+        if rsi_v is not None and bb_low is not None and close_v is not None and close_v < bb_low and rsi_v < 30:
+            signals.append("Buy")
+        elif rsi_v is not None and bb_high is not None and close_v is not None and close_v > bb_high and rsi_v > 70:
+            signals.append("Sell")
+        else:
             signals.append("")
     data['Signal'] = signals
     return data
@@ -143,7 +125,6 @@ if st.button("Run Analyse", key="run"):
         data = generate_signals(data)
         st.session_state['data'] = data
 
-        # Prepare persistent CSV bytes so repeated downloads work
         csv_io = BytesIO(); data.to_csv(csv_io)
         st.session_state['csv_bytes'] = csv_io.getvalue()
 
@@ -164,7 +145,6 @@ if st.session_state.get('analysis_done') and st.session_state['data'] is not Non
 
     st.write(st.session_state['data'].tail())
 
-    # CSV Export Button (stable across reruns)
     st.download_button(
         label="📥 Download CSV",
         data=st.session_state['csv_bytes'],
@@ -173,7 +153,6 @@ if st.session_state.get('analysis_done') and st.session_state['data'] is not Non
         key="dl_csv"
     )
 
-    # Trade Log Button (stable across reruns)
     st.download_button(
         label="📥 Download Trade Log",
         data=st.session_state['trade_csv_bytes'],
