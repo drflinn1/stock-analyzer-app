@@ -20,13 +20,13 @@ on:
         required: false
         default: ""
   schedule:
-    # --- Market OPEN ~ 9:35 AM US/Eastern ---
-    - cron: "35 13 * 3-10 1-5"  # Mar–Oct (DST): 13:35 UTC
-    - cron: "35 14 * 11-2 1-5"  # Nov–Feb (Standard): 14:35 UTC
-
-    # --- Market CLOSE ~ 4:05 PM US/Eastern ---
-    - cron: "05 20 * 3-10 1-5"  # Mar–Oct (DST): 20:05 UTC
-    - cron: "05 21 * 11-2 1-5"  # Nov–Feb (Standard): 21:05 UTC
+    # US market open/afternoon runs on trading days (Mon–Fri)
+    # DST months (Mar–Oct): 9:35 ET and 14:35 ET
+    - cron: "35 13 * 3-10 1-5"   # 09:35 ET during DST (13:35 UTC)
+    - cron: "35 18 * 3-10 1-5"   # 14:35 ET during DST (18:35 UTC)
+    # Standard months (Nov–Feb): 9:35 ET and 14:35 ET
+    - cron: "35 14 * 11,12,1,2 1-5"  # 09:35 ET standard time (14:35 UTC)
+    - cron: "35 19 * 11,12,1,2 1-5"  # 14:35 ET standard time (19:35 UTC)
 
 jobs:
   run:
@@ -54,15 +54,15 @@ jobs:
 
           # Optional brokers (safe if unset)
           EQUITY_BROKER: robinhood
-          RH_USERNAME:      ${{ secrets.RH_USERNAME }}
-          RH_PASSWORD:      ${{ secrets.RH_PASSWORD }}
-          RH_TOTP_SECRET:   ${{ secrets.RH_TOTP_SECRET }}
-          RH_DEVICE_TOKEN:  ${{ secrets.RH_DEVICE_TOKEN }}
+          RH_USERNAME:     ${{ secrets.RH_USERNAME }}
+          RH_PASSWORD:     ${{ secrets.RH_PASSWORD }}
+          RH_TOTP_SECRET:  ${{ secrets.RH_TOTP_SECRET }}
+          RH_DEVICE_TOKEN: ${{ secrets.RH_DEVICE_TOKEN }}
 
-          CRYPTO_EXCHANGE:        ${{ vars.CRYPTO_EXCHANGE }}
-          CRYPTO_API_KEY:         ${{ secrets.CRYPTO_API_KEY }}
-          CRYPTO_API_SECRET:      ${{ secrets.CRYPTO_API_SECRET }}
-          CRYPTO_API_PASSPHRASE:  ${{ secrets.CRYPTO_API_PASSPHRASE }}
+          CRYPTO_EXCHANGE:       ${{ vars.CRYPTO_EXCHANGE }}
+          CRYPTO_API_KEY:        ${{ secrets.CRYPTO_API_KEY }}
+          CRYPTO_API_SECRET:     ${{ secrets.CRYPTO_API_SECRET }}
+          CRYPTO_API_PASSPHRASE: ${{ secrets.CRYPTO_API_PASSPHRASE }}
         run: |
           python main.py
 
