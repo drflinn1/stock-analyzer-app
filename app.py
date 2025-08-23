@@ -138,12 +138,15 @@ if st.button("Run Analyse", key="run"):
 if st.session_state.get('analysis_done') and st.session_state['data'] is not None:
     st.subheader(f"Results for {ticker}")
 
-    if TA_AVAILABLE and 'BB_high' in st.session_state['data']:
-        st.line_chart(st.session_state['data'][['Close', 'BB_high', 'BB_low']].dropna(how='all'))
+    df = st.session_state['data']
+    # Plot only the columns that actually exist to avoid KeyErrors
+    plot_cols = [c for c in ['Close', 'BB_high', 'BB_low'] if c in df.columns]
+    if len(plot_cols) == 0:
+        st.warning("No chartable columns available.")
     else:
-        st.line_chart(st.session_state['data'][['Close']])
+        st.line_chart(df[plot_cols].dropna(how='all'))
 
-    st.write(st.session_state['data'].tail())
+    st.write(df.tail())
 
     st.download_button(
         label="📥 Download CSV",
