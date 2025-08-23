@@ -148,9 +148,8 @@ if st.session_state.get('analysis_done') and st.session_state['data'] is not Non
     else:
         # Prepare a safe, numeric, single-index DataFrame for charting
         chart_df = df[plot_cols].copy()
-        # Coerce to numeric
-        for c in plot_cols:
-            chart_df[c] = pd.to_numeric(chart_df[c], errors='coerce')
+        # Coerce to numeric for all columns safely
+        chart_df = chart_df.apply(pd.to_numeric, errors='coerce')
         # Flatten MultiIndex columns if present
         if isinstance(chart_df.columns, pd.MultiIndex):
             chart_df.columns = ["_".join([str(x) for x in tup if x is not None and x != ""]).strip() for tup in chart_df.columns]
