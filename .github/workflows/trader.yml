@@ -20,8 +20,13 @@ on:
         required: false
         default: ""
   schedule:
-    # 13:35 UTC ≈ 9:35am US/Eastern during Daylight Saving Time
-    - cron: "35 13 * * 1-5"
+    # --- Market OPEN ~ 9:35 AM US/Eastern ---
+    - cron: "35 13 * 3-10 1-5"  # Mar–Oct (DST): 13:35 UTC
+    - cron: "35 14 * 11-2 1-5"  # Nov–Feb (Standard): 14:35 UTC
+
+    # --- Market CLOSE ~ 4:05 PM US/Eastern ---
+    - cron: "05 20 * 3-10 1-5"  # Mar–Oct (DST): 20:05 UTC
+    - cron: "05 21 * 11-2 1-5"  # Nov–Feb (Standard): 21:05 UTC
 
 jobs:
   run:
