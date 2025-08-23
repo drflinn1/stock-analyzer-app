@@ -38,14 +38,13 @@ jobs:
 
       - name: Run trader (main.py)
         env:
-          # ---- inputs passed to your script ----
           SYMBOLS: ${{ github.event.inputs.symbols || 'AAPL,MSFT,BTC-USD' }}
           START:   ${{ github.event.inputs.start   || '2023-01-01' }}
           END:     ${{ github.event.inputs.end     || '' }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
           OUT_DIR: out
 
-          # ---- brokers (optional; safe if unset) ----
+          # Optional brokers (safe if unset)
           EQUITY_BROKER: robinhood
           RH_USERNAME:      ${{ secrets.RH_USERNAME }}
           RH_PASSWORD:      ${{ secrets.RH_PASSWORD }}
