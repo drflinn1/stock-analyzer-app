@@ -1,0 +1,32 @@
+name: headless-trader
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # every hour (UTC)
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run headless dry-run trader
+        env:
+          SYMBOLS: AAPL,MSFT,BTC-USD
+          DRY_RUN: 'true'
+          START: '2023-01-01'
+          OUT_DIR: out
+        run: |
+          python main.py
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-outputs
+          path: out
