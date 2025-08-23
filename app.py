@@ -139,12 +139,48 @@ if st.session_state.get('analysis_done') and st.session_state['data'] is not Non
     st.subheader(f"Results for {ticker}")
 
     df = st.session_state['data']
-    # Plot only the columns that actually exist to avoid KeyErrors
-    plot_cols = [c for c in ['Close', 'BB_high', 'BB_low'] if c in df.columns]
+    # Determine which columns are available for plotting
+    base_cols = ['Close', 'BB_high', 'BB_low']
+    plot_cols = [c for c in base_cols if c in df.columns]
+
     if len(plot_cols) == 0:
         st.warning("No chartable columns available.")
     else:
-        st.line_chart(df[plot_cols].dropna(how='all'))
+        # Prepare a safe, numeric, single-index DataFrame for charting
+        chart_df = df[plot_cols].copy()
+        # Coerce to numeric
+        for c in plot_cols:
+            chart_df[c] = pd.to_numeric(chart_df[c], errors='coerce')
+        # Flatten MultiIndex columns if present
+        if isinstance(chart_df.columns, pd.MultiIndex):
+            chart_df.columns = ["_".join([str(x) for x in tup if x is not None and x != ""]).strip() for tup in chart_df.columns]
+            plot_cols = list(chart_df.columns)
+        # Ensure a single DatetimeIndex
+        if isinstance(chart_df.index, pd.MultiIndex):
+            tmp = chart_df.reset_index()
+            # pick the first datetime-like column as the x-axis
+            date_col = None
+            for col in tmp.columns:
+                if pd.api.types.is_datetime64_any_dtype(tmp[col]):
+                    date_col = col
+                    break
+            if date_col is None:
+                date_col = tmp.columns[0]
+                tmp[date_col] = pd.to_datetime(tmp[date_col], errors='coerce')
+            chart_df = tmp.set_index(date_col)
+        else:
+            chart_df.index.name = 'Date'
+        # Try standard line_chart first; if it fails, fall back to Altair
+        try:
+            st.line_chart(chart_df[plot_cols].dropna(how='all'))
+        except Exception as e:
+            import altair as alt
+            st.warning(f"Chart fallback due to data shape: {e}")
+            melted = chart_df.reset_index().melt('Date', value_vars=plot_cols, var_name='Series', value_name='Value')
+            chart = alt.Chart(melted).mark_line().encode(
+                x='Date:T', y='Value:Q', color='Series:N'
+            )
+            st.altair_chart(chart, use_container_width=True)
 
     st.write(df.tail())
 
