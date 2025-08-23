@@ -108,6 +108,8 @@ if 'csv_bytes' not in st.session_state:
     st.session_state['csv_bytes'] = None
 if 'trade_csv_bytes' not in st.session_state:
     st.session_state['trade_csv_bytes'] = None
+if 'zip_bytes' not in st.session_state:
+    st.session_state['zip_bytes'] = None
 
 # --- Inputs ---
 ticker = st.text_input("Enter Stock Ticker (e.g. AAPL)", "AAPL", key="ticker")
@@ -132,11 +134,20 @@ if st.button("Run Analyse", key="run"):
         trade_io = BytesIO(); trade_log.to_csv(trade_io)
         st.session_state['trade_csv_bytes'] = trade_io.getvalue()
 
+        # Prepare a single ZIP containing both files to bypass browser multi-download blocking
+        from zipfile import ZipFile, ZIP_DEFLATED
+        zip_io = BytesIO()
+        with ZipFile(zip_io, 'w', ZIP_DEFLATED) as zf:
+            zf.writestr(f"{ticker}_analysis.csv", st.session_state['csv_bytes'] or b"")
+            zf.writestr(f"{ticker}_trade_log.csv", st.session_state['trade_csv_bytes'] or b"")
+        st.session_state['zip_bytes'] = zip_io.getvalue()
+
         st.session_state['analysis_done'] = True
 
 # --- Results ---
 if st.session_state.get('analysis_done') and st.session_state['data'] is not None:
     st.subheader(f"Results for {ticker}")
+    st.caption("Tip: If your browser blocks downloads, use the ZIP button below or allow automatic downloads for streamlit.app in your browser site settings.")
 
     df = st.session_state['data']
     # Determine which columns are available for plotting
@@ -182,6 +193,14 @@ if st.session_state.get('analysis_done') and st.session_state['data'] is not Non
             st.altair_chart(chart, use_container_width=True)
 
     st.write(df.tail())
+
+    st.download_button(
+        label="📦 Download Both (ZIP)",
+        data=st.session_state['zip_bytes'],
+        file_name=f"{ticker}_files.zip",
+        mime="application/zip",
+        key="dl_zip"
+    )
 
     st.download_button(
         label="📥 Download CSV",
