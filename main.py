@@ -261,13 +261,17 @@ def download_data(ticker: str, start, end):
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty or not TA_AVAILABLE:
         return df
-    close = df['Close']
+    # Normalize Close to a 1-D numeric Series (yfinance can return a 2-D frame when cols are MultiIndex)
+    close = df['Close'] if 'Close' in df.columns else None
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
     close = pd.to_numeric(close, errors='coerce')
+
     rsi = ta.momentum.RSIIndicator(close=close).rsi()
     bb = ta.volatility.BollingerBands(close=close)
     out = df.copy()
+    # Persist normalized Close back so downstream code always sees 1-D numeric
+    out['Close'] = close
     out['RSI'] = rsi
     out['BB_high'] = bb.bollinger_hband()
     out['BB_low'] = bb.bollinger_lband()
@@ -282,7 +286,12 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
         df['Signal'] = ""
         return df
 
-    close = pd.to_numeric(df['Close'], errors='coerce')
+    # Ensure Close is 1-D numeric
+    close = df['Close']
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    close = pd.to_numeric(close, errors='coerce')
+
     sig = []
     for i in range(len(df)):
         rsi = df['RSI'].iloc[i]
