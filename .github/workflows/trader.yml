@@ -22,20 +22,21 @@ on:
       equity_dollars:
         description: "EQUITY dollars per trade (override)"
         required: false
-        default: "1"
+        default: "200"
       crypto_dollars:
         description: "CRYPTO dollars per trade (override)"
         required: false
-        default: "1"
+        default: "100"
   schedule:
-    # 13:35 UTC ≈ 9:35 AM ET  (Mon–Fri)
+    # ~09:35 AM ET on weekdays (13:35 UTC during DST)
     - cron: "35 13 * * 1-5"
-    # 19:50 UTC ≈ 3:50 PM ET  (Mon–Fri)
+    # ~03:50 PM ET on weekdays (19:50 UTC during DST)
     - cron: "50 19 * * 1-5"
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,34 +51,34 @@ jobs:
 
       - name: Run trader (main.py)
         env:
-          # --- Strategy window & control ---
+          # Inputs (with safe defaults so schedule runs work too)
           SYMBOLS: ${{ github.event.inputs.symbols || 'AAPL,MSFT,BTC-USD' }}
           START:   ${{ github.event.inputs.start   || '2023-01-01' }}
           END:     ${{ github.event.inputs.end     || '' }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
-          OUT_DIR: out
 
-          # --- Order sizing (defaults for scheduled runs; can override in Run workflow) ---
+          # Optional per-trade dollar overrides
           EQUITY_DOLLARS_PER_TRADE:  ${{ github.event.inputs.equity_dollars || '200' }}
           CRYPTO_DOLLARS_PER_TRADE:  ${{ github.event.inputs.crypto_dollars || '100' }}
 
-          # --- Brokers (equity via Robinhood; crypto optional) ---
-          EQUITY_BROKER: robinhood
-          RH_USERNAME:     ${{ secrets.RH_USERNAME }}
-          RH_PASSWORD:     ${{ secrets.RH_PASSWORD }}
-          RH_TOTP_SECRET:  ${{ secrets.RH_TOTP_SECRET }}
-          RH_DEVICE_TOKEN: ${{ secrets.RH_DEVICE_TOKEN }}
+          OUT_DIR: out
 
-          CRYPTO_EXCHANGE:       ${{ vars.CRYPTO_EXCHANGE }}
-          CRYPTO_API_KEY:        ${{ secrets.CRYPTO_API_KEY }}
-          CRYPTO_API_SECRET:     ${{ secrets.CRYPTO_API_SECRET }}
-          CRYPTO_API_PASSPHRASE: ${{ secrets.CRYPTO_API_PASSPHRASE }}
-        run: |
-          python main.py
+          # Brokers (safe if unset)
+          EQUITY_BROKER: robinhood
+          RH_USERNAME:      ${{ secrets.RH_USERNAME }}
+          RH_PASSWORD:      ${{ secrets.RH_PASSWORD }}
+          RH_TOTP_SECRET:   ${{ secrets.RH_TOTP_SECRET }}   # optional
+          RH_DEVICE_TOKEN:  ${{ secrets.RH_DEVICE_TOKEN }}  # optional
+
+          CRYPTO_EXCHANGE:        ${{ vars.CRYPTO_EXCHANGE }}
+          CRYPTO_API_KEY:         ${{ secrets.CRYPTO_API_KEY }}
+          CRYPTO_API_SECRET:      ${{ secrets.CRYPTO_API_SECRET }}
+          CRYPTO_API_PASSPHRASE:  ${{ secrets.CRYPTO_API_PASSPHRASE }}
+        run: python main.py
 
       - name: List outputs (for diagnostics)
         run: |
-          echo "Listing out/ (if it exists):"
+          echo "Listing out/:"
           ls -lah out || true
 
       - name: Upload outputs
