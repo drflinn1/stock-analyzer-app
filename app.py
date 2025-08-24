@@ -1,219 +1,163 @@
-# app.py (final)
-import streamlit as st
-import yfinance as yf
+# main.py (final headless runner)
+import os
 import pandas as pd
-from datetime import datetime
-from io import BytesIO
+import yfinance as yf
 
-# Try importing ta, or fall back gracefully
 try:
     import ta
     TA_AVAILABLE = True
 except ImportError:
     TA_AVAILABLE = False
 
-# -------------------------------
-# Helper functions
-# -------------------------------
+# Optional broker adapters
+try:
+    from trader.broker_robinhood import RobinhoodBroker
+except Exception:
+    RobinhoodBroker = None
 
-def download_data(ticker, start, end):
-    data = yf.download(ticker, start=start, end=end, progress=False)
-    if data is None or data.empty:
+try:
+    from trader.broker_crypto_ccxt import CCXTCryptoBroker
+except Exception:
+    CCXTCryptoBroker = None
+
+
+# ---------- helpers ----------
+
+def download_data(ticker: str, start, end):
+    df = yf.download(ticker, start=start, end=end, progress=False)
+    if df is None or df.empty:
         return pd.DataFrame()
-    data = data.dropna(how="all")
-    return data
+    return df.dropna(how="all")
 
 
-def add_indicators(data: pd.DataFrame) -> pd.DataFrame:
-    if data is None or data.empty:
-        return data
-
-    if not TA_AVAILABLE:
-        st.warning("⚠️ The 'ta' library is not installed. Indicators will be skipped.")
-        for col in ("RSI", "BB_high", "BB_low"):
-            data[col] = pd.NA
-        return data
-
-    if 'Close' not in data.columns:
-        st.error("Downloaded data does not contain a 'Close' column.")
-        return data
-
-    # Ensure Close is a 1‑D numeric Series
-    close = data['Close']
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or not TA_AVAILABLE:
+        return df
+    # Normalize Close to 1-D numeric (yfinance can yield 2-D columns)
+    close = df['Close'] if 'Close' in df.columns else None
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
     close = pd.to_numeric(close, errors='coerce')
-
-    data = data.copy()
-    data['Close'] = close.astype(float)
-
-    if close.isna().all():
-        st.error("Price data contains no numeric 'Close' values for the selected range.")
-        for col in ("RSI", "BB_high", "BB_low"):
-            data[col] = pd.NA
-        return data
 
     rsi = ta.momentum.RSIIndicator(close=close).rsi()
     bb = ta.volatility.BollingerBands(close=close)
+    out = df.copy()
+    out['Close'] = close
+    out['RSI'] = rsi
+    out['BB_high'] = bb.bollinger_hband()
+    out['BB_low'] = bb.bollinger_lband()
+    return out
 
-    data['RSI'] = rsi
-    data['BB_high'] = bb.bollinger_hband()
-    data['BB_low'] = bb.bollinger_lband()
-    return data
 
+def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or 'Close' not in df.columns:
+        return df
+    if not TA_AVAILABLE or 'RSI' not in df.columns:
+        df = df.copy(); df['Signal'] = ""; return df
 
-def generate_signals(data: pd.DataFrame) -> pd.DataFrame:
-    if data is None or data.empty:
-        return data
-
-    needs = {'RSI', 'BB_low', 'BB_high', 'Close'}
-    if not TA_AVAILABLE or not needs.issubset(data.columns):
-        data['Signal'] = ""
-        return data
-
-    close = data['Close']
+    close = df['Close']
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
     close = pd.to_numeric(close, errors='coerce')
 
-    signals = []
-    for i in range(len(data)):
-        try:
-            rsi_v = float(data['RSI'].iloc[i]) if pd.notna(data['RSI'].iloc[i]) else None
-            bb_low = float(data['BB_low'].iloc[i]) if pd.notna(data['BB_low'].iloc[i]) else None
-            bb_high = float(data['BB_high'].iloc[i]) if pd.notna(data['BB_high'].iloc[i]) else None
-            close_v = float(close.iloc[i]) if pd.notna(close.iloc[i]) else None
-        except Exception:
-            rsi_v = bb_low = bb_high = close_v = None
-
-        if rsi_v is not None and bb_low is not None and close_v is not None and close_v < bb_low and rsi_v < 30:
-            signals.append("Buy")
-        elif rsi_v is not None and bb_high is not None and close_v is not None and close_v > bb_high and rsi_v > 70:
-            signals.append("Sell")
+    sig = []
+    for i in range(len(df)):
+        rsi = df['RSI'].iloc[i]
+        bb_l = df['BB_low'].iloc[i]
+        bb_h = df['BB_high'].iloc[i]
+        c = close.iloc[i]
+        if pd.notna(c) and pd.notna(bb_l) and pd.notna(rsi) and float(c) < float(bb_l) and float(rsi) < 30:
+            sig.append("Buy")
+        elif pd.notna(c) and pd.notna(bb_h) and pd.notna(rsi) and float(c) > float(bb_h) and float(rsi) > 70:
+            sig.append("Sell")
         else:
-            signals.append("")
-    data['Signal'] = signals
-    return data
+            sig.append("")
+    out = df.copy(); out['Signal'] = sig; return out
 
 
-# -------------------------------
-# Streamlit App
-# -------------------------------
+# ---------- main ----------
 
-st.set_page_config(page_title="Stock Analyzer Bot", layout="wide")
-st.title("📈 Stock Analyzer Bot")
+def main():
+    symbols = [s.strip() for s in os.getenv('SYMBOLS', 'AAPL,MSFT,BTC-USD').split(',') if s.strip()]
+    start = os.getenv('START', '2023-01-01')
+    end = os.getenv('END', '') or None
+    dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
+    outdir = os.getenv('OUT_DIR', 'out'); os.makedirs(outdir, exist_ok=True)
 
-# Persist state so downloads don't reset the app
-for k, v in {
-    'analysis_done': False,
-    'data': None,
-    'csv_bytes': None,
-    'trade_csv_bytes': None,
-    'zip_bytes': None,
-}.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+    # Brokers (optional)
+    equity_enabled = os.getenv('EQUITY_BROKER', 'robinhood') == 'robinhood' and RobinhoodBroker is not None
+    crypto_enabled = os.getenv('CRYPTO_EXCHANGE', '') != '' and CCXTCryptoBroker is not None
 
-# Inputs
-col1, col2, col3 = st.columns([2, 1, 1])
-with col1:
-    ticker = st.text_input("Enter Stock Ticker (e.g. AAPL)", "AAPL", key="ticker")
-with col2:
-    start_date = st.date_input("Start Date", datetime(2023, 1, 1), key="start")
-with col3:
-    end_date = st.date_input("End Date", datetime.today(), key="end")
+    rb = None
+    if equity_enabled:
+        ts = os.getenv('RH_TOTP_SECRET', '').strip() or None
 
-# Run analysis
-if st.button("Run Analyse", key="run"):
-    data = download_data(ticker, start_date, end_date)
-    if data is None or data.empty:
-        st.error("No price data returned for the selection. Try another ticker or adjust the dates.")
-        st.session_state['analysis_done'] = False
-    else:
-        data = add_indicators(data)
-        data = generate_signals(data)
-        st.session_state['data'] = data
+        rb = RobinhoodBroker(
+            username=os.getenv('RH_USERNAME', ''),
+            password=os.getenv('RH_PASSWORD', ''),
+            totp_secret=ts,
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            if ts is None:
+                print("Robinhood 2FA: No TOTP secret set – will wait for app/SMS approval if challenged…")
+            rb.login()
 
-        # Build downloads (CSV + trade log + ZIP wrapper)
-        csv_io, trade_io, zip_io = BytesIO(), BytesIO(), BytesIO()
-        data.to_csv(csv_io)
-        st.session_state['csv_bytes'] = csv_io.getvalue()
+    cb = None
+    if crypto_enabled:
+        cb = CCXTCryptoBroker(
+            exchange_id=os.getenv('CRYPTO_EXCHANGE', 'kraken'),
+            api_key=os.getenv('CRYPTO_API_KEY', None),
+            api_secret=os.getenv('CRYPTO_API_SECRET', None),
+            api_password=os.getenv('CRYPTO_API_PASSPHRASE', None),
+            dry_run=dry_run,
+        )
 
-        trade_log = data[data.get('Signal', "") != ""] if 'Signal' in data.columns else pd.DataFrame()
-        trade_log.to_csv(trade_io)
-        st.session_state['trade_csv_bytes'] = trade_io.getvalue()
+    eq_notional = float(os.getenv('EQUITY_DOLLARS_PER_TRADE', '200'))
+    cr_notional = float(os.getenv('CRYPTO_DOLLARS_PER_TRADE', '100'))
 
-        from zipfile import ZipFile, ZIP_DEFLATED
-        with ZipFile(zip_io, 'w', ZIP_DEFLATED) as zf:
-            zf.writestr(f"{ticker}_analysis.csv", st.session_state['csv_bytes'] or b"")
-            zf.writestr(f"{ticker}_trade_log.csv", st.session_state['trade_csv_bytes'] or b"")
-        st.session_state['zip_bytes'] = zip_io.getvalue()
+    combined = []
+    for sym in symbols:
+        df = download_data(sym, start, end)
+        df = add_indicators(df)
+        df = generate_signals(df)
+        # Save artifacts
+        df.to_csv(os.path.join(outdir, f"{sym}_analysis.csv"))
 
-        st.session_state['analysis_done'] = True
+        # tidy trade log: reset index→Date, add Ticker, keep consistent columns
+        t = df[df.get('Signal', "") != ""].copy()
+        t = t.reset_index()  # make Date a column
+        if 'Date' not in t.columns:
+            # yfinance sometimes calls the reset column 'index' — normalize it
+            t.rename(columns={t.columns[0]: 'Date'}, inplace=True)
+        t.insert(1, 'Ticker', sym)
+        keep_cols = [c for c in ['Date', 'Ticker', 'Close', 'RSI', 'BB_high', 'BB_low', 'Signal'] if c in t.columns]
+        t = t[keep_cols]
+        t.to_csv(os.path.join(outdir, f"{sym}_trade_log.csv"), index=False)
+        combined.append(t)
 
-# Results
-if st.session_state.get('analysis_done') and st.session_state['data'] is not None:
-    st.subheader(f"Results for {ticker}")
-    st.caption("Tip: If your browser blocks downloads, use the ZIP button below or allow automatic downloads for streamlit.app in your browser site settings.")
-
-    df = st.session_state['data']
-    plot_cols = [c for c in ['Close', 'BB_high', 'BB_low'] if c in df.columns]
-
-    if len(plot_cols) == 0:
-        st.warning("No chartable columns available.")
-    else:
-        chart_df = df[plot_cols].copy()
-        chart_df = chart_df.apply(pd.to_numeric, errors='coerce')
-        if isinstance(chart_df.columns, pd.MultiIndex):
-            chart_df.columns = ["_".join([str(x) for x in tup if x not in (None, "")]).strip() for tup in chart_df.columns]
-            plot_cols = list(chart_df.columns)
-        if isinstance(chart_df.index, pd.MultiIndex):
-            tmp = chart_df.reset_index()
-            date_col = None
-            for col in tmp.columns:
-                if pd.api.types.is_datetime64_any_dtype(tmp[col]):
-                    date_col = col; break
-            if date_col is None:
-                date_col = tmp.columns[0]
-                tmp[date_col] = pd.to_datetime(tmp[date_col], errors='coerce')
-            chart_df = tmp.set_index(date_col)
+        # Execute most recent signal (still dry-run unless flipped)
+        last = t.tail(1)
+        if not last.empty:
+            action = last['Signal'].iloc[0]
+            side = 'buy' if action.lower() == 'buy' else 'sell'
+            is_crypto = '-' in sym and sym.upper().endswith('-USD')
+            if is_crypto and cb is not None:
+                res = cb.place_market_notional(symbol=sym, side=side, notional_usd=cr_notional)
+                print(f"CRYPTO {sym} {side} -> {res}")
+            elif rb is not None:
+                res = rb.place_market(symbol=sym, side=side, notional=eq_notional)
+                print(f"EQUITY {sym} {side} -> {res}")
+            else:
+                print(f"No broker configured for {sym}; would {side} ${cr_notional if is_crypto else eq_notional} (dry_run={dry_run})")
         else:
-            chart_df.index.name = 'Date'
-        try:
-            st.line_chart(chart_df[plot_cols].dropna(how='all'))
-        except Exception as e:
-            import altair as alt
-            st.warning(f"Chart fallback due to data shape: {e}")
-            melted = chart_df.reset_index().melt('Date', value_vars=plot_cols, var_name='Series', value_name='Value')
-            chart = alt.Chart(melted).mark_line().encode(x='Date:T', y='Value:Q', color='Series:N')
-            st.altair_chart(chart, use_container_width=True)
+            print(f"[{sym}] no signals in range.")
 
-    st.write(df.tail())
+    if any([not t.empty for t in combined]):
+        all_trades = pd.concat([t for t in combined if not t.empty], ignore_index=True)
+        all_trades.to_csv(os.path.join(outdir, 'combined_trade_log.csv'), index=False)
+    print(f"Dry run = {dry_run}. Orders{' NOT' if dry_run else ''} placed. Files saved to {outdir}/")
 
-    dl1, dl2, dl3 = st.columns([1,1,1])
-    with dl1:
-        st.download_button(
-            label="📦 Download Both (ZIP)",
-            data=st.session_state['zip_bytes'],
-            file_name=f"{ticker}_files.zip",
-            mime="application/zip",
-            key="dl_zip"
-        )
-    with dl2:
-        st.download_button(
-            label="📥 Download CSV",
-            data=st.session_state['csv_bytes'],
-            file_name=f"{ticker}_analysis.csv",
-            mime="text/csv",
-            key="dl_csv"
-        )
-    with dl3:
-        st.download_button(
-            label="📥 Download Trade Log",
-            data=st.session_state['trade_csv_bytes'],
-            file_name=f"{ticker}_trade_log.csv",
-            mime="text/csv",
-            key="dl_trades"
-        )
-else:
-    st.info("Set your inputs and click **Run Analyse** to generate results.")
+
+if __name__ == '__main__':
+    main()
