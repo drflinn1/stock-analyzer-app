@@ -113,8 +113,12 @@ def main():
             dry_run=dry_run,
         )
 
-    eq_notional = float(os.getenv('EQUITY_DOLLARS_PER_TRADE', '200'))
+    # --- Notional controls & overrides ---
+    # Clamp equity notional to Robinhood's fractional minimum (>= $1)
+    eq_notional = max(float(os.getenv('EQUITY_DOLLARS_PER_TRADE', '200')), 1.01)
     cr_notional = float(os.getenv('CRYPTO_DOLLARS_PER_TRADE', '100'))
+    # Optional override to force a side for quick live tests
+    force_side = os.getenv('FORCE_SIDE', '').lower()
 
     combined = []
     for sym in symbols:
@@ -141,15 +145,23 @@ def main():
         if not last.empty:
             action = last['Signal'].iloc[0]
             side = 'buy' if action.lower() == 'buy' else 'sell'
+            if force_side in ('buy', 'sell'):
+                print(f"FORCE_SIDE override active -> {force_side}")
+                side = force_side
             is_crypto = '-' in sym and sym.upper().endswith('-USD')
-            if is_crypto and cb is not None:
-                res = cb.place_market_notional(symbol=sym, side=side, notional_usd=cr_notional)
-                print(f"CRYPTO {sym} {side} -> {res}")
-            elif rb is not None:
-                res = rb.place_market(symbol=sym, side=side, notional=eq_notional)
-                print(f"EQUITY {sym} {side} -> {res}")
-            else:
-                print(f"No broker configured for {sym}; would {side} ${cr_notional if is_crypto else eq_notional} (dry_run={dry_run})")
+
+            try:
+                if is_crypto and cb is not None:
+                    res = cb.place_market_notional(symbol=sym, side=side, notional_usd=cr_notional)
+                    print(f"CRYPTO {sym} {side} -> {res}")
+                elif rb is not None:
+                    res = rb.place_market(symbol=sym, side=side, notional=eq_notional)
+                    print(f"EQUITY {sym} {side} ${eq_notional:.2f} -> {res}")
+                else:
+                    print(f"No broker configured for {sym}; would {side} ${cr_notional if is_crypto else eq_notional} (dry_run={dry_run})")
+            except Exception as e:
+                # Swallow broker errors so the workflow can still finish and upload artifacts
+                print(f"[WARN] Order for {sym} skipped: {e}")
         else:
             print(f"[{sym}] no signals in range.")
 
