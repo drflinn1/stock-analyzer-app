@@ -16,22 +16,26 @@ on:
         required: true
         default: "2023-01-01"
       end:
-        description: "End date (YYYY-MM-DD, empty=today)"
+        description: "End date (YYYY-MM-DD, empty = today)"
         required: false
         default: ""
+      equity_dollars:
+        description: "EQUITY dollars per trade (override)"
+        required: false
+        default: "1"
+      crypto_dollars:
+        description: "CRYPTO dollars per trade (override)"
+        required: false
+        default: "1"
   schedule:
-    # US market open/afternoon runs on trading days (Mon–Fri)
-    # DST months (Mar–Oct): 9:35 ET and 14:35 ET
-    - cron: "35 13 * 3-10 1-5"   # 09:35 ET during DST (13:35 UTC)
-    - cron: "35 18 * 3-10 1-5"   # 14:35 ET during DST (18:35 UTC)
-    # Standard months (Nov–Feb): 9:35 ET and 14:35 ET
-    - cron: "35 14 * 11,12,1,2 1-5"  # 09:35 ET standard time (14:35 UTC)
-    - cron: "35 19 * 11,12,1,2 1-5"  # 14:35 ET standard time (19:35 UTC)
+    # 13:35 UTC ≈ 9:35 AM ET  (Mon–Fri)
+    - cron: "35 13 * * 1-5"
+    # 19:50 UTC ≈ 3:50 PM ET  (Mon–Fri)
+    - cron: "50 19 * * 1-5"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,13 +50,18 @@ jobs:
 
       - name: Run trader (main.py)
         env:
+          # --- Strategy window & control ---
           SYMBOLS: ${{ github.event.inputs.symbols || 'AAPL,MSFT,BTC-USD' }}
           START:   ${{ github.event.inputs.start   || '2023-01-01' }}
           END:     ${{ github.event.inputs.end     || '' }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
           OUT_DIR: out
 
-          # Optional brokers (safe if unset)
+          # --- Order sizing (defaults for scheduled runs; can override in Run workflow) ---
+          EQUITY_DOLLARS_PER_TRADE:  ${{ github.event.inputs.equity_dollars || '200' }}
+          CRYPTO_DOLLARS_PER_TRADE:  ${{ github.event.inputs.crypto_dollars || '100' }}
+
+          # --- Brokers (equity via Robinhood; crypto optional) ---
           EQUITY_BROKER: robinhood
           RH_USERNAME:     ${{ secrets.RH_USERNAME }}
           RH_PASSWORD:     ${{ secrets.RH_PASSWORD }}
