@@ -1,12 +1,13 @@
 # trader/broker_robinhood.py
 from __future__ import annotations
-import inspect
+import time
 from typing import Optional
 
 try:
     import robin_stocks.robinhood as rh
 except Exception as e:
-    raise RuntimeError(f"robin_stocks not available: {e}")
+    raise RuntimeError("robin_stocks is required for RobinhoodBroker") from e
+
 
 class RobinhoodBroker:
     def __init__(
@@ -14,59 +15,62 @@ class RobinhoodBroker:
         username: str,
         password: str,
         totp_secret: Optional[str] = None,
-        device_token: Optional[str] = None,
         dry_run: bool = True,
     ):
         self.username = username
         self.password = password
-        self.totp_secret = totp_secret
-        self.device_token = device_token
+        self.totp_secret = (totp_secret or "").strip() or None
         self.dry_run = dry_run
+        self.logged_in = False
 
-    def login(self) -> None:
-        """
-        Logs in non-interactively when TOTP is provided; otherwise lets RH handle
-        app/SMS approval if possible. Adapts to robin_stocks versions that don't
-        accept device_token.
-        """
-        kwargs = {
-            "username": self.username,
-            "password": self.password,
-            "store_session": False,
-        }
-
-        # If we have a TOTP secret, generate the one-time code
-        if self.totp_secret:
-            try:
-                import pyotp
-                kwargs["mfa_code"] = pyotp.TOTP(self.totp_secret).now()
-            except Exception as e:
-                print(f"[Robinhood] Warning: could not generate TOTP: {e}")
-
-        # Add device_token only if this robin_stocks version supports it
+    def _gen_mfa(self) -> Optional[str]:
+        if not self.totp_secret:
+            return None
         try:
-            if "device_token" in inspect.signature(rh.login).parameters and self.device_token:
-                kwargs["device_token"] = self.device_token
+            import pyotp
+            return pyotp.TOTP(self.totp_secret).now()
         except Exception:
-            pass
+            return None
 
-        try:
-            rh.login(**kwargs)
-        except TypeError:
-            # Very old versions: retry without device_token/mfa kwargs
-            kwargs.pop("device_token", None)
-            kwargs.pop("mfa_code", None)
-            rh.login(**kwargs)
+    def login(self) -> bool:
+        if self.dry_run:
+            return True
+        mfa_code = self._gen_mfa()
+        # NOTE: do NOT pass device_token; some versions of robin_stocks reject it.
+        res = rh.login(
+            username=self.username,
+            password=self.password,
+            mfa_code=mfa_code,          # None if you didn't set RH_TOTP_SECRET
+            store_session=True,
+        )
+        # robin_stocks returns a dict on success; None/False on failure
+        self.logged_in = bool(res)
+        if not self.logged_in:
+            raise RuntimeError("Robinhood login failed (MFA/app approval may be required).")
+        return True
 
     def place_market(self, symbol: str, side: str, notional: float):
-        """
-        Place a simple fractional notional market order.
-        """
+        """Market order using dollar notional for buys; fractional quantity for sells."""
         if self.dry_run:
-            return {"status": "dry_run", "symbol": symbol, "side": side, "notional": notional}
+            return {"dry_run": True, "symbol": symbol, "side": side, "notional": notional}
 
-        if side.lower() == "buy":
-            return rh.orders.order_buy_fractional_by_price(symbol, notional, timeInForce="gfd")
+        if not self.logged_in:
+            self.login()
+
+        side = side.lower().strip()
+        if side not in ("buy", "sell"):
+            raise ValueError("side must be 'buy' or 'sell'")
+
+        # Latest price to translate notional → fractional quantity if needed
+        price_str = rh.get_latest_price(symbol)[0]
+        price = float(price_str)
+
+        if side == "buy":
+            # Fractional dollar notional buy
+            return rh.orders.order_buy_fractional_by_price(
+                symbol, amountInDollars=float(notional)
+            )
         else:
-            return rh.orders.order_sell_fractional_by_price(symbol, notional, timeInForce="gfd")
-
+            # Fractional sell: compute an approximate fractional quantity to sell
+            qty = round(float(notional) / price, 6)
+            return rh.orders.order_sell_fractional_by_quantity(symbol, quantity=qty)
