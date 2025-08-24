@@ -91,13 +91,11 @@ def main():
     rb = None
     if equity_enabled:
         ts = os.getenv('RH_TOTP_SECRET', '').strip() or None
-        dt = os.getenv('RH_DEVICE_TOKEN', '').strip() or None
 
         rb = RobinhoodBroker(
             username=os.getenv('RH_USERNAME', ''),
             password=os.getenv('RH_PASSWORD', ''),
             totp_secret=ts,
-            device_token=dt,
             dry_run=dry_run,
         )
         if not dry_run:
