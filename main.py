@@ -1,6 +1,5 @@
-# main.py — headless runner with crypto + equities screeners (autopick)
-import os
-import math
+# main.py — headless runner (autopick + optional auto-sizing)
+import os, json
 import pandas as pd
 import yfinance as yf
 
@@ -21,20 +20,44 @@ try:
 except Exception:
     CCXTCryptoBroker = None
 
-# CCXT for crypto screener
+# Optional libs for autopick
 try:
-    import ccxt  # type: ignore
+    from pycoingecko import CoinGeckoAPI
+except Exception:
+    CoinGeckoAPI = None
+
+try:
+    import ccxt  # used to check which USD pairs are actually tradable on Kraken
 except Exception:
     ccxt = None
 
 
-# ---------- helpers ----------
-def download_data(ticker: str, start, end):
+# ------------------- helpers -------------------
+
+def parse_bool(v, default=False):
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
+
+def parse_float(v, default):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+def parse_advanced_json(env_text: str) -> dict:
+    """Read optional JSON tuning without raising."""
+    try:
+        return json.loads(env_text) if env_text and env_text.strip() else {}
+    except Exception:
+        return {}
+
+def yf_download(ticker: str, start, end):
     df = yf.download(ticker, start=start, end=end, progress=False)
     if df is None or df.empty:
         return pd.DataFrame()
     return df.dropna(how="all")
-
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty or not TA_AVAILABLE:
@@ -52,7 +75,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out['BB_high'] = bb.bollinger_hband()
     out['BB_low'] = bb.bollinger_lband()
     return out
-
 
 def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty or 'Close' not in df.columns:
@@ -79,183 +101,82 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
             sig.append("")
     out = df.copy(); out['Signal'] = sig; return out
 
-
-def is_crypto_symbol(sym: str) -> bool:
-    return '-' in sym and sym.upper().endswith('-USD')
-
-
-def ccxt_to_dash(sym: str) -> str:
-    # 'BTC/USD' -> 'BTC-USD'
-    return sym.replace('/', '-')
-
-
-# ---------- CRYPTO SCREENER ----------
-def autopick_top_crypto(exchange_id: str,
-                        min_quote_vol_usd: float,
-                        top_n: int,
-                        rank_by: str = "pct") -> list[str]:
+def kraken_usd_pairs():
+    """Return a set like {'BTC/USD','ETH/USD',...} of tradable USD pairs on Kraken."""
+    markets = set()
     if ccxt is None:
-        print("SCREENER: ccxt not available; skipping autopick.")
-        return []
+        return markets
     try:
-        ex_class = getattr(ccxt, exchange_id)
+        ex = ccxt.kraken()
+        ex.load_markets()
+        for sym in ex.markets:
+            if sym.endswith('/USD'):
+                markets.add(sym.upper())
     except Exception:
-        print(f"SCREENER: Unknown exchange id '{exchange_id}'; skipping.")
-        return []
+        pass
+    return markets
 
-    ex = ex_class({'enableRateLimit': True})
-    try:
-        markets = ex.load_markets()
-    except Exception as e:
-        print(f"SCREENER: load_markets failed: {e}; skipping.")
-        return []
-
-    usd_syms = [s for s, m in markets.items()
-                if m.get('active') and m.get('spot') and s.endswith('/USD')]
-    if not usd_syms:
-        print("SCREENER: no USD spot markets discovered; skipping.")
-        return []
-
-    # fetch tickers
-    tickers = {}
-    try:
-        if hasattr(ex, "fetch_tickers"):
-            tickers = ex.fetch_tickers(usd_syms)
-        else:
-            for s in usd_syms:
-                tickers[s] = ex.fetch_ticker(s)
-    except Exception as e:
-        print(f"SCREENER: fetch_tickers failed: {e}; skipping.")
-        return []
-
-    STABLES = {'USDT', 'USDC', 'DAI', 'TUSD', 'FDUSD', 'PYUSD', 'GUSD', 'USD', 'EUR'}
-
-    rows = []
-    for s, t in tickers.items():
-        base = s.split('/')[0]
-        if base in STABLES:
-            continue
-        last = t.get('last')
-        pct = t.get('percentage')  # 24h %
-        qvol = t.get('quoteVolume')
-        if qvol is None:
-            bvol = t.get('baseVolume')
-            qvol = (bvol * last) if (bvol is not None and last is not None) else None
-        if qvol is None or qvol < float(min_quote_vol_usd):
-            continue
-        rows.append((s, float(pct) if pct is not None else 0.0, float(qvol)))
-
-    if not rows:
-        print("SCREENER: no markets passed filters; skipping.")
-        return []
-
-    rows.sort(key=(lambda x: x[2] if rank_by.lower() == "vol" else x[1]), reverse=True)
-    picked = [ccxt_to_dash(s) for s, _, _ in rows[:max(0, int(top_n))]]
-
-    preview = ", ".join([f"{ccxt_to_dash(s)}(+{pct:.2f}% / ${qvol:,.0f})"
-                         for s, pct, qvol in rows[:max(0, int(top_n))]])
-    print(f"SCREENER: top {top_n} -> {preview}" if preview else "SCREENER: none")
-    return picked
-
-
-# ---------- EQUITY SCREENER ----------
-# Curated liquid US universe (50-ish tickers)
-EQUITY_UNIVERSE = [
-    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","BRK-B","AVGO","COST",
-    "LLY","JPM","V","UNH","XOM","JNJ","WMT","MA","PG","HD",
-    "ORCL","BAC","MRK","KO","PEP","CRM","CVX","ABBV","ADBE","NFLX",
-    "LIN","ACN","AMD","DIS","CSCO","TMO","NEE","MCD","WFC","TXN",
-    "IBM","CAT","GE","VZ","PFE","DHR","MS","QCOM","AMAT","HON",
-]
-
-def autopick_top_equities(universe: list[str],
-                          min_avg_dollar_vol: float,
-                          top_n: int,
-                          rank_by: str = "pct") -> list[str]:
+def autopick_crypto_symbols(top_n=1, min_vol_usd=10_000_000, direction='up') -> list:
     """
-    Rank a fixed liquid universe by 1-day % move or by avg $ volume (5d).
-    Filters by 5-day average dollar volume (Close * Volume).
+    Choose top movers from CoinGecko and return list of yfinance tickers like ['BTC-USD','ETH-USD'].
+    direction='up' (=gainers) or 'down' (=losers)
     """
-    if not universe:
+    if CoinGeckoAPI is None:
         return []
-
-    try:
-        data = yf.download(" ".join(universe), period="10d", interval="1d",
-                           group_by="ticker", progress=False)
-    except Exception as e:
-        print(f"EQ-SCREENER: download failed: {e}")
-        return []
-
-    rows = []
-    multi = isinstance(data.columns, pd.MultiIndex)
-
-    def have_ticker(t: str) -> bool:
-        if multi:
-            return t in data.columns.get_level_values(0)
-        return True  # single case
-
-    for t in universe:
-        if not have_ticker(t):
-            continue
+    cg = CoinGeckoAPI()
+    order = 'price_change_percentage_24h_desc' if direction == 'up' else 'price_change_percentage_24h_asc'
+    data = cg.get_coins_markets(
+        vs_currency='usd',
+        order=order,
+        price_change_percentage='24h',
+        per_page=100, page=1)
+    # filter by volume and map to Kraken USD pairs
+    kraken_pairs = kraken_usd_pairs()
+    picks = []
+    for row in data:
         try:
-            sub = data[t] if multi else data
-            sub = sub.dropna()
-            if len(sub) < 2:
+            vol = float(row.get('total_volume') or 0)
+            if vol < float(min_vol_usd):
                 continue
-            last = float(sub["Close"].iloc[-1])
-            prev = float(sub["Close"].iloc[-2])
-            pct = 0.0 if prev == 0 else (last - prev) / prev * 100.0
-            avg_vol = float(pd.to_numeric(sub["Volume"], errors="coerce").tail(5).mean())
-            avg_dv = avg_vol * last
-            if math.isnan(avg_dv) or avg_dv < float(min_avg_dollar_vol):
+            base = (row.get('symbol') or '').upper()
+            if not base:
                 continue
-            rows.append((t, pct, avg_dv))
+            ccxt_symbol = f"{base}/USD"
+            if ccxt_symbol.upper() in kraken_pairs:
+                # return yfinance style ticker
+                picks.append(f"{base}-USD")
+            if len(picks) >= int(top_n):
+                break
         except Exception:
             continue
-
-    if not rows:
-        print("EQ-SCREENER: no equities passed filters; skipping.")
-        return []
-
-    rows.sort(key=(lambda x: x[2] if rank_by.lower() == "vol" else x[1]), reverse=True)
-    picked = [t for t, _, _ in rows[:max(0, int(top_n))]]
-    preview = ", ".join([f"{t}(+{pct:.2f}% / ${dv:,.0f})" for t, pct, dv in rows[:max(0, int(top_n))]])
-    print(f"EQ-SCREENER: top {top_n} -> {preview}" if preview else "EQ-SCREENER: none")
-    return picked
+    return picks
 
 
-# ---------- main ----------
+# ------------------- main -------------------
+
 def main():
-    # Core run knobs
-    symbols_input = [s.strip() for s in os.getenv('SYMBOLS', 'AAPL,MSFT,BTC-USD').split(',') if s.strip()]
+    # -------- read inputs / envs --------
+    symbols = [s.strip() for s in os.getenv('SYMBOLS', 'AAPL,MSFT,BTC-USD').split(',') if s.strip()]
     start = os.getenv('START', '2023-01-01')
     end = os.getenv('END', '') or None
-    dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
+    dry_run = parse_bool(os.getenv('DRY_RUN', 'true'), default=True)
     outdir = os.getenv('OUT_DIR', 'out'); os.makedirs(outdir, exist_ok=True)
 
-    # Brokers enabled?
-    equity_enabled = os.getenv('EQUITY_BROKER', 'robinhood') == 'robinhood' and RobinhoodBroker is not None
-    crypto_exchange_id = os.getenv('CRYPTO_EXCHANGE', '').strip()
-    crypto_enabled = crypto_exchange_id != '' and CCXTCryptoBroker is not None
+    # size inputs (fixed notionals)
+    eq_notional_fixed = parse_float(os.getenv('EQUITY_DOLLARS_PER_TRADE', '200'), 200.0)
+    cr_notional_fixed = parse_float(os.getenv('CRYPTO_DOLLARS_PER_TRADE', '100'), 100.0)
 
-    # Optional: force side
-    force_side = os.getenv('FORCE_SIDE', '').strip().lower()
-    if force_side not in ('buy', 'sell'):
-        force_side = None
+    force_side = (os.getenv('FORCE_SIDE') or '').strip().lower()  # '', 'buy', 'sell'
 
-    # Autopick (crypto)
-    crypto_autopick = os.getenv('CRYPTO_AUTOPICK', 'false').lower() == 'true'
-    crypto_pick_n = int(os.getenv('CRYPTO_AUTOPICK_TOP_N', '3'))
-    crypto_min_vol = float(os.getenv('CRYPTO_AUTOPICK_MIN_VOL_USD', '500000'))
-    crypto_rank_by = os.getenv('CRYPTO_AUTOPICK_RANK', 'pct').lower()
+    # autopick toggles and advanced JSON
+    use_crypto_autopick = parse_bool(os.getenv('AUTOPICK_CRYPTO_TOP', 'false'))
+    use_equity_autopick = parse_bool(os.getenv('AUTOPICK_EQUITIES_TOP', 'false'))
+    advanced = parse_advanced_json(os.getenv('ADVANCED_JSON', ''))
 
-    # Autopick (equities)
-    equity_autopick = os.getenv('EQUITY_AUTOPICK', 'false').lower() == 'true'
-    equity_pick_n = int(os.getenv('EQUITY_AUTOPICK_TOP_N', '3'))
-    equity_min_dv = float(os.getenv('EQUITY_AUTOPICK_MIN_DOLLAR_VOL', '100000000'))  # $100M
-    equity_rank_by = os.getenv('EQUITY_AUTOPICK_RANK', 'pct').lower()
+    # -------- brokers (optional) --------
+    equity_enabled = (os.getenv('EQUITY_BROKER', 'robinhood') == 'robinhood') and (RobinhoodBroker is not None)
+    crypto_enabled = (os.getenv('CRYPTO_EXCHANGE', '').strip() != '') and (CCXTCryptoBroker is not None)
 
-    # Instantiate brokers
     rb = None
     if equity_enabled:
         ts = os.getenv('RH_TOTP_SECRET', '').strip() or None
@@ -273,44 +194,45 @@ def main():
     cb = None
     if crypto_enabled:
         cb = CCXTCryptoBroker(
-            exchange_id=crypto_exchange_id,
+            exchange_id=os.getenv('CRYPTO_EXCHANGE', 'kraken'),
             api_key=os.getenv('CRYPTO_API_KEY', None),
             api_secret=os.getenv('CRYPTO_API_SECRET', None),
             api_password=os.getenv('CRYPTO_API_PASSPHRASE', None),
             dry_run=dry_run,
         )
 
-    # Notional sizes
-    eq_notional = float(os.getenv('EQUITY_DOLLARS_PER_TRADE', '200'))
-    cr_notional = float(os.getenv('CRYPTO_DOLLARS_PER_TRADE', '100'))
+    # -------- optional autopick lists --------
+    if use_crypto_autopick:
+        top_n = int(advanced.get('crypto_top_n', 1))
+        min_vol = float(advanced.get('crypto_min_vol_usd', 10_000_000))
+        direction = str(advanced.get('crypto_direction', 'up')).lower()
+        picks = autopick_crypto_symbols(top_n=top_n, min_vol_usd=min_vol, direction=direction)
+        if picks:
+            symbols = picks
+            print(f"AUTOPICK (crypto): {symbols}  (top_n={top_n}, min_vol_usd={min_vol}, direction={direction})")
+        else:
+            print("AUTOPICK (crypto): no eligible Kraken USD pairs found from CoinGecko; keeping provided symbols.")
 
-    # Autopicks
-    crypto_picks = autopick_top_crypto(crypto_exchange_id, crypto_min_vol, crypto_pick_n, crypto_rank_by) \
-        if (crypto_enabled and crypto_autopick) else []
-    equity_picks = autopick_top_equities(EQUITY_UNIVERSE, equity_min_dv, equity_pick_n, equity_rank_by) \
-        if equity_autopick else []
+    # (equities autopick placeholder – will add when you’re ready)
+    if use_equity_autopick:
+        print("AUTOPICK (equities): not implemented yet in this step; using provided symbols.")
 
-    # Final symbols: user list + autopicks (unique, keep order)
-    symbols = list(dict.fromkeys(symbols_input + equity_picks + crypto_picks))
+    # -------- analyze all symbols & collect candidate orders --------
+    combined_logs = []
+    planned_orders = []   # will size after we know how many signals there are
 
-    print(
-        "CONFIG:",
-        f"dry_run={dry_run}",
-        f"equity_enabled={bool(rb)}",
-        f"crypto_enabled={bool(cb)}",
-        f"exchange={crypto_exchange_id or '(none)'}",
-        f"force_side={force_side or '(none)'}",
-        f"autopick_crypto={crypto_autopick} top_n={crypto_pick_n} min_vol=${crypto_min_vol:,.0f} rank_by={crypto_rank_by}",
-        f"autopick_equity={equity_autopick} top_n={equity_pick_n} min_$vol=${equity_min_dv:,.0f} rank_by={equity_rank_by}",
-    )
+    print(f"CONFIG: dry_run={dry_run} equity_enabled={bool(rb)} crypto_enabled={bool(cb)} "
+          f"exchange={os.getenv('CRYPTO_EXCHANGE','')} force_side={force_side or '(none)'}")
 
-    combined = []
     for sym in symbols:
-        df = download_data(sym, start, end)
+        df = yf_download(sym, start, end)
         df = add_indicators(df)
         df = generate_signals(df)
+
+        # Save artifacts
         df.to_csv(os.path.join(outdir, f"{sym}_analysis.csv"))
 
+        # Build tidy trade log
         t = df[df.get('Signal', "") != ""].copy()
         t = t.reset_index()
         if 'Date' not in t.columns:
@@ -319,42 +241,92 @@ def main():
         keep_cols = [c for c in ['Date', 'Ticker', 'Close', 'RSI', 'BB_high', 'BB_low', 'Signal'] if c in t.columns]
         t = t[keep_cols]
         t.to_csv(os.path.join(outdir, f"{sym}_trade_log.csv"), index=False)
-        combined.append(t)
+        combined_logs.append(t)
 
-        # Decide side
-        signal = ''
+        # Decide last signal
         last = t.tail(1)
-        if not last.empty:
-            signal = last['Signal'].iloc[0]
-        actual_side = force_side or (signal.lower() if signal else '')
-
-        is_cr = is_crypto_symbol(sym)
-        print("ROUTE:",
-              sym,
-              f"is_crypto={is_cr}",
-              f"signal={signal or '(none)'}",
-              f"actual_side={actual_side or '(none)'}",
-              f"eq_notional={eq_notional}",
-              f"cr_notional={cr_notional}",
-              f"dry_run={dry_run}")
-
-        if not actual_side:
-            print(f"SKIP {sym} -> no signal and no FORCE_SIDE.")
+        if last.empty:
+            print(f"[{sym}] no signals in range.")
             continue
 
-        if is_cr and cb is not None:
-            res = cb.place_market_notional(symbol=sym, side=actual_side, notional_usd=cr_notional)
-            print(f"CRYPTO {sym} {actual_side} -> {res}")
-        elif (not is_cr) and rb is not None:
-            res = rb.place_market(symbol=sym, side=actual_side, notional=eq_notional)
-            print(f"EQUITY {sym} {actual_side} -> {res}")
-        else:
-            print(f"No broker configured for {sym}; would {actual_side} "
-                  f"${cr_notional if is_cr else eq_notional} (dry_run={dry_run})")
+        action = last['Signal'].iloc[0]
+        side = 'buy' if action.lower() == 'buy' else 'sell'
+        if force_side in ('buy', 'sell'):
+            side = force_side
 
-    if any([not t.empty for t in combined]):
-        all_trades = pd.concat([t for t in combined if not t.empty], ignore_index=True)
+        is_crypto = ('-USD' in sym.upper())  # yfinance crypto format
+        planned_orders.append({
+            "sym_yf": sym,
+            "sym_ccxt": sym.upper().replace('-', '/'),  # BTC-USD -> BTC/USD
+            "is_crypto": is_crypto,
+            "side": side,
+        })
+
+    # -------- size crypto orders (fixed by default; optional pct_balance) --------
+    crypto_orders = [o for o in planned_orders if o['is_crypto']]
+    equity_orders = [o for o in planned_orders if not o['is_crypto']]
+
+    # Default per-order notionals
+    eq_per_order = eq_notional_fixed
+    cr_per_order = cr_notional_fixed
+
+    # Optional automatic sizing for crypto
+    sizing_mode = str(advanced.get('sizing_mode', 'fixed')).lower()
+    if sizing_mode == 'pct_balance' and cb is not None:
+        pct = float(advanced.get('balance_pct', 0.20))     # use 20% of free USD
+        min_per = float(advanced.get('min_per_order', 5.0))
+        max_per = float(advanced.get('max_per_order', 25.0))
+        split = parse_bool(advanced.get('split_by_signals', True), True)
+
+        free_usd = 0.0
+        try:
+            # use broker's exchange handle to fetch balance
+            bal = cb.exchange.fetch_balance()
+            free_usd = float(bal.get('free', {}).get('USD', 0.0))
+        except Exception:
+            pass
+
+        pool = max(0.0, free_usd * pct)
+        if split and crypto_orders:
+            cr_per_order = pool / len(crypto_orders)
+        else:
+            cr_per_order = pool
+
+        # clamp to safety bounds
+        cr_per_order = max(min_per, min(max_per, cr_per_order))
+
+        print(f"SIZING: mode=pct_balance free_usd={free_usd:.2f} pct={pct} "
+              f"orders={len(crypto_orders)} per_order={cr_per_order:.2f} "
+              f"(min={min_per}, max={max_per}, split={split})")
+    else:
+        if sizing_mode != 'fixed':
+            # any unknown modes fall back to fixed
+            print(f"SIZING: mode=fixed (using CRYPTO_DOLLARS_PER_TRADE={cr_per_order})")
+
+    # -------- place orders --------
+    for o in planned_orders:
+        if o['is_crypto']:
+            if cb is None:
+                print(f"No crypto broker configured; would {o['side']} ${cr_per_order} {o['sym_yf']} (dry_run={dry_run})")
+                continue
+            print(f"ROUTE: {o['sym_yf']} is_crypto=True side={o['side']} "
+                  f"eq_notional={eq_per_order} cr_notional={cr_per_order} dry_run={dry_run}")
+            res = cb.place_market_notional(symbol=o['sym_yf'], side=o['side'], notional_usd=cr_per_order)
+            print(f"CRYPTO {o['sym_yf']} {o['side']} -> {res}")
+        else:
+            if rb is None:
+                print(f"No equity broker configured; would {o['side']} ${eq_per_order} {o['sym_yf']} (dry_run={dry_run})")
+                continue
+            print(f"ROUTE: {o['sym_yf']} is_crypto=False side={o['side']} "
+                  f"eq_notional={eq_per_order} cr_notional={cr_per_order} dry_run={dry_run}")
+            res = rb.place_market(symbol=o['sym_yf'], side=o['side'], notional=eq_per_order)
+            print(f"EQUITY {o['sym_yf']} {o['side']} -> {res}")
+
+    # -------- write combined log --------
+    if any([not t.empty for t in combined_logs]):
+        all_trades = pd.concat([t for t in combined_logs if not t.empty], ignore_index=True)
         all_trades.to_csv(os.path.join(outdir, 'combined_trade_log.csv'), index=False)
+
     print(f"Dry run = {dry_run}. Orders{' NOT' if dry_run else ''} placed. Files saved to {outdir}/")
 
 
