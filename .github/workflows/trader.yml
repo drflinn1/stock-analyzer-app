@@ -10,7 +10,7 @@ on:
       symbols:
         description: "Comma-separated symbols"
         required: true
-        default: "BTC-USD"
+        default: "AAPL,BTC-USD"
       start:
         description: "Start date (YYYY-MM-DD)"
         required: true
@@ -26,78 +26,117 @@ on:
       crypto_dollars:
         description: "CRYPTO dollars per trade (override)"
         required: false
-        default: "100"
+        default: "10"
       force_side:
         description: "Force side for crypto (buy/sell or empty)"
         required: false
         default: ""
 
-      # ---------- Crypto autopick ----------
+      # --- Autopick (crypto) ---
       crypto_autopick:
-        description: "Auto-pick top crypto (true/false)"
+        description: "Autopick crypto top movers? (true/false)"
         required: false
         default: "false"
       crypto_pick_n:
-        description: "When crypto_autopick=true: number of tickers to add"
+        description: "How many crypto to pick"
         required: false
         default: "3"
       crypto_min_usd:
-        description: "When crypto_autopick=true: min 24h $ volume"
+        description: "Min 24h USD volume"
         required: false
         default: "500000"
       crypto_rank_by:
-        description: "When crypto_autopick=true: rank by 'pct' (1d %) or 'vol'"
+        description: "Rank by (pct or dollar)"
         required: false
         default: "pct"
 
-      # ---------- Equities autopick ----------
+      # --- Autopick (equities) ---
       equity_autopick:
-        description: "Auto-pick top equities from a liquid US universe (true/false)"
+        description: "Autopick equities top movers? (true/false)"
         required: false
         default: "false"
       equity_pick_n:
-        description: "When equity_autopick=true: number of tickers to add"
+        description: "How many equities to pick"
         required: false
         default: "3"
       equity_min_dollar_vol:
-        description: "When equity_autopick=true: min 5d avg $ volume (Close*Vol)"
+        description: "Min daily dollar volume"
         required: false
         default: "100000000"
       equity_rank_by:
-        description: "When equity_autopick=true: rank by 'pct' (1d %) or 'vol'"
+        description: "Rank by (pct or dollar)"
         required: false
         default: "pct"
 
-  # Optional daily schedule (09:35 ET on weekdays)
   schedule:
-    - cron: "35 13 * * 1-5"
+    - cron: "35 13 * * 1-5" # ~9:35 AM ET
+    - cron: "50 19 * * 1-5" # ~3:50 PM ET
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+    # Guard inputs so non-dispatch events (cron/commit) don’t error
+    env:
+      DRY_RUN:                      ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run)              || 'true' }}
+      SYMBOLS:                      ${{ (github.event_name == 'workflow_dispatch' && inputs.symbols)              || 'AAPL,BTC-USD' }}
+      START:                        ${{ (github.event_name == 'workflow_dispatch' && inputs.start)                || '2023-01-01' }}
+      END:                          ${{ (github.event_name == 'workflow_dispatch' && inputs.end)                  || '' }}
+      EQUITY_DOLLARS_PER_TRADE:     ${{ (github.event_name == 'workflow_dispatch' && inputs.equity_dollars)       || '200' }}
+      CRYPTO_DOLLARS_PER_TRADE:     ${{ (github.event_name == 'workflow_dispatch' && inputs.crypto_dollars)       || '10' }}
+      FORCE_SIDE:                   ${{ (github.event_name == 'workflow_dispatch' && inputs.force_side)           || '' }}
+
+      CRYPTO_AUTOPICK:              ${{ (github.event_name == 'workflow_dispatch' && inputs.crypto_autopick)      || 'false' }}
+      CRYPTO_PICK_N:                ${{ (github.event_name == 'workflow_dispatch' && inputs.crypto_pick_n)        || '3' }}
+      CRYPTO_MIN_USD:               ${{ (github.event_name == 'workflow_dispatch' && inputs.crypto_min_usd)       || '500000' }}
+      CRYPTO_RANK_BY:               ${{ (github.event_name == 'workflow_dispatch' && inputs.crypto_rank_by)       || 'pct' }}
+
+      EQUITY_AUTOPICK:              ${{ (github.event_name == 'workflow_dispatch' && inputs.equity_autopick)      || 'false' }}
+      EQUITY_PICK_N:                ${{ (github.event_name == 'workflow_dispatch' && inputs.equity_pick_n)        || '3' }}
+      EQUITY_MIN_DOLLAR_VOL:        ${{ (github.event_name == 'workflow_dispatch' && inputs.equity_min_dollar_vol)|| '100000000' }}
+      EQUITY_RANK_BY:               ${{ (github.event_name == 'workflow_dispatch' && inputs.equity_rank_by)       || 'pct' }}
+
+      OUT_DIR: out
+      EQUITY_BROKER: robinhood
+
+      # Secrets/vars
+      CRYPTO_EXCHANGE:        ${{ vars.CRYPTO_EXCHANGE }}
+      RH_USERNAME:            ${{ secrets.RH_USERNAME }}
+      RH_PASSWORD:            ${{ secrets.RH_PASSWORD }}
+      RH_TOTP_SECRET:         ${{ secrets.RH_TOTP_SECRET }}
+      CRYPTO_API_KEY:         ${{ secrets.CRYPTO_API_KEY }}
+      CRYPTO_API_SECRET:      ${{ secrets.CRYPTO_API_SECRET }}
+      CRYPTO_API_PASSPHRASE:  ${{ secrets.CRYPTO_API_PASSPHRASE }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
-        run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
 
       - name: Run bot
-        env:
-          # Core inputs
-          DRY_RUN: ${{ inputs.dry_run }}
-          SYMBOLS: ${{ inputs.symbols }}
-          START: ${{ inputs.start }}
-          END: ${{ inputs.end }}
-          EQUITY_DOLLARS_PER_TRADE: ${{ inputs.equity_dollars }}
-          CRYPTO_DOLLARS_PER_TRADE: ${{ inputs.crypto_dollars }}
-          FORCE_SIDE: ${{ inputs.force_side }}
+        run: |
+          echo "CONFIG:"
+          echo "  dry_run=$DRY_RUN"
+          echo "  symbols=$SYMBOLS"
+          echo "  start=$START end=$END"
+          echo "  crypto_autopick=$CRYPTO_AUTOPICK equity_autopick=$EQUITY_AUTOPICK"
+          python main.py
 
-          # Crypto autopick env
-          CRYPTO_AUTOPICK: ${{ inputs.crypto_autopick }}
-          CRY
+      - name: List out
+        if: always()
+        run: |
+          echo "Listing out/:"
+          ls -la out || true
+
+      - name: Upload outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-outputs.zip
+          path: out/
