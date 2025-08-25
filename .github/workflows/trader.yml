@@ -31,42 +31,18 @@ on:
         description: "Force side for crypto (buy/sell or empty)"
         required: false
         default: ""
-
-      # --- Autopick (crypto) ---
       crypto_autopick:
         description: "Autopick crypto top movers? (true/false)"
         required: false
         default: "false"
-      crypto_pick_n:
-        description: "How many crypto to pick"
-        required: false
-        default: "3"
-      crypto_min_usd:
-        description: "Min 24h USD volume"
-        required: false
-        default: "500000"
-      crypto_rank_by:
-        description: "Rank by (pct or dollar)"
-        required: false
-        default: "pct"
-
-      # --- Autopick (equities) ---
       equity_autopick:
         description: "Autopick equities top movers? (true/false)"
         required: false
         default: "false"
-      equity_pick_n:
-        description: "How many equities to pick"
+      autopick_overrides:
+        description: "Optional JSON for advanced settings (see notes)"
         required: false
-        default: "3"
-      equity_min_dollar_vol:
-        description: "Min daily dollar volume"
-        required: false
-        default: "100000000"
-      equity_rank_by:
-        description: "Rank by (pct or dollar)"
-        required: false
-        default: "pct"
+        default: ""
 
   schedule:
     - cron: "35 13 * * 1-5" # ~9:35 AM ET
@@ -76,30 +52,23 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
-    # Guard inputs so non-dispatch events (cron/commit) don’t error
+    # Guard every input so cron/push runs still work (inputs.* doesn't exist there)
     env:
-      DRY_RUN:                      ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run)              || 'true' }}
-      SYMBOLS:                      ${{ (github.event_name == 'workflow_dispatch' && inputs.symbols)              || 'AAPL,BTC-USD' }}
-      START:                        ${{ (github.event_name == 'workflow_dispatch' && inputs.start)                || '2023-01-01' }}
-      END:                          ${{ (github.event_name == 'workflow_dispatch' && inputs.end)                  || '' }}
-      EQUITY_DOLLARS_PER_TRADE:     ${{ (github.event_name == 'workflow_dispatch' && inputs.equity_dollars)       || '200' }}
-      CRYPTO_DOLLARS_PER_TRADE:     ${{ (github.event_name == 'workflow_dispatch' && inputs.crypto_dollars)       || '10' }}
-      FORCE_SIDE:                   ${{ (github.event_name == 'workflow_dispatch' && inputs.force_side)           || '' }}
-
-      CRYPTO_AUTOPICK:              ${{ (github.event_name == 'workflow_dispatch' && inputs.crypto_autopick)      || 'false' }}
-      CRYPTO_PICK_N:                ${{ (github.event_name == 'workflow_dispatch' && inputs.crypto_pick_n)        || '3' }}
-      CRYPTO_MIN_USD:               ${{ (github.event_name == 'workflow_dispatch' && inputs.crypto_min_usd)       || '500000' }}
-      CRYPTO_RANK_BY:               ${{ (github.event_name == 'workflow_dispatch' && inputs.crypto_rank_by)       || 'pct' }}
-
-      EQUITY_AUTOPICK:              ${{ (github.event_name == 'workflow_dispatch' && inputs.equity_autopick)      || 'false' }}
-      EQUITY_PICK_N:                ${{ (github.event_name == 'workflow_dispatch' && inputs.equity_pick_n)        || '3' }}
-      EQUITY_MIN_DOLLAR_VOL:        ${{ (github.event_name == 'workflow_dispatch' && inputs.equity_min_dollar_vol)|| '100000000' }}
-      EQUITY_RANK_BY:               ${{ (github.event_name == 'workflow_dispatch' && inputs.equity_rank_by)       || 'pct' }}
+      DRY_RUN:                      ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run)               || 'true' }}
+      SYMBOLS:                      ${{ (github.event_name == 'workflow_dispatch' && inputs.symbols)               || 'AAPL,BTC-USD' }}
+      START:                        ${{ (github.event_name == 'workflow_dispatch' && inputs.start)                 || '2023-01-01' }}
+      END:                          ${{ (github.event_name == 'workflow_dispatch' && inputs.end)                   || '' }}
+      EQUITY_DOLLARS_PER_TRADE:     ${{ (github.event_name == 'workflow_dispatch' && inputs.equity_dollars)        || '200' }}
+      CRYPTO_DOLLARS_PER_TRADE:     ${{ (github.event_name == 'workflow_dispatch' && inputs.crypto_dollars)        || '10' }}
+      FORCE_SIDE:                   ${{ (github.event_name == 'workflow_dispatch' && inputs.force_side)            || '' }}
+      CRYPTO_AUTOPICK:              ${{ (github.event_name == 'workflow_dispatch' && inputs.crypto_autopick)       || 'false' }}
+      EQUITY_AUTOPICK:              ${{ (github.event_name == 'workflow_dispatch' && inputs.equity_autopick)       || 'false' }}
+      AUTOPICK_OVERRIDES:           ${{ (github.event_name == 'workflow_dispatch' && inputs.autopick_overrides)    || '' }}
 
       OUT_DIR: out
       EQUITY_BROKER: robinhood
 
-      # Secrets/vars
+      # Exchange/broker config
       CRYPTO_EXCHANGE:        ${{ vars.CRYPTO_EXCHANGE }}
       RH_USERNAME:            ${{ secrets.RH_USERNAME }}
       RH_PASSWORD:            ${{ secrets.RH_PASSWORD }}
@@ -126,6 +95,7 @@ jobs:
           echo "  symbols=$SYMBOLS"
           echo "  start=$START end=$END"
           echo "  crypto_autopick=$CRYPTO_AUTOPICK equity_autopick=$EQUITY_AUTOPICK"
+          echo "  force_side=$FORCE_SIDE"
           python main.py
 
       - name: List out
