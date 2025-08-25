@@ -84,14 +84,25 @@ def main():
     dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
     outdir = os.getenv('OUT_DIR', 'out'); os.makedirs(outdir, exist_ok=True)
 
+    # Optional override for crypto (buy/sell). Empty string = follow signal.
+    force_side = os.getenv('FORCE_SIDE', '').strip().lower()
+    if force_side not in ('buy', 'sell'):
+        force_side = ''
+
     # Brokers (optional)
     equity_enabled = os.getenv('EQUITY_BROKER', 'robinhood') == 'robinhood' and RobinhoodBroker is not None
     crypto_enabled = os.getenv('CRYPTO_EXCHANGE', '') != '' and CCXTCryptoBroker is not None
 
+    # Helpful one-liner so we can see config in the logs
+    print(
+        f"CONFIG: dry_run={dry_run} equity_enabled={equity_enabled} "
+        f"crypto_enabled={crypto_enabled} exchange={os.getenv('CRYPTO_EXCHANGE','')} "
+        f"force_side={force_side or '(none)'}"
+    )
+
     rb = None
     if equity_enabled:
         ts = os.getenv('RH_TOTP_SECRET', '').strip() or None
-
         rb = RobinhoodBroker(
             username=os.getenv('RH_USERNAME', ''),
             password=os.getenv('RH_PASSWORD', ''),
@@ -113,12 +124,9 @@ def main():
             dry_run=dry_run,
         )
 
-    # --- Notional controls & overrides ---
-    # Clamp equity notional to Robinhood's fractional minimum (>= $1)
-    eq_notional = max(float(os.getenv('EQUITY_DOLLARS_PER_TRADE', '200')), 1.01)
+    # Notionals (workflow can override these)
+    eq_notional = float(os.getenv('EQUITY_DOLLARS_PER_TRADE', '200'))
     cr_notional = float(os.getenv('CRYPTO_DOLLARS_PER_TRADE', '100'))
-    # Optional override to force a side for quick live tests
-    force_side = os.getenv('FORCE_SIDE', '').lower()
 
     combined = []
     for sym in symbols:
@@ -144,24 +152,27 @@ def main():
         last = t.tail(1)
         if not last.empty:
             action = last['Signal'].iloc[0]
-            side = 'buy' if action.lower() == 'buy' else 'sell'
-            if force_side in ('buy', 'sell'):
-                print(f"FORCE_SIDE override active -> {force_side}")
-                side = force_side
+            side_from_signal = 'buy' if action.lower() == 'buy' else 'sell'
             is_crypto = '-' in sym and sym.upper().endswith('-USD')
 
-            try:
-                if is_crypto and cb is not None:
-                    res = cb.place_market_notional(symbol=sym, side=side, notional_usd=cr_notional)
-                    print(f"CRYPTO {sym} {side} -> {res}")
-                elif rb is not None:
-                    res = rb.place_market(symbol=sym, side=side, notional=eq_notional)
-                    print(f"EQUITY {sym} {side} ${eq_notional:.2f} -> {res}")
-                else:
-                    print(f"No broker configured for {sym}; would {side} ${cr_notional if is_crypto else eq_notional} (dry_run={dry_run})")
-            except Exception as e:
-                # Swallow broker errors so the workflow can still finish and upload artifacts
-                print(f"[WARN] Order for {sym} skipped: {e}")
+            # Pick side: FORCE_SIDE wins for crypto if provided
+            actual_side = force_side if (force_side in ('buy', 'sell') and is_crypto) else side_from_signal
+
+            print(
+                f"ROUTE: {sym} is_crypto={is_crypto} signal={side_from_signal} "
+                f"actual_side={actual_side} eq_notional={eq_notional} "
+                f"cr_notional={cr_notional} dry_run={dry_run}"
+            )
+
+            if is_crypto and cb is not None:
+                res = cb.place_market_notional(symbol=sym, side=actual_side, notional_usd=cr_notional)
+                print(f"CRYPTO {sym} {actual_side} -> {res}")
+            elif rb is not None:
+                res = rb.place_market(symbol=sym, side=actual_side, notional=eq_notional)
+                print(f"EQUITY {sym} {actual_side} -> {res}")
+            else:
+                will = cr_notional if is_crypto else eq_notional
+                print(f"No broker configured for {sym}; would {actual_side} ${will} (dry_run={dry_run})")
         else:
             print(f"[{sym}] no signals in range.")
 
