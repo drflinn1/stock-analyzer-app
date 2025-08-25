@@ -1,0 +1,72 @@
+name: autopick-crypto-daily
+
+on:
+  # Weekdays at 13:35 UTC (~9:35am ET). Adjust if you want.
+  schedule:
+    - cron: "35 13 * * 1-5"
+  # So you can test it any time
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    # Defaults for a SAFE paper run using crypto autopick only
+    env:
+      DRY_RUN: "true"                         # flip to "false" when you’re ready to go live
+      SYMBOLS: " "                            # <- space keeps it effectively blank so autopick is used
+      START: "2023-01-01"
+      END: ""
+      EQUITY_DOLLARS_PER_TRADE: "0"           # equities off
+      CRYPTO_DOLLARS_PER_TRADE: "5"           # your per-trade notional for crypto (paper)
+      FORCE_SIDE: ""                          # empty = normal strategy; "buy" or "sell" to force
+      CRYPTO_AUTOPICK: "true"
+      EQUITY_AUTOPICK: "false"
+      AUTOPICK_OVERRIDES: ""                  # optional, keep empty
+      OUT_DIR: "out"
+
+      # Brokers/exchanges (these match what you already use)
+      EQUITY_BROKER: "robinhood"
+      CRYPTO_EXCHANGE: "kraken"
+
+      # Secrets (must already be set in repo settings → Secrets and variables → Actions)
+      RH_USERNAME: ${{ secrets.RH_USERNAME }}
+      RH_PASSWORD: ${{ secrets.RH_PASSWORD }}
+      RH_TOTP_SECRET: ${{ secrets.RH_TOTP_SECRET }}
+      CRYPTO_API_KEY: ${{ secrets.CRYPTO_API_KEY }}
+      CRYPTO_API_SECRET: ${{ secrets.CRYPTO_API_SECRET }}
+      CRYPTO_API_PASSPHRASE: ${{ secrets.CRYPTO_API_PASSPHRASE }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        run: |
+          echo "CONFIG:"
+          echo "  dry_run=$DRY_RUN"
+          echo "  symbols='$SYMBOLS'"
+          echo "  start=$START end=$END"
+          echo "  crypto_autopick=$CRYPTO_AUTOPICK equity_autopick=$EQUITY_AUTOPICK"
+          echo "  force_side=$FORCE_SIDE"
+          python main.py
+
+      - name: List out/
+        run: |
+          echo "Listing out/:"
+          ls -la out || true
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-outputs.zip
+          path: out/
+          if-no-files-found: warn
