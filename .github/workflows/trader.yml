@@ -16,74 +16,79 @@ on:
         required: true
         default: "2023-01-01"
       end:
-        description: "End date (YYYY-MM-DD, empty = today)"
+        description: "End date (YYYY-MM-DD, empty=today)"
         required: false
         default: ""
       equity_dollars:
         description: "EQUITY dollars per trade (override)"
         required: false
-        default: "200"
+        default: "2"
       crypto_dollars:
         description: "CRYPTO dollars per trade (override)"
         required: false
-        default: "100"
+        default: "10"
+      force_side:
+        description: "Force side for crypto (buy/sell or empty)"
+        required: false
+        default: ""
+
   schedule:
-    # ~09:35 AM ET on weekdays (13:35 UTC during DST)
-    - cron: "35 13 * * 1-5"
-    # ~03:50 PM ET on weekdays (19:50 UTC during DST)
-    - cron: "50 19 * * 1-5"
+    - cron: "35 13 * * 1-5"   # ~9:35 AM ET
+    - cron: "50 19 * * 1-5"   # ~3:50 PM ET
+
+concurrency:
+  group: trader
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      # Inputs, with safe defaults for scheduled runs (dry-run true by default)
+      DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run) || 'true' }}
+      SYMBOLS: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.symbols) || 'AAPL,MSFT,BTC-USD' }}
+      START:   ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.start)   || '2023-01-01' }}
+      END:     ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.end)     || '' }}
+      EQUITY_DOLLARS_PER_TRADE:  ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.equity_dollars)  || '2' }}
+      CRYPTO_DOLLARS_PER_TRADE:  ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.crypto_dollars)  || '10' }}
+      FORCE_SIDE: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.force_side) || '' }}
+      OUT_DIR: out
+
+      # Brokers
+      EQUITY_BROKER: robinhood
+
+      # Repo Variables (Actions → Variables)
+      CRYPTO_EXCHANGE: ${{ vars.CRYPTO_EXCHANGE }}
+
+      # Secrets (Actions → Secrets)
+      RH_USERNAME: ${{ secrets.RH_USERNAME }}
+      RH_PASSWORD: ${{ secrets.RH_PASSWORD }}
+      RH_TOTP_SECRET: ${{ secrets.RH_TOTP_SECRET }}
+      CRYPTO_API_KEY: ${{ secrets.CRYPTO_API_KEY }}
+      CRYPTO_API_SECRET: ${{ secrets.CRYPTO_API_SECRET }}
+      CRYPTO_API_PASSPHRASE: ${{ secrets.CRYPTO_API_PASSPHRASE }}
+
+      PYTHONUNBUFFERED: "1"
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run trader (main.py)
-        env:
-          # Inputs (with safe defaults so schedule runs work too)
-          SYMBOLS: ${{ github.event.inputs.symbols || 'AAPL,MSFT,BTC-USD' }}
-          START:   ${{ github.event.inputs.start   || '2023-01-01' }}
-          END:     ${{ github.event.inputs.end     || '' }}
-          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
-
-          # Optional per-trade dollar overrides
-          EQUITY_DOLLARS_PER_TRADE:  ${{ github.event.inputs.equity_dollars || '200' }}
-          CRYPTO_DOLLARS_PER_TRADE:  ${{ github.event.inputs.crypto_dollars || '100' }}
-
-          OUT_DIR: out
-
-          # Brokers (safe if unset)
-          EQUITY_BROKER: robinhood
-          RH_USERNAME:      ${{ secrets.RH_USERNAME }}
-          RH_PASSWORD:      ${{ secrets.RH_PASSWORD }}
-          RH_TOTP_SECRET:   ${{ secrets.RH_TOTP_SECRET }}   # optional
-          RH_DEVICE_TOKEN:  ${{ secrets.RH_DEVICE_TOKEN }}  # optional
-
-          CRYPTO_EXCHANGE:        ${{ vars.CRYPTO_EXCHANGE }}
-          CRYPTO_API_KEY:         ${{ secrets.CRYPTO_API_KEY }}
-          CRYPTO_API_SECRET:      ${{ secrets.CRYPTO_API_SECRET }}
-          CRYPTO_API_PASSPHRASE:  ${{ secrets.CRYPTO_API_PASSPHRASE }}
+      - name: Run bot
         run: python main.py
 
-      - name: List outputs (for diagnostics)
+      - name: List out
         run: |
           echo "Listing out/:"
-          ls -lah out || true
+          ls -alh out
 
-      - name: Upload outputs
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: trade-outputs
           path: out/**
-          if-no-files-found: warn
