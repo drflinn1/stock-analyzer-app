@@ -10,7 +10,7 @@ on:
       symbols:
         description: "Comma-separated symbols (leave blank or a single space for autopick)"
         required: true
-        default: "SPY,BTC-USD"
+        default: "SPY"
       start:
         description: "Start date (YYYY-MM-DD)"
         required: true
@@ -32,23 +32,15 @@ on:
         required: false
         default: ""
       crypto_autopick:
-        description: "Autopick crypto top movers? (true/false)"
+        description: "Autopick crypto top movers? true/false"
         required: true
         default: "false"
       equity_autopick:
-        description: "Autopick equities top movers? (true/false)"
+        description: "Autopick equities top movers? true/false"
         required: true
         default: "false"
-      daily_equity_cap:
-        description: "Max EQUITY dollars to spend this run/day (0 = no cap)"
-        required: false
-        default: "0"
-      daily_crypto_cap:
-        description: "Max CRYPTO dollars to spend this run/day (0 = no cap)"
-        required: false
-        default: "0"
-      advanced_json:
-        description: "Optional JSON for advanced settings (see notes)"
+      overrides_json:
+        description: "Optional JSON for advanced settings (e.g. {\"eq_daily_cap\":25,\"cr_daily_cap\":0})"
         required: false
         default: ""
 
@@ -57,8 +49,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -74,36 +65,38 @@ jobs:
           SYMBOLS: ${{ inputs.symbols }}
           START: ${{ inputs.start }}
           END: ${{ inputs.end }}
+
           EQUITY_DOLLARS_PER_TRADE: ${{ inputs.equity_dollars_per_trade }}
           CRYPTO_DOLLARS_PER_TRADE: ${{ inputs.crypto_dollars_per_trade }}
+
           FORCE_SIDE: ${{ inputs.force_side }}
           CRYPTO_AUTOPICK: ${{ inputs.crypto_autopick }}
           EQUITY_AUTOPICK: ${{ inputs.equity_autopick }}
-          AUTOPICK_OVERRIDES: ${{ inputs.advanced_json }}
 
-          # NEW: daily caps
-          DAILY_EQUITY_CAP: ${{ inputs.daily_equity_cap }}
-          DAILY_CRYPTO_CAP: ${{ inputs.daily_crypto_cap }}
+          # Put caps (and any future advanced flags) in this JSON.
+          AUTOPICK_OVERRIDES: ${{ inputs.overrides_json }}
 
           OUT_DIR: out
+
+          # Brokers/exchange
           EQUITY_BROKER: robinhood
           CRYPTO_EXCHANGE: kraken
 
-          # secrets
+          # Secrets
           RH_USERNAME: ${{ secrets.RH_USERNAME }}
           RH_PASSWORD: ${{ secrets.RH_PASSWORD }}
           RH_TOTP_SECRET: ${{ secrets.RH_TOTP_SECRET }}
           CRYPTO_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           CRYPTO_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
           CRYPTO_API_PASSPHRASE: ${{ secrets.KRAKEN_API_PASSPHRASE }}
+
         run: |
           echo "CONFIG:"
           echo "  dry_run=$DRY_RUN"
           echo "  symbols=$SYMBOLS"
           echo "  start=$START end=$END"
-          echo "  equity_autopick=$EQUITY_AUTOPICK crypto_autopick=$CRYPTO_AUTOPICK"
+          echo "  crypto_autopick=$CRYPTO_AUTOPICK equity_autopick=$EQUITY_AUTOPICK"
           echo "  force_side=$FORCE_SIDE"
-          echo "  daily caps: equity=$DAILY_EQUITY_CAP crypto=$DAILY_CRYPTO_CAP"
           python main.py
 
       - name: List out/
@@ -111,9 +104,8 @@ jobs:
           echo "Listing out/:"
           ls -la out || true
 
-      - name: Upload artifacts
+      - name: Upload outputs
         uses: actions/upload-artifact@v4
         with:
           name: trade-outputs.zip
           path: out/
-          if-no-files-found: warn
