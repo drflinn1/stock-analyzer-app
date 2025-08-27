@@ -34,6 +34,13 @@ jobs:
           TRADE_MODE: "live"
           DRY_RUN: "false"
 
+          # Limit to crypto only (so equities path won't try to log in)
+          MARKET: "crypto"
+          EQUITY_BROKER: "none"
+
+          # Optional: pin symbols (adjust if you later add more)
+          SYMBOLS: "BTC-USD"
+
           # Notifications
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
