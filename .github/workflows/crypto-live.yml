@@ -3,15 +3,12 @@ name: Crypto Live
 on:
   workflow_dispatch:
   schedule:
-    # Morning + evening (UTC). 14:00 UTC ≈ 7 AM PT / 10 AM ET; 22:00 UTC ≈ 3 PM PT / 6 PM ET
     - cron: "0 14 * * *"
     - cron: "0 22 * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
-    # Prevent overlapping crypto runs
     concurrency:
       group: crypto-live
       cancel-in-progress: false
@@ -30,25 +27,18 @@ jobs:
 
       - name: Run Crypto Live (Kraken, cautious caps)
         env:
-          # Force LIVE
           TRADE_MODE: "live"
           DRY_RUN: "false"
 
-          # Limit to crypto only (so equities path won't try to log in)
           MARKET: "crypto"
           EQUITY_BROKER: "none"
-
-          # Optional: pin symbols (adjust if you later add more)
           SYMBOLS: "BTC-USD"
 
-          # Notifications
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
-          # Exchange selection (cover common code paths)
           EXCHANGE: "kraken"
           CCXT_EXCHANGE: "kraken"
 
-          # API creds (generic + exchange-specific)
           CRYPTO_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
           CRYPTO_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
           CCXT_API_KEY:      ${{ secrets.KRAKEN_API_KEY }}
@@ -56,7 +46,7 @@ jobs:
           KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
-          python main.py \
+          python tools/run_live.py \
             --market crypto \
             --exchange kraken \
             --strategy cautious \
