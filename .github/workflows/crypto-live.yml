@@ -3,8 +3,7 @@ name: Crypto Live
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 14 * * *"   # ~7 AM PT
-    - cron: "0 22 * * *"   # ~3 PM PT
+    - cron: "*/15 * * * *"   # every 15 minutes
 
 jobs:
   run:
@@ -25,28 +24,26 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Crypto Live (Kraken, cautious caps, autopick basket)
+      - name: Run Crypto Live (Kraken, cautious caps, 15-min, dip gate)
         env:
-          # Live mode (belt + suspenders)
           TRADE_MODE: "live"
           DRY_RUN: "false"
 
-          # Limit to crypto path; mimic "autopick" by scanning a small basket
           MARKET: "crypto"
           EQUITY_BROKER: "none"
 
-          # Basket to scan (comma-separated). Adjust anytime.
-          # This mirrors how Trader scans multiple tickers.
+          # Basket to scan (comma-separated)
           SYMBOLS: "BTC-USD,ETH-USD,SOL-USD,ADA-USD,XRP-USD,LTC-USD,DOGE-USD"
 
-          # Notifications
+          # Dip gate controls (tune anytime)
+          DROP_PCT: "1.5"         # require >=1.5% below 60m SMA to trade
+          LOOKBACK_MIN: "60"      # SMA window in minutes
+
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
-          # Exchange selection
           EXCHANGE: "kraken"
           CCXT_EXCHANGE: "kraken"
 
-          # API creds
           CRYPTO_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
           CRYPTO_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
           CCXT_API_KEY:      ${{ secrets.KRAKEN_API_KEY }}
