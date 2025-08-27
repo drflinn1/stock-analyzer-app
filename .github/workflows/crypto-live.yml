@@ -8,14 +8,15 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    # Keep crypto runs from overlapping if manually triggered more than once
+
+    # Prevent overlap if you manually trigger more than once
     concurrency:
       group: crypto-live
       cancel-in-progress: false
 
     steps:
       - name: Checkout repo
-      - uses: actions/checkout@v3
+        uses: actions/checkout@v3
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -31,17 +32,17 @@ jobs:
           TRADE_MODE: "live"
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
-          # Exchange selection (belt-and-suspenders envs to match most code paths)
+          # Exchange selection (cover common code paths)
           EXCHANGE: "kraken"
           CCXT_EXCHANGE: "kraken"
 
-          # API creds (map to both generic + exchange-specific names)
-          CRYPTO_API_KEY:      ${{ secrets.KRAKEN_API_KEY }}
-          CRYPTO_API_SECRET:   ${{ secrets.KRAKEN_API_SECRET }}
-          CCXT_API_KEY:        ${{ secrets.KRAKEN_API_KEY }}
-          CCXT_API_SECRET:     ${{ secrets.KRAKEN_API_SECRET }}
-          KRAKEN_API_KEY:      ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET:   ${{ secrets.KRAKEN_API_SECRET }}
+          # API creds (generic + exchange-specific)
+          CRYPTO_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
+          CRYPTO_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          CCXT_API_KEY:      ${{ secrets.KRAKEN_API_KEY }}
+          CCXT_API_SECRET:   ${{ secrets.KRAKEN_API_SECRET }}
+          KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           python main.py \
             --market crypto \
