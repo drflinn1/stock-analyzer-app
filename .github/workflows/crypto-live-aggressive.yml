@@ -1,0 +1,57 @@
+name: Crypto Live (Aggressive)
+
+on:
+  workflow_dispatch:
+  # Tip: uncomment the schedule below if you want it to auto-run daily too
+  # schedule:
+  #   - cron: "0 14 * * *"   # ~7 AM PT
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: crypto-live-aggressive
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Crypto Live (Aggressive caps, autopick basket)
+        env:
+          TRADE_MODE: "live"
+          DRY_RUN: "false"
+
+          MARKET: "crypto"
+          EQUITY_BROKER: "none"
+
+          # Same basket for now; you can add/remove pairs freely
+          SYMBOLS: "BTC-USD,ETH-USD,SOL-USD,ADA-USD,XRP-USD,LTC-USD,DOGE-USD"
+
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+          EXCHANGE: "kraken"
+          CCXT_EXCHANGE: "kraken"
+
+          CRYPTO_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
+          CRYPTO_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          CCXT_API_KEY:      ${{ secrets.KRAKEN_API_KEY }}
+          CCXT_API_SECRET:   ${{ secrets.KRAKEN_API_SECRET }}
+          KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        run: |
+          python tools/run_live.py \
+            --market crypto \
+            --exchange kraken \
+            --strategy cautious \
+            --cap_per_trade 50 \
+            --cap_daily 200 \
+            --dry_run false
