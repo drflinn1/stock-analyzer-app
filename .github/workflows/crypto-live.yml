@@ -3,12 +3,15 @@ name: Crypto Live
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 14 * * *"   # runs daily at 14:00 UTC (7 AM PT / 10 AM ET)
+    # Morning + evening (UTC). 14:00 UTC ≈ 7 AM PT / 10 AM ET; 22:00 UTC ≈ 3 PM PT / 6 PM ET
+    - cron: "0 14 * * *"
+    - cron: "0 22 * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
+    # Prevent overlapping crypto runs
     concurrency:
       group: crypto-live
       cancel-in-progress: false
@@ -27,14 +30,14 @@ jobs:
 
       - name: Run Crypto Live (Kraken, cautious caps)
         env:
-          # Force live
+          # Force LIVE
           TRADE_MODE: "live"
           DRY_RUN: "false"
 
           # Notifications
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
-          # Exchange selection
+          # Exchange selection (cover common code paths)
           EXCHANGE: "kraken"
           CCXT_EXCHANGE: "kraken"
 
