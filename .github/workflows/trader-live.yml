@@ -1,113 +1,40 @@
-name: trader-live
+name: Trader Live
 
 on:
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Run in dry-run mode? true/false"
-        required: true
-        default: "true"
-      symbols:
-        description: "Comma-separated symbols (leave blank or a single space for autopick)"
-        required: true
-        default: "SPY,BTC-USD"
-      start:
-        description: "Start date (YYYY-MM-DD)"
-        required: true
-        default: "2023-01-01"
-      equity_dollars_per_trade:
-        description: "EQUITY dollars per trade"
-        required: true
-        default: "200"
-      crypto_dollars_per_trade:
-        description: "CRYPTO dollars per trade"
-        required: true
-        default: "10"
-      force_side:
-        description: "Force side for crypto (buy/sell or empty)"
-        required: false
-        default: ""
-      crypto_autopick:
-        description: "Autopick crypto top movers? true/false"
-        required: true
-        default: "true"
-      equity_autopick:
-        description: "Autopick equities top movers? true/false"
-        required: true
-        default: "false"
-      daily_equity_cap:
-        description: "Max EQUITY spend per day (USD)"
-        required: true
-        default: "25"
-      daily_crypto_cap:
-        description: "Max CRYPTO spend per day (USD)"
-        required: true
-        default: "15"
+  schedule:
+    - cron: "0 14 * * *"   # runs daily at 14:00 UTC (7 AM PT / 10 AM ET)
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run bot
+      - name: Run Trader Live (equities, cautious caps)
         env:
-          # controls
-          DRY_RUN: ${{ inputs.dry_run }}
-          SYMBOLS: ${{ inputs.symbols }}
-          START: ${{ inputs.start }}
-          END: ""
-          EQUITY_DOLLARS_PER_TRADE: ${{ inputs.equity_dollars_per_trade }}
-          CRYPTO_DOLLARS_PER_TRADE: ${{ inputs.crypto_dollars_per_trade }}
-          FORCE_SIDE: ${{ inputs.force_side }}
-          CRYPTO_AUTOPICK: ${{ inputs.crypto_autopick }}
-          EQUITY_AUTOPICK: ${{ inputs.equity_autopick }}
-          DAILY_EQUITY_CAP: ${{ inputs.daily_equity_cap }}
-          DAILY_CRYPTO_CAP: ${{ inputs.daily_crypto_cap }}
+          # Force live
+          TRADE_MODE: "live"
+          DRY_RUN: "false"
 
-          # house defaults
-          OUT_DIR: out
-          EQUITY_BROKER: robinhood
-          CRYPTO_EXCHANGE: kraken
-
-          # secrets
-          RH_USERNAME: ${{ secrets.RH_USERNAME }}
-          RH_PASSWORD: ${{ secrets.RH_PASSWORD }}
-          RH_TOTP_SECRET: ${{ secrets.RH_TOTP_SECRET }}
-          CRYPTO_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          CRYPTO_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          CRYPTO_API_PASSPHRASE: ${{ secrets.KRAKEN_API_PASSPHRASE }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ROBINHOOD_USERNAME: ${{ secrets.ROBINHOOD_USERNAME }}
+          ROBINHOOD_PASSWORD: ${{ secrets.ROBINHOOD_PASSWORD }}
+          ROBINHOOD_MFA:      ${{ secrets.ROBINHOOD_MFA }}
+          RH_DEVICE_TOKEN:    ${{ secrets.RH_DEVICE_TOKEN }}
         run: |
-          echo "CONFIG:"
-          echo "  dry_run=$DRY_RUN"
-          echo "  symbols=$SYMBOLS"
-          echo "  start=$START end=$END"
-          echo "  crypto_autopick=$CRYPTO_AUTOPICK equity_autopick=$EQUITY_AUTOPICK"
-          echo "  force_side=$FORCE_SIDE"
-          echo "  daily caps - eq=$DAILY_EQUITY_CAP cr=$DAILY_CRYPTO_CAP"
-          python main.py
-
-      - name: List out/
-        run: |
-          echo "Listing out/:"
-          ls -la out || true
-
-      - name: Upload results
-        uses: actions/upload-artifact@v4
-        with:
-          name: trade-outputs.zip
-          path: out/
-          if-no-files-found: warn
-          compression-level: 6
-          overwrite: false
-          include-hidden-files: false
+          python main.py \
+            --strategy cautious \
+            --cap_per_trade 25 \
+            --cap_daily 25 \
+            --dry_run false
