@@ -1,107 +1,450 @@
-name: headless-trader-live
+#!/usr/bin/env python3
+import os
+import sys
+import time
+import math
+from datetime import datetime, timezone
+from pathlib import Path
 
-on:
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Run in dry-run mode? true/false"
-        required: true
-        default: "true"
-      symbols:
-        description: "Comma-separated symbols (leave blank or a single space for autopick)"
-        required: true
-        default: "SPY,BTC-USD"
-      equity_dollars_per_trade:
-        description: "EQUITY dollars per trade"
-        required: true
-        default: "200"
-      crypto_dollars_per_trade:
-        description: "CRYPTO dollars per trade"
-        required: true
-        default: "5"
-      force_side:
-        description: "Force side for crypto (buy/sell or empty)"
-        required: false
-        default: ""
-      crypto_autopick:
-        description: "Autopick crypto top movers? true/false"
-        required: true
-        default: "true"
-      equity_autopick:
-        description: "Autopick equities top movers? true/false"
-        required: true
-        default: "false"
-      daily_equity_cap:
-        description: "Max EQUITY spend per day (USD)"
-        required: true
-        default: "25"
-      daily_crypto_cap:
-        description: "Max CRYPTO spend per day (USD)"
-        required: true
-        default: "15"
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from ta.momentum import RSIIndicator
+from ta.volatility import BollingerBands
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
+# brokers / exchanges
+import robin_stocks.robinhood as r
+import ccxt
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+OUT_DIR = os.getenv("OUT_DIR", "out")
+Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+# -----------------------------
+# Utilities / config parsing
+# -----------------------------
+def _b(s: str, default: bool = False) -> bool:
+    if s is None:
+        return default
+    return str(s).strip().lower() in {"1", "true", "t", "yes", "y"}
 
-      - name: Install deps
-        run: pip install -r requirements.txt
+def _f(s: str, default: float = 0.0) -> float:
+    try:
+        return float(s)
+    except Exception:
+        return default
 
-      - name: Run bot
-        env:
-          DRY_RUN: ${{ github.event.inputs.dry_run }}
-          SYMBOLS: ${{ github.event.inputs.symbols }}
-          # START/END intentionally omitted to keep inputs under the 10-limit.
-          # main.py will handle blanks (defaults).
-          START: ""
-          END: ""
-          EQUITY_DOLLARS_PER_TRADE: ${{ github.event.inputs.equity_dollars_per_trade }}
-          CRYPTO_DOLLARS_PER_TRADE: ${{ github.event.inputs.crypto_dollars_per_trade }}
-          FORCE_SIDE: ${{ github.event.inputs.force_side }}
-          CRYPTO_AUTOPICK: ${{ github.event.inputs.crypto_autopick }}
-          EQUITY_AUTOPICK: ${{ github.event.inputs.equity_autopick }}
-          # Advanced inputs pared back to stay under the limit
-          AUTOPICK_OVERRIDES: ""
-          OUT_DIR: "out"
-          # Brokers / Exchanges
-          EQUITY_BROKER: robinhood
-          CRYPTO_EXCHANGE: kraken
-          # API/Secret envs are expected to be set as repo secrets in Actions settings
-          RH_USERNAME: ${{ secrets.RH_USERNAME }}
-          RH_PASSWORD: ${{ secrets.RH_PASSWORD }}
-          RH_TOTP_SECRET: ${{ secrets.RH_TOTP_SECRET }}
-          CRYPTO_API_KEY: ${{ secrets.CRYPTO_API_KEY }}
-          CRYPTO_API_SECRET: ${{ secrets.CRYPTO_API_SECRET }}
-          CRYPTO_API_PASSPHRASE: ${{ secrets.CRYPTO_API_PASSPHRASE }}
-          # Daily spend caps (new)
-          DAILY_EQUITY_CAP: ${{ github.event.inputs.daily_equity_cap }}
-          DAILY_CRYPTO_CAP: ${{ github.event.inputs.daily_crypto_cap }}
-        run: |
-          echo "CONFIG:"
-          echo "  dry_run=$DRY_RUN"
-          echo "  symbols=$SYMBOLS"
-          echo "  start=$START end=$END"
-          echo "  crypto_autopick=$CRYPTO_AUTOPICK equity_autopick=$EQUITY_AUTOPICK"
-          echo "  force_side=$FORCE_SIDE"
-          python main.py
+def _n(s: str, default: float = 0.0) -> float:
+    # alias for notional amounts
+    return _f(s, default)
 
-      - name: List out/
-        run: |
-          echo "Listing out/:"
-          ls -la out || true
+def ts_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
 
-      - name: Upload results
-        uses: actions/upload-artifact@v4
-        with:
-          name: trade-outputs.zip
-          path: out/
-          if-no-files-found: warn
+def is_crypto_symbol(sym: str) -> bool:
+    # simple heuristic: crypto symbols we use look like "BTC-USD"
+    return "-" in sym or "/" in sym
+
+def norm_pair_for_ccxt(sym: str) -> str:
+    # Accepts "BTC-USD" or "BTC/USD" -> "BTC/USD"
+    return sym.replace("-", "/").upper()
+
+# -----------------------------
+# yfinance safety helpers
+# -----------------------------
+def _pick_col(df: pd.DataFrame, name: str) -> pd.Series:
+    """
+    Return df[name] as a 1D numeric Series even if yfinance produced a MultiIndex
+    or a 1-column DataFrame.
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        col = df.xs(name, axis=1, level=0)
+    else:
+        col = df[name]
+
+    if isinstance(col, pd.DataFrame):
+        col = col.iloc[:, 0]
+    return pd.to_numeric(col, errors="coerce")
+
+def fetch_ohlcv(ticker: str, start: str, end: str) -> dict:
+    df = yf.download(
+        ticker,
+        start=start if start else None,
+        end=end if end else None,
+        progress=False,
+        group_by="column",
+        auto_adjust=False,  # keep raw OHLCV
+    )
+    if df is None or df.empty or len(df) < 25:
+        raise ValueError("no or too little data")
+
+    return {
+        "close": _pick_col(df, "Close"),
+        "open": _pick_col(df, "Open"),
+        "high": _pick_col(df, "High"),
+        "low": _pick_col(df, "Low"),
+        "volume": _pick_col(df, "Volume"),
+        "df": df,
+    }
+
+def compute_indicators(close: pd.Series) -> dict:
+    rsi = RSIIndicator(close=close, window=14).rsi()
+    bb = BollingerBands(close=close, window=20, window_dev=2)
+    return {
+        "rsi": rsi,
+        "bb_high": bb.bollinger_hband(),
+        "bb_low": bb.bollinger_lband(),
+    }
+
+# -----------------------------
+# Decision engine (very simple)
+# -----------------------------
+def decide_signal(close: pd.Series, ind: dict, force_side: str | None) -> str:
+    """
+    Returns 'buy', 'sell' or 'hold'
+    Priority: explicit force_side -> RSI/BB rules
+    """
+    if force_side in {"buy", "sell"}:
+        return force_side
+
+    last_close = close.dropna().iloc[-1]
+    rsi = ind["rsi"].dropna().iloc[-1]
+    bb_h = ind["bb_high"].dropna().iloc[-1]
+    bb_l = ind["bb_low"].dropna().iloc[-1]
+
+    # Simple combo rules
+    if rsi <= 30 or last_close <= bb_l:
+        return "buy"
+    if rsi >= 70 or last_close >= bb_h:
+        return "sell"
+    return "hold"
+
+# -----------------------------
+# Robinhood (equities)
+# -----------------------------
+def rh_login():
+    user = os.getenv("RH_USERNAME")
+    pwd = os.getenv("RH_PASSWORD")
+    totp = os.getenv("RH_TOTP_SECRET", "")
+    if not user or not pwd:
+        raise RuntimeError("Missing RH_USERNAME / RH_PASSWORD")
+
+    # use challenges/approvals (it will print prompts to console)
+    print("Starting login process...")
+    r.authentication.login(
+        username=user,
+        password=pwd,
+        expiresIn=86400,
+        by_sms=not bool(totp),
+        store_session=False,
+        mfa_code=None,
+        challenge_type="sms" if not totp else None,
+    )
+    print("Verification successful!")
+
+def rh_place_equity(symbol: str, side: str, notional_usd: float, dry_run: bool) -> dict:
+    payload = {"symbol": symbol, "side": side, "notional": notional_usd}
+    if dry_run:
+        return {"dry_run": True, **payload}
+
+    # Fractional dollar orders
+    if side == "buy":
+        oid = r.orders.order_buy_fractional_by_price(symbol, amountInDollars=notional_usd, timeInForce="gfd")
+    elif side == "sell":
+        oid = r.orders.order_sell_fractional_by_price(symbol, amountInDollars=notional_usd, timeInForce="gfd")
+    else:
+        return {"skipped": "hold", **payload}
+
+    return {"dry_run": False, **payload, "order_id": oid}
+
+def rh_position_dollars(symbol: str) -> float:
+    pos = r.account.build_holdings()
+    if symbol.upper() in pos:
+        # estimate available market value in dollars
+        try:
+            return float(pos[symbol.upper()].get("equity", 0))
+        except Exception:
+            return 0.0
+    return 0.0
+
+# -----------------------------
+# Kraken via ccxt (crypto)
+# -----------------------------
+def ccxt_exchange():
+    ex_name = os.getenv("CRYPTO_EXCHANGE", "kraken").lower()
+    key = os.getenv("CRYPTO_API_KEY", "")
+    sec = os.getenv("CRYPTO_API_SECRET", "")
+    pwd = os.getenv("CRYPTO_API_PASSPHRASE", None)
+
+    cls = getattr(ccxt, ex_name)
+    opts = {"apiKey": key, "secret": sec}
+    if pwd:
+        opts["password"] = pwd
+
+    ex = cls(opts)
+    ex.load_markets()
+    return ex
+
+def ccxt_base_free(ex, sym: str) -> float:
+    ex.fetch_balance()  # ensure fresh
+    base = norm_pair_for_ccxt(sym).split("/")[0]
+    bal = ex.fetch_balance()
+    free = bal.get(base, {}).get("free", 0.0)
+    try:
+        return float(free or 0.0)
+    except Exception:
+        return 0.0
+
+def ccxt_place_crypto(ex, sym: str, side: str, notional_usd: float, dry_run: bool) -> dict:
+    market = norm_pair_for_ccxt(sym)
+    payload = {"symbol": sym, "side": side, "notional_usd": notional_usd}
+
+    if side == "hold":
+        return {"skipped": "hold", **payload}
+
+    # price to convert dollars -> amount
+    ticker = ex.fetch_ticker(market)
+    price = float(ticker["last"]) if ticker and ticker.get("last") else None
+    if not price or price <= 0:
+        return {"skipped": "no_price", **payload}
+
+    amount = round(notional_usd / price, 8)  # base size
+
+    if side == "sell":
+        base_free = ccxt_base_free(ex, sym)
+        if base_free <= 0:
+            return {"skipped": "no_position", "reason": "base_free=0", **payload}
+        amount = min(amount, base_free)
+
+    if dry_run:
+        return {"dry_run": True, **payload, "amount": amount}
+
+    order = ex.create_order(market, type="market", side=side, amount=amount)
+    return {"dry_run": False, **payload, "amount": amount, "order": order}
+
+# -----------------------------
+# CSV logging helpers
+# -----------------------------
+def write_analysis_csv(ticker: str, close, high, low, open_, volume, ind: dict):
+    df = pd.DataFrame(
+        {
+            "Price": close,
+            "Close": close,
+            "High": high,
+            "Low": low,
+            "Open": open_,
+            "Volume": volume,
+            "RSI": ind["rsi"],
+            "BB_high": ind["bb_high"],
+            "BB_low": ind["bb_low"],
+        }
+    )
+    df.to_csv(f"{OUT_DIR}/{ticker}_analysis.csv", index_label="Date")
+
+def append_trade_log(ticker: str, close, ind: dict, signal: str):
+    last_idx = close.dropna().index[-1]
+    row = pd.DataFrame(
+        {
+            "Date": [pd.to_datetime(last_idx).strftime("%-m/%-d/%Y") if hasattr(last_idx, "strftime") else str(last_idx)],
+            "Ticker": [ticker],
+            "Close": [float(close.dropna().iloc[-1])],
+            "RSI": [float(ind["rsi"].dropna().iloc[-1])],
+            "BB_high": [float(ind["bb_high"].dropna().iloc[-1])],
+            "BB_low": [float(ind["bb_low"].dropna().iloc[-1])],
+            "Signal": [signal.capitalize()],
+        }
+    )
+
+    per_file = f"{OUT_DIR}/{ticker}_trade_log.csv"
+    comb_file = f"{OUT_DIR}/combined_trade_log.csv"
+
+    header = not os.path.exists(per_file)
+    row.to_csv(per_file, mode="a", header=header, index=False)
+
+    header2 = not os.path.exists(comb_file)
+    row.to_csv(comb_file, mode="a", header=header2, index=False)
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    # --- env ---
+    dry_run = _b(os.getenv("DRY_RUN", "true"))
+    start = os.getenv("START", "2023-01-01").strip()
+    end = os.getenv("END", "").strip()
+    symbols_raw = os.getenv("SYMBOLS", "").strip()
+    force_side_crypto = os.getenv("FORCE_SIDE", "").strip().lower() or None
+
+    eq_notional = _n(os.getenv("EQUITY_DOLLARS_PER_TRADE", "2"))
+    cr_notional = _n(os.getenv("CRYPTO_DOLLARS_PER_TRADE", "5"))
+
+    crypto_autopick = _b(os.getenv("CRYPTO_AUTOPICK", "true"))
+    equity_autopick = _b(os.getenv("EQUITY_AUTOPICK", "false"))
+    autopick_overrides = (os.getenv("AUTOPICK_OVERRIDES", "") or "").strip()
+
+    equity_broker = os.getenv("EQUITY_BROKER", "robinhood").lower()
+    crypto_exchange = os.getenv("CRYPTO_EXCHANGE", "kraken").lower()
+
+    # daily caps (USD)
+    daily_eq_cap = _n(os.getenv("DAILY_EQUITY_CAP", "0"))
+    daily_cr_cap = _n(os.getenv("DAILY_CRYPTO_CAP", "0"))
+
+    # --- symbols selection / autopick ---
+    symbols = []
+    if symbols_raw:
+        symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+    else:
+        # "single space" means autopick in your UI; emulate that here
+        if crypto_autopick:
+            symbols.append("BTC-USD")
+        if equity_autopick:
+            symbols.append("SPY")
+
+    # append any manual overrides
+    if autopick_overrides:
+        for s in autopick_overrides.split(","):
+            s = s.strip().upper()
+            if s and s not in symbols:
+                symbols.append(s)
+
+    # flags for which venue is active
+    equity_enabled = any(not is_crypto_symbol(s) for s in symbols)
+    crypto_enabled = any(is_crypto_symbol(s) for s in symbols)
+
+    # --- print config ---
+    print("CONFIG PATH:", sys.executable)
+    print("Python:", sys.version)
+    print("DRY_RUN:", dry_run)
+    print("SYMBOLS:", ",".join(symbols) if symbols else "(none)")
+    print("START:", start or "(empty)")
+    print("END:", end or "(empty)")
+    print("EQUITY_DOLLARS_PER_TRADE:", eq_notional)
+    print("CRYPTO_DOLLARS_PER_TRADE:", cr_notional)
+    print("FORCE_SIDE:", force_side_crypto or "(none)")
+    print("crypto_autopick:", crypto_autopick, "equity_autopick:", equity_autopick)
+    print("autopick_overrides:", autopick_overrides or "(none)")
+    print("OUT_DIR:", OUT_DIR)
+    print("EQUITY_BROKER:", equity_broker)
+    print("CRYPTO_EXCHANGE:", crypto_exchange)
+    print("DAILY_EQUITY_CAP:", daily_eq_cap or 0)
+    print("DAILY_CRYPTO_CAP:", daily_cr_cap or 0)
+    print("----")
+
+    # --- connect brokers if needed ---
+    if equity_enabled and equity_broker == "robinhood":
+        try:
+            rh_login()
+        except Exception as e:
+            print("Robinhood login error:", e)
+            if not dry_run:
+                print("Switching to dry-run due to login problem.")
+                dry_run = True
+
+    ex = None
+    if crypto_enabled:
+        try:
+            ex = ccxt_exchange()
+        except Exception as e:
+            print("Exchange init error:", e)
+            if not dry_run:
+                print("Switching to dry-run due to exchange init problem.")
+                dry_run = True
+
+    # --- spend accounting (per run/day) ---
+    spent_eq = 0.0
+    spent_cr = 0.0
+
+    # --- iterate symbols ---
+    for ticker in symbols:
+        is_crypto = is_crypto_symbol(ticker)
+        fside = force_side_crypto if is_crypto else None
+
+        # cap check (per venue)
+        if is_crypto and daily_cr_cap > 0 and spent_cr >= daily_cr_cap:
+            print(f"CAP: crypto cap reached (${spent_cr:.2f} >= ${daily_cr_cap:.2f}). Skipping {ticker}.")
+            continue
+        if (not is_crypto) and daily_eq_cap > 0 and spent_eq >= daily_eq_cap:
+            print(f"CAP: equity cap reached (${spent_eq:.2f} >= ${daily_eq_cap:.2f}). Skipping {ticker}.")
+            continue
+
+        # data & indicators
+        try:
+            data = fetch_ohlcv(ticker, start=start, end=end)
+            ind = compute_indicators(data["close"])
+        except Exception as e:
+            print(f"Data error for {ticker}: {e}")
+            continue
+
+        # write per-ticker analysis
+        write_analysis_csv(
+            ticker,
+            data["close"],
+            data["high"],
+            data["low"],
+            data["open"],
+            data["volume"],
+            ind,
+        )
+
+        signal = decide_signal(data["close"], ind, fside)
+        append_trade_log(ticker, data["close"], ind, signal)
+
+        # decide notional & venue
+        eq_amount = eq_notional if not is_crypto else 0.0
+        cr_amount = cr_notional if is_crypto else 0.0
+
+        print(
+            f"ROUTE: {ticker} is_crypto={is_crypto} side={signal} "
+            f"eq_notional={eq_amount} cr_notional={cr_amount} dry_run={dry_run}"
+        )
+
+        # execute / simulate
+        if is_crypto:
+            # enforce cap before order
+            if signal in {"buy", "sell"} and daily_cr_cap > 0:
+                # if placing this would exceed cap, trim the notional
+                remaining = max(daily_cr_cap - spent_cr, 0.0)
+                if remaining <= 0:
+                    print(f"CAP: no remaining crypto budget today. Skipping {ticker}.")
+                    continue
+                if cr_amount > remaining:
+                    print(f"CAP: trimming crypto notional from ${cr_amount} -> ${remaining}")
+                    cr_amount = remaining
+
+            res = ccxt_place_crypto(ex, ticker, signal, cr_amount, dry_run)
+            print("CRYPTO", ticker, signal, "->", res)
+
+            if signal in {"buy", "sell"} and not res.get("skipped"):
+                spent_cr += cr_amount
+
+        else:
+            # equities via Robinhood
+            if signal == "hold":
+                print("EQUITY", ticker, signal, "->", {"skipped": "hold"})
+            else:
+                # cap trim
+                if daily_eq_cap > 0:
+                    remaining = max(daily_eq_cap - spent_eq, 0.0)
+                    if remaining <= 0:
+                        print(f"CAP: no remaining equity budget today. Skipping {ticker}.")
+                        continue
+                    if eq_amount > remaining:
+                        print(f"CAP: trimming equity notional from ${eq_amount} -> ${remaining}")
+                        eq_amount = remaining
+
+                # if selling but no position, skip
+                if signal == "sell":
+                    have = rh_position_dollars(ticker)
+                    if have <= 0:
+                        print(f"EQUITY {ticker} sell -> {{'skipped':'no_position'}}")
+                        continue
+
+                res = rh_place_equity(ticker, signal, eq_amount, dry_run)
+                print("EQUITY", ticker, signal, "->", res)
+
+                if not res.get("skipped"):
+                    spent_eq += eq_amount
+
+    print(f"Dry run = {dry_run}. Orders {'NOT ' if dry_run else ''}placed. Files saved to {OUT_DIR}/")
+
+if __name__ == "__main__":
+    main()
