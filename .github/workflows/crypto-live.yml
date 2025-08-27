@@ -9,7 +9,6 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
-    # Prevent overlap if you manually trigger more than once
     concurrency:
       group: crypto-live
       cancel-in-progress: false
@@ -28,11 +27,14 @@ jobs:
 
       - name: Run Crypto Live (Kraken, cautious caps)
         env:
-          # Mode / notifications
+          # Force live
           TRADE_MODE: "live"
+          DRY_RUN: "false"
+
+          # Notifications
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
-          # Exchange selection (cover common code paths)
+          # Exchange selection
           EXCHANGE: "kraken"
           CCXT_EXCHANGE: "kraken"
 
@@ -49,4 +51,5 @@ jobs:
             --exchange kraken \
             --strategy cautious \
             --cap_per_trade 10 \
-            --cap_daily 15
+            --cap_daily 15 \
+            --dry_run false
