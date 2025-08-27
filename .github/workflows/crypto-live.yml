@@ -1,60 +1,27 @@
-name: Crypto Live
+name: Crypto Live (Cautious)
 
 on:
-  workflow_dispatch:
   schedule:
     - cron: "*/15 * * * *"   # every 15 minutes
+  workflow_dispatch:          # still allow manual run
 
 jobs:
-  run:
+  trade:
     runs-on: ubuntu-latest
-    concurrency:
-      group: crypto-live
-      cancel-in-progress: false
-
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
-
+      - uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
-      - name: Run Crypto Live (Kraken, cautious caps, 15-min, dip gate)
+      - name: Run cautious live trading
         env:
-          TRADE_MODE: "live"
-          DRY_RUN: "false"
-
-          MARKET: "crypto"
-          EQUITY_BROKER: "none"
-
-          # Basket to scan (comma-separated)
-          SYMBOLS: "BTC-USD,ETH-USD,SOL-USD,ADA-USD,XRP-USD,LTC-USD,DOGE-USD"
-
-          # Dip gate controls (tune anytime)
-          DROP_PCT: "2.0"        # require >= 2.0% below SMA to allow BUYS
-          LOOKBACK_MIN: "60"     # (leave as-is unless you want a longer SMA)
-
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-
-          EXCHANGE: "kraken"
-          CCXT_EXCHANGE: "kraken"
-
-          CRYPTO_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
-          CRYPTO_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          CCXT_API_KEY:      ${{ secrets.KRAKEN_API_KEY }}
-          CCXT_API_SECRET:   ${{ secrets.KRAKEN_API_SECRET }}
-          KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-        run: |
-          python tools/run_live.py \
-            --market crypto \
-            --exchange kraken \
-            --strategy cautious \
-            --cap_per_trade 10 \
-            --cap_daily 15 \
-            --dry_run false
+          MODE: live
+          DRY_RUN: "true"            # change to "false" once you’re ready
+          PROFILE: cautious
+          DROP_PCT: "0.0"            # dip gate OFF
+          TRADE_SIZE: "10"           # $10 per trade
+          DAILY_CAP: "15"            # $15/day cap
+        run: python main.py
