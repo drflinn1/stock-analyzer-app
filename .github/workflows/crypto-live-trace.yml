@@ -1,0 +1,49 @@
+name: Crypto Live (Trace)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: crypto-live-trace
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run STRICT Crypto (trace ambiguous Series)
+        env:
+          # Force LIVE for parity with your live job
+          TRADE_MODE: "live"
+          DRY_RUN: "false"
+
+          # Limit to crypto only
+          MARKET: "crypto"
+          EQUITY_BROKER: "none"
+          SYMBOLS: "BTC-USD"
+
+          # Exchange & creds
+          EXCHANGE: "kraken"
+          CCXT_EXCHANGE: "kraken"
+          CRYPTO_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
+          CRYPTO_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          CCXT_API_KEY:      ${{ secrets.KRAKEN_API_KEY }}
+          CCXT_API_SECRET:   ${{ secrets.KRAKEN_API_SECRET }}
+          KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
+          # Make warnings fatal so we see everything
+          PYTHONWARNINGS: "error"
+        run: |
+          python tools/safe_run_crypto.py
