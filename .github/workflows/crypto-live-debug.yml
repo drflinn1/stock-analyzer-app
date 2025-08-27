@@ -42,7 +42,7 @@ jobs:
           CRYPTO_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
           CRYPTO_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
           CCXT_API_KEY:      ${{ secrets.KRAKEN_API_KEY }}
-          CCXT_API_SECRET:   ${{ secrets_KRAKEN_API_SECRET }} # note: if your secret is named exactly as above, keep it
+          CCXT_API_SECRET:   ${{ secrets.KRAKEN_API_SECRET }}
           KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
@@ -54,7 +54,7 @@ jobs:
         run: |
           set -euxo pipefail
           python -V
-          # -W error again on CLI to be extra sure
+          # Also pass -W error via CLI to be extra sure
           python -W error main.py \
             --market crypto \
             --exchange kraken \
