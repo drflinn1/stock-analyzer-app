@@ -4,15 +4,16 @@ tools/run_live.py
 
 Wrapper that:
 1) Cleans a noisy pandas message in logs.
-2) Optional "dip gate": only run trades if price has dropped >= DROP_PCT
-   vs a LOOKBACK_MIN-minute SMA for at least one symbol.
+2) Dip gate: only allow BUYS when price has dropped >= DROP_PCT vs LOOKBACK_MIN SMA.
+   - If the dip gate FAILS, we still run but force sells only (buys disabled).
+   - If the dip gate PASSES, we run normally (buys & sells).
 
 Env/CLI controls (defaults in parentheses):
-  DROP_PCT (1.5)          # % drop vs SMA required to proceed
+  DROP_PCT (1.5)          # % drop vs SMA required to allow buys
   LOOKBACK_MIN (60)       # minutes of 1m candles for SMA
   SYMBOLS (from workflow) # comma-separated, e.g. BTC-USD,ETH-USD,...
 
-If the gate is not satisfied, the script exits 0 (no orders).
+If DROP_PCT <= 0, the dip gate is disabled (both buys & sells allowed).
 """
 
 import os
@@ -38,7 +39,7 @@ class _FilterStream(io.TextIOBase):
 sys.stdout = _FilterStream(sys.stdout)
 sys.stderr = _FilterStream(sys.stderr)
 
-# Build argv if launched directly
+# Build argv if launched directly (same defaults as before)
 if len(sys.argv) == 1:
     sys.argv = [
         "main.py",
@@ -58,18 +59,16 @@ os.environ.setdefault("DRY_RUN", "false")
 # Dip gate (ccxt + 1m OHLC)
 # -------------------------
 def _parse_symbols() -> List[str]:
-    # Prefer env SYMBOLS, else derive from CLI (if present)
     env_syms = os.environ.get("SYMBOLS", "")
     if env_syms.strip():
         raw = env_syms.split(",")
     else:
-        # Fallback: scan argv for --symbols or single --symbol (not required)
+        # fallback: scan argv for --symbols/--symbol if present
         raw = []
         for i, tok in enumerate(sys.argv):
             if tok in ("--symbols", "--symbol") and i + 1 < len(sys.argv):
                 raw = sys.argv[i + 1].split(",")
                 break
-    # Normalize to ccxt symbols (BTC-USD -> BTC/USD)
     syms = [s.strip().replace("-", "/").upper() for s in raw if s.strip()]
     return syms or ["BTC/USD"]
 
@@ -81,14 +80,14 @@ def _int_env(name: str, default: int) -> int:
     try: return int(float(os.environ.get(name, "").strip() or default))
     except Exception: return default
 
-def dip_gate():
+def dip_gate_allows_buys() -> bool:
     drop_pct = _float_env("DROP_PCT", 1.5)         # %
     lookback = _int_env("LOOKBACK_MIN", 60)        # minutes
     symbols = _parse_symbols()
 
-    # If user explicitly disables with DROP_PCT <= 0, always proceed
+    # Disable gate entirely with DROP_PCT<=0
     if drop_pct <= 0 or lookback <= 1:
-        print(f"[dip-gate] Disabled (DROP_PCT={drop_pct}, LOOKBACK_MIN={lookback}). Proceeding.")
+        print(f"[dip-gate] Disabled (DROP_PCT={drop_pct}, LOOKBACK_MIN={lookback}). Buys & sells allowed.")
         return True
 
     try:
@@ -98,10 +97,9 @@ def dip_gate():
         limit = max(lookback, 5)
 
         print(f"[dip-gate] Checking {symbols} for {drop_pct:.3f}% drop vs {lookback}m SMA...")
-        proceed = False
+        allow_buys = False
 
         for sym in symbols:
-            # Fetch 1m candles
             ohlcv = ex.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
             if not ohlcv or len(ohlcv) < 3:
                 print(f"[dip-gate] {sym}: insufficient candles ({len(ohlcv) if ohlcv else 0}); skipping symbol.")
@@ -118,22 +116,32 @@ def dip_gate():
             print(f"[dip-gate] {sym}: last={last:.6f} SMA={sma:.6f} drop={drop:.3f}%")
 
             if drop >= drop_pct:
-                print(f"[dip-gate] {sym}: threshold met (>= {drop_pct}%). Trading allowed.")
-                proceed = True
-                # We allow run to proceed if ANY symbol meets dip; no need to check all, but continue for logging
+                print(f"[dip-gate] {sym}: threshold met (>= {drop_pct}%). Buys allowed.")
+                allow_buys = True
+                # continue logging for other symbols
 
-        if not proceed:
-            print(f"[dip-gate] No symbol met dip threshold ({drop_pct}%). Skipping run.")
-        return proceed
+        if not allow_buys:
+            print(f"[dip-gate] No symbol met dip threshold ({drop_pct}%). Buys will be blocked; sells allowed.")
+        return allow_buys
 
     except Exception as e:
-        # If dip gate fails (network, ccxt, etc.), fail open (proceed) so trading can still happen
-        print(f"[dip-gate] Error while checking dips: {e}. Proceeding anyway.")
+        # Fail open (both buys/sells allowed) if gate cannot evaluate for any reason
+        print(f"[dip-gate] Error while checking dips: {e}. Buys & sells allowed.")
         return True
 
-if not dip_gate():
-    # Exit gracefully without running the core bot
-    sys.exit(0)
+# Decide how to run main.py
+buys_allowed = dip_gate_allows_buys()
 
-# Hand off to your app
+# If buys are NOT allowed, force sells only for this run by appending --force_side sell
+argv = list(sys.argv)
+if "--force_side" not in argv:
+    if not buys_allowed:
+        print("[dip-gate] Enforcing sells-only this run (--force_side sell).")
+        argv.extend(["--force_side", "sell"])
+    else:
+        # explicit clarity
+        argv.extend(["--force_side", "(none)"])
+
+# Hand off to your app with possibly-adjusted argv
+sys.argv = argv
 runpy.run_path("main.py", run_name="__main__")
