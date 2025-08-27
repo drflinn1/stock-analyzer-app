@@ -3,15 +3,12 @@ name: Trader Live
 on:
   workflow_dispatch:
   schedule:
-    # Morning + evening (UTC). 14:00 UTC ≈ 7 AM PT / 10 AM ET; 22:00 UTC ≈ 3 PM PT / 6 PM ET
     - cron: "0 14 * * *"
     - cron: "0 22 * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
-    # Prevent overlapping equity runs
     concurrency:
       group: equities-live
       cancel-in-progress: false
@@ -30,20 +27,16 @@ jobs:
 
       - name: Run Trader Live (equities, cautious caps)
         env:
-          # Force LIVE
           TRADE_MODE: "live"
           DRY_RUN: "false"
-
-          # Notifications
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
-          # Robinhood creds
           ROBINHOOD_USERNAME: ${{ secrets.ROBINHOOD_USERNAME }}
           ROBINHOOD_PASSWORD: ${{ secrets.ROBINHOOD_PASSWORD }}
           ROBINHOOD_MFA:      ${{ secrets.ROBINHOOD_MFA }}
           RH_DEVICE_TOKEN:    ${{ secrets.RH_DEVICE_TOKEN }}
         run: |
-          python main.py \
+          python tools/run_live.py \
             --strategy cautious \
             --cap_per_trade 25 \
             --cap_daily 25 \
