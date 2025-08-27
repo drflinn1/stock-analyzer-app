@@ -6,19 +6,11 @@ on:
       dry_run:
         description: "Run in dry-run mode? true/false"
         required: true
-        default: "false"
+        default: "true"
       symbols:
         description: "Comma-separated symbols (leave blank or a single space for autopick)"
         required: true
-        default: "SPY"
-      start:
-        description: "Start date (YYYY-MM-DD)"
-        required: true
-        default: "2023-01-01"
-      end:
-        description: "End date (YYYY-MM-DD, empty=today)"
-        required: false
-        default: ""
+        default: "SPY,BTC-USD"
       equity_dollars_per_trade:
         description: "EQUITY dollars per trade"
         required: true
@@ -26,7 +18,7 @@ on:
       crypto_dollars_per_trade:
         description: "CRYPTO dollars per trade"
         required: true
-        default: "10"
+        default: "5"
       force_side:
         description: "Force side for crypto (buy/sell or empty)"
         required: false
@@ -34,22 +26,27 @@ on:
       crypto_autopick:
         description: "Autopick crypto top movers? true/false"
         required: true
-        default: "false"
+        default: "true"
       equity_autopick:
         description: "Autopick equities top movers? true/false"
         required: true
         default: "false"
-      overrides_json:
-        description: "Optional JSON for advanced settings (e.g. {\"eq_daily_cap\":25,\"cr_daily_cap\":0})"
-        required: false
-        default: ""
+      daily_equity_cap:
+        description: "Max EQUITY spend per day (USD)"
+        required: true
+        default: "25"
+      daily_crypto_cap:
+        description: "Max CRYPTO spend per day (USD)"
+        required: true
+        default: "15"
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -61,35 +58,33 @@ jobs:
 
       - name: Run bot
         env:
-          DRY_RUN: ${{ inputs.dry_run }}
-          SYMBOLS: ${{ inputs.symbols }}
-          START: ${{ inputs.start }}
-          END: ${{ inputs.end }}
-
-          EQUITY_DOLLARS_PER_TRADE: ${{ inputs.equity_dollars_per_trade }}
-          CRYPTO_DOLLARS_PER_TRADE: ${{ inputs.crypto_dollars_per_trade }}
-
-          FORCE_SIDE: ${{ inputs.force_side }}
-          CRYPTO_AUTOPICK: ${{ inputs.crypto_autopick }}
-          EQUITY_AUTOPICK: ${{ inputs.equity_autopick }}
-
-          # Put caps (and any future advanced flags) in this JSON.
-          AUTOPICK_OVERRIDES: ${{ inputs.overrides_json }}
-
-          OUT_DIR: out
-
-          # Brokers/exchange
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          SYMBOLS: ${{ github.event.inputs.symbols }}
+          # START/END intentionally omitted to keep inputs under the 10-limit.
+          # main.py will handle blanks (defaults).
+          START: ""
+          END: ""
+          EQUITY_DOLLARS_PER_TRADE: ${{ github.event.inputs.equity_dollars_per_trade }}
+          CRYPTO_DOLLARS_PER_TRADE: ${{ github.event.inputs.crypto_dollars_per_trade }}
+          FORCE_SIDE: ${{ github.event.inputs.force_side }}
+          CRYPTO_AUTOPICK: ${{ github.event.inputs.crypto_autopick }}
+          EQUITY_AUTOPICK: ${{ github.event.inputs.equity_autopick }}
+          # Advanced inputs pared back to stay under the limit
+          AUTOPICK_OVERRIDES: ""
+          OUT_DIR: "out"
+          # Brokers / Exchanges
           EQUITY_BROKER: robinhood
           CRYPTO_EXCHANGE: kraken
-
-          # Secrets
+          # API/Secret envs are expected to be set as repo secrets in Actions settings
           RH_USERNAME: ${{ secrets.RH_USERNAME }}
           RH_PASSWORD: ${{ secrets.RH_PASSWORD }}
           RH_TOTP_SECRET: ${{ secrets.RH_TOTP_SECRET }}
-          CRYPTO_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          CRYPTO_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          CRYPTO_API_PASSPHRASE: ${{ secrets.KRAKEN_API_PASSPHRASE }}
-
+          CRYPTO_API_KEY: ${{ secrets.CRYPTO_API_KEY }}
+          CRYPTO_API_SECRET: ${{ secrets.CRYPTO_API_SECRET }}
+          CRYPTO_API_PASSPHRASE: ${{ secrets.CRYPTO_API_PASSPHRASE }}
+          # Daily spend caps (new)
+          DAILY_EQUITY_CAP: ${{ github.event.inputs.daily_equity_cap }}
+          DAILY_CRYPTO_CAP: ${{ github.event.inputs.daily_crypto_cap }}
         run: |
           echo "CONFIG:"
           echo "  dry_run=$DRY_RUN"
@@ -104,8 +99,9 @@ jobs:
           echo "Listing out/:"
           ls -la out || true
 
-      - name: Upload outputs
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
           name: trade-outputs.zip
           path: out/
+          if-no-files-found: warn
