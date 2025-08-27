@@ -36,8 +36,8 @@ jobs:
           SYMBOLS: "BTC-USD,ETH-USD,SOL-USD,ADA-USD,XRP-USD,LTC-USD,DOGE-USD"
 
           # Dip gate controls (tune anytime)
-          DROP_PCT: "1.5"         # require >=1.5% below 60m SMA to trade
-          LOOKBACK_MIN: "60"      # SMA window in minutes
+          DROP_PCT: "2.0"        # require >= 2.0% below SMA to allow BUYS
+          LOOKBACK_MIN: "60"     # (leave as-is unless you want a longer SMA)
 
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
