@@ -2,21 +2,22 @@
 """
 Stock Analyzer / Crypto Live Runner
 - Series-safe & 1-D hardened (no ambiguous pandas truth checks)
-- Robust to empty/missing data (graceful skip, no IndexError)
+- Robust empty/sparse-data handling + interval fallback (5m→15m→30m→1h→1d)
 - Auto-pick top performers (24h change) when CRYPTO_AUTOPICK=true
 - Env knobs:
     MODE: "live" | "paper" (informational)
     DRY_RUN: "true" | "false"
     PROFILE: "cautious" | "aggressive"
     DROP_PCT: "0.0" | "2.0" ...
-    TRADE_SIZE: float in USD (e.g., "10")
-    DAILY_CAP: float USD (e.g., "15")
-    INTERVAL: yfinance interval for strategy bars (default "5m")
-    LOOKBACK_MIN: rows for strategy calc (default 200)
-    CRYPTO_AUTOPICK: "true" | "false"  (default true)
+    TRADE_SIZE: float USD
+    DAILY_CAP: float USD
+    INTERVAL: primary interval for strategy (default "5m")
+    LOOKBACK_MIN: rows to fetch for strategy calc (default 200)
+    MIN_BARS: minimum bars required after cleaning (default 30)
+    CRYPTO_AUTOPICK: "true" | "false" (default true)
     AUTOPICK_TOP_N: integer (default 4)
-    CRYPTO_UNIVERSE: comma list (default: BTC-USD,ETH-USD,SOL-USD,ADA-USD,XRP-USD,LTC-USD,DOGE-USD,AVAX-USD,BNB-USD,MATIC-USD)
-    CRYPTO_TICKERS: comma list used only if CRYPTO_AUTOPICK=false
+    CRYPTO_UNIVERSE: comma list (default sample majors)
+    CRYPTO_TICKERS: used only if CRYPTO_AUTOPICK=false
 - Persists daily cap to out/caps_YYYYMMDD.json
 - Saves artifacts to out/routes_*.json/csv
 """
@@ -105,10 +106,7 @@ def save_caps(caps: Dict[str, Any]):
 # ---------------------------
 
 def to_series_1d(x) -> pd.Series:
-    """
-    Coerce input to a 1-D float Series.
-    Handles DataFrame (takes first column), ndarray (ravel), list/tuple, or Series.
-    """
+    """Coerce input to a 1-D float Series."""
     if isinstance(x, pd.DataFrame):
         if x.shape[1] == 0:
             return pd.Series(dtype=float)
@@ -163,40 +161,44 @@ def _period_for_interval(interval: str) -> str:
         "1d": "5y",
     }.get(interval, "30d")
 
-def fetch_ohlc(ticker: str, interval: str, lookback: int) -> pd.DataFrame:
+def fetch_ohlc_once(ticker: str, interval: str, lookback: int) -> pd.DataFrame:
     period = _period_for_interval(interval)
     df = yf.download(ticker, period=period, interval=interval, progress=False)
-
-    # Normalize shape / columns
     if df is None or not isinstance(df, (pd.DataFrame, pd.Series)) or len(df) == 0:
-        return pd.DataFrame()  # <- empty, handled upstream
+        return pd.DataFrame()
     if isinstance(df, pd.Series):
         df = df.to_frame()
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[-1] if isinstance(c, tuple) else c for c in df.columns]
     df = df.rename(columns=str.lower)
-
-    # Ensure expected columns exist
     for c in ["open", "high", "low", "close", "volume"]:
         if c not in df.columns:
             if c == "close" and "adj close" in df.columns:
                 df["close"] = df["adj close"]
             else:
                 df[c] = np.nan
-
     df = df.tail(int(lookback)).copy()
     df.dropna(subset=["close"], inplace=True)
-
-    # Coerce to 1-D numeric series for close
     if "close" not in df or df["close"].empty:
-        return pd.DataFrame()  # nothing to work with
-
-    df["close"] = to_series_1d(df["close"]).values
-    # Still empty or too small? Return empty to be skipped gracefully.
-    if len(df["close"]) == 0:
         return pd.DataFrame()
-
+    df["close"] = to_series_1d(df["close"]).values
     return df
+
+def fetch_ohlc_with_fallback(ticker: str, interval: str, lookback: int, min_bars: int) -> Tuple[pd.DataFrame, str]:
+    """
+    Try primary interval, then fall back through 15m→30m→1h→1d until we get >= min_bars.
+    Returns (df, used_interval) where df may be empty if all fail.
+    """
+    chain = [interval]
+    for alt in ["15m", "30m", "1h", "1d"]:
+        if alt not in chain:
+            chain.append(alt)
+
+    for iv in chain:
+        df = fetch_ohlc_once(ticker, iv, lookback)
+        if not df.empty and len(df) >= max(10, min_bars):  # allow a little slack
+            return df, iv
+    return pd.DataFrame(), chain[-1]
 
 # 24h perf for ranking (independent of strategy interval)
 def pct_change_24h(ticker: str) -> float:
@@ -210,7 +212,6 @@ def pct_change_24h(ticker: str) -> float:
         if len(close) < 2:
             return float("-inf")
         last = float(close.iloc[-1])
-        # 24h ago (approx) — if the exact timestamp isn’t present, use ~24 bars back fallback
         idx_24 = -24 if len(close) >= 25 else -(len(close)-1)
         base = float(close.iloc[idx_24])
         if base <= 0:
@@ -231,12 +232,12 @@ def rank_top_performers(universe: List[str], top_n: int) -> List[str]:
 # Strategy (collapse to latest)
 # ---------------------------
 
-def decide_signal(df: pd.DataFrame, profile: str, drop_pct_gate: float) -> Dict[str, Any]:
+def decide_signal(df: pd.DataFrame, profile: str, drop_pct_gate: float, min_bars: int) -> Dict[str, Any]:
     """
     Return dict: {side: buy|sell|skip, reason: str}
     Uses only last candle scalars to avoid ambiguous boolean checks.
     """
-    if df is None or df.empty or "close" not in df or len(df["close"]) < 30:
+    if df is None or df.empty or "close" not in df or len(df["close"]) < max(10, min_bars):
         return {"side": "skip", "reason": "insufficient_data"}
 
     close = to_series_1d(df["close"])
@@ -278,9 +279,7 @@ def simulate_order(symbol: str, side: str, notional_usd: float) -> Dict[str, Any
     return {"ok": True, "message": f"DRY_RUN {side} ${notional_usd:.2f} {symbol}"}
 
 def place_order_live(symbol: str, side: str, notional_usd: float) -> Dict[str, Any]:
-    """
-    Live order stub via ccxt if keys exist; otherwise returns disabled.
-    """
+    """Live order stub via ccxt if keys exist; otherwise returns disabled."""
     try:
         import ccxt  # type: ignore
         api_key = os.environ.get("KRAKEN_API_KEY")
@@ -312,6 +311,7 @@ def run() -> int:
     daily_cap = env_float("DAILY_CAP", 15.0)
     interval = env_str("INTERVAL", "5m")
     lookback = int(env_float("LOOKBACK_MIN", 200))
+    min_bars = env_int("MIN_BARS", 30)
 
     autopick = env_bool("CRYPTO_AUTOPICK", True)
     top_n = env_int("AUTOPICK_TOP_N", 4)
@@ -327,7 +327,7 @@ def run() -> int:
         tickers = [t.strip() for t in tickers_env.split(",") if t.strip()]
 
     log(f"START: mode={mode} dry_run={dry_run} profile={profile} drop_pct={drop_pct} "
-        f"trade_size={trade_size} daily_cap={daily_cap} interval={interval} lookback={lookback}")
+        f"trade_size={trade_size} daily_cap={daily_cap} interval={interval} lookback={lookback} min_bars={min_bars}")
     log(f"TICKERS: {', '.join(tickers)}")
 
     caps = load_caps()
@@ -349,11 +349,12 @@ def run() -> int:
             "dry_run": dry_run,
         }
         try:
-            df = fetch_ohlc(sym, interval=interval, lookback=lookback)
-            if df is None or df.empty or "close" not in df or len(df["close"]) < 30:
-                route.update({"side": "skip", "reason": "no_data"})
+            df, used_iv = fetch_ohlc_with_fallback(sym, interval=interval, lookback=lookback, min_bars=min_bars)
+            if df is None or df.empty or "close" not in df or len(df["close"]) < max(10, min_bars):
+                route.update({"side": "skip", "reason": f"no_data({used_iv})"})
             else:
-                dec = decide_signal(df, profile=profile, drop_pct_gate=drop_pct)
+                log(f"DATA: {sym} interval={used_iv} bars={len(df)}")
+                dec = decide_signal(df, profile=profile, drop_pct_gate=drop_pct, min_bars=min_bars)
                 side = dec["side"]
                 reason = dec["reason"]
 
@@ -368,17 +369,17 @@ def run() -> int:
                                 route.update({"side": "skip", "reason": "cap_reached"})
                             else:
                                 res = simulate_order(sym, side, notional) if dry_run else place_order_live(sym, side, notional)
-                                route.update({"side": side, "reason": reason, "notional": float(notional),
+                                route.update({"side": side, "reason": f"{reason} iv={used_iv}", "notional": float(notional),
                                               "live_ok": bool(res.get("ok")), "live_msg": str(res.get("message"))})
                                 if res.get("ok") and side == "buy":
                                     spent += notional
                                     remaining = max(0.0, daily_cap - spent)
                         else:
                             res = simulate_order(sym, side, notional) if dry_run else place_order_live(sym, side, notional)
-                            route.update({"side": side, "reason": reason, "notional": float(notional),
+                            route.update({"side": side, "reason": f"{reason} iv={used_iv}", "notional": float(notional),
                                           "live_ok": bool(res.get("ok")), "live_msg": str(res.get("message"))})
                 else:
-                    route.update({"side": "skip", "reason": reason})
+                    route.update({"side": "skip", "reason": f"{reason} iv={used_iv}"})
 
         except Exception as e:
             route.update({"side": "skip", "reason": "data_error", "error": f"{type(e).__name__}: {e}"})
@@ -406,4 +407,3 @@ def run() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(run())
-
