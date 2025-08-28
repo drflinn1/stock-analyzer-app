@@ -2,7 +2,8 @@
 """
 Stock Analyzer / Crypto Live Runner
 - Series-safe & 1-D hardened (no ambiguous pandas truth checks)
-- NEW: Auto-pick top performers from a crypto universe (24h change)
+- Robust to empty/missing data (graceful skip, no IndexError)
+- Auto-pick top performers (24h change) when CRYPTO_AUTOPICK=true
 - Env knobs:
     MODE: "live" | "paper" (informational)
     DRY_RUN: "true" | "false"
@@ -12,7 +13,7 @@ Stock Analyzer / Crypto Live Runner
     DAILY_CAP: float USD (e.g., "15")
     INTERVAL: yfinance interval for strategy bars (default "5m")
     LOOKBACK_MIN: rows for strategy calc (default 200)
-    CRYPTO_AUTOPICK: "true" | "false"  (if true, ignore CRYPTO_TICKERS and rank universe)
+    CRYPTO_AUTOPICK: "true" | "false"  (default true)
     AUTOPICK_TOP_N: integer (default 4)
     CRYPTO_UNIVERSE: comma list (default: BTC-USD,ETH-USD,SOL-USD,ADA-USD,XRP-USD,LTC-USD,DOGE-USD,AVAX-USD,BNB-USD,MATIC-USD)
     CRYPTO_TICKERS: comma list used only if CRYPTO_AUTOPICK=false
@@ -25,7 +26,7 @@ import json
 import shutil
 import pathlib
 import traceback
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Tuple
 
 import numpy as np
@@ -165,28 +166,41 @@ def _period_for_interval(interval: str) -> str:
 def fetch_ohlc(ticker: str, interval: str, lookback: int) -> pd.DataFrame:
     period = _period_for_interval(interval)
     df = yf.download(ticker, period=period, interval=interval, progress=False)
+
+    # Normalize shape / columns
     if df is None or not isinstance(df, (pd.DataFrame, pd.Series)) or len(df) == 0:
-        raise RuntimeError(f"No data for {ticker} @ {interval}/{period}")
+        return pd.DataFrame()  # <- empty, handled upstream
     if isinstance(df, pd.Series):
         df = df.to_frame()
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[-1] if isinstance(c, tuple) else c for c in df.columns]
     df = df.rename(columns=str.lower)
+
+    # Ensure expected columns exist
     for c in ["open", "high", "low", "close", "volume"]:
         if c not in df.columns:
             if c == "close" and "adj close" in df.columns:
                 df["close"] = df["adj close"]
             else:
                 df[c] = np.nan
+
     df = df.tail(int(lookback)).copy()
     df.dropna(subset=["close"], inplace=True)
+
+    # Coerce to 1-D numeric series for close
+    if "close" not in df or df["close"].empty:
+        return pd.DataFrame()  # nothing to work with
+
     df["close"] = to_series_1d(df["close"]).values
+    # Still empty or too small? Return empty to be skipped gracefully.
+    if len(df["close"]) == 0:
+        return pd.DataFrame()
+
     return df
 
 # 24h perf for ranking (independent of strategy interval)
 def pct_change_24h(ticker: str) -> float:
     try:
-        # 2 days of hourly bars → compare now vs ~24h ago
         hist = yf.download(ticker, period="2d", interval="1h", progress=False)
         if hist is None or len(hist) < 2:
             return float("-inf")
@@ -196,10 +210,9 @@ def pct_change_24h(ticker: str) -> float:
         if len(close) < 2:
             return float("-inf")
         last = float(close.iloc[-1])
-        # find the closest bar >= (now - 24h)
-        cutoff = pd.Timestamp.utcnow() - pd.Timedelta(hours=24)
-        last_24 = close.loc[close.index >= cutoff]
-        base = float(last_24.iloc[0]) if len(last_24) else float(close.iloc[-25]) if len(close) > 25 else float(close.iloc[0])
+        # 24h ago (approx) — if the exact timestamp isn’t present, use ~24 bars back fallback
+        idx_24 = -24 if len(close) >= 25 else -(len(close)-1)
+        base = float(close.iloc[idx_24])
         if base <= 0:
             return float("-inf")
         return (last - base) / base
@@ -223,10 +236,16 @@ def decide_signal(df: pd.DataFrame, profile: str, drop_pct_gate: float) -> Dict[
     Return dict: {side: buy|sell|skip, reason: str}
     Uses only last candle scalars to avoid ambiguous boolean checks.
     """
+    if df is None or df.empty or "close" not in df or len(df["close"]) < 30:
+        return {"side": "skip", "reason": "insufficient_data"}
+
     close = to_series_1d(df["close"])
+
+    # Indicators
     rsi_s = rsi(close, 14)
     bb_lower, bb_mid, bb_upper = bollinger(close, 20, 2.0)
 
+    # Scalars (last candle only)
     price = float(close.iloc[-1])
     rsi_last = float(rsi_s.iloc[-1])
     lower_hit = bool(price < float(bb_lower.iloc[-1]))
@@ -236,7 +255,7 @@ def decide_signal(df: pd.DataFrame, profile: str, drop_pct_gate: float) -> Dict[
     window = min(max(30, len(close)//2), 300)
     hi_window = float(close.tail(window).max())
     dip_from_high = (hi_window - price) / hi_window if hi_window > 0 else 0.0
-    dip_ok = dip_from_high >= (drop_pct_gate / 100.0) if drop_pct_gate > 0 else True
+    dip_ok = (dip_from_high >= (drop_pct_gate / 100.0)) if drop_pct_gate > 0 else True
 
     if profile == "cautious":
         want_buy = (lower_hit or (rsi_last < 35.0)) and dip_ok
@@ -294,7 +313,6 @@ def run() -> int:
     interval = env_str("INTERVAL", "5m")
     lookback = int(env_float("LOOKBACK_MIN", 200))
 
-    # Autopick controls
     autopick = env_bool("CRYPTO_AUTOPICK", True)
     top_n = env_int("AUTOPICK_TOP_N", 4)
     default_universe = "BTC-USD,ETH-USD,SOL-USD,ADA-USD,XRP-USD,LTC-USD,DOGE-USD,AVAX-USD,BNB-USD,MATIC-USD"
@@ -332,32 +350,35 @@ def run() -> int:
         }
         try:
             df = fetch_ohlc(sym, interval=interval, lookback=lookback)
-            dec = decide_signal(df, profile=profile, drop_pct_gate=drop_pct)
-            side = dec["side"]
-            reason = dec["reason"]
+            if df is None or df.empty or "close" not in df or len(df["close"]) < 30:
+                route.update({"side": "skip", "reason": "no_data"})
+            else:
+                dec = decide_signal(df, profile=profile, drop_pct_gate=drop_pct)
+                side = dec["side"]
+                reason = dec["reason"]
 
-            if side in ("buy", "sell"):
-                if side == "buy" and remaining <= 0.0:
-                    route.update({"side": "skip", "reason": "cap_reached"})
-                else:
-                    notional = trade_size
-                    if side == "buy":
-                        notional = min(notional, remaining)
-                        if notional <= 0:
-                            route.update({"side": "skip", "reason": "cap_reached"})
+                if side in ("buy", "sell"):
+                    if side == "buy" and remaining <= 0.0:
+                        route.update({"side": "skip", "reason": "cap_reached"})
+                    else:
+                        notional = trade_size
+                        if side == "buy":
+                            notional = min(notional, remaining)
+                            if notional <= 0:
+                                route.update({"side": "skip", "reason": "cap_reached"})
+                            else:
+                                res = simulate_order(sym, side, notional) if dry_run else place_order_live(sym, side, notional)
+                                route.update({"side": side, "reason": reason, "notional": float(notional),
+                                              "live_ok": bool(res.get("ok")), "live_msg": str(res.get("message"))})
+                                if res.get("ok") and side == "buy":
+                                    spent += notional
+                                    remaining = max(0.0, daily_cap - spent)
                         else:
                             res = simulate_order(sym, side, notional) if dry_run else place_order_live(sym, side, notional)
                             route.update({"side": side, "reason": reason, "notional": float(notional),
                                           "live_ok": bool(res.get("ok")), "live_msg": str(res.get("message"))})
-                            if res.get("ok") and side == "buy":
-                                spent += notional
-                                remaining = max(0.0, daily_cap - spent)
-                    else:
-                        res = simulate_order(sym, side, notional) if dry_run else place_order_live(sym, side, notional)
-                        route.update({"side": side, "reason": reason, "notional": float(notional),
-                                      "live_ok": bool(res.get("ok")), "live_msg": str(res.get("message"))})
-            else:
-                route.update({"side": "skip", "reason": reason})
+                else:
+                    route.update({"side": "skip", "reason": reason})
 
         except Exception as e:
             route.update({"side": "skip", "reason": "data_error", "error": f"{type(e).__name__}: {e}"})
@@ -385,3 +406,4 @@ def run() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(run())
+
