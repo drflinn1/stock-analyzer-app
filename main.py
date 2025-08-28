@@ -1,6 +1,5 @@
 import os
 import sys
-import time
 import logging
 import ccxt
 import yfinance as yf
@@ -15,53 +14,73 @@ logger = logging.getLogger(__name__)
 
 # ========== Env Configs ==========
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "10"))
+TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "10"))   # spend per buy in QUOTE (e.g., USDT)
 DAILY_CAP = float(os.getenv("DAILY_CAP", "50"))
-DROP_PCT = float(os.getenv("DROP_PCT", "2.0"))  # buy trigger % drop
-SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",")
+DROP_PCT = float(os.getenv("DROP_PCT", "2.0"))
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",") if s.strip()]
+
+# Kraken credentials for live trading
+KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY")
+KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET")
 
 # ========== Broker Setup ==========
 def get_exchange():
-    exchange = ccxt.kraken({
-        "enableRateLimit": True,
-    })
-    return exchange
+    opts = {"enableRateLimit": True}
+    if not DRY_RUN:
+        if not KRAKEN_API_KEY or not KRAKEN_API_SECRET:
+            raise RuntimeError("Missing Kraken API credentials in environment.")
+        opts.update({"apiKey": KRAKEN_API_KEY, "secret": KRAKEN_API_SECRET})
+    return ccxt.kraken(opts)
 
 # ========== Data Fetch ==========
-def get_latest_price(symbol: str):
-    base, quote = symbol.split("/")
-    ticker = yf.Ticker(base + "-USD")
-    hist = ticker.history(period="1d", interval="1m")
+def get_latest_price(symbol: str) -> float:
+    base, _ = symbol.split("/")
+    t = yf.Ticker(base + "-USD")
+    hist = t.history(period="1d", interval="1m")
     if hist.empty:
         raise ValueError(f"No price data for {symbol}")
-    return hist["Close"].iloc[-1]
+    return float(hist["Close"].iloc[-1])
 
 # ========== Trading Logic ==========
 def should_buy(symbol: str, drop_pct: float) -> bool:
-    base, quote = symbol.split("/")
-    ticker = yf.Ticker(base + "-USD")
-    hist = ticker.history(period="5d", interval="1h")
+    base, _ = symbol.split("/")
+    t = yf.Ticker(base + "-USD")
+    hist = t.history(period="5d", interval="1h")
     if len(hist) < 2:
+        logger.info(f"{symbol}: not enough data to evaluate gate")
         return False
-    last = hist["Close"].iloc[-1]
-    prev = hist["Close"].iloc[-2]
+    last = float(hist["Close"].iloc[-1])
+    prev = float(hist["Close"].iloc[-2])
     change_pct = (last - prev) / prev * 100
     logger.info(f"{symbol}: change {change_pct:.2f}% (gate {drop_pct}%)")
     return change_pct <= -drop_pct
 
-def place_order(exchange, symbol: str, side: str, amount: float):
+def quantize_amount(exchange, symbol: str, amount: float) -> float:
+    """Round amount to exchange precision and enforce min size."""
+    markets = exchange.load_markets()
+    m = markets.get(symbol)
+    if not m:
+        raise ValueError(f"Symbol not found on exchange: {symbol}")
+    q = float(exchange.amount_to_precision(symbol, amount))
+    min_amt = (m.get("limits", {}).get("amount", {}) or {}).get("min")
+    if min_amt and q < float(min_amt):
+        logger.info(f"Adjusted to min amount for {symbol}: {min_amt}")
+        q = float(min_amt)
+    return q
+
+def place_order(exchange, symbol: str, side: str, quote_spend: float, last_price: float):
+    # convert quote spend (e.g., USDT) into base qty (BTC/ETH)
+    base_qty = quote_spend / max(last_price, 1e-9)
     if DRY_RUN:
-        logger.info(f"[DRY RUN] {side} {amount} {symbol}")
+        logger.info(f"[DRY RUN] {side} ~{base_qty:.8f} {symbol} (spend {quote_spend} quote @ {last_price})")
         return
-    try:
-        order = exchange.create_market_order(symbol, side, amount)
-        logger.info(f"Executed order: {order}")
-    except Exception as e:
-        logger.error(f"Order failed for {symbol}: {e}")
+    qty = quantize_amount(exchange, symbol, base_qty)
+    logger.info(f"Placing order: {side} {qty} {symbol} (~{quote_spend} quote @ {last_price})")
+    order = exchange.create_market_order(symbol, side, qty)
+    logger.info(f"Executed order: {order}")
 
 # ========== Alarm Hook ==========
 def post_alarm(message: str):
-    # Placeholder for Slack/email later
     logger.warning(f"ALARM: {message}")
 
 # ========== Main ==========
@@ -79,11 +98,10 @@ def main():
                 if spent_today + TRADE_AMOUNT > DAILY_CAP:
                     post_alarm(f"Daily cap {DAILY_CAP} reached, skipping {symbol}")
                     continue
-                place_order(exchange, symbol, "buy", TRADE_AMOUNT)
+                place_order(exchange, symbol, "buy", TRADE_AMOUNT, price)
                 spent_today += TRADE_AMOUNT
             else:
                 logger.info(f"No buy signal for {symbol}")
-
         except Exception as e:
             logger.error(f"Error with {symbol}: {e}")
 
