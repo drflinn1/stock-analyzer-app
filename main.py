@@ -1,33 +1,31 @@
 #!/usr/bin/env python3
 """
-Stock Analyzer / Crypto Live Runner (Series-safe)
-
-- Uses yfinance for market data
-- RSI + Bollinger sample strategy, collapsed to LAST candle booleans
-- Env-controlled behavior:
-    MODE: "live" | "paper"
-    DRY_RUN: "true" | "false"     # if "true", never places real orders
+Stock Analyzer / Crypto Live Runner
+- Series-safe & 1-D hardened (no ambiguous pandas truth checks)
+- NEW: Auto-pick top performers from a crypto universe (24h change)
+- Env knobs:
+    MODE: "live" | "paper" (informational)
+    DRY_RUN: "true" | "false"
     PROFILE: "cautious" | "aggressive"
-    DROP_PCT: "0.0" or "2.0" etc   # minimum dip vs recent high to allow buys
-    TRADE_SIZE: "$" float as string (e.g., "10")
-    DAILY_CAP: "$" float (e.g., "15")
-    CRYPTO_TICKERS: comma list (default: BTC-USD,ETH-USD)
-    LOOKBACK_MIN: candles to fetch (default 200)
-    INTERVAL: yfinance interval (default "5m")
-- Persists daily spend cap under out/caps_YYYYMMDD.json
-- Writes run artifacts to out/
-
-This file intentionally avoids any ambiguous pandas truth checks.
+    DROP_PCT: "0.0" | "2.0" ...
+    TRADE_SIZE: float in USD (e.g., "10")
+    DAILY_CAP: float USD (e.g., "15")
+    INTERVAL: yfinance interval for strategy bars (default "5m")
+    LOOKBACK_MIN: rows for strategy calc (default 200)
+    CRYPTO_AUTOPICK: "true" | "false"  (if true, ignore CRYPTO_TICKERS and rank universe)
+    AUTOPICK_TOP_N: integer (default 4)
+    CRYPTO_UNIVERSE: comma list (default: BTC-USD,ETH-USD,SOL-USD,ADA-USD,XRP-USD,LTC-USD,DOGE-USD,AVAX-USD,BNB-USD,MATIC-USD)
+    CRYPTO_TICKERS: comma list used only if CRYPTO_AUTOPICK=false
+- Persists daily cap to out/caps_YYYYMMDD.json
+- Saves artifacts to out/routes_*.json/csv
 """
 
 import os
 import json
-import math
-import time
 import shutil
 import pathlib
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Tuple
 
 import numpy as np
@@ -40,7 +38,6 @@ except Exception as e:
 
 OUT_DIR = pathlib.Path("out")
 OUT_DIR.mkdir(exist_ok=True, parents=True)
-
 
 # ---------------------------
 # Utilities
@@ -62,6 +59,13 @@ def env_bool(name: str, default: bool) -> bool:
     if v is None:
         return default
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    try:
+        return int(v) if v is not None else default
+    except Exception:
+        return default
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -95,58 +99,120 @@ def load_caps() -> Dict[str, Any]:
 def save_caps(caps: Dict[str, Any]):
     write_json(today_caps_path(), caps)
 
+# ---------------------------
+# 1D helpers
+# ---------------------------
+
+def to_series_1d(x) -> pd.Series:
+    """
+    Coerce input to a 1-D float Series.
+    Handles DataFrame (takes first column), ndarray (ravel), list/tuple, or Series.
+    """
+    if isinstance(x, pd.DataFrame):
+        if x.shape[1] == 0:
+            return pd.Series(dtype=float)
+        x = x.iloc[:, 0]
+    elif isinstance(x, np.ndarray):
+        x = pd.Series(np.ravel(x))
+    elif isinstance(x, (list, tuple)):
+        x = pd.Series(list(x))
+    elif isinstance(x, pd.Series):
+        pass
+    else:
+        x = pd.Series(x)
+    return pd.to_numeric(x, errors="coerce")
 
 # ---------------------------
 # Indicators (Series-safe)
 # ---------------------------
 
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(up, index=series.index).ewm(span=period, adjust=False).mean()
-    roll_down = pd.Series(down, index=series.index).ewm(span=period, adjust=False).mean()
-    rs = roll_up / (roll_down.replace(0, np.nan))
-    rsi_val = 100.0 - (100.0 / (1.0 + rs))
-    return rsi_val.fillna(50.0)
+def rsi(src, period: int = 14) -> pd.Series:
+    close = to_series_1d(src).copy()
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    roll_up = gain.ewm(span=period, adjust=False).mean()
+    roll_down = loss.ewm(span=period, adjust=False).mean().replace(0, np.nan)
+    rs = roll_up / roll_down
+    out = 100.0 - (100.0 / (1.0 + rs))
+    return out.fillna(50.0)
 
-def bollinger(series: pd.Series, window: int = 20, num_std: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    ma = series.rolling(window=window).mean()
-    sd = series.rolling(window=window).std(ddof=0)
+def bollinger(src, window: int = 20, num_std: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    s = to_series_1d(src)
+    ma = s.rolling(window=window).mean()
+    sd = s.rolling(window=window).std(ddof=0)
     upper = ma + num_std * sd
     lower = ma - num_std * sd
     return lower, ma, upper
-
 
 # ---------------------------
 # Data
 # ---------------------------
 
-def fetch_ohlc(ticker: str, interval: str, lookback: int) -> pd.DataFrame:
-    # yfinance requires period when using intraday intervals. Use a safe mapping.
-    # For 5m data, period cannot exceed ~60d. We'll ask for "7d" to be safe and then trim.
-    period_map = {
+def _period_for_interval(interval: str) -> str:
+    return {
         "1m": "7d",
         "2m": "30d",
         "5m": "30d",
         "15m": "60d",
         "30m": "60d",
-        "60m": "730d",  # 2y
+        "60m": "730d",
         "90m": "730d",
         "1h": "730d",
         "1d": "5y",
-    }
-    period = period_map.get(interval, "30d")
+    }.get(interval, "30d")
+
+def fetch_ohlc(ticker: str, interval: str, lookback: int) -> pd.DataFrame:
+    period = _period_for_interval(interval)
     df = yf.download(ticker, period=period, interval=interval, progress=False)
-    if not isinstance(df, pd.DataFrame) or df.empty:
+    if df is None or not isinstance(df, (pd.DataFrame, pd.Series)) or len(df) == 0:
         raise RuntimeError(f"No data for {ticker} @ {interval}/{period}")
-    # yfinance columns: ['Open','High','Low','Close','Adj Close','Volume']
+    if isinstance(df, pd.Series):
+        df = df.to_frame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[-1] if isinstance(c, tuple) else c for c in df.columns]
     df = df.rename(columns=str.lower)
-    # keep last N rows to make the indicator math stable but light
-    df = df.tail(int(lookback))
-    df.dropna(inplace=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c not in df.columns:
+            if c == "close" and "adj close" in df.columns:
+                df["close"] = df["adj close"]
+            else:
+                df[c] = np.nan
+    df = df.tail(int(lookback)).copy()
+    df.dropna(subset=["close"], inplace=True)
+    df["close"] = to_series_1d(df["close"]).values
     return df
 
+# 24h perf for ranking (independent of strategy interval)
+def pct_change_24h(ticker: str) -> float:
+    try:
+        # 2 days of hourly bars → compare now vs ~24h ago
+        hist = yf.download(ticker, period="2d", interval="1h", progress=False)
+        if hist is None or len(hist) < 2:
+            return float("-inf")
+        hist = hist.rename(columns=str.lower)
+        close = to_series_1d(hist.get("close", hist.get("adj close", [])))
+        close.dropna(inplace=True)
+        if len(close) < 2:
+            return float("-inf")
+        last = float(close.iloc[-1])
+        # find the closest bar >= (now - 24h)
+        cutoff = pd.Timestamp.utcnow() - pd.Timedelta(hours=24)
+        last_24 = close.loc[close.index >= cutoff]
+        base = float(last_24.iloc[0]) if len(last_24) else float(close.iloc[-25]) if len(close) > 25 else float(close.iloc[0])
+        if base <= 0:
+            return float("-inf")
+        return (last - base) / base
+    except Exception:
+        return float("-inf")
+
+def rank_top_performers(universe: List[str], top_n: int) -> List[str]:
+    scores = []
+    for t in universe:
+        p = pct_change_24h(t)
+        scores.append((t, p))
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return [t for t, _ in scores[:max(1, top_n)]]
 
 # ---------------------------
 # Strategy (collapse to latest)
@@ -154,35 +220,28 @@ def fetch_ohlc(ticker: str, interval: str, lookback: int) -> pd.DataFrame:
 
 def decide_signal(df: pd.DataFrame, profile: str, drop_pct_gate: float) -> Dict[str, Any]:
     """
-    Returns dict with:
-      side: "buy" | "sell" | "skip"
-      reason: str
-    Never returns a pandas Series as a condition — all checks use the LAST candle.
+    Return dict: {side: buy|sell|skip, reason: str}
+    Uses only last candle scalars to avoid ambiguous boolean checks.
     """
-    close = df["close"]
-    # Indicators
+    close = to_series_1d(df["close"])
     rsi_s = rsi(close, 14)
     bb_lower, bb_mid, bb_upper = bollinger(close, 20, 2.0)
 
-    # Scalars (last candle only)
     price = float(close.iloc[-1])
     rsi_last = float(rsi_s.iloc[-1])
-    lower_hit = bool((close.iloc[-1] < bb_lower.iloc[-1]))
-    upper_hit = bool((close.iloc[-1] > bb_upper.iloc[-1]))
+    lower_hit = bool(price < float(bb_lower.iloc[-1]))
+    upper_hit = bool(price > float(bb_upper.iloc[-1]))
 
-    # Simple trailing-high dip gate (past X bars)
-    window = 96  # ~8 hours on 5m bars
+    # Trailing-high dip gate
+    window = min(max(30, len(close)//2), 300)
     hi_window = float(close.tail(window).max())
     dip_from_high = (hi_window - price) / hi_window if hi_window > 0 else 0.0
     dip_ok = dip_from_high >= (drop_pct_gate / 100.0) if drop_pct_gate > 0 else True
 
-    # Profile-specific tweaks
     if profile == "cautious":
-        # Gentle: buy if price < lower band OR RSI < 35; sell if price > upper band OR RSI > 65
         want_buy = (lower_hit or (rsi_last < 35.0)) and dip_ok
         want_sell = (upper_hit or (rsi_last > 65.0))
-    else:  # aggressive
-        # Tighter to bands, stronger RSI swing
+    else:
         want_buy = (lower_hit and (rsi_last < 30.0)) and dip_ok
         want_sell = (upper_hit and (rsi_last > 70.0))
 
@@ -192,60 +251,41 @@ def decide_signal(df: pd.DataFrame, profile: str, drop_pct_gate: float) -> Dict[
         return {"side": "sell", "reason": f"sell_cond: upper_hit={upper_hit} rsi={rsi_last:.1f}"}
     return {"side": "skip", "reason": "neutral_or_conflict"}
 
+# ---------------------------
+# Execution (dry vs live)
+# ---------------------------
 
-# ---------------------------
-# Execution (dry run vs live)
-# ---------------------------
+def simulate_order(symbol: str, side: str, notional_usd: float) -> Dict[str, Any]:
+    return {"ok": True, "message": f"DRY_RUN {side} ${notional_usd:.2f} {symbol}"}
 
 def place_order_live(symbol: str, side: str, notional_usd: float) -> Dict[str, Any]:
     """
-    Live order stub. We keep this minimal so DRY_RUN=true users are safe.
-    If you want true live crypto via Kraken with ccxt, fill credentials in env and uncomment.
+    Live order stub via ccxt if keys exist; otherwise returns disabled.
     """
-    # Example: integrate ccxt if available and creds present
     try:
         import ccxt  # type: ignore
         api_key = os.environ.get("KRAKEN_API_KEY")
         api_secret = os.environ.get("KRAKEN_API_SECRET")
         if not api_key or not api_secret:
-            return {"ok": False, "message": "ccxt live disabled: missing KRAKEN_API_KEY/SECRET"}
-
-        ex = ccxt.kraken({
-            "apiKey": api_key,
-            "secret": api_secret,
-            "enableRateLimit": True,
-        })
-
-        # market buy/sell by cost
-        base = symbol.split("-")[0] if "-" in symbol else symbol.split("/")[0]
+            return {"ok": False, "message": "ccxt live disabled (missing KRAKEN_API_KEY/SECRET)"}
+        ex = ccxt.kraken({"apiKey": api_key, "secret": api_secret, "enableRateLimit": True})
         market = symbol.replace("-", "/")
-        # fetch price to approximate amount
         ticker = ex.fetch_ticker(market)
         price = float(ticker["last"])
         amount = round(notional_usd / price, 8) if price > 0 else None
         if not amount or amount <= 0:
             return {"ok": False, "message": f"bad amount for {symbol} @ {price}"}
-
-        if side == "buy":
-            order = ex.create_market_buy_order(market, amount)
-        else:
-            order = ex.create_market_sell_order(market, amount)
-
+        order = ex.create_market_buy_order(market, amount) if side == "buy" else ex.create_market_sell_order(market, amount)
         return {"ok": True, "message": "live order placed", "order": order}
     except Exception as e:
         return {"ok": False, "message": f"live error: {e}"}
-
-
-def simulate_order(symbol: str, side: str, notional_usd: float) -> Dict[str, Any]:
-    return {"ok": True, "message": f"DRY_RUN {side} ${notional_usd:.2f} {symbol}"}
-
 
 # ---------------------------
 # Run
 # ---------------------------
 
 def run() -> int:
-    mode = env_str("MODE", "live")  # informational
+    mode = env_str("MODE", "live")
     dry_run = env_bool("DRY_RUN", True)
     profile = env_str("PROFILE", "cautious").lower().strip()
     drop_pct = env_float("DROP_PCT", 0.0)
@@ -253,21 +293,31 @@ def run() -> int:
     daily_cap = env_float("DAILY_CAP", 15.0)
     interval = env_str("INTERVAL", "5m")
     lookback = int(env_float("LOOKBACK_MIN", 200))
-    tickers_env = env_str("CRYPTO_TICKERS", "BTC-USD,ETH-USD")
-    tickers = [t.strip() for t in tickers_env.split(",") if t.strip()]
 
-    # Banner
+    # Autopick controls
+    autopick = env_bool("CRYPTO_AUTOPICK", True)
+    top_n = env_int("AUTOPICK_TOP_N", 4)
+    default_universe = "BTC-USD,ETH-USD,SOL-USD,ADA-USD,XRP-USD,LTC-USD,DOGE-USD,AVAX-USD,BNB-USD,MATIC-USD"
+    universe_env = env_str("CRYPTO_UNIVERSE", default_universe)
+    universe = [t.strip() for t in universe_env.split(",") if t.strip()]
+
+    if autopick:
+        tickers = rank_top_performers(universe, top_n)
+        log(f"AUTOPICK: top_{top_n} of {len(universe)} by ~24h change → {', '.join(tickers)}")
+    else:
+        tickers_env = env_str("CRYPTO_TICKERS", "BTC-USD,ETH-USD")
+        tickers = [t.strip() for t in tickers_env.split(",") if t.strip()]
+
     log(f"START: mode={mode} dry_run={dry_run} profile={profile} drop_pct={drop_pct} "
         f"trade_size={trade_size} daily_cap={daily_cap} interval={interval} lookback={lookback}")
     log(f"TICKERS: {', '.join(tickers)}")
 
-    # Load daily cap state
     caps = load_caps()
     spent = float(caps.get("spent_usd", 0.0))
     remaining = max(0.0, daily_cap - spent)
     log(f"DAILY CAP: spent=${spent:.2f} remaining=${remaining:.2f} (cap=${daily_cap:.2f})")
 
-    rows = []
+    rows: List[Dict[str, Any]] = []
 
     for sym in tickers:
         route = {
@@ -290,62 +340,36 @@ def run() -> int:
                 if side == "buy" and remaining <= 0.0:
                     route.update({"side": "skip", "reason": "cap_reached"})
                 else:
-                    notional = trade_size if side == "buy" else trade_size  # symmetric
+                    notional = trade_size
                     if side == "buy":
-                        # enforce cap
                         notional = min(notional, remaining)
                         if notional <= 0:
                             route.update({"side": "skip", "reason": "cap_reached"})
                         else:
-                            # place
-                            if dry_run:
-                                res = simulate_order(sym, side, notional)
-                            else:
-                                res = place_order_live(sym, side, notional)
-                            route.update({
-                                "side": side,
-                                "reason": reason,
-                                "notional": float(notional),
-                                "live_ok": bool(res.get("ok")),
-                                "live_msg": str(res.get("message")),
-                            })
+                            res = simulate_order(sym, side, notional) if dry_run else place_order_live(sym, side, notional)
+                            route.update({"side": side, "reason": reason, "notional": float(notional),
+                                          "live_ok": bool(res.get("ok")), "live_msg": str(res.get("message"))})
                             if res.get("ok") and side == "buy":
                                 spent += notional
                                 remaining = max(0.0, daily_cap - spent)
                     else:
-                        # sell (no cap reduction)
-                        if dry_run:
-                            res = simulate_order(sym, side, notional)
-                        else:
-                            res = place_order_live(sym, side, notional)
-                        route.update({
-                            "side": side,
-                            "reason": reason,
-                            "notional": float(notional),
-                            "live_ok": bool(res.get("ok")),
-                            "live_msg": str(res.get("message")),
-                        })
+                        res = simulate_order(sym, side, notional) if dry_run else place_order_live(sym, side, notional)
+                        route.update({"side": side, "reason": reason, "notional": float(notional),
+                                      "live_ok": bool(res.get("ok")), "live_msg": str(res.get("message"))})
             else:
                 route.update({"side": "skip", "reason": reason})
 
         except Exception as e:
-            route.update({
-                "side": "skip",
-                "reason": "data_error",
-                "error": f"{type(e).__name__}: {e}",
-            })
+            route.update({"side": "skip", "reason": "data_error", "error": f"{type(e).__name__}: {e}"})
             log(f"ERROR {sym}: {e}\n{traceback.format_exc()}")
 
         rows.append(route)
-        # Pretty route line (similar to your logs)
         log(f"ROUTE: {sym} is_crypto=True side={route['side']} reason={route['reason']} "
             f"eq_notional=0 cr_notional={route.get('notional', 0.0)} dry_run={dry_run}")
 
-    # Save cap state
     caps["spent_usd"] = round(spent, 2)
     save_caps(caps)
 
-    # Write CSV/JSON artifact for each run
     ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     json_path = OUT_DIR / f"routes_{ts_tag}.json"
     csv_path = OUT_DIR / f"routes_{ts_tag}.csv"
@@ -358,7 +382,6 @@ def run() -> int:
 
     log(f"END: spent=${spent:.2f} remaining=${max(0.0, daily_cap - spent):.2f} dry_run={dry_run}")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(run())
