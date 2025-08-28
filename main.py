@@ -1,6 +1,5 @@
 import os
 import sys
-import math
 import logging
 import ccxt
 
@@ -21,6 +20,8 @@ UNIVERSE = os.getenv("UNIVERSE", "AUTO_USDT")
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "30"))
 MIN_LAST_CANDLE_USD = float(os.getenv("MIN_LAST_CANDLE_USD", "50000"))
 EXCLUDE = set(s.strip() for s in os.getenv("EXCLUDE", "").split(",") if s.strip())
+TIMEFRAME = os.getenv("TIMEFRAME", "1h")
+FORCE_BUY = os.getenv("FORCE_BUY", "false").lower() == "true"
 
 KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY")
 KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET")
@@ -53,14 +54,16 @@ def build_universe(exchange):
     return symbols
 
 # ===== Helpers =====
-def last_hour_change_and_dollar(symbol, candles):
+def last_change_and_dollar(candles):
+    # candles: [ts, open, high, low, close, volume]
     if len(candles) < 2:
-        return None, None
-    last = candles[-1][4]
-    prev = candles[-2][4]
-    change_pct = (last - prev) / prev * 100 if prev else 0.0
-    last_vol_usd = candles[-1][5] * last
-    return change_pct, last_vol_usd
+        return None, None, None
+    prev_close = candles[-2][4]
+    last_close = candles[-1][4]
+    vol_last = candles[-1][5]
+    change_pct = (last_close - prev_close) / prev_close * 100 if prev_close else 0.0
+    usd = vol_last * last_close
+    return change_pct, usd, last_close
 
 def quantize_amount(exchange, symbol: str, amount: float) -> float:
     q = float(exchange.amount_to_precision(symbol, amount))
@@ -96,30 +99,39 @@ def main():
         logger.info("No symbols to evaluate.")
         return
 
-    candidates = []
+    eligible = []
+    scanned = []
     for s in symbols:
         try:
-            ohlcv = ex.fetch_ohlcv(s, timeframe='1h', limit=3)
+            ohlcv = ex.fetch_ohlcv(s, timeframe=TIMEFRAME, limit=3)
             if not ohlcv:
                 continue
-            chg, usd = last_hour_change_and_dollar(s, ohlcv)
+            chg, usd, last_price = last_change_and_dollar(ohlcv)
             if chg is None:
                 continue
             if usd is not None and usd < MIN_LAST_CANDLE_USD:
                 continue
+            scanned.append((chg, usd or 0.0, s, last_price))
             if chg <= -DROP_PCT:
-                candidates.append((chg, usd or 0.0, s, ohlcv[-1][4]))
+                eligible.append((chg, usd or 0.0, s, last_price))
         except Exception as e:
             logger.info(f"Skip {s}: {e}")
 
-    if not candidates:
+    if eligible:
+        eligible.sort(key=lambda t: (t[0], -t[1]))  # most negative first, then larger $vol
+        pick_from = eligible
+        logger.info(f"Eligible candidates: {len(eligible)}")
+    elif FORCE_BUY and scanned:
+        scanned.sort(key=lambda t: (t[0], -t[1]))
+        pick_from = scanned
+        logger.info("No candidates met the drop gate; FORCE_BUY enabled — picking top drop.")
+    else:
         logger.info("No candidates met the drop gate.")
         logger.info("=== END TRADING OUTPUT ===")
         return
 
-    candidates.sort(key=lambda t: (t[0], -t[1]))
-    best_chg, best_usd, best_sym, last_price = candidates[0]
-    logger.info(f"Best candidate: {best_sym} change {best_chg:.2f}% last ${last_price:.4f} vol~${best_usd:.0f}")
+    chg, usd, best_sym, last_price = pick_from[0]
+    logger.info(f"Best candidate: {best_sym} change {chg:.2f}% last ${last_price:.6f} vol~${usd:.0f}")
 
     base_qty = TRADE_AMOUNT / max(last_price, 1e-9)
     if DRY_RUN:
