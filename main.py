@@ -286,19 +286,52 @@ def generate_signal(df: pd.DataFrame) -> str:
 
 
 # -----------------------------
-# Order placeholder
+# Order execution (Kraken via ccxt) — safe by default
 # -----------------------------
 
+BROKER = os.getenv("BROKER", "kraken").lower()
+TRADE_USD = float(os.getenv("TRADE_USD", os.getenv("TRADE_SIZE", "0")))  # prefer TRADE_USD; fall back to TRADE_SIZE
+
+
+def _kraken_client() -> ccxt.Exchange:
+    return ccxt.kraken({
+        "enableRateLimit": True,
+        "apiKey": os.getenv("KRAKEN_API_KEY", None),
+        "secret": os.getenv("KRAKEN_SECRET", None),
+    })
+
+
 def place_order(symbol: str, side: str, qty: float) -> None:
+    """Places a MARKET order on Kraken when DRY_RUN is False, otherwise logs.
+    qty is the base-asset amount (e.g., BTC amount for BTC/USD).
+    """
     if DRY_RUN:
         print(f"[DRY_RUN] {side} {qty} of {symbol}")
         return
-    # TODO: wire to real broker/venue when live trading is enabled
-    print(f"(LIVE) {side} {qty} of {symbol} — NOT IMPLEMENTED HERE")
+    if BROKER != "kraken":
+        print(f"(LIVE) Broker '{BROKER}' not supported in this script yet.")
+        return
+
+    ex = _kraken_client()
+    market = normalize_crypto_symbol(symbol, ex)
+
+    try:
+        # Ensure amount precision obeys exchange rules
+        ex.load_markets()
+        info = ex.market(market)
+        precision = info.get("precision", {}).get("amount", 8)
+        step = 10 ** -precision
+        qty = max(step, math.floor(qty / step) * step)
+
+        order = ex.create_order(market, type="market", side=side.lower(), amount=qty)
+        print(f"(LIVE) Placed {side} {qty} {market} → order id: {order.get('id') or order}")
+    except Exception as e:
+        print(f"(LIVE) Order error for {market}: {e}")
 
 
 # -----------------------------
 # Runner
+
 # -----------------------------
 
 def run_once(symbols: List[str], timeframe: Optional[str] = None, limit: int = DEFAULT_LIMIT) -> None:
