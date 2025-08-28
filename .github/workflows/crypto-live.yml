@@ -2,8 +2,8 @@ name: Crypto Live (Cautious)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes
-  workflow_dispatch:          # allow manual runs too
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
 
 jobs:
   trade:
@@ -23,23 +23,15 @@ jobs:
       - name: Run cautious live trading
         env:
           MODE: live
-          DRY_RUN: "true"                 # set to "false" when you're ready for real orders
+          DRY_RUN: "true"
           PROFILE: cautious
           DROP_PCT: "0.0"
           TRADE_SIZE: "10"
           DAILY_CAP: "15"
-
-          # Strategy data controls
           INTERVAL: "5m"
           LOOKBACK_MIN: "200"
           MIN_BARS: "30"
-
-          # Autopick top performers
           CRYPTO_AUTOPICK: "true"
           AUTOPICK_TOP_N: "4"
           CRYPTO_UNIVERSE: "BTC-USD,ETH-USD,SOL-USD,ADA-USD,XRP-USD,LTC-USD,DOGE-USD,AVAX-USD,BNB-USD,MATIC-USD"
-
-          # Optional: enable real Kraken orders (only matters when DRY_RUN="false")
-          # KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          # KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: python main.py
