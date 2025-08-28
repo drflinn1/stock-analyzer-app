@@ -1,0 +1,36 @@
+name: Crypto Live (Debug)
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # run every 5 minutes for testing
+  workflow_dispatch:
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run debug trading (DRY_RUN)
+        env:
+          MODE: "live"
+          DRY_RUN: "true"            # always dry-run for debug
+          PROFILE: "debug"
+          SYMBOLS: "BTC/USD,ETH/USD"
+          TIMEFRAME: "15m"
+          AUTOPICK: "true"
+          BROKER: "kraken"
+          TRADE_USD: "10"
+          BB_K: "1.8"
+          RSI_BUY_MIN: "42"
+          RSI_SELL_MIN: "58"
+        run: python main.py
