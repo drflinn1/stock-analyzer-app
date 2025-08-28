@@ -13,12 +13,13 @@ env:
   DAILY_CAP: "50"               # max spend per run
   DROP_PCT: "0.0"               # min drop to consider (percent)
   SELL_DROP_PCT: "2.0"          # stop loss below entry (percent)
-  UNIVERSE: "AUTO_USD"         # scan most Kraken USDT spot markets
-  MAX_SYMBOLS: "60"             # scan up to N pairs
+  UNIVERSE: "AUTO"         # scan most Kraken USDT spot markets
+  MAX_SYMBOLS: "80"             # scan up to N pairs
   MIN_LAST_CANDLE_USD: "0"  # liquidity filter (lower to allow more)
   EXCLUDE: "USDT/USDT,USD/USDT"
   TIMEFRAME: "1m"               # <— faster candles to find moves now
   FORCE_BUY: "true"             # <— if nothing meets DROP_PCT, buy top drop anyway
+  TRADE_AMOUNT: "25"
 
 jobs:
   run:
