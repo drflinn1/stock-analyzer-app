@@ -30,4 +30,7 @@ jobs:
           AUTOPICK: "true"
           BROKER: "kraken"
           TRADE_USD: "10"
+          BB_K: "1.8"
+          RSI_BUY_MIN: "38"
+          RSI_SELL_MIN: "62"
         run: python main.py
