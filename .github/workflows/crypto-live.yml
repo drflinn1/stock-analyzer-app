@@ -2,17 +2,21 @@ name: Crypto Live
 
 on:
   workflow_dispatch:
-  # Optional schedule (07:00 & 15:00 PT ≈ 14:00 & 22:00 UTC during DST)
+  # Optional schedule (every 15 min)
   # schedule:
-  #   - cron: '0 14,22 * * *'
+  #   - cron: '*/15 * * * *'
 
 env:
   PYTHON_VERSION: "3.11"
-  DRY_RUN: "false"          # LIVE
-  TRADE_AMOUNT: "10"        # spend per buy in USDT (quote)
-  DAILY_CAP: "50"           # max spend per run
-  DROP_PCT: "2.0"           # buy trigger: previous→current drop %
-  SYMBOLS: "BTC/USDT,ETH/USDT"
+  DRY_RUN: "false"              # set to "true" for a safe test
+  TRADE_AMOUNT: "10"            # spend per buy in USDT (quote)
+  DAILY_CAP: "50"               # max spend per run
+  DROP_PCT: "2.0"               # min hourly drop to consider
+  SELL_DROP_PCT: "2.0"          # stop loss % below entry
+  UNIVERSE: "AUTO_USDT"         # AUTO_USDT = scan most Kraken USDT spot markets
+  MAX_SYMBOLS: "30"             # cap how many to analyze per run
+  MIN_LAST_CANDLE_USD: "50000"  # filter out illiquid markets
+  EXCLUDE: "USDT/USDT,USD/USDT" # comma-separated symbols to skip
 
 jobs:
   run:
@@ -41,7 +45,10 @@ jobs:
           echo "TRADE_AMOUNT=${TRADE_AMOUNT}"
           echo "DAILY_CAP=${DAILY_CAP}"
           echo "DROP_PCT=${DROP_PCT}"
-          echo "SYMBOLS=${SYMBOLS}"
+          echo "SELL_DROP_PCT=${SELL_DROP_PCT}"
+          echo "UNIVERSE=${UNIVERSE}"
+          echo "MAX_SYMBOLS=${MAX_SYMBOLS}"
+          echo "MIN_LAST_CANDLE_USD=${MIN_LAST_CANDLE_USD}"
 
       - name: Run trader (Kraken)
         env:
@@ -49,7 +56,11 @@ jobs:
           TRADE_AMOUNT: ${{ env.TRADE_AMOUNT }}
           DAILY_CAP: ${{ env.DAILY_CAP }}
           DROP_PCT: ${{ env.DROP_PCT }}
-          SYMBOLS: ${{ env.SYMBOLS }}
+          SELL_DROP_PCT: ${{ env.SELL_DROP_PCT }}
+          UNIVERSE: ${{ env.UNIVERSE }}
+          MAX_SYMBOLS: ${{ env.MAX_SYMBOLS }}
+          MIN_LAST_CANDLE_USD: ${{ env.MIN_LAST_CANDLE_USD }}
+          EXCLUDE: ${{ env.EXCLUDE }}
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
