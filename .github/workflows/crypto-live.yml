@@ -21,7 +21,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run cautious live trading
-        env:
+          env:
           MODE: "live"
           DRY_RUN: "true"           # keep "true" until you're ready to actually trade
           PROFILE: "cautious"
