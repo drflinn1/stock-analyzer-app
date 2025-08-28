@@ -2,7 +2,7 @@ name: Crypto Live (Cautious)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: '*/15 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -15,7 +15,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -23,14 +23,14 @@ jobs:
       - name: Run cautious live trading
         env:
           MODE: "live"
-          DRY_RUN: "true"      # keep "true" until ready for live orders
+          DRY_RUN: "true"            # keep true until you’re ready for live trades
           PROFILE: "cautious"
           SYMBOLS: "BTC/USD,ETH/USD"
           TIMEFRAME: "15m"
           AUTOPICK: "true"
           BROKER: "kraken"
           TRADE_USD: "10"
-          BB_K: "1.8"
-          RSI_BUY_MIN: "38"
-          RSI_SELL_MIN: "62"
+          BB_K: "1.8"               # Bollinger Band width
+          RSI_BUY_MIN: "38"         # easier to trigger BUYs
+          RSI_SELL_MIN: "62"        # easier to trigger SELLs
         run: python main.py
