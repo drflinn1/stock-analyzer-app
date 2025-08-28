@@ -53,6 +53,11 @@ SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USD,ETH/USD").split(",")
 BROKER = os.getenv("BROKER", "kraken").lower()
 TRADE_USD = float(os.getenv("TRADE_USD", "0"))
 
+# Tunables for easier signal firing
+RSI_BUY_MIN = float(os.getenv("RSI_BUY_MIN", "38"))   # was ~oversold 30; higher -> more buys
+RSI_SELL_MIN = float(os.getenv("RSI_SELL_MIN", "62"))  # lower than 70 -> more sells
+BB_K = float(os.getenv("BB_K", "1.8"))                 # Bollinger width k (default 2.0) -> tighter bands
+
 FALLBACK_TIMEFRAMES = ["5m", "15m", "1h", "4h", "1d"]
 FIAT_QUOTE = os.getenv("FIAT_QUOTE", "USD")
 
@@ -180,10 +185,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df["rsi14"] = rsi.fillna(method="bfill")
         ma = df["close"].rolling(20).mean()
         std = df["close"].rolling(20).std(ddof=0)
-        df["bb_mid"], df["bb_up"], df["bb_down"] = ma, ma + 2*std, ma - 2*std
+        df["bb_mid"], df["bb_up"], df["bb_down"] = ma, ma + BB_K*std, ma - BB_K*std
         return df
     df["rsi14"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
-    bb = ta.volatility.BollingerBands(df["close"], window=20, window_dev=2)
+    bb = ta.volatility.BollingerBands(df["close"], window=20, window_dev=BB_K)
     df["bb_mid"], df["bb_up"], df["bb_down"] = bb.bollinger_mavg(), bb.bollinger_hband(), bb.bollinger_lband()
     return df
 
@@ -192,9 +197,28 @@ def generate_signal(df: pd.DataFrame) -> str:
     if len(df) < 25:
         return "HOLD"
     last, prev = df.iloc[-1], df.iloc[-2]
-    if last["close"] > last["bb_down"] and prev["close"] <= prev["bb_down"] and last["rsi14"] > prev["rsi14"]:
+
+    # Looser, more test-friendly rules
+    buy_cond = (
+        (last["close"] > last["bb_down"] and prev["close"] <= prev["bb_down"])  # bounce off lower band
+        or (prev["rsi14"] <= RSI_BUY_MIN and last["rsi14"] > prev["rsi14"] and last["close"] > prev["close"])  # RSI rising from low
+    )
+    sell_cond = (
+        (prev["close"] >= prev["bb_up"] and last["close"] < last["bb_up"] and last["rsi14"] <= prev["rsi14"])  # fade from upper band
+        or (last["rsi14"] >= RSI_SELL_MIN and last["close"] < last["bb_mid"])  # RSI high + slip under mid
+    )
+
+    if buy_cond:
         return "BUY"
-    if last["close"] >= last["bb_up"] and last["rsi14"] >= 70:
+    if sell_cond:
+        return "SELL"
+    return "HOLD"
+    last, prev = df.iloc[-1], df.iloc[-2]
+    # Looser BUY condition: allow RSI > 40 instead of strictly rising
+    if last["close"] > last["bb_down"] and last["rsi14"] > 40:
+        return "BUY"
+    # Looser SELL condition: RSI >= 60 (was 70)
+    if last["close"] >= last["bb_up"] and last["rsi14"] >= 60:
         return "SELL"
     return "HOLD"
 
