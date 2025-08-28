@@ -8,15 +8,17 @@ on:
 
 env:
   PYTHON_VERSION: "3.11"
-  DRY_RUN: "false"              # set to "true" for a safe test
+  DRY_RUN: "false"              # set "true" to simulate
   TRADE_AMOUNT: "10"            # spend per buy in USDT (quote)
   DAILY_CAP: "50"               # max spend per run
-  DROP_PCT: "0.5"               # min hourly drop to consider
-  SELL_DROP_PCT: "0.5"          # stop loss % below entry
-  UNIVERSE: "AUTO_USDT"         # AUTO_USDT = scan most Kraken USDT spot markets
-  MAX_SYMBOLS: "30"             # cap how many to analyze per run
-  MIN_LAST_CANDLE_USD: "50000"  # filter out illiquid markets
-  EXCLUDE: "USDT/USDT,USD/USDT" # comma-separated symbols to skip
+  DROP_PCT: "0.5"               # min drop to consider (percent)
+  SELL_DROP_PCT: "2.0"          # stop loss below entry (percent)
+  UNIVERSE: "AUTO_USDT"         # scan most Kraken USDT spot markets
+  MAX_SYMBOLS: "60"             # scan up to N pairs
+  MIN_LAST_CANDLE_USD: "10000"  # liquidity filter (lower to allow more)
+  EXCLUDE: "USDT/USDT,USD/USDT"
+  TIMEFRAME: "5m"               # <— faster candles to find moves now
+  FORCE_BUY: "true"             # <— if nothing meets DROP_PCT, buy top drop anyway
 
 jobs:
   run:
@@ -36,7 +38,7 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install ccxt yfinance
+            pip install ccxt
           fi
 
       - name: Show runtime knobs
@@ -49,6 +51,8 @@ jobs:
           echo "UNIVERSE=${UNIVERSE}"
           echo "MAX_SYMBOLS=${MAX_SYMBOLS}"
           echo "MIN_LAST_CANDLE_USD=${MIN_LAST_CANDLE_USD}"
+          echo "TIMEFRAME=${TIMEFRAME}"
+          echo "FORCE_BUY=${FORCE_BUY}"
 
       - name: Run trader (Kraken)
         env:
@@ -61,6 +65,8 @@ jobs:
           MAX_SYMBOLS: ${{ env.MAX_SYMBOLS }}
           MIN_LAST_CANDLE_USD: ${{ env.MIN_LAST_CANDLE_USD }}
           EXCLUDE: ${{ env.EXCLUDE }}
+          TIMEFRAME: ${{ env.TIMEFRAME }}
+          FORCE_BUY: ${{ env.FORCE_BUY }}
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
