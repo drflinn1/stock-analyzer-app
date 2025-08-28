@@ -3,36 +3,43 @@ name: Crypto Live (Cautious)
 on:
   schedule:
     - cron: "*/15 * * * *"   # every 15 minutes
-  workflow_dispatch:          # still allow manual run
+  workflow_dispatch:          # allow manual runs too
 
 jobs:
   trade:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
       - name: Run cautious live trading
-    env:
-  MODE: live
-  DRY_RUN: "true"              # keep TRUE for burn-in; switch to "false" in Step 5
-  PROFILE: cautious
-  DROP_PCT: "0.0"
-  TRADE_SIZE: "10"
-  DAILY_CAP: "15"
-  INTERVAL: "5m"
-  LOOKBACK_MIN: "200"
-  MIN_BARS: "30"
+        env:
+          MODE: live
+          DRY_RUN: "true"                 # set to "false" when you're ready for real orders
+          PROFILE: cautious
+          DROP_PCT: "0.0"
+          TRADE_SIZE: "10"
+          DAILY_CAP: "15"
 
-  # Autopick controls
-  CRYPTO_AUTOPICK: "true"
-  AUTOPICK_TOP_N: "4"
-  CRYPTO_UNIVERSE: "BTC-USD,ETH-USD,SOL-USD,ADA-USD,XRP-USD,LTC-USD,DOGE-USD,AVAX-USD,BNB-USD,MATIC-USD"
+          # Strategy data controls
+          INTERVAL: "5m"
+          LOOKBACK_MIN: "200"
+          MIN_BARS: "30"
 
-  # (Only needed for REAL live orders via Kraken/ccxt)
-  KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-  KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          # Autopick top performers
+          CRYPTO_AUTOPICK: "true"
+          AUTOPICK_TOP_N: "4"
+          CRYPTO_UNIVERSE: "BTC-USD,ETH-USD,SOL-USD,ADA-USD,XRP-USD,LTC-USD,DOGE-USD,AVAX-USD,BNB-USD,MATIC-USD"
+
+          # Optional: enable real Kraken orders (only matters when DRY_RUN="false")
+          # KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          # KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        run: python main.py
