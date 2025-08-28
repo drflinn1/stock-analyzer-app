@@ -11,13 +11,13 @@ env:
   DRY_RUN: "false"              # set "true" to simulate
   TRADE_AMOUNT: "10"            # spend per buy in USDT (quote)
   DAILY_CAP: "50"               # max spend per run
-  DROP_PCT: "0.5"               # min drop to consider (percent)
+  DROP_PCT: "0.0"               # min drop to consider (percent)
   SELL_DROP_PCT: "2.0"          # stop loss below entry (percent)
   UNIVERSE: "AUTO_USDT"         # scan most Kraken USDT spot markets
   MAX_SYMBOLS: "60"             # scan up to N pairs
-  MIN_LAST_CANDLE_USD: "10000"  # liquidity filter (lower to allow more)
+  MIN_LAST_CANDLE_USD: "0"  # liquidity filter (lower to allow more)
   EXCLUDE: "USDT/USDT,USD/USDT"
-  TIMEFRAME: "5m"               # <— faster candles to find moves now
+  TIMEFRAME: "1m"               # <— faster candles to find moves now
   FORCE_BUY: "true"             # <— if nothing meets DROP_PCT, buy top drop anyway
 
 jobs:
