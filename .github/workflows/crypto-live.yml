@@ -11,8 +11,8 @@ env:
   DRY_RUN: "false"              # set to "true" for a safe test
   TRADE_AMOUNT: "10"            # spend per buy in USDT (quote)
   DAILY_CAP: "50"               # max spend per run
-  DROP_PCT: "2.0"               # min hourly drop to consider
-  SELL_DROP_PCT: "2.0"          # stop loss % below entry
+  DROP_PCT: "0.5"               # min hourly drop to consider
+  SELL_DROP_PCT: "0.5"          # stop loss % below entry
   UNIVERSE: "AUTO_USDT"         # AUTO_USDT = scan most Kraken USDT spot markets
   MAX_SYMBOLS: "30"             # cap how many to analyze per run
   MIN_LAST_CANDLE_USD: "50000"  # filter out illiquid markets
