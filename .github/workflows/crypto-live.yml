@@ -9,7 +9,7 @@ on:
 env:
   PYTHON_VERSION: "3.11"
   DRY_RUN: "false"              # set "true" to simulate
-  TRADE_AMOUNT: "10"            # spend per buy in USDT (quote)
+  TRADE_AMOUNT: "25"            # spend per buy in USDT (quote)
   DAILY_CAP: "50"               # max spend per run
   DROP_PCT: "0.0"               # min drop to consider (percent)
   SELL_DROP_PCT: "2.0"          # stop loss below entry (percent)
@@ -19,7 +19,6 @@ env:
   EXCLUDE: "USDT/USDT,USD/USDT"
   TIMEFRAME: "1m"               # <— faster candles to find moves now
   FORCE_BUY: "true"             # <— if nothing meets DROP_PCT, buy top drop anyway
-  TRADE_AMOUNT: "25"
 
 jobs:
   run:
