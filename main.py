@@ -239,6 +239,7 @@ def _qty_for(symbol: str, last_close: float) -> float:
 
 
 def run_once(symbols: List[str], timeframe: Optional[str] = None, limit: int = DEFAULT_LIMIT) -> None:
+    print("\n=== START TRADING OUTPUT ===")
     for sym in symbols:
         tf = choose_timeframe(sym, preferred=(timeframe or DEFAULT_TIMEFRAME))
         print(f"\n=== {sym} @ {tf} ===")
@@ -257,6 +258,7 @@ def run_once(symbols: List[str], timeframe: Optional[str] = None, limit: int = D
             place_order(sym, "BUY", qty)
         elif sig == "SELL":
             place_order(sym, "SELL", qty)
+    print("=== END TRADING OUTPUT ===\n")
 
 
 def parse_args(argv: List[str]) -> Tuple[List[str], Optional[str], int]:
@@ -272,6 +274,8 @@ def parse_args(argv: List[str]) -> Tuple[List[str], Optional[str], int]:
 
 if __name__ == "__main__":
     syms, tf, lim = parse_args(sys.argv[1:])
+    print("=== START TRADING OUTPUT ===")
     print(f"DRY_RUN={DRY_RUN} | AUTOPICK={AUTOPICK} | DEFAULT_TIMEFRAME={DEFAULT_TIMEFRAME} | LIMIT={lim}")
     print(f"Symbols: {syms}")
     run_once(syms, timeframe=tf, limit=lim)
+    print("=== END TRADING OUTPUT ===")
