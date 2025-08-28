@@ -21,9 +21,9 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run cautious live trading
-         env:
+        env:
           MODE: "live"
-          DRY_RUN: "true"             # keep "true" until ready for live orders
+          DRY_RUN: "true"      # keep "true" until ready for live orders
           PROFILE: "cautious"
           SYMBOLS: "BTC/USD,ETH/USD"
           TIMEFRAME: "15m"
