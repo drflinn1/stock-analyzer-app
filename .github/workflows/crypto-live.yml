@@ -21,18 +21,13 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run cautious live trading
-          env:
+         env:
           MODE: "live"
-          DRY_RUN: "true"           # keep "true" until you're ready to actually trade
+          DRY_RUN: "true"             # keep "true" until ready for live orders
           PROFILE: "cautious"
-          DROP_PCT: "0.0"
-          TRADE_USD: "10"
-          DAILY_CAP: "15"
-          INTERVAL: "5m"
-          LOOKBACK_MIN: "200"
-          MIN_BARS: "30"
-          CRYPTO_AUTOPICK: "true"
-          AUTOPICK_TOP_N: "4"
-          CRYPTO_UNIVERSE: "BTC-USD,ETH-USD,SOL-USD,ADA-USD,XRP-USD,LTC-USD,DOGE-USD,AVAX-USD,BNB-USD,MATIC-USD"
+          SYMBOLS: "BTC/USD,ETH/USD"
+          TIMEFRAME: "15m"
+          AUTOPICK: "true"
           BROKER: "kraken"
+          TRADE_USD: "10"
         run: python main.py
