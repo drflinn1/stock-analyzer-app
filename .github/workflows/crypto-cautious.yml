@@ -1,4 +1,4 @@
-name: Crypto Live Cautious
+name: Crypto Live (Cautious)
 
 on:
   workflow_dispatch:
