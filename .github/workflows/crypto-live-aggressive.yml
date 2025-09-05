@@ -22,4 +22,5 @@ jobs:
           DROP_PCT: "2.0"            # safer buy gate (2%+ dip required)
           TRADE_SIZE: "15"
           DAILY_CAP: "25"
+          EXCLUDE: "U/USD"
         run: python main.py
