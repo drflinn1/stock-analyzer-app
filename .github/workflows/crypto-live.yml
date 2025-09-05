@@ -4,32 +4,36 @@ on:
   workflow_dispatch:
 
 env:
+  # Python
   PYTHON_VERSION: "3.11"
 
-  STOP_LOSS_PCT: "2.0"              # % below filled buy price (e.g., 2.0 = 2%)
-  STOP_LOSS_USE_LIMIT: "true"       # true = stop-loss-LIMIT; false = stop-loss (market)
-  STOP_LOSS_LIMIT_OFFSET_BP: "10"   # limit is 10 bp (=0.10%) below the stop trigger
+  # --- Stop-loss knobs ------------------------
+  STOP_LOSS_PCT: "2.0"               # % below filled buy price
+  STOP_LOSS_USE_LIMIT: "true"        # true = stop-loss-LIMIT; false = stop-loss (market)
+  STOP_LOSS_LIMIT_OFFSET_BP: "10"    # 10 bp (0.10%) under the stop trigger
 
-  # ---- Live knobs ----
-  DRY_RUN: "false"              # set "true" for safe simulation
-  TRADE_AMOUNT: "25"            # spend per buy in *quote* currency
+  # --- Live knobs -----------------------------
+  DRY_RUN: "false"                    # set "true" for simulation
+  TRADE_AMOUNT: "25"                  # spend per buy in *quote* currency
   DAILY_CAP: "75"
 
-  # ---- Signal / selection ----
-  TIMEFRAME: "1m"               # fast candles so something triggers
-  DROP_PCT: "0.0"               # accept any move (we’ll force-pick worst drop)
-  FORCE_BUY: "true"             # if gate not met, buy top drop anyway
+  # --- Selection / universe -------------------
+  DROP_PCT: "2.0"
+  UNIVERSE_SIZE: "100"
+  PREFERRED_QUOTES: "USD,USDT"
 
-  # ---- Universe & liquidity ----
-  UNIVERSE: "AUTO"              # <-- SCAN automatically (not a symbol)
-  PREFERRED_QUOTES: "USD,USDT"  # prefer USD first (you have USD)
-  MAX_SYMBOLS: "100"
-  MIN_LAST_CANDLE_USD: "0"
-  EXCLUDE: "USDT/USDT,USD/USDT"
+  # (Optional legacy knobs you had before — safe to keep, ignored by current runner)
+  # TIMEFRAME: "1m"
+  # FORCE_BUY: "true"
+  # UNIVERSE: "AUTO"
+  # MAX_SYMBOLS: "100"
+  # MIN_LAST_CANDLE_USD: "0"
+  # EXCLUDE: "USDT/USDT,USD/USDT"
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -42,36 +46,40 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # If requirements.txt exists, install it; then ensure ccxt is present.
+          (test -f requirements.txt && pip install -r requirements.txt) || true
           pip install ccxt
 
       - name: Show runtime knobs
         run: |
           echo "DRY_RUN=${DRY_RUN}"
           echo "TRADE_AMOUNT=${TRADE_AMOUNT}"
+          echo "DAILY_CAP=${DAILY_CAP}"
+          echo "STOP_LOSS_PCT=${STOP_LOSS_PCT}"
+          echo "STOP_LOSS_USE_LIMIT=${STOP_LOSS_USE_LIMIT}"
+          echo "STOP_LOSS_LIMIT_OFFSET_BP=${STOP_LOSS_LIMIT_OFFSET_BP}"
           echo "DROP_PCT=${DROP_PCT}"
-          echo "TIMEFRAME=${TIMEFRAME}"
-          echo "FORCE_BUY=${FORCE_BUY}"
-          echo "UNIVERSE=${UNIVERSE}"
+          echo "UNIVERSE_SIZE=${UNIVERSE_SIZE}"
           echo "PREFERRED_QUOTES=${PREFERRED_QUOTES}"
-          echo "MAX_SYMBOLS=${MAX_SYMBOLS}"
-          echo "MIN_LAST_CANDLE_USD=${MIN_LAST_CANDLE_USD}"
 
       - name: Run trader (Kraken)
         env:
+          # pass through knobs explicitly (okay to rely on inherited env too)
           DRY_RUN: ${{ env.DRY_RUN }}
           TRADE_AMOUNT: ${{ env.TRADE_AMOUNT }}
           DAILY_CAP: ${{ env.DAILY_CAP }}
+          STOP_LOSS_PCT: ${{ env.STOP_LOSS_PCT }}
+          STOP_LOSS_USE_LIMIT: ${{ env.STOP_LOSS_USE_LIMIT }}
+          STOP_LOSS_LIMIT_OFFSET_BP: ${{ env.STOP_LOSS_LIMIT_OFFSET_BP }}
           DROP_PCT: ${{ env.DROP_PCT }}
-          SELL_DROP_PCT: "2.0"
-          UNIVERSE: ${{ env.UNIVERSE }}
+          UNIVERSE_SIZE: ${{ env.UNIVERSE_SIZE }}
           PREFERRED_QUOTES: ${{ env.PREFERRED_QUOTES }}
-          MAX_SYMBOLS: ${{ env.MAX_SYMBOLS }}
-          MIN_LAST_CANDLE_USD: ${{ env.MIN_LAST_CANDLE_USD }}
-          EXCLUDE: ${{ env.EXCLUDE }}
-          TIMEFRAME: ${{ env.TIMEFRAME }}
-          FORCE_BUY: ${{ env.FORCE_BUY }}
+
+          # --- Exchange credentials (map to names the code expects) ---
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          KRAKEN_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}
+          # KRAKEN_PASSWORD: ${{ secrets.KRAKEN_PASSWORD }}  # not needed for spot; leave unset
+
         run: |
           python -V
           python main.py
