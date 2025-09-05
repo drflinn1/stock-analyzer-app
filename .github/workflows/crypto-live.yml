@@ -2,6 +2,10 @@ name: Crypto Live
 
 on:
   workflow_dispatch:
+  
+concurrency:
+  group: crypto-live
+  cancel-in-progress: true
 
 env:
   # Python
