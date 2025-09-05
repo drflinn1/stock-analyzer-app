@@ -6,6 +6,10 @@ on:
 env:
   PYTHON_VERSION: "3.11"
 
+  STOP_LOSS_PCT: "2.0"              # % below filled buy price (e.g., 2.0 = 2%)
+  STOP_LOSS_USE_LIMIT: "true"       # true = stop-loss-LIMIT; false = stop-loss (market)
+  STOP_LOSS_LIMIT_OFFSET_BP: "10"   # limit is 10 bp (=0.10%) below the stop trigger
+
   # ---- Live knobs ----
   DRY_RUN: "false"              # set "true" for safe simulation
   TRADE_AMOUNT: "25"            # spend per buy in *quote* currency
