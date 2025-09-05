@@ -1,0 +1,80 @@
+name: Crypto Live (Every 15 min)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"     # runs every 15 minutes (UTC)
+  workflow_dispatch:            # still lets you run it manually
+
+concurrency:
+  group: crypto-live
+  cancel-in-progress: true      # ensures no overlapping runs
+
+env:
+  # Python
+  PYTHON_VERSION: "3.11"
+
+  # --- Stop-loss knobs ---
+  STOP_LOSS_PCT: "2.0"
+  STOP_LOSS_USE_LIMIT: "true"
+  STOP_LOSS_LIMIT_OFFSET_BP: "10"
+
+  # --- Live knobs (start modest; you can raise later) ---
+  DRY_RUN: "false"
+  TRADE_AMOUNT: "25"
+  DAILY_CAP: "75"               # note: not enforced by code yet (see note below)
+
+  # --- Selection / universe ---
+  DROP_PCT: "2.0"               # only buy if drop >= 2% vs 24h pct
+  UNIVERSE_SIZE: "100"
+  PREFERRED_QUOTES: "USD,USDT"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          (test -f requirements.txt && pip install -r requirements.txt) || true
+          pip install ccxt
+
+      - name: Show runtime knobs
+        run: |
+          echo "DRY_RUN=${DRY_RUN}"
+          echo "TRADE_AMOUNT=${TRADE_AMOUNT}"
+          echo "DAILY_CAP=${DAILY_CAP}"
+          echo "STOP_LOSS_PCT=${STOP_LOSS_PCT}"
+          echo "STOP_LOSS_USE_LIMIT=${STOP_LOSS_USE_LIMIT}"
+          echo "STOP_LOSS_LIMIT_OFFSET_BP=${STOP_LOSS_LIMIT_OFFSET_BP}"
+          echo "DROP_PCT=${DROP_PCT}"
+          echo "UNIVERSE_SIZE=${UNIVERSE_SIZE}"
+          echo "PREFERRED_QUOTES=${PREFERRED_QUOTES}"
+
+      - name: Run trader (Kraken)
+        env:
+          DRY_RUN: ${{ env.DRY_RUN }}
+          TRADE_AMOUNT: ${{ env.TRADE_AMOUNT }}
+          DAILY_CAP: ${{ env.DAILY_CAP }}
+          STOP_LOSS_PCT: ${{ env.STOP_LOSS_PCT }}
+          STOP_LOSS_USE_LIMIT: ${{ env.STOP_LOSS_USE_LIMIT }}
+          STOP_LOSS_LIMIT_OFFSET_BP: ${{ env.STOP_LOSS_LIMIT_OFFSET_BP }}
+          DROP_PCT: ${{ env.DROP_PCT }}
+          UNIVERSE_SIZE: ${{ env.UNIVERSE_SIZE }}
+          PREFERRED_QUOTES: ${{ env.PREFERRED_QUOTES }}
+
+          # Exchange credentials (map to names the code expects)
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}
+
+        run: |
+          python -V
+          python main.py
