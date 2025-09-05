@@ -2,7 +2,8 @@ name: Crypto Live
 
 on:
   workflow_dispatch:
-  
+
+# prevent overlap with Cautious and 15-min jobs
 concurrency:
   group: crypto-live
   cancel-in-progress: true
@@ -11,29 +12,24 @@ env:
   # Python
   PYTHON_VERSION: "3.11"
 
-  # --- Stop-loss knobs ------------------------
-  STOP_LOSS_PCT: "2.0"               # % below filled buy price
-  STOP_LOSS_USE_LIMIT: "true"        # true = stop-loss-LIMIT; false = stop-loss (market)
-  STOP_LOSS_LIMIT_OFFSET_BP: "10"    # 10 bp (0.10%) under the stop trigger
+  # --- Stop-loss knobs ---
+  STOP_LOSS_PCT: "2.0"
+  STOP_LOSS_USE_LIMIT: "true"
+  STOP_LOSS_LIMIT_OFFSET_BP: "10"
 
-  # --- Live knobs -----------------------------
-  DRY_RUN: "false"                    # set "true" for simulation
-  TRADE_AMOUNT: "25"                  # spend per buy in *quote* currency
+  # --- Live knobs ---
+  DRY_RUN: "false"
+  TRADE_AMOUNT: "25"
   DAILY_CAP: "75"
 
-  # --- Selection / universe -------------------
+  # --- Selection / universe ---
   DROP_PCT: "2.0"
   UNIVERSE_SIZE: "100"
   PREFERRED_QUOTES: "USD,USDT"
 
-  # (Optional legacy knobs you had before — safe to keep, ignored by current runner)
-  # TIMEFRAME: "1m"
-  # FORCE_BUY: "true"
-  # UNIVERSE: "AUTO"
-  # MAX_SYMBOLS: "100"
-  # MIN_LAST_CANDLE_USD: "0"
-  # EXCLUDE: "USDT/USDT,USD/USDT"
+  # --- Symbol controls ---
   EXCLUDE: "U/USD"
+  # WHITELIST: "BTC/USD,ETH/USD,SOL/USD"   # optional: restrict to only these
 
 jobs:
   run:
@@ -51,7 +47,6 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # If requirements.txt exists, install it; then ensure ccxt is present.
           (test -f requirements.txt && pip install -r requirements.txt) || true
           pip install ccxt
 
@@ -66,10 +61,11 @@ jobs:
           echo "DROP_PCT=${DROP_PCT}"
           echo "UNIVERSE_SIZE=${UNIVERSE_SIZE}"
           echo "PREFERRED_QUOTES=${PREFERRED_QUOTES}"
+          echo "EXCLUDE=${EXCLUDE}"
+          echo "WHITELIST=${WHITELIST}"
 
       - name: Run trader (Kraken)
         env:
-          # pass through knobs explicitly (okay to rely on inherited env too)
           DRY_RUN: ${{ env.DRY_RUN }}
           TRADE_AMOUNT: ${{ env.TRADE_AMOUNT }}
           DAILY_CAP: ${{ env.DAILY_CAP }}
@@ -79,12 +75,12 @@ jobs:
           DROP_PCT: ${{ env.DROP_PCT }}
           UNIVERSE_SIZE: ${{ env.UNIVERSE_SIZE }}
           PREFERRED_QUOTES: ${{ env.PREFERRED_QUOTES }}
+          EXCLUDE: ${{ env.EXCLUDE }}
+          WHITELIST: ${{ env.WHITELIST }}
 
-          # --- Exchange credentials (map to names the code expects) ---
+          # Exchange credentials (map names the code expects)
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}
-          # KRAKEN_PASSWORD: ${{ secrets.KRAKEN_PASSWORD }}  # not needed for spot; leave unset
-
         run: |
           python -V
           python main.py
