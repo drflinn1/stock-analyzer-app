@@ -70,6 +70,7 @@ jobs:
           DROP_PCT: ${{ env.DROP_PCT }}
           UNIVERSE_SIZE: ${{ env.UNIVERSE_SIZE }}
           PREFERRED_QUOTES: ${{ env.PREFERRED_QUOTES }}
+          EXCLUDE: "U/USD"
 
           # Exchange credentials (map to names the code expects)
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
