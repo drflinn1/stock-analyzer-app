@@ -14,8 +14,8 @@ env:
 
   # --- Exchange credentials (from repo Secrets) ---
   KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-  KRAKEN_SECRET:  ${{ secrets.KRAKEN_SECRET }}
-  # KRAKEN_PASSWORD: ${{ secrets.KRAKEN_PASSWORD }}   # only if your API key uses one
+  KRAKEN_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}   # <-- map to your existing secret
+  # KRAKEN_PASSWORD: ${{ secrets.KRAKEN_PASSWORD }}  # not needed for Kraken spot; leave out
 
   # --- Cautious live knobs ---
   DRY_RUN: "false"        # set "true" for safe simulation
