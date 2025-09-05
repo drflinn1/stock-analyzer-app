@@ -20,8 +20,8 @@ env:
 
   # --- Live knobs (start modest; you can raise later) ---
   DRY_RUN: "false"
-  TRADE_AMOUNT: "25"
-  DAILY_CAP: "75"               # note: not enforced by code yet (see note below)
+  TRADE_AMOUNT: "10"
+  DAILY_CAP: "50"               # note: not enforced by code yet (see note below)
 
   # --- Selection / universe ---
   DROP_PCT: "2.0"               # only buy if drop >= 2% vs 24h pct
