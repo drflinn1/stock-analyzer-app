@@ -27,6 +27,8 @@ env:
   DROP_PCT: "2.0"
   PREFERRED_QUOTES: "USD,USDT"
 
+  EXCLUDE: "U/USD"
+
 jobs:
   trade:
     runs-on: ubuntu-latest
