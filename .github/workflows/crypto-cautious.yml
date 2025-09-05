@@ -2,36 +2,33 @@ name: Crypto Live (Cautious)
 
 on:
   workflow_dispatch:
-  
+
+# prevent overlap with Live & 15-min jobs
 concurrency:
   group: crypto-live
   cancel-in-progress: true
 
 env:
-  # Python
   PYTHON_VERSION: "3.11"
 
   # --- Stop-loss knobs ---
-  STOP_LOSS_PCT: "2.0"               # % below filled buy price (e.g., 2.0 = 2%)
-  STOP_LOSS_USE_LIMIT: "true"        # true = stop-loss-LIMIT; false = stop-loss (market)
-  STOP_LOSS_LIMIT_OFFSET_BP: "10"    # limit is 10 bp (=0.10%) below the stop trigger
+  STOP_LOSS_PCT: "2.0"
+  STOP_LOSS_USE_LIMIT: "true"
+  STOP_LOSS_LIMIT_OFFSET_BP: "10"
 
-  # --- Exchange credentials (from repo Secrets) ---
-  KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-  KRAKEN_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}   # <-- map to your existing secret
-  # KRAKEN_PASSWORD: ${{ secrets.KRAKEN_PASSWORD }}  # not needed for Kraken spot; leave out
+  # --- Cautious caps ---
+  DRY_RUN: "false"
+  TRADE_AMOUNT: "10"
+  DAILY_CAP: "15"
 
-  # --- Cautious live knobs ---
-  DRY_RUN: "false"        # set "true" for safe simulation
-  TRADE_AMOUNT: "10"      # spend per buy in *quote* currency (USD/USDT)
-  DAILY_CAP: "15"         # daily spend cap in quote currency
-
-  # (Optional) selection defaults; ok to omit
-  UNIVERSE_SIZE: "100"
+  # --- Selection / universe ---
   DROP_PCT: "2.0"
+  UNIVERSE_SIZE: "100"
   PREFERRED_QUOTES: "USD,USDT"
 
+  # --- Symbol controls ---
   EXCLUDE: "U/USD"
+  # WHITELIST: "BTC/USD,ETH/USD,SOL/USD"   # optional
 
 jobs:
   trade:
@@ -49,7 +46,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          (test -f requirements.txt && pip install -r requirements.txt) || true
+          pip install ccxt
 
       - name: Show runtime knobs
         run: |
@@ -62,8 +60,25 @@ jobs:
           echo "DROP_PCT=${DROP_PCT}"
           echo "UNIVERSE_SIZE=${UNIVERSE_SIZE}"
           echo "PREFERRED_QUOTES=${PREFERRED_QUOTES}"
+          echo "EXCLUDE=${EXCLUDE}"
+          echo "WHITELIST=${WHITELIST}"
 
       - name: Run trader (Kraken)
+        env:
+          DRY_RUN: ${{ env.DRY_RUN }}
+          TRADE_AMOUNT: ${{ env.TRADE_AMOUNT }}
+          DAILY_CAP: ${{ env.DAILY_CAP }}
+          STOP_LOSS_PCT: ${{ env.STOP_LOSS_PCT }}
+          STOP_LOSS_USE_LIMIT: ${{ env.STOP_LOSS_USE_LIMIT }}
+          STOP_LOSS_LIMIT_OFFSET_BP: ${{ env.STOP_LOSS_LIMIT_OFFSET_BP }}
+          DROP_PCT: ${{ env.DROP_PCT }}
+          UNIVERSE_SIZE: ${{ env.UNIVERSE_SIZE }}
+          PREFERRED_QUOTES: ${{ env.PREFERRED_QUOTES }}
+          EXCLUDE: ${{ env.EXCLUDE }}
+          WHITELIST: ${{ env.WHITELIST }}
+
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           python -V
           python main.py
