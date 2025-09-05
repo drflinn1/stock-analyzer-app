@@ -24,6 +24,10 @@ jobs:
 
       - name: Run STRICT Crypto (trace ambiguous Series)
         env:
+          STOP_LOSS_PCT: "2.0"              # % below filled buy price (e.g., 2.0 = 2%)
+          STOP_LOSS_USE_LIMIT: "true"       # true = stop-loss-LIMIT; false = stop-loss (market)
+          STOP_LOSS_LIMIT_OFFSET_BP: "10"   # limit is 10 bp (=0.10%) below the stop trigger
+
           # Force LIVE for parity with your live job
           TRADE_MODE: "live"
           DRY_RUN: "false"
