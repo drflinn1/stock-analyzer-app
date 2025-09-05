@@ -24,6 +24,7 @@ jobs:
       EQUITY_AUTOPICK: "false"
       AUTOPICK_OVERRIDES: ""                  # optional, keep empty
       OUT_DIR: "out"
+      EXCLUDE: "U/USD"
 
       # Brokers/exchanges (these match what you already use)
       EQUITY_BROKER: "robinhood"
