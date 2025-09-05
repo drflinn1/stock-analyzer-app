@@ -37,4 +37,6 @@ jobs:
           BB_K: "1.8"
           RSI_BUY_MIN: "42"
           RSI_SELL_MIN: "58"
+          EXCLUDE: "U/USD"
+
         run: python main.py
