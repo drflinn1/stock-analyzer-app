@@ -29,6 +29,7 @@ env:
   # MAX_SYMBOLS: "100"
   # MIN_LAST_CANDLE_USD: "0"
   # EXCLUDE: "USDT/USDT,USD/USDT"
+  EXCLUDE: "U/USD"
 
 jobs:
   run:
