@@ -17,17 +17,18 @@ env:
   STOP_LOSS_USE_LIMIT: "true"
   STOP_LOSS_LIMIT_OFFSET_BP: "10"
 
-  # --- Live knobs (tune as desired) ---
+  # --- Live knobs ---
   DRY_RUN: "false"
   TRADE_AMOUNT: "25"
   DAILY_CAP: "75"
+  DAILY_CAP_TZ: "America/Los_Angeles"    # NEW
 
   # --- Selection / universe ---
   DROP_PCT: "2.0"
   UNIVERSE_SIZE: "100"
   PREFERRED_QUOTES: "USD,USDT"
-  MIN_DOLLAR_VOL_24H: "500000"   # NEW
-  MIN_PRICE: "0.01"              # NEW
+  MIN_DOLLAR_VOL_24H: "500000"
+  MIN_PRICE: "0.01"
 
   # --- Symbol controls ---
   EXCLUDE: "U/USD"
@@ -56,6 +57,7 @@ jobs:
           echo "DRY_RUN=${DRY_RUN}"
           echo "TRADE_AMOUNT=${TRADE_AMOUNT}"
           echo "DAILY_CAP=${DAILY_CAP}"
+          echo "DAILY_CAP_TZ=${DAILY_CAP_TZ}"
           echo "STOP_LOSS_PCT=${STOP_LOSS_PCT}"
           echo "STOP_LOSS_USE_LIMIT=${STOP_LOSS_USE_LIMIT}"
           echo "STOP_LOSS_LIMIT_OFFSET_BP=${STOP_LOSS_LIMIT_OFFSET_BP}"
@@ -72,6 +74,7 @@ jobs:
           DRY_RUN: ${{ env.DRY_RUN }}
           TRADE_AMOUNT: ${{ env.TRADE_AMOUNT }}
           DAILY_CAP: ${{ env.DAILY_CAP }}
+          DAILY_CAP_TZ: ${{ env.DAILY_CAP_TZ }}
           STOP_LOSS_PCT: ${{ env.STOP_LOSS_PCT }}
           STOP_LOSS_USE_LIMIT: ${{ env.STOP_LOSS_USE_LIMIT }}
           STOP_LOSS_LIMIT_OFFSET_BP: ${{ env.STOP_LOSS_LIMIT_OFFSET_BP }}
