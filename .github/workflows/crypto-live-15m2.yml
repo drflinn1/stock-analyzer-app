@@ -30,13 +30,20 @@ jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: ${{ env.PYTHON_VERSION }} }
-      - run: |
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
           python -m pip install --upgrade pip
           (test -f requirements.txt && pip install -r requirements.txt) || true
           pip install ccxt
+
       - name: Show runtime knobs
         run: |
           echo "DRY_RUN=${DRY_RUN}"
@@ -44,6 +51,7 @@ jobs:
           echo "DAILY_CAP=${DAILY_CAP}  TZ=${DAILY_CAP_TZ}"
           echo "MIN_DOLLAR_VOL_24H=${MIN_DOLLAR_VOL_24H}  MIN_PRICE=${MIN_PRICE}"
           echo "EXCLUDE=${EXCLUDE}"
+
       - name: Run trader (Kraken)
         env:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
