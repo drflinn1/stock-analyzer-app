@@ -5,57 +5,11 @@ on:
     - cron: '*/15 * * * *'
   workflow_dispatch:
 
-concurrency:
-  group: crypto-live
-  cancel-in-progress: true
-
-env:
-  PYTHON_VERSION: "3.11"
-  STOP_LOSS_PCT: "2.0"
-  STOP_LOSS_USE_LIMIT: "true"
-  STOP_LOSS_LIMIT_OFFSET_BP: "10"
-  DRY_RUN: "false"
-  SKIP_BALANCE_PING: "true"
-  TRADE_AMOUNT: "25"
-  DAILY_CAP: "75"
-  DAILY_CAP_TZ: "America/Los_Angeles"
-  DROP_PCT: "2.0"
-  UNIVERSE_SIZE: "100"
-  PREFERRED_QUOTES: "USD,USDT"
-  MIN_DOLLAR_VOL_24H: "500000"
-  MIN_PRICE: "0.01"
-  EXCLUDE: "U/USD"
-
 jobs:
-  run:
+  poke:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Install dependencies
+      - name: Say hi
         run: |
-          python -m pip install --upgrade pip
-          (test -f requirements.txt && pip install -r requirements.txt) || true
-          pip install ccxt
-
-      - name: Show runtime knobs
-        run: |
-          echo "DRY_RUN=${DRY_RUN}"
-          echo "SKIP_BALANCE_PING=${SKIP_BALANCE_PING}"
-          echo "DAILY_CAP=${DAILY_CAP}  TZ=${DAILY_CAP_TZ}"
-          echo "MIN_DOLLAR_VOL_24H=${MIN_DOLLAR_VOL_24H}  MIN_PRICE=${MIN_PRICE}"
-          echo "EXCLUDE=${EXCLUDE}"
-
-      - name: Run trader (Kraken)
-        env:
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}
-        run: |
-          python -V
-          python main.py
+          echo "Hello from cron"
+          date -u
