@@ -19,9 +19,10 @@ env:
 
   # --- Live knobs ---
   DRY_RUN: "false"
+  SKIP_BALANCE_PING: "true"          # NEW
   TRADE_AMOUNT: "25"
   DAILY_CAP: "75"
-  DAILY_CAP_TZ: "America/Los_Angeles"    # NEW
+  DAILY_CAP_TZ: "America/Los_Angeles"
 
   # --- Selection / universe ---
   DROP_PCT: "2.0"
@@ -55,6 +56,7 @@ jobs:
       - name: Show runtime knobs
         run: |
           echo "DRY_RUN=${DRY_RUN}"
+          echo "SKIP_BALANCE_PING=${SKIP_BALANCE_PING}"
           echo "TRADE_AMOUNT=${TRADE_AMOUNT}"
           echo "DAILY_CAP=${DAILY_CAP}"
           echo "DAILY_CAP_TZ=${DAILY_CAP_TZ}"
@@ -72,6 +74,7 @@ jobs:
       - name: Run trader (Kraken)
         env:
           DRY_RUN: ${{ env.DRY_RUN }}
+          SKIP_BALANCE_PING: ${{ env.SKIP_BALANCE_PING }}
           TRADE_AMOUNT: ${{ env.TRADE_AMOUNT }}
           DAILY_CAP: ${{ env.DAILY_CAP }}
           DAILY_CAP_TZ: ${{ env.DAILY_CAP_TZ }}
