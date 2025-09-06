@@ -3,7 +3,6 @@ name: Crypto Live (Cautious)
 on:
   workflow_dispatch:
 
-# prevent overlap with Live & 15-min jobs
 concurrency:
   group: crypto-live
   cancel-in-progress: true
@@ -25,15 +24,16 @@ env:
   DROP_PCT: "2.0"
   UNIVERSE_SIZE: "100"
   PREFERRED_QUOTES: "USD,USDT"
+  MIN_DOLLAR_VOL_24H: "500000"   # NEW
+  MIN_PRICE: "0.01"              # NEW
 
   # --- Symbol controls ---
   EXCLUDE: "U/USD"
-  # WHITELIST: "BTC/USD,ETH/USD,SOL/USD"   # optional
+  # WHITELIST: "BTC/USD,ETH/USD,SOL/USD"
 
 jobs:
   trade:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -60,6 +60,8 @@ jobs:
           echo "DROP_PCT=${DROP_PCT}"
           echo "UNIVERSE_SIZE=${UNIVERSE_SIZE}"
           echo "PREFERRED_QUOTES=${PREFERRED_QUOTES}"
+          echo "MIN_DOLLAR_VOL_24H=${MIN_DOLLAR_VOL_24H}"
+          echo "MIN_PRICE=${MIN_PRICE}"
           echo "EXCLUDE=${EXCLUDE}"
           echo "WHITELIST=${WHITELIST}"
 
@@ -74,9 +76,10 @@ jobs:
           DROP_PCT: ${{ env.DROP_PCT }}
           UNIVERSE_SIZE: ${{ env.UNIVERSE_SIZE }}
           PREFERRED_QUOTES: ${{ env.PREFERRED_QUOTES }}
+          MIN_DOLLAR_VOL_24H: ${{ env.MIN_DOLLAR_VOL_24H }}
+          MIN_PRICE: ${{ env.MIN_PRICE }}
           EXCLUDE: ${{ env.EXCLUDE }}
           WHITELIST: ${{ env.WHITELIST }}
-
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}
         run: |
