@@ -6,6 +6,7 @@ Crypto live runner (Kraken via CCXT) with:
 - EXCLUDE/WHITELIST symbol controls
 - Auto-skip region-restricted symbols and try the next candidate
 - Daily-cap day boundary in a configurable timezone (default America/Los_Angeles)
+- OPTIONAL: Skip balance ping (to silence permission warnings)
 
 "Today" is the local day in DAILY_CAP_TZ; we convert that midnight to UTC for API calls.
 """
@@ -14,7 +15,7 @@ import os
 import time
 import traceback
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo  # Python 3.11+ stdlib
+from zoneinfo import ZoneInfo  # Python 3.11+
 
 import ccxt
 
@@ -53,11 +54,12 @@ def _parse_symlist(s):
 PYTHON_VERSION            = os.getenv("PYTHON_VERSION", "3.11")
 EXCHANGE_ID               = os.getenv("EXCHANGE_ID", "kraken").lower()
 DRY_RUN                   = _to_bool(os.getenv("DRY_RUN", "true"), True)
+SKIP_BALANCE_PING         = _to_bool(os.getenv("SKIP_BALANCE_PING", "true"), True)  # NEW
 
 # Notional knobs (quote currency spend)
 TRADE_AMOUNT              = _to_float(os.getenv("TRADE_AMOUNT", "25"), 25.0)
 DAILY_CAP                 = _to_float(os.getenv("DAILY_CAP", "75"), 75.0)
-DAILY_CAP_TZ              = os.getenv("DAILY_CAP_TZ", "America/Los_Angeles")  # NEW
+DAILY_CAP_TZ              = os.getenv("DAILY_CAP_TZ", "America/Los_Angeles")
 
 # Signal / selection knobs
 DROP_PCT                  = _to_float(os.getenv("DROP_PCT", os.getenv("DROP_THRESHOLD", "2.0")), 2.0)
@@ -225,4 +227,202 @@ def place_percent_stop_loss(exchange, symbol, filled_amount, avg_fill_price):
         log.warning("Cannot place stop-loss: missing filled_amount or avg_fill_price")
         return None
 
-    stop_trigger_
+    stop_trigger = avg_fill_price * (1.0 - STOP_LOSS_PCT / 100.0)
+    if STOP_LOSS_USE_LIMIT:
+        limit_price = stop_trigger * (1.0 - STOP_LOSS_LIMIT_OFFSET_BP / 10000.0)
+    else:
+        limit_price = None
+
+    trigger_px = price_prec(exchange, symbol, stop_trigger)
+    amount_px  = amt_prec(exchange, symbol, filled_amount)
+    limit_px   = price_prec(exchange, symbol, limit_price) if limit_price else None
+
+    if STOP_LOSS_USE_LIMIT:
+        log.info(f"Placing STOP-LOSS-LIMIT for {symbol}: trigger={trigger_px}, limit={limit_px}, amount={amount_px}")
+        params = {"price2": limit_px, "trigger": "last"}
+        order = exchange.create_order(
+            symbol=symbol,
+            type="stop-loss-limit",
+            side="sell",
+            amount=amount_px,
+            price=trigger_px,
+            params=params,
+        )
+    else:
+        log.info(f"Placing STOP-LOSS (market) for {symbol}: trigger={trigger_px}, amount={amount_px}")
+        params = {"trigger": "last"}
+        order = exchange.create_order(
+            symbol=symbol,
+            type="stop-loss",
+            side="sell",
+            amount=amount_px,
+            price=trigger_px,
+            params=params,
+        )
+    log.info(f"Stop-loss order placed: id={order.get('id')}, type={order.get('type')}")
+    return order
+
+# ------------------------ Runner ----------------------------------------------
+def main():
+    log.info("=== START TRADING OUTPUT ===")
+    log.info(f"Python {PYTHON_VERSION}")
+    log.info(f"Universe size: {UNIVERSE_SIZE}  (quotes preferred: {PREFERRED_QUOTES})")
+    if WHITELIST:
+        log.info(f"Whitelist active ({len(WHITELIST)}): {sorted(list(WHITELIST))}")
+    if EXCLUDE_LIST:
+        log.info(f"Exclude list ({len(EXCLUDE_LIST)}): {sorted(list(EXCLUDE_LIST))}")
+
+    try:
+        exchange = make_exchange()
+    except Exception as e:
+        log.error(f"Exchange init failed: {e}")
+        raise
+
+    # Optional balance ping; many keys lack this perm (harmless). Now skippable.
+    try:
+        if not DRY_RUN and not SKIP_BALANCE_PING:
+            _ = exchange.fetch_balance()
+        elif not DRY_RUN and SKIP_BALANCE_PING:
+            log.info("Skipping balance ping (SKIP_BALANCE_PING=true).")
+    except Exception as e:
+        log.warning(f"Balance check skipped: {exchange.id} {{\"error\":[\"{str(e)}\"]}}")
+
+    # Log daily-cap window (local) and compute 'since' for today in local TZ
+    since_ms, local_midnight_iso = cap_window_start()
+    log.info(f"Daily-cap window start (local {DAILY_CAP_TZ}): {local_midnight_iso}")
+
+    # Universe
+    rows = build_spot_universe(exchange)
+    log.info(f"Eligible candidates: {len(rows)}")
+    if not rows:
+        log.info("No tradable symbols in universe (after filters).")
+        log.info("=== END TRADING OUTPUT ===")
+        return
+
+    # Try up to N symbols this run, auto-skipping restricted ones
+    TRIES = min(5, len(rows))
+    tried_symbols = set()
+    for _ in range(TRIES):
+        candidates = [r for r in rows if r["symbol"] not in tried_symbols]
+        if not candidates:
+            log.info("No remaining candidates to try.")
+            break
+        best = pick_best_candidate(candidates)
+        if not best:
+            log.info("No candidate meets rules.")
+            break
+
+        symbol = best["symbol"]
+        tried_symbols.add(symbol)
+
+        last   = float(best["last"])
+        pct    = best["pct"]
+        qvol   = best["qvol"]
+        log.info(f"Best candidate: {symbol} change {pct}% last {last} vol${qvol}")
+
+        quote_ccy = quote_currency_of(exchange, symbol)
+        if quote_ccy not in PREFERRED_QUOTES:
+            log.info(f"Skipping {symbol}: quote currency {quote_ccy} not in {PREFERRED_QUOTES}")
+            continue
+
+        # Enforce daily cap (local-tz window)
+        desired_quote_notional = TRADE_AMOUNT
+        approved_quote_notional, spent_today, remaining = enforce_daily_cap_or_adjust(
+            exchange, symbol, last_price=last, desired_quote_notional=desired_quote_notional, since_ms=since_ms
+        )
+        if approved_quote_notional <= 0:
+            log.info("Order blocked by daily-cap guard.")
+            log.info("=== END TRADING OUTPUT ===")
+            return
+
+        # Compute base amount from approved notional
+        try:
+            m = exchange.market(symbol)
+            base_amt = approved_quote_notional / last
+            min_amt = (m.get("limits", {}).get("amount", {}) or {}).get("min")
+            if min_amt:
+                base_amt = max(base_amt, float(min_amt))
+            base_amt = amt_prec(exchange, symbol, base_amt)
+            if base_amt <= 0:
+                raise ValueError("Computed base amount <= 0 after precision/min checks.")
+        except Exception as e:
+            log.error(f"Amount computation failed for {symbol}: {e}")
+            continue
+
+        if DRY_RUN:
+            log.info(f"[DRY_RUN] Would place market BUY: {base_amt} {symbol} (~${approved_quote_notional:.2f})")
+            log.info("Skip stop-loss in DRY_RUN.")
+            log.info("=== END TRADING OUTPUT ===")
+            return
+
+        # Live BUY (with restricted-asset auto-skip)
+        try:
+            log.info(f"Placing market buy: {base_amt} {symbol} @ market (notional ≈ ${approved_quote_notional:.2f})")
+            buy_order = exchange.create_order(
+                symbol=symbol,
+                type="market",
+                side="buy",
+                amount=base_amt,
+            )
+            log.info(f"Executed buy: id='{buy_order.get('id')}', info: '{buy_order.get('info')}'")
+        except Exception as e:
+            msg = str(e).lower()
+            if "restricted" in msg or "invalid permissions" in msg:
+                log.warning(f"Skipping restricted symbol {symbol}: {e}")
+                continue
+            log.error(f"BUY failed for {symbol}: {e}")
+            break  # other errors: abort run
+
+        # After BUY → fetch fill → place stop-loss
+        try:
+            buy_id = (buy_order.get("id") if isinstance(buy_order, dict) else None)
+            avg_fill_price = None
+            filled_amount = None
+
+            time.sleep(1.0)  # let fills settle
+            if buy_id:
+                try:
+                    o = exchange.fetch_order(buy_id, symbol)
+                    avg_fill_price = o.get("average") or o.get("price")
+                    filled_amount  = o.get("filled") or o.get("amount")
+                except Exception as fe:
+                    log.warning(f"fetch_order failed ({fe}); falling back to ticker for fill price.")
+
+            if avg_fill_price is None:
+                t = exchange.fetch_ticker(symbol)
+                avg_fill_price = t.get("last") or t.get("close") or t.get("ask") or t.get("bid")
+                log.info(f"Fallback avg_fill_price from ticker: {avg_fill_price}")
+
+            if filled_amount is None:
+                if 'cost' in buy_order and buy_order['cost'] and avg_fill_price:
+                    filled_amount = float(buy_order['cost']) / float(avg_fill_price)
+                else:
+                    filled_amount = float(buy_order.get("amount") or buy_order.get("filled") or base_amt)
+
+            # Final precision clamp
+            filled_amount = amt_prec(exchange, symbol, filled_amount)
+            avg_fill_price = price_prec(exchange, symbol, avg_fill_price)
+
+            sl = place_percent_stop_loss(
+                exchange=exchange,
+                symbol=symbol,
+                filled_amount=filled_amount,
+                avg_fill_price=avg_fill_price,
+            )
+            if sl:
+                log.info(f"Placed stop-loss @ ~{STOP_LOSS_PCT}% below fill. Kraken id: {sl.get('id')}")
+        except Exception as e:
+            log.error(f"Stop-loss placement failed for {symbol}: {e}")
+
+        # Buy succeeded (don’t try more symbols this run)
+        break
+
+    log.info("=== END TRADING OUTPUT ===")
+
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        log.error("Fatal error:\n" + "".join(traceback.format_exc()))
+        raise
