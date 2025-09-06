@@ -2,15 +2,14 @@ name: Crypto Live (Every 15 min)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"     # runs every 15 minutes (UTC)
-  workflow_dispatch:            # still lets you run it manually
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
 
 concurrency:
   group: crypto-live
-  cancel-in-progress: true      # ensures no overlapping runs
+  cancel-in-progress: true
 
 env:
-  # Python
   PYTHON_VERSION: "3.11"
 
   # --- Stop-loss knobs ---
@@ -18,20 +17,25 @@ env:
   STOP_LOSS_USE_LIMIT: "true"
   STOP_LOSS_LIMIT_OFFSET_BP: "10"
 
-  # --- Live knobs (start modest; you can raise later) ---
+  # --- Live knobs (tune as desired) ---
   DRY_RUN: "false"
-  TRADE_AMOUNT: "10"
-  DAILY_CAP: "50"               # note: not enforced by code yet (see note below)
+  TRADE_AMOUNT: "25"
+  DAILY_CAP: "75"
 
   # --- Selection / universe ---
-  DROP_PCT: "2.0"               # only buy if drop >= 2% vs 24h pct
+  DROP_PCT: "2.0"
   UNIVERSE_SIZE: "100"
   PREFERRED_QUOTES: "USD,USDT"
+  MIN_DOLLAR_VOL_24H: "500000"   # NEW
+  MIN_PRICE: "0.01"              # NEW
+
+  # --- Symbol controls ---
+  EXCLUDE: "U/USD"
+  # WHITELIST: "BTC/USD,ETH/USD,SOL/USD"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -58,6 +62,10 @@ jobs:
           echo "DROP_PCT=${DROP_PCT}"
           echo "UNIVERSE_SIZE=${UNIVERSE_SIZE}"
           echo "PREFERRED_QUOTES=${PREFERRED_QUOTES}"
+          echo "MIN_DOLLAR_VOL_24H=${MIN_DOLLAR_VOL_24H}"
+          echo "MIN_PRICE=${MIN_PRICE}"
+          echo "EXCLUDE=${EXCLUDE}"
+          echo "WHITELIST=${WHITELIST}"
 
       - name: Run trader (Kraken)
         env:
@@ -70,12 +78,12 @@ jobs:
           DROP_PCT: ${{ env.DROP_PCT }}
           UNIVERSE_SIZE: ${{ env.UNIVERSE_SIZE }}
           PREFERRED_QUOTES: ${{ env.PREFERRED_QUOTES }}
-          EXCLUDE: "U/USD"
-
-          # Exchange credentials (map to names the code expects)
+          MIN_DOLLAR_VOL_24H: ${{ env.MIN_DOLLAR_VOL_24H }}
+          MIN_PRICE: ${{ env.MIN_PRICE }}
+          EXCLUDE: ${{ env.EXCLUDE }}
+          WHITELIST: ${{ env.WHITELIST }}
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}
-
         run: |
           python -V
           python main.py
