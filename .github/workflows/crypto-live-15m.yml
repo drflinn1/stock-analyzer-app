@@ -20,8 +20,8 @@ env:
   # --- Live knobs ---
   DRY_RUN: "false"
   SKIP_BALANCE_PING: "true"          # NEW
-  TRADE_AMOUNT: "25"
-  DAILY_CAP: "75"
+  TRADE_AMOUNT: "15"
+  DAILY_CAP: "50"
   DAILY_CAP_TZ: "America/Los_Angeles"
 
   # --- Selection / universe ---
