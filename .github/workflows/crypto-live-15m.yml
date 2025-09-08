@@ -20,7 +20,9 @@ env:
   # --- Live knobs ---
   DRY_RUN: "false"
   SKIP_BALANCE_PING: "false"          # NEW
-  TRADE_AMOUNT: "15"
+  TRADE_AMOUNT: "20"           # was "15"
+  AUTO_TOP_UP_TO_MIN: "true"   # NEW: bump to pair's min if needed (still obeys daily cap)
+  MIN_ORDER_BUFFER_USD: "0.25" # NEW: tiny cushion above exchange minimum
   DAILY_CAP: "50"
   DAILY_CAP_TZ: "America/Los_Angeles"
 
