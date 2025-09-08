@@ -2,14 +2,15 @@ name: Crypto Live (Every 15 min)
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
-  workflow_dispatch:
+    - cron: "*/15 * * * *"   # every 15 minutes
+  workflow_dispatch:         # allow manual runs from Actions tab
 
 concurrency:
   group: crypto-live
   cancel-in-progress: true
 
 env:
+  # --- Runtime ---
   PYTHON_VERSION: "3.11"
 
   # --- Stop-loss knobs ---
@@ -19,10 +20,10 @@ env:
 
   # --- Live knobs ---
   DRY_RUN: "false"
-  SKIP_BALANCE_PING: "false"          # NEW
-  TRADE_AMOUNT: "20"           # was "15"
-  AUTO_TOP_UP_TO_MIN: "true"   # NEW: bump to pair's min if needed (still obeys daily cap)
-  MIN_ORDER_BUFFER_USD: "0.25" # NEW: tiny cushion above exchange minimum
+  SKIP_BALANCE_PING: "false"      # IMPORTANT: check free USD before placing orders
+  TRADE_AMOUNT: "20"              # nominal per buy (USD)
+  AUTO_TOP_UP_MIN: "true"         # bump to pair's exchange minimum if needed
+  MIN_ORDER_BUFFER_USD: "0.50"    # cushion for fees/rounding so Kraken doesn’t reject
   DAILY_CAP: "50"
   DAILY_CAP_TZ: "America/Los_Angeles"
 
@@ -33,13 +34,16 @@ env:
   MIN_DOLLAR_VOL_24H: "500000"
   MIN_PRICE: "0.01"
 
-  # --- Symbol controls ---
+  # --- Filters ---
   EXCLUDE: "U/USD"
-  # WHITELIST: "BTC/USD,ETH/USD,SOL/USD"
+  WHITELIST: ""
 
 jobs:
   run:
+    name: Run trader (Kraken)
     runs-on: ubuntu-latest
+    permissions: {}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -52,46 +56,24 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          (test -f requirements.txt && pip install -r requirements.txt) || true
+          pip install -r requirements.txt
+          # make sure ccxt is there (some lockfiles omit it)
           pip install ccxt
 
-      - name: Show runtime knobs
+      - name: Echo live env
         run: |
           echo "DRY_RUN=${DRY_RUN}"
           echo "SKIP_BALANCE_PING=${SKIP_BALANCE_PING}"
           echo "TRADE_AMOUNT=${TRADE_AMOUNT}"
+          echo "AUTO_TOP_UP_MIN=${AUTO_TOP_UP_MIN}"
+          echo "MIN_ORDER_BUFFER_USD=${MIN_ORDER_BUFFER_USD}"
           echo "DAILY_CAP=${DAILY_CAP}"
           echo "DAILY_CAP_TZ=${DAILY_CAP_TZ}"
-          echo "STOP_LOSS_PCT=${STOP_LOSS_PCT}"
-          echo "STOP_LOSS_USE_LIMIT=${STOP_LOSS_USE_LIMIT}"
-          echo "STOP_LOSS_LIMIT_OFFSET_BP=${STOP_LOSS_LIMIT_OFFSET_BP}"
-          echo "DROP_PCT=${DROP_PCT}"
-          echo "UNIVERSE_SIZE=${UNIVERSE_SIZE}"
-          echo "PREFERRED_QUOTES=${PREFERRED_QUOTES}"
-          echo "MIN_DOLLAR_VOL_24H=${MIN_DOLLAR_VOL_24H}"
-          echo "MIN_PRICE=${MIN_PRICE}"
-          echo "EXCLUDE=${EXCLUDE}"
-          echo "WHITELIST=${WHITELIST}"
 
-      - name: Run trader (Kraken)
+      - name: Run trader
         env:
-          DRY_RUN: ${{ env.DRY_RUN }}
-          SKIP_BALANCE_PING: ${{ env.SKIP_BALANCE_PING }}
-          TRADE_AMOUNT: ${{ env.TRADE_AMOUNT }}
-          DAILY_CAP: ${{ env.DAILY_CAP }}
-          DAILY_CAP_TZ: ${{ env.DAILY_CAP_TZ }}
-          STOP_LOSS_PCT: ${{ env.STOP_LOSS_PCT }}
-          STOP_LOSS_USE_LIMIT: ${{ env.STOP_LOSS_USE_LIMIT }}
-          STOP_LOSS_LIMIT_OFFSET_BP: ${{ env.STOP_LOSS_LIMIT_OFFSET_BP }}
-          DROP_PCT: ${{ env.DROP_PCT }}
-          UNIVERSE_SIZE: ${{ env.UNIVERSE_SIZE }}
-          PREFERRED_QUOTES: ${{ env.PREFERRED_QUOTES }}
-          MIN_DOLLAR_VOL_24H: ${{ env.MIN_DOLLAR_VOL_24H }}
-          MIN_PRICE: ${{ env.MIN_PRICE }}
-          EXCLUDE: ${{ env.EXCLUDE }}
-          WHITELIST: ${{ env.WHITELIST }}
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}
+          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET }}
         run: |
           python -V
           python main.py
