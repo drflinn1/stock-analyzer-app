@@ -1,25 +1,45 @@
 #!/usr/bin/env python3
-"""
-Crypto live runner (Kraken via CCXT) with:
-- %-based stop-loss (default 2% below fill)
-- Daily spend cap enforcement in quote currency (USD/USDT)
-- EXCLUDE/WHITELIST symbol controls
-- Auto-skip region-restricted symbols and try the next candidate
-- Daily-cap day boundary in a configurable timezone (default America/Los_Angeles)
-- OPTIONAL: Skip balance ping (to silence permission warnings)
-
-"Today" is the local day in DAILY_CAP_TZ; we convert that midnight to UTC for API calls.
-"""
+# -*- coding: utf-8 -*-
 
 import os
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo  # Python 3.11+
 
 import ccxt
 
-# -------------------------- Logging -------------------------------------------
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+def _to_float(x, fallback=0.0):
+    try:
+        return float(str(x).strip())
+    except Exception:
+        return float(fallback)
+
+def _to_int(x, fallback=0):
+    try:
+        return int(str(x).strip())
+    except Exception:
+        return int(fallback)
+
+def _to_bool(x, fallback=False):
+    try:
+        return str(x).strip().lower() in ("1", "true", "t", "yes", "y", "on")
+    except Exception:
+        return bool(fallback)
+
+def _to_list_csv(x):
+    if not x:
+        return []
+    return [p.strip() for p in str(x).split(",") if p.strip()]
+
+# ---------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------
+
 import logging
 logging.basicConfig(
     level=logging.INFO,
@@ -27,402 +47,313 @@ logging.basicConfig(
 )
 log = logging.getLogger("runner")
 
-# -------------------------- Env knobs -----------------------------------------
-def _to_float(x, fallback=None):
-    try:
-        return float(x)
-    except Exception:
-        return fallback
+# ---------------------------------------------------------------------
+# Env knobs / config (in sync with your YAML)
+# ---------------------------------------------------------------------
 
-def _to_int(x, fallback=None):
-    try:
-        return int(str(x).strip())
-    except Exception:
-        return fallback
+PYTHON_VERSION = "3.11"
 
-def _to_bool(x, default=False):
-    if x is None:
-        return default
-    s = str(x).strip().lower()
-    return s in ("1", "true", "yes", "y", "on")
+# Stop-loss knobs (kept for compatibility; optional placing)
+STOP_LOSS_PCT            = _to_float(os.getenv("STOP_LOSS_PCT", "2.0"))
+STOP_LOSS_USE_LIMIT      = _to_bool(os.getenv("STOP_LOSS_USE_LIMIT", "true"))
+STOP_LOSS_LIMIT_OFFSET_BP= _to_float(os.getenv("STOP_LOSS_LIMIT_OFFSET_BP", "10"))
 
-def _parse_symlist(s):
-    if not s:
-        return set()
-    return set([part.strip().upper() for part in s.split(",") if part.strip()])
+# Live knobs
+DRY_RUN           = _to_bool(os.getenv("DRY_RUN", "false"))
+SKIP_BALANCE_PING = _to_bool(os.getenv("SKIP_BALANCE_PING", "false"))
+TRADE_AMOUNT_USD  = _to_float(os.getenv("TRADE_AMOUNT", "20"))         # was 15
+DAILY_CAP_USD     = _to_float(os.getenv("DAILY_CAP", "50"))
+DAILY_CAP_TZ      = os.getenv("DAILY_CAP_TZ", "America/Los_Angeles")
 
-PYTHON_VERSION            = os.getenv("PYTHON_VERSION", "3.11")
-EXCHANGE_ID               = os.getenv("EXCHANGE_ID", "kraken").lower()
-DRY_RUN                   = _to_bool(os.getenv("DRY_RUN", "true"), True)
-SKIP_BALANCE_PING         = _to_bool(os.getenv("SKIP_BALANCE_PING", "true"), True)  # NEW
+# New min-notional safety knobs
+AUTO_TOP_UP_TO_MIN   = _to_bool(os.getenv("AUTO_TOP_UP_TO_MIN", "true"))
+MIN_ORDER_BUFFER_USD = _to_float(os.getenv("MIN_ORDER_BUFFER_USD", "0.25"))
 
-# Notional knobs (quote currency spend)
-TRADE_AMOUNT              = _to_float(os.getenv("TRADE_AMOUNT", "25"), 25.0)
-DAILY_CAP                 = _to_float(os.getenv("DAILY_CAP", "75"), 75.0)
-DAILY_CAP_TZ              = os.getenv("DAILY_CAP_TZ", "America/Los_Angeles")
+# Universe / selection knobs (kept compatible with your YAML)
+DROP_PCT            = _to_float(os.getenv("DROP_PCT", "2.0"))          # min % drop to consider
+UNIVERSE_SIZE       = _to_int(os.getenv("UNIVERSE_SIZE", "100"))       # soft cap when scanning
+PREFERRED_QUOTES    = _to_list_csv(os.getenv("PREFERRED_QUOTES", "USD,USDT"))
+MIN_DOLLAR_VOL_24H  = _to_float(os.getenv("MIN_DOLLAR_VOL_24H", "500000"))
+MIN_PRICE           = _to_float(os.getenv("MIN_PRICE", "0.01"))
+EXCLUDE             = set(_to_list_csv(os.getenv("EXCLUDE", "")))      # e.g. ['U/USD']
+WHITELIST           = set(_to_list_csv(os.getenv("WHITELIST", "")))    # optional allow list
 
-# Signal / selection knobs
-DROP_PCT                  = _to_float(os.getenv("DROP_PCT", os.getenv("DROP_THRESHOLD", "2.0")), 2.0)
-UNIVERSE_SIZE             = _to_int(os.getenv("UNIVERSE_SIZE", "100"), 100)
-PREFERRED_QUOTES          = [q.strip().upper() for q in os.getenv("PREFERRED_QUOTES", "USD,USDT").split(",") if q.strip()]
-MIN_PRICE                 = _to_float(os.getenv("MIN_PRICE", "0"), 0.0)
-MIN_DOLLAR_VOL_24H        = _to_float(os.getenv("MIN_DOLLAR_VOL_24H", "0"), 0)
+API_KEY  = os.getenv("KRAKEN_API_KEY", "")
+API_SECRET = os.getenv("KRAKEN_SECRET", "")
 
-# List controls
-EXCLUDE_LIST              = _parse_symlist(os.getenv("EXCLUDE", ""))   # e.g. "U/USD, AKE/USD"
-WHITELIST                 = _parse_symlist(os.getenv("WHITELIST", "")) # e.g. "BTC/USD,ETH/USD"
+# ---------------------------------------------------------------------
+# Exchange helpers
+# ---------------------------------------------------------------------
 
-# Stop-loss knobs
-STOP_LOSS_PCT             = _to_float(os.getenv("STOP_LOSS_PCT", "2.0"), 2.0)
-STOP_LOSS_USE_LIMIT       = _to_bool(os.getenv("STOP_LOSS_USE_LIMIT", "true"), True)
-STOP_LOSS_LIMIT_OFFSET_BP = _to_int(os.getenv("STOP_LOSS_LIMIT_OFFSET_BP", "10"), 10)  # 10 bp = 0.10%
+def kraken() -> ccxt.kraken:
+    ex = ccxt.kraken({
+        "apiKey": API_KEY,
+        "secret": API_SECRET,
+        "enableRateLimit": True,
+        "options": {
+            "fetchTickersMaxLength": 200,  # friendlier batching
+        },
+    })
+    ex.load_markets()
+    return ex
 
-# ------------------------ Utility / Exchange ----------------------------------
-def make_exchange():
-    params = {"enableRateLimit": True, "options": {"adjustForTimeDifference": True}}
-    if not DRY_RUN:
-        key = os.getenv("KRAKEN_API_KEY") or os.getenv("API_KEY") or ""
-        secret = os.getenv("KRAKEN_SECRET") or os.getenv("API_SECRET") or ""
-        password = os.getenv("KRAKEN_PASSWORD") or os.getenv("API_PASSWORD") or None
-        params.update({"apiKey": key, "secret": secret})
-        if password:
-            params.update({"password": password})
-
-    if EXCHANGE_ID != "kraken":
-        raise RuntimeError("This runner is currently wired for Kraken only.")
-    return ccxt.kraken(params)
-
-def price_prec(exchange, symbol, px):
-    return float(exchange.price_to_precision(symbol, px))
-
-def amt_prec(exchange, symbol, amt):
-    return float(exchange.amount_to_precision(symbol, amt))
-
-def quote_currency_of(exchange, symbol):
-    try:
-        return exchange.market(symbol).get("quote", "").upper()
-    except Exception:
-        return ""
-
-# ------------------------ Universe / Selection --------------------------------
-def build_spot_universe(exchange):
-    exchange.load_markets()
-    markets = exchange.markets
-
-    candidates = []
-    for sym, m in markets.items():
-        if not m.get("active", True):
-            continue
-        if m.get("type") not in (None, "spot"):
-            continue
-        quote = m.get("quote", "").upper()
-        if quote not in PREFERRED_QUOTES:
-            continue
-        symU = sym.upper()
-        if WHITELIST and symU not in WHITELIST:
-            continue
-        if symU in EXCLUDE_LIST:
-            continue
-        candidates.append(sym)
-
-    tickers = exchange.fetch_tickers(candidates)
-    rows = []
-    for sym in candidates:
-        t = tickers.get(sym) or {}
-        last = t.get("last") or t.get("close") or t.get("ask") or t.get("bid")
-        if not last:
-            continue
-        if MIN_PRICE and last < MIN_PRICE:
-            continue
-        pct = t.get("percentage")      # 24h %
-        qvol = t.get("quoteVolume")    # 24h quote volume (USD)
-        if MIN_DOLLAR_VOL_24H and (qvol is None or qvol < MIN_DOLLAR_VOL_24H):
-            continue
-        rows.append({"symbol": sym, "last": last, "pct": pct, "qvol": qvol})
-
-    rows.sort(key=lambda r: (r["pct"] if r["pct"] is not None else 0), reverse=False)
-    if UNIVERSE_SIZE and len(rows) > UNIVERSE_SIZE:
-        rows = rows[:UNIVERSE_SIZE]
-    return rows
-
-def pick_best_candidate(rows):
-    best = None
-    for r in rows:
-        pct = r["pct"]
-        if pct is not None and pct <= -abs(DROP_PCT):
-            best = r
-            break
-    if not best and rows:
-        best = rows[0]
-    return best
-
-# ------------------------ Daily cap helpers (LOCAL TZ) ------------------------
-def cap_window_start():
+def tz_midnight_utc(tz_name: str) -> int:
     """
-    Returns (since_ms_utc, local_midnight_iso) for the start of 'today' in DAILY_CAP_TZ.
+    Return UTC ms for local midnight in the given timezone (today).
     """
-    try:
-        tz = ZoneInfo(DAILY_CAP_TZ)
-    except Exception:
-        tz = timezone.utc
-    now_local = datetime.now(tz)
-    local_midnight = datetime(now_local.year, now_local.month, now_local.day, tzinfo=tz)
-    start_utc = local_midnight.astimezone(timezone.utc)
-    return int(start_utc.timestamp() * 1000), local_midnight.isoformat()
+    now_local = datetime.now(ZoneInfo(tz_name))
+    local_midnight = datetime(
+        year=now_local.year, month=now_local.month, day=now_local.day,
+        tzinfo=ZoneInfo(tz_name)
+    )
+    return int(local_midnight.timestamp() * 1000)
 
-def sum_today_quote_spend(exchange, quotes, since_ms):
+def spent_today_usd(exchange: ccxt.Exchange, since_ms: int) -> float:
     """
-    Returns today's total BUY notional (quote currency) summed across symbols with
-    quote in `quotes` list. Uses fetch_my_trades since local-midnight (converted to UTC ms).
+    Sum USD/USDT cost of BUY trades since 'since_ms'.
     """
     total = 0.0
     try:
-        trades = exchange.fetch_my_trades(symbol=None, since=since_ms, limit=500)
-        for tr in trades or []:
-            side = tr.get("side")
-            cost = tr.get("cost")  # quote notional
-            sym  = tr.get("symbol")
-            ts   = tr.get("timestamp") or 0
-            if side != "buy" or cost is None or not sym or ts < since_ms:
+        trades = exchange.fetch_my_trades(since=since_ms)
+        for t in trades:
+            if t.get("side") != "buy":
                 continue
-            quote = sym.split("/")[-1].upper() if "/" in sym else quote_currency_of(exchange, sym)
-            if quote in quotes:
-                total += float(cost)
+            sym = t.get("symbol", "")
+            cost = _to_float(t.get("cost", 0.0))
+            # Only count USD / USDT quote
+            if "/" in sym:
+                quote = sym.split("/")[-1]
+                if quote in ("USD", "USDT"):
+                    total += cost
     except Exception as e:
-        log.warning(f"Daily-cap spend check failed (enable 'Query trades' permission?): {e}")
-        return None
-    return float(total)
+        log.warning(f"fetch_my_trades failed; assuming $0 spent today. ({e})")
+    return total
 
-def enforce_daily_cap_or_adjust(exchange, symbol, last_price, desired_quote_notional, since_ms):
+def min_notional_usd(exchange: ccxt.Exchange, symbol: str):
     """
-    Compares today's spend vs DAILY_CAP. Returns (approved_quote_notional, spent_today, remaining).
+    Try to determine the minimum notional (USD) for the pair.
+    We look in markets-limits if available; otherwise fall back to
+    amount.min * price.min.
     """
-    if DAILY_CAP is None or DAILY_CAP <= 0:
-        return desired_quote_notional, 0.0, float("inf")
+    try:
+        m = exchange.markets.get(symbol, {}) or {}
+        limits = m.get("limits", {}) or {}
+        cost_min = (limits.get("cost") or {}).get("min")
+        if cost_min is not None:
+            return float(cost_min)
+    except Exception:
+        pass
 
-    spent = sum_today_quote_spend(exchange, set(PREFERRED_QUOTES), since_ms)
-    if spent is None:
-        log.warning("Skipping buy: cannot confirm daily spend (API permission?).")
-        return 0.0, None, 0.0
+    try:
+        m = exchange.markets.get(symbol, {}) or {}
+        limits = m.get("limits", {}) or {}
+        amt_min = (limits.get("amount") or {}).get("min")
+        px_min  = (limits.get("price") or {}).get("min")
+        if amt_min is not None and px_min is not None:
+            return float(amt_min) * float(px_min)
+    except Exception:
+        pass
 
-    remaining = max(0.0, DAILY_CAP - spent)
-    if remaining <= 0:
-        log.info(f"Daily cap reached. Spent today ≈ ${spent:.2f} / cap ${DAILY_CAP:.2f}. Skipping buy.")
-        return 0.0, spent, 0.0
+    return None
 
-    approved = min(desired_quote_notional, remaining)
-    if approved < desired_quote_notional:
-        log.info(f"Trimming order to fit daily cap: wanted ${desired_quote_notional:.2f}, remaining ${remaining:.2f} → using ${approved:.2f}")
-    else:
-        log.info(f"Daily spend so far ≈ ${spent:.2f}. Remaining ≈ ${remaining:.2f}.")
-    return approved, spent, remaining
+# ---------------------------------------------------------------------
+# Candidate selection
+# ---------------------------------------------------------------------
 
-# ------------------------ Stop-loss helpers -----------------------------------
-def place_percent_stop_loss(exchange, symbol, filled_amount, avg_fill_price):
+def pick_best_drop(exchange: ccxt.Exchange):
     """
-    Places a Kraken stop-loss or stop-loss-limit sell for 'filled_amount' base units
-    at STOP_LOSS_PCT below 'avg_fill_price', using correct precision/params.
+    Fetch tickers and pick the 'best' (biggest negative percentage change)
+    that meets basic liquidity/price requirements and respects WHITELIST/EXCLUDE.
     """
-    if not filled_amount or not avg_fill_price:
-        log.warning("Cannot place stop-loss: missing filled_amount or avg_fill_price")
-        return None
+    tickers = exchange.fetch_tickers()
+    ranked = []
 
-    stop_trigger = avg_fill_price * (1.0 - STOP_LOSS_PCT / 100.0)
-    if STOP_LOSS_USE_LIMIT:
-        limit_price = stop_trigger * (1.0 - STOP_LOSS_LIMIT_OFFSET_BP / 10000.0)
-    else:
-        limit_price = None
+    for sym, t in tickers.items():
+        if "/" not in sym:
+            continue
 
-    trigger_px = price_prec(exchange, symbol, stop_trigger)
-    amount_px  = amt_prec(exchange, symbol, filled_amount)
-    limit_px   = price_prec(exchange, symbol, limit_price) if limit_price else None
+        base, quote = sym.split("/")
+        if PREFERRED_QUOTES and quote not in PREFERRED_QUOTES:
+            continue
 
-    if STOP_LOSS_USE_LIMIT:
-        log.info(f"Placing STOP-LOSS-LIMIT for {symbol}: trigger={trigger_px}, limit={limit_px}, amount={amount_px}")
-        params = {"price2": limit_px, "trigger": "last"}
-        order = exchange.create_order(
-            symbol=symbol,
-            type="stop-loss-limit",
-            side="sell",
-            amount=amount_px,
-            price=trigger_px,
-            params=params,
-        )
-    else:
-        log.info(f"Placing STOP-LOSS (market) for {symbol}: trigger={trigger_px}, amount={amount_px}")
-        params = {"trigger": "last"}
-        order = exchange.create_order(
-            symbol=symbol,
-            type="stop-loss",
-            side="sell",
-            amount=amount_px,
-            price=trigger_px,
-            params=params,
-        )
-    log.info(f"Stop-loss order placed: id={order.get('id')}, type={order.get('type')}")
-    return order
+        # Whitelist / Exclude
+        if WHITELIST and sym not in WHITELIST:
+            continue
+        if sym in EXCLUDE or f"{base}/{quote}" in EXCLUDE or f"{base}/{quote}".replace("/", "") in EXCLUDE:
+            continue
 
-# ------------------------ Runner ----------------------------------------------
+        last = _to_float(t.get("last", t.get("close", 0.0)))
+        if last <= 0 or last < MIN_PRICE:
+            continue
+
+        # Try to get 24h percent change and volume in quote
+        pct = t.get("percentage", None)
+        quote_vol = _to_float(t.get("quoteVolume") or t.get("baseVolume", 0.0) * last)
+
+        # If exchange doesn't return quoteVolume, this is a best effort
+        if pct is None:
+            # no standardized pct => skip symbol
+            continue
+
+        pct = _to_float(pct)
+        if pct >= 0 or abs(pct) < DROP_PCT:
+            continue
+
+        if quote_vol < MIN_DOLLAR_VOL_24H:
+            continue
+
+        ranked.append((pct, quote_vol, last, sym))
+
+    # Most negative percentage first
+    ranked.sort(key=lambda x: x[0])  # pct ascending (more negative first)
+    if not ranked:
+        return None, None
+
+    top = ranked[0]
+    pct, qvol, last, sym = top
+    return sym, last
+
+# ---------------------------------------------------------------------
+# Stop-loss (optional). We keep it simple and only place if you enabled it.
+# ---------------------------------------------------------------------
+
+def try_place_stop_loss(exchange: ccxt.Exchange, symbol: str, amount: float, fill_price: float):
+    """
+    Optionally place a stop-loss(-limit) SELL using ccxt unified params.
+    We'll try stop-loss-limit if STOP_LOSS_USE_LIMIT, else stop-loss (market).
+    """
+    if STOP_LOSS_PCT <= 0:
+        return
+
+    try:
+        stop_price  = fill_price * (1.0 - STOP_LOSS_PCT / 100.0)
+        if STOP_LOSS_USE_LIMIT:
+            # place limit a bit below stop (offset in basis points)
+            limit_price = stop_price * (1.0 - STOP_LOSS_LIMIT_OFFSET_BP / 10000.0)
+            params = {"stopPrice": round(stop_price, 8)}
+            order = exchange.create_order(
+                symbol=symbol,
+                type="stop-loss-limit",
+                side="sell",
+                amount=amount,
+                price=round(limit_price, 8),
+                params=params
+            )
+            log.info(f"Stop-loss-limit placed: id={order.get('id')} stop={stop_price:.8f} limit={limit_price:.8f}")
+        else:
+            params = {"stopPrice": round(stop_price, 8)}
+            order = exchange.create_order(
+                symbol=symbol,
+                type="stop-loss",
+                side="sell",
+                amount=amount,
+                price=None,
+                params=params
+            )
+            log.info(f"Stop-loss placed: id={order.get('id')} stop={stop_price:.8f}")
+    except Exception as e:
+        log.warning(f"Stop-loss placement failed: {e}")
+
+# ---------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------
+
 def main():
     log.info("=== START TRADING OUTPUT ===")
     log.info(f"Python {PYTHON_VERSION}")
+
     log.info(f"Universe size: {UNIVERSE_SIZE}  (quotes preferred: {PREFERRED_QUOTES})")
-    if WHITELIST:
-        log.info(f"Whitelist active ({len(WHITELIST)}): {sorted(list(WHITELIST))}")
-    if EXCLUDE_LIST:
-        log.info(f"Exclude list ({len(EXCLUDE_LIST)}): {sorted(list(EXCLUDE_LIST))}")
+    if EXCLUDE:
+        log.info(f"Exclude list ({len(EXCLUDE)}): {sorted(EXCLUDE)}")
 
-    try:
-        exchange = make_exchange()
-    except Exception as e:
-        log.error(f"Exchange init failed: {e}")
-        raise
+    if not API_KEY or not API_SECRET:
+        log.error("Missing API key/secret. Set KRAKEN_API_KEY and KRAKEN_SECRET.")
+        return
 
-    # Optional balance ping; many keys lack this perm (harmless). Now skippable.
-    try:
-        if not DRY_RUN and not SKIP_BALANCE_PING:
+    exchange = kraken()
+
+    # Optional ping to surface permission errors earlier
+    if not SKIP_BALANCE_PING and not DRY_RUN:
+        try:
             _ = exchange.fetch_balance()
-        elif not DRY_RUN and SKIP_BALANCE_PING:
-            log.info("Skipping balance ping (SKIP_BALANCE_PING=true).")
-    except Exception as e:
-        log.warning(f"Balance check skipped: {exchange.id} {{\"error\":[\"{str(e)}\"]}}")
+        except Exception as e:
+            log.error(f"Balance ping failed: {e}")
+            return
+    else:
+        log.info("Skipping balance ping (SKIP_BALANCE_PING=true).")
 
-    # Log daily-cap window (local) and compute 'since' for today in local TZ
-    since_ms, local_midnight_iso = cap_window_start()
-    log.info(f"Daily-cap window start (local {DAILY_CAP_TZ}): {local_midnight_iso}")
+    # Compute start of daily window in your local tz
+    start_ms = tz_midnight_utc(DAILY_CAP_TZ)
+    log.info(f"Daily-cap window start (local {DAILY_CAP_TZ}): {datetime.fromtimestamp(start_ms/1000, ZoneInfo(DAILY_CAP_TZ)).isoformat()}")
 
-    # Universe
-    rows = build_spot_universe(exchange)
-    log.info(f"Eligible candidates: {len(rows)}")
-    if not rows:
-        log.info("No tradable symbols in universe (after filters).")
+    # How much have we spent today already?
+    spent_today = 0.0
+    if not DRY_RUN:
+        spent_today = spent_today_usd(exchange, since_ms=start_ms)
+
+    # Pick a candidate
+    symbol, last = pick_best_drop(exchange)
+    if not symbol:
+        log.info("No eligible candidates today.")
         log.info("=== END TRADING OUTPUT ===")
         return
 
-    # Try up to N symbols this run, auto-skipping restricted ones
-    TRIES = min(5, len(rows))
-    tried_symbols = set()
-    for _ in range(TRIES):
-        candidates = [r for r in rows if r["symbol"] not in tried_symbols]
-        if not candidates:
-            log.info("No remaining candidates to try.")
-            break
-        best = pick_best_candidate(candidates)
-        if not best:
-            log.info("No candidate meets rules.")
-            break
+    # Best candidate chosen
+    # We'll display a synthetic 'change' as unknown here; fetch_tickers gave us pct internally
+    log.info(f"Best candidate: {symbol} (last {last})")
 
-        symbol = best["symbol"]
-        tried_symbols.add(symbol)
+    # Daily cap math
+    remaining = max(0.0, DAILY_CAP_USD - spent_today)
+    log.info(f"Daily spend so far ≈ ${spent_today:.2f}. Remaining ≈ ${remaining:.2f}.")
 
-        last   = float(best["last"])
-        pct    = best["pct"]
-        qvol   = best["qvol"]
-        log.info(f"Best candidate: {symbol} change {pct}% last {last} vol${qvol}")
+    if remaining <= 0.0:
+        log.info("Daily cap reached. Skipping buy.")
+        log.info("=== END TRADING OUTPUT ===")
+        return
 
-        quote_ccy = quote_currency_of(exchange, symbol)
-        if quote_ccy not in PREFERRED_QUOTES:
-            log.info(f"Skipping {symbol}: quote currency {quote_ccy} not in {PREFERRED_QUOTES}")
-            continue
+    # Planned spend (subject to min-notional)
+    spend_usd = min(TRADE_AMOUNT_USD, remaining)
 
-        # Enforce daily cap (local-tz window)
-        desired_quote_notional = TRADE_AMOUNT
-        approved_quote_notional, spent_today, remaining = enforce_daily_cap_or_adjust(
-            exchange, symbol, last_price=last, desired_quote_notional=desired_quote_notional, since_ms=since_ms
-        )
-        if approved_quote_notional <= 0:
-            log.info("Order blocked by daily-cap guard.")
-            log.info("=== END TRADING OUTPUT ===")
-            return
+    # Min-notional guard (+ optional top-up)
+    min_cost = min_notional_usd(exchange, symbol)
+    if min_cost is not None:
+        needed = float(min_cost) + MIN_ORDER_BUFFER_USD
+        if spend_usd < needed:
+            if AUTO_TOP_UP_TO_MIN and (spent_today + needed) <= DAILY_CAP_USD:
+                log.info(f"Top-up: {symbol} minimum ≈ ${min_cost:.2f}. "
+                         f"Raising notional from ${spend_usd:.2f} to ${needed:.2f}.")
+                spend_usd = min(needed, remaining)
+            else:
+                log.info(f"Skipping {symbol}: exchange minimum ≈ ${min_cost:.2f} "
+                         f"> planned ${spend_usd:.2f}.")
+                log.info("=== END TRADING OUTPUT ===")
+                return
 
-        # Compute base amount from approved notional
-        try:
-            m = exchange.market(symbol)
-            base_amt = approved_quote_notional / last
-            min_amt = (m.get("limits", {}).get("amount", {}) or {}).get("min")
-            if min_amt:
-                base_amt = max(base_amt, float(min_amt))
-            base_amt = amt_prec(exchange, symbol, base_amt)
-            if base_amt <= 0:
-                raise ValueError("Computed base amount <= 0 after precision/min checks.")
-        except Exception as e:
-            log.error(f"Amount computation failed for {symbol}: {e}")
-            continue
+    # Final amount
+    amount = spend_usd / float(last)
 
-        if DRY_RUN:
-            log.info(f"[DRY_RUN] Would place market BUY: {base_amt} {symbol} (~${approved_quote_notional:.2f})")
-            log.info("Skip stop-loss in DRY_RUN.")
-            log.info("=== END TRADING OUTPUT ===")
-            return
+    # Place buy (unless DRY_RUN)
+    if DRY_RUN:
+        log.info(f"[DRY RUN] Would buy {amount:.8f} {symbol} @ market (≈ ${spend_usd:.2f})")
+        log.info("=== END TRADING OUTPUT ===")
+        return
 
-        # Live BUY (with restricted-asset auto-skip)
-        try:
-            log.info(f"Placing market buy: {base_amt} {symbol} @ market (notional ≈ ${approved_quote_notional:.2f})")
-            buy_order = exchange.create_order(
-                symbol=symbol,
-                type="market",
-                side="buy",
-                amount=base_amt,
-            )
-            log.info(f"Executed buy: id='{buy_order.get('id')}', info: '{buy_order.get('info')}'")
-        except Exception as e:
-            msg = str(e).lower()
-            if "restricted" in msg or "invalid permissions" in msg:
-                log.warning(f"Skipping restricted symbol {symbol}: {e}")
-                continue
-            log.error(f"BUY failed for {symbol}: {e}")
-            break  # other errors: abort run
+    try:
+        log.info(f"Placing market buy: {amount:.8f} {symbol} @ market (notional ≈ ${spend_usd:.2f})")
+        order = exchange.create_order(symbol=symbol, type="market", side="buy", amount=amount)
+        log.info(f"BUY placed: id={order.get('id')} status={order.get('status')}")
 
-        # After BUY → fetch fill → place stop-loss
-        try:
-            buy_id = (buy_order.get("id") if isinstance(buy_order, dict) else None)
-            avg_fill_price = None
-            filled_amount = None
+        # Derive a fill price to anchor a stop (if you want to place one)
+        fill_price = float(last)
+        try_place_stop_loss(exchange, symbol, amount, fill_price)
 
-            time.sleep(1.0)  # let fills settle
-            if buy_id:
-                try:
-                    o = exchange.fetch_order(buy_id, symbol)
-                    avg_fill_price = o.get("average") or o.get("price")
-                    filled_amount  = o.get("filled") or o.get("amount")
-                except Exception as fe:
-                    log.warning(f"fetch_order failed ({fe}); falling back to ticker for fill price.")
-
-            if avg_fill_price is None:
-                t = exchange.fetch_ticker(symbol)
-                avg_fill_price = t.get("last") or t.get("close") or t.get("ask") or t.get("bid")
-                log.info(f"Fallback avg_fill_price from ticker: {avg_fill_price}")
-
-            if filled_amount is None:
-                if 'cost' in buy_order and buy_order['cost'] and avg_fill_price:
-                    filled_amount = float(buy_order['cost']) / float(avg_fill_price)
-                else:
-                    filled_amount = float(buy_order.get("amount") or buy_order.get("filled") or base_amt)
-
-            # Final precision clamp
-            filled_amount = amt_prec(exchange, symbol, filled_amount)
-            avg_fill_price = price_prec(exchange, symbol, avg_fill_price)
-
-            sl = place_percent_stop_loss(
-                exchange=exchange,
-                symbol=symbol,
-                filled_amount=filled_amount,
-                avg_fill_price=avg_fill_price,
-            )
-            if sl:
-                log.info(f"Placed stop-loss @ ~{STOP_LOSS_PCT}% below fill. Kraken id: {sl.get('id')}")
-        except Exception as e:
-            log.error(f"Stop-loss placement failed for {symbol}: {e}")
-
-        # Buy succeeded (don’t try more symbols this run)
-        break
+    except ccxt.BaseError as e:
+        log.error(f"BUY failed for {symbol}: kraken {e}")
+    except Exception as e:
+        log.error(f"BUY failed for {symbol}: {e}\n{traceback.format_exc()}")
 
     log.info("=== END TRADING OUTPUT ===")
 
-# ------------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        log.error("Fatal error:\n" + "".join(traceback.format_exc()))
-        raise
+    main()
