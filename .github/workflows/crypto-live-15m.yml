@@ -73,7 +73,7 @@ jobs:
       - name: Run trader
         env:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET }}
+          KRAKEN_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           python -V
           python main.py
