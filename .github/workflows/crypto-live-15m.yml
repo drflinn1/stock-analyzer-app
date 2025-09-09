@@ -12,44 +12,35 @@ concurrency:
 env:
   PYTHON_VERSION: "3.11"
 
-# --- Stop-loss knobs ---
-STOP_LOSS_PCT: "2.0"
-STOP_LOSS_USE_LIMIT: "true"
-STOP_LOSS_LIMIT_OFFSET_BP: "10"
+  # --- Stop-loss knobs ---
+  STOP_LOSS_PCT: "2.0"
+  STOP_LOSS_USE_LIMIT: "true"
+  STOP_LOSS_LIMIT_OFFSET_BP: "10"
 
-# --- Live knobs ---
-DRY_RUN: "false"
-SKIP_BALANCE_PING: "false"
-TRADE_AMOUNT: "20"
-AUTO_TOP_UP_MIN: "true"
-MIN_ORDER_BUFFER_USD: "0.25"
-DAILY_CAP: "50"
-DAILY_CAP_TZ: "America/Los_Angeles"
+  # --- Live knobs ---
+  DRY_RUN: "false"
+  SKIP_BALANCE_PING: "false"
+  TRADE_AMOUNT: "20"
+  AUTO_TOP_UP_MIN: "true"
+  MIN_ORDER_BUFFER_USD: "0.25"
+  DAILY_CAP: "50"
+  DAILY_CAP_TZ: "America/Los_Angeles"
 
-# --- Selection / universe ---
-DROP_PCT: "1.5"              # was 2.0 → slightly easier to find dips
-UNIVERSE_SIZE: "200"          # was 100 → consider more symbols
-PREFERRED_QUOTES: "USD"       # keep it simple on Kraken
-MIN_DOLLAR_VOL_24H: "200000"  # was 500000 → more candidates, still decent liquidity
-MIN_PRICE: "0.01"
-EXCLUDE: "U/USD"
-WHITELIST: ""                 # <— leave blank so it auto-picks
-
-
-  # keep synthetic out
+  # --- Selection / universe ---
+  DROP_PCT: "1.5"
+  UNIVERSE_SIZE: "200"
+  PREFERRED_QUOTES: "USD"
+  MIN_DOLLAR_VOL_24H: "200000"
+  MIN_PRICE: "0.01"
   EXCLUDE: "U/USD"
-
-  # >>> Option B: US-tradable majors only <<<
-  WHITELIST: >
-    BTC/USD,ETH/USD,SOL/USD,LTC/USD,DOGE/USD,ADA/USD,AVAX/USD,
-    LINK/USD,ATOM/USD,DOT/USD,OP/USD,ARB/USD
+  WHITELIST: ""
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -61,7 +52,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install ccxt
 
       - name: Echo live env
         run: |
@@ -72,13 +62,18 @@ jobs:
           echo "MIN_ORDER_BUFFER_USD=${MIN_ORDER_BUFFER_USD}"
           echo "DAILY_CAP=${DAILY_CAP}"
           echo "DAILY_CAP_TZ=${DAILY_CAP_TZ}"
+          echo "DROP_PCT=${DROP_PCT}"
+          echo "UNIVERSE_SIZE=${UNIVERSE_SIZE}"
           echo "PREFERRED_QUOTES=${PREFERRED_QUOTES}"
+          echo "MIN_DOLLAR_VOL_24H=${MIN_DOLLAR_VOL_24H}"
+          echo "MIN_PRICE=${MIN_PRICE}"
+          echo "EXCLUDE=${EXCLUDE}"
           echo "WHITELIST=${WHITELIST}"
 
       - name: Run trader
         env:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}
+          KRAKEN_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           python -V
           python main.py
