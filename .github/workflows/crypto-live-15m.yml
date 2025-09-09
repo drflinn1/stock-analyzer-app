@@ -12,26 +12,29 @@ concurrency:
 env:
   PYTHON_VERSION: "3.11"
 
-  # --- Stop-loss knobs ---
-  STOP_LOSS_PCT: "2.0"
-  STOP_LOSS_USE_LIMIT: "true"
-  STOP_LOSS_LIMIT_OFFSET_BP: "10"
+# --- Stop-loss knobs ---
+STOP_LOSS_PCT: "2.0"
+STOP_LOSS_USE_LIMIT: "true"
+STOP_LOSS_LIMIT_OFFSET_BP: "10"
 
-  # --- Live knobs ---
-  DRY_RUN: "false"
-  SKIP_BALANCE_PING: "false"
-  TRADE_AMOUNT: "20"
-  AUTO_TOP_UP_MIN: "true"         # if pair’s min notional is slightly above TRADE_AMOUNT, bump to min
-  MIN_ORDER_BUFFER_USD: "0.25"    # tiny cushion above the exchange minimum
-  DAILY_CAP: "50"
-  DAILY_CAP_TZ: "America/Los_Angeles"
+# --- Live knobs ---
+DRY_RUN: "false"
+SKIP_BALANCE_PING: "false"
+TRADE_AMOUNT: "20"
+AUTO_TOP_UP_MIN: "true"
+MIN_ORDER_BUFFER_USD: "0.25"
+DAILY_CAP: "50"
+DAILY_CAP_TZ: "America/Los_Angeles"
 
-  # --- Selection / universe ---
-  DROP_PCT: "2.0"
-  UNIVERSE_SIZE: "100"
-  PREFERRED_QUOTES: "USD"         # keep USD to dodge USDT restrictions
-  MIN_DOLLAR_VOL_24H: "500000"
-  MIN_PRICE: "0.01"
+# --- Selection / universe ---
+DROP_PCT: "1.5"              # was 2.0 → slightly easier to find dips
+UNIVERSE_SIZE: "200"          # was 100 → consider more symbols
+PREFERRED_QUOTES: "USD"       # keep it simple on Kraken
+MIN_DOLLAR_VOL_24H: "200000"  # was 500000 → more candidates, still decent liquidity
+MIN_PRICE: "0.01"
+EXCLUDE: "U/USD"
+WHITELIST: ""                 # <— leave blank so it auto-picks
+
 
   # keep synthetic out
   EXCLUDE: "U/USD"
