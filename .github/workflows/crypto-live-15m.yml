@@ -20,9 +20,9 @@ env:
   # --- Live knobs ---
   DRY_RUN: "false"
   SKIP_BALANCE_PING: "false"
-  TRADE_AMOUNT: "20"
+  TRADE_AMOUNT: "30"
   AUTO_TOP_UP_MIN: "true"
-  MIN_ORDER_BUFFER_USD: "0.25"
+  MIN_ORDER_BUFFER_USD: "50"
   DAILY_CAP: "50"
   DAILY_CAP_TZ: "America/Los_Angeles"
 
