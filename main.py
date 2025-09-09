@@ -2,7 +2,7 @@ import os
 import time
 import logging
 import traceback
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import ccxt
@@ -46,14 +46,16 @@ def _get_list(name: str, default: str = "") -> list[str]:
 # ---------------------------- Config -----------------------------------
 DRY_RUN                 = _get_bool("DRY_RUN", False)
 SKIP_BALANCE_PING       = _get_bool("SKIP_BALANCE_PING", True)
+
 TRADE_AMOUNT            = _get_float("TRADE_AMOUNT", 20.0)
 AUTO_TOP_UP_MIN         = _get_bool("AUTO_TOP_UP_MIN", True)
 MIN_ORDER_BUFFER_USD    = _get_float("MIN_ORDER_BUFFER_USD", 0.25)
 
 DAILY_CAP               = _get_float("DAILY_CAP", 50.0)
 DAILY_CAP_TZ            = os.getenv("DAILY_CAP_TZ", "America/Los_Angeles")
+QUOTE_BALANCE_BUFFER_USD = _get_float("QUOTE_BALANCE_BUFFER_USD", 0.50)  # NEW: leave at 0.50–1.00
 
-DROP_PCT                = _get_float("DROP_PCT", 2.0)              # look for <= -DROP_PCT
+DROP_PCT                = _get_float("DROP_PCT", 2.0)
 UNIVERSE_SIZE           = _get_int("UNIVERSE_SIZE", 100)
 PREFERRED_QUOTES        = [q.upper() for q in _get_list("PREFERRED_QUOTES", "USD,USDT")]
 MIN_DOLLAR_VOL_24H      = _get_float("MIN_DOLLAR_VOL_24H", 500_000)
@@ -64,6 +66,7 @@ WHITELIST               = set([s.upper() for s in _get_list("WHITELIST", "")])
 
 API_KEY                 = os.getenv("KRAKEN_API_KEY", "") or os.getenv("CRYPTO_API_KEY", "")
 API_SECRET              = os.getenv("KRAKEN_SECRET", "") or os.getenv("CRYPTO_API_SECRET", "")
+
 
 # ---------------------- Exchange bootstrap -----------------------------
 def build_kraken():
@@ -93,7 +96,6 @@ def _get_market(exchange, symbol):
 def _ceil_to_step(x, step):
     if not step:
         return x
-    # ceil to step with numeric stability
     k = (float(x) + float(step) - 1e-18) / float(step)
     return round(int(k) * float(step), 18)
 
@@ -112,11 +114,9 @@ def min_notional_usd(exchange, symbol, last_price):
     candidates = []
     if cost_min is not None:
         candidates.append(float(cost_min))
-
     if amt_min is not None and last_price is not None:
         eff_px = max(float(last_price), float(px_min) if px_min is not None else 0.0)
         candidates.append(float(amt_min) * eff_px)
-
     if not candidates:
         return None
     return max(candidates)
@@ -131,21 +131,18 @@ def build_amount_for_notional(exchange, symbol, notional_usd, last_price):
     limits = (m.get("limits") or {})
     amount_limits = (limits.get("amount") or {})
 
-    step    = amount_limits.get("step")             # preferred if present
+    step    = amount_limits.get("step")
     amt_min = amount_limits.get("min")
-    precision = (m.get("precision") or {}).get("amount")  # decimals
+    precision = (m.get("precision") or {}).get("amount")
 
     amt = float(notional_usd) / float(last_price)
 
-    # enforce step/precision
     if step:
         amt = _ceil_to_step(amt, float(step))
     elif precision is not None:
         fmt = f"{{:.{int(precision)}f}}"
-        # nudge upward to avoid under-min after rounding
         amt = float(fmt.format(amt + (10 ** -(int(precision) + 2))))
 
-    # minimum amount
     if amt_min is not None and amt < float(amt_min):
         if step:
             amt = _ceil_to_step(float(amt_min), float(step))
@@ -158,9 +155,8 @@ def place_market_buy(exchange, symbol, base_notional_usd, min_buffer_usd, daily_
     """
     Try to place a market buy at requested notional or at the
     pair-specific min notional + buffer if AUTO_TOP_UP_MIN is True.
-    Retries once on volume/min errors.
+    Retries once on volume/min or 'Insufficient funds' conditions.
     """
-    # live last price
     t = exchange.fetch_ticker(symbol)
     last = float(t.get("last") or t.get("close") or 0.0)
     if not last or last <= 0:
@@ -173,7 +169,6 @@ def place_market_buy(exchange, symbol, base_notional_usd, min_buffer_usd, daily_
         if pair_min is not None:
             target = max(target, float(pair_min) + float(min_buffer_usd))
 
-    # always obey daily cap remainder
     target = min(target, float(daily_cap_remaining_usd))
     if target <= 0:
         raise RuntimeError("No remaining daily-cap headroom")
@@ -190,9 +185,7 @@ def place_market_buy(exchange, symbol, base_notional_usd, min_buffer_usd, daily_
         return _create(amount)
     except Exception as e:
         msg = str(e)
-        # Kraken under-min messages
-        if "volume minimum not met" in msg or "Insufficient funds" in msg:
-            # recalc min and retry once
+        if ("volume minimum not met" in msg) or ("Insufficient funds" in msg):
             pair_min_2 = min_notional_usd(exchange, symbol, last)
             if pair_min_2 is not None:
                 bumped = max(float(base_notional_usd), float(pair_min_2) + float(min_buffer_usd))
@@ -205,7 +198,6 @@ def place_market_buy(exchange, symbol, base_notional_usd, min_buffer_usd, daily_
 
 # ------------------------ Universe / candidates -------------------------
 def _is_quote_ok(symbol: str) -> bool:
-    # symbol like "BTC/USD"
     for q in PREFERRED_QUOTES:
         if symbol.upper().endswith("/" + q):
             return True
@@ -217,9 +209,6 @@ def _quote(symbol: str) -> str:
 
 
 def _dollar_volume(exchange, symbol, ticker):
-    """
-    Try quoteVolume or baseVolume*last
-    """
     qv = ticker.get("quoteVolume")
     if qv is not None:
         try:
@@ -235,18 +224,12 @@ def _dollar_volume(exchange, symbol, ticker):
 
 
 def build_universe(exchange):
-    """
-    Build list of (symbol, last, change_pct, dollar_vol) candidates
-    """
     out = []
     tickers = exchange.fetch_tickers()
     for symbol, t in tickers.items():
-        # prefer spot only, preferred quotes
         if not _is_quote_ok(symbol):
             continue
-
         sym_up = symbol.upper()
-
         if WHITELIST:
             if sym_up not in WHITELIST:
                 continue
@@ -261,7 +244,6 @@ def build_universe(exchange):
             last = float(last)
         except Exception:
             continue
-
         if last < MIN_PRICE:
             continue
 
@@ -269,7 +251,6 @@ def build_universe(exchange):
         if dv < MIN_DOLLAR_VOL_24H:
             continue
 
-        # % change: use ticker['percentage'] when available else infer
         pct = t.get("percentage")
         if pct is None:
             open_px = t.get("open")
@@ -280,18 +261,15 @@ def build_universe(exchange):
                     continue
             except Exception:
                 continue
-
         try:
             pct = float(pct)
         except Exception:
             continue
 
-        # looking for drops
         if pct <= -abs(DROP_PCT):
             out.append((symbol, last, pct, dv))
 
-    # sort by most negative change first, then bigger $volume
-    out.sort(key=lambda x: (x[2], -x[3]))  # pct asc (more negative), vol desc
+    out.sort(key=lambda x: (x[2], -x[3]))
     return out[:UNIVERSE_SIZE]
 
 
@@ -304,14 +282,9 @@ def day_start_ts_ms(tz_name: str) -> int:
 
 
 def spent_today_usd(exchange) -> float:
-    """
-    Sum of cost of *closed BUY* orders since local midnight (any symbol).
-    Kraken returns 'cost' in orders; sum that.
-    If the call fails, fall back to 0 but keep running.
-    """
     since = day_start_ts_ms(DAILY_CAP_TZ)
     try:
-        orders = exchange.fetchClosedOrders(symbol=None, since=since)  # Kraken supports None
+        orders = exchange.fetchClosedOrders(symbol=None, since=since)
     except Exception as e:
         log.warning(f"Could not fetch closed orders for daily-cap calc: {e}")
         return 0.0
@@ -322,7 +295,6 @@ def spent_today_usd(exchange) -> float:
             if (o.get("side") == "buy") and (o.get("status") in ("closed", "closed_partially", "filled", "done", None)):
                 cost = o.get("cost")
                 if cost is None:
-                    # fallback: price*amount
                     cost = float(o.get("price") or 0.0) * float(o.get("amount") or 0.0)
                 total += float(cost or 0.0)
         except Exception:
@@ -330,15 +302,28 @@ def spent_today_usd(exchange) -> float:
     return float(total)
 
 
+# ---------------------- Quote-balance (NEW) -----------------------------
+def fetch_free_balances(exchange) -> dict[str, float]:
+    """
+    Return free balances for the quotes we care about (USD, USDT).
+    """
+    out = {"USD": 0.0, "USDT": 0.0}
+    try:
+        b = exchange.fetch_balance()
+        free = b.get("free") or b  # Kraken returns 'free'
+        for code in out.keys():
+            v = free.get(code)
+            if v is not None:
+                out[code] = float(v)
+    except Exception as e:
+        log.warning(f"Could not fetch balance details: {e}")
+    return out
+
+
 # --------------------------- Jurisdiction -------------------------------
 def jurisdiction_block_message(e: Exception) -> str | None:
-    """
-    Detect messages like: "Invalid permissions:MIRROR trading restricted for US:WA."
-    Return the region string if found, else None.
-    """
     msg = str(e)
     if "Invalid permissions" in msg and "restricted for" in msg:
-        # try to pull the substring after 'restricted for '
         try:
             after = msg.split("restricted for", 1)[1].strip()
             region = after.split(".", 1)[0].strip()
@@ -351,11 +336,10 @@ def jurisdiction_block_message(e: Exception) -> str | None:
 # ------------------------------- Main -----------------------------------
 def main():
     log.info("=== START TRADING OUTPUT ===")
-    log.info("Python %s", ".".join(map(str, (3, 11))))
+    log.info("Python 3.11")
 
     kraken = build_kraken()
 
-    # optional balance ping
     if not SKIP_BALANCE_PING:
         try:
             _ = kraken.fetch_balance()
@@ -363,11 +347,9 @@ def main():
         except Exception as e:
             log.warning(f"Balance fetch failed (continuing): {e}")
 
-    # daily cap window
     start_local = datetime.fromtimestamp(day_start_ts_ms(DAILY_CAP_TZ) / 1000.0, tz=timezone.utc).astimezone(ZoneInfo(DAILY_CAP_TZ))
     log.info(f"Daily-cap window start (local {DAILY_CAP_TZ}): {start_local.isoformat()}")
 
-    # compute spent today
     spent = spent_today_usd(kraken)
     remaining = max(0.0, DAILY_CAP - spent)
     log.info(f"Daily spend so far ≈ ${spent:.2f}. Remaining ≈ ${remaining:.2f}.")
@@ -377,33 +359,35 @@ def main():
         log.info("=== END TRADING OUTPUT ===")
         return
 
-    # build universe
     universe = build_universe(kraken)
     log.info(f"Eligible candidates: {len(universe)}")
-
     if not universe:
         log.info("No candidates matched filters this run.")
         log.info("=== END TRADING OUTPUT ===")
         return
 
-    best = universe[0]
-    log.info(f"Best candidate: {best[0]} change {best[2]:.6f}% last {best[1]} vol${best[3]:.2f}")
-
-    # in-run ban for jurisdiction-blocked symbols
     banned_this_run = set()
+    free_quotes = fetch_free_balances(kraken)
+    log.info(f"Free quotes snapshot: USD=${free_quotes.get('USD',0.0):.2f}, USDT=${free_quotes.get('USDT',0.0):.2f}")
 
-    # iterate through universe until we either buy successfully or exhaust
     for symbol, last, pct, dv in universe:
-        if symbol in banned_this_run:
-            continue
-
-        # obey remaining cap snapshot for each try
         if remaining <= 0:
             log.info("Daily cap reached during loop; stopping.")
             break
+        if symbol in banned_this_run:
+            continue
 
-        notional = min(TRADE_AMOUNT, remaining)
-        log.info(f"Placing market buy: {notional:.9f} {symbol} @ market (notional ≈ ${notional:.2f})")
+        quote = _quote(symbol)
+        free_q = float(free_quotes.get(quote, 0.0))
+        headroom = max(0.0, free_q - QUOTE_BALANCE_BUFFER_USD)
+
+        # clamp by available quote balance
+        notional = min(TRADE_AMOUNT, remaining, headroom)
+        if notional <= 0:
+            log.info(f"Skip {symbol}: no free {quote} balance (free={free_q:.2f}, cushion={QUOTE_BALANCE_BUFFER_USD:.2f}).")
+            continue
+
+        log.info(f"Placing market buy: {notional:.8f} {symbol} @ market (notional ≈ ${notional:.2f})")
 
         try:
             order = place_market_buy(
@@ -414,13 +398,11 @@ def main():
                 daily_cap_remaining_usd=remaining
             )
             log.info(f"BUY ok: {order.get('id','?')} {symbol}")
-            # assume we spent 'notional' (slippage/fees ignored in this simple accounting)
             remaining -= notional
             break
 
         except Exception as e:
             msg = str(e)
-            # jurisdiction handling
             region = jurisdiction_block_message(e)
             if region:
                 log.warning(
@@ -430,20 +412,11 @@ def main():
                 banned_this_run.add(symbol)
                 continue
 
-            # explicit min-volume error path already handled in place_market_buy (1 retry)
-            if "volume minimum not met" in msg:
+            if "volume minimum not met" in msg or "Insufficient funds" in msg:
                 log.error(f"[ERROR] BUY failed for {symbol}: {e}")
                 continue
 
-            # Kraken often returns "Insufficient funds" when actually below min;
-            # we already retried once with min inside place_market_buy. If it still fails, just log.
-            if "Insufficient funds" in msg:
-                log.error(f"[ERROR] BUY failed for {symbol}: {e}")
-                continue
-
-            # any other error
             log.error(f"[ERROR] BUY failed for {symbol}: {e}")
-            # do not ban unless it's a jurisdiction block
             continue
 
     log.info("=== END TRADING OUTPUT ===")
@@ -455,5 +428,4 @@ if __name__ == "__main__":
     except Exception as err:
         log.error("Fatal error: %s", err)
         traceback.print_exc()
-        # Non-zero exit so Actions marks the run red when something truly fatal happens.
         raise
