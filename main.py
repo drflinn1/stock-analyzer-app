@@ -1,274 +1,326 @@
-import os, time, traceback
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo  # Python 3.11+
-import ccxt
+import os
+import math
+import time
 import logging
+import traceback
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
-# ---------------- Logging ----------------
+import ccxt
+
+# -----------------------------------------------------------------------------
+# logging
+# -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("runner")
 
-# --------------- Env knobs ----------------
+# -----------------------------------------------------------------------------
+# env helpers
+# -----------------------------------------------------------------------------
 def _to_float(x, fallback=None):
     try:
-        return float(x)
+        return float(str(x).strip())
     except Exception:
         return fallback
 
+def _to_bool(x, fallback=False):
+    if x is None:
+        return fallback
+    s = str(x).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return fallback
+
+def _csv_list(val):
+    if not val:
+        return []
+    return [p.strip() for p in str(val).split(",") if p.strip()]
+
+# -----------------------------------------------------------------------------
+# read knobs from env (kept compatible with what you already use)
+# -----------------------------------------------------------------------------
 PYTHON_VERSION = os.getenv("PYTHON_VERSION", "3.11")
 
-# Stop-loss knobs (kept for later)
+# stop loss
 STOP_LOSS_PCT = _to_float(os.getenv("STOP_LOSS_PCT", "2.0"), 2.0)
-STOP_LOSS_USE_LIMIT = os.getenv("STOP_LOSS_USE_LIMIT", "true").lower() == "true"
+STOP_LOSS_USE_LIMIT = _to_bool(os.getenv("STOP_LOSS_USE_LIMIT", "true"), True)
 STOP_LOSS_LIMIT_OFFSET_BP = _to_float(os.getenv("STOP_LOSS_LIMIT_OFFSET_BP", "10"), 10.0)
 
-# Live knobs
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
-SKIP_BALANCE_PING = os.getenv("SKIP_BALANCE_PING", "false").lower() == "true"
+# NEW: take profit
+TAKE_PROFIT_PCT = _to_float(os.getenv("TAKE_PROFIT_PCT", "5.0"), 5.0)  # percent above fill
+
+# live knobs
+DRY_RUN = _to_bool(os.getenv("DRY_RUN", "false"))
+SKIP_BALANCE_PING = _to_bool(os.getenv("SKIP_BALANCE_PING", "false"))
 TRADE_AMOUNT = _to_float(os.getenv("TRADE_AMOUNT", "20"), 20.0)
-AUTO_TOP_UP_MIN = os.getenv("AUTO_TOP_UP_MIN", "true").lower() == "true"
+AUTO_TOP_UP_MIN = _to_bool(os.getenv("AUTO_TOP_UP_MIN", "true"), True)
 MIN_ORDER_BUFFER_USD = _to_float(os.getenv("MIN_ORDER_BUFFER_USD", "0.50"), 0.50)
 MIN_NOTIONAL_FLOOR_USD = _to_float(os.getenv("MIN_NOTIONAL_FLOOR_USD", "20"), 20.0)
-
 DAILY_CAP = _to_float(os.getenv("DAILY_CAP", "50"), 50.0)
 DAILY_CAP_TZ = os.getenv("DAILY_CAP_TZ", "America/Los_Angeles")
 
-# Universe / filters
+# universe / filters
 DROP_PCT = _to_float(os.getenv("DROP_PCT", "1.5"), 1.5)
-UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "200"))
-PREFERRED_QUOTES = [x.strip() for x in os.getenv("PREFERRED_QUOTES", "USD,USDT").split(",") if x.strip()]
-MIN_DOLLAR_VOL_24H = _to_float(os.getenv("MIN_DOLLAR_VOL_24H", "500000"), 500000.0)
+UNIVERSE_SIZE = int(_to_float(os.getenv("UNIVERSE_SIZE", "200"), 200))
+PREFERRED_QUOTES = _csv_list(os.getenv("PREFERRED_QUOTES", "USD,USDT"))
+MIN_DOLLAR_VOL_24H = _to_float(os.getenv("MIN_DOLLAR_VOL_24H", "200000"), 200000.0)
 MIN_PRICE = _to_float(os.getenv("MIN_PRICE", "0.01"), 0.01)
+EXCLUDE = set(_csv_list(os.getenv("EXCLUDE", "U/USD")))
+WHITELIST = set(_csv_list(os.getenv("WHITELIST", "")))
 
-EXCLUDE = [x.strip() for x in os.getenv("EXCLUDE", "U/USD").split(",") if x.strip()]
-WHITELIST = [x.strip() for x in os.getenv("WHITELIST", "").split(",") if x.strip()]
+# secrets
+KEY = os.getenv("KRAKEN_API_KEY")
+SECRET = os.getenv("KRAKEN_API_SECRET")
 
-# Secrets
-KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "")
-KRAKEN_SECRET = os.getenv("KRAKEN_SECRET", "")
+# -----------------------------------------------------------------------------
+# exchange
+# -----------------------------------------------------------------------------
+def make_exchange():
+    if not KEY or not SECRET:
+        raise RuntimeError("Missing API key/secret. Set KRAKEN_API_KEY and KRAKEN_API_SECRET.")
+    return ccxt.kraken({
+        "apiKey": KEY,
+        "secret": SECRET,
+        "enableRateLimit": True,
+        # Use 'last' trigger semantics for conditionals
+        "options": {"trading": {"stop": {"trigger": "last"}}},
+    })
 
-# -------------- Helpers -------------------
-def midnight_of_today(tzname: str):
-    now = datetime.now(ZoneInfo(tzname))
-    return now.replace(hour=0, minute=0, second=0, microsecond=0)
-
-def _min_notional_usd(exchange: ccxt.Exchange, symbol: str, last_price: float|None = None):
-    """
-    Try to derive exchange minimum notional (USD) for a symbol using ccxt markets metadata.
-    Returns a float or None.
-    """
-    m = (exchange.markets or {}).get(symbol, {}) or {}
+# -----------------------------------------------------------------------------
+# util: pair minimum notional (USD) from exchange limits (approx)
+# -----------------------------------------------------------------------------
+def min_notional_usd(exchange: ccxt.Exchange, symbol: str, px: float | None) -> float | None:
+    m = exchange.markets.get(symbol, {})
     limits = m.get("limits", {}) or {}
+    # prefer explicit 'cost' min if provided
     cost_min = (limits.get("cost") or {}).get("min")
-    if cost_min is not None:
+    if cost_min:
         try:
             return float(cost_min)
         except Exception:
             pass
-
+    # fallback: amount*price using min amount and current price
     amt_min = (limits.get("amount") or {}).get("min")
-    px_min  = (limits.get("price") or {}).get("min")
-    if amt_min is not None and px_min is not None:
+    if amt_min is not None and px is not None:
         try:
-            return float(amt_min) * float(px_min)
+            return float(amt_min) * float(px)
         except Exception:
-            pass
-
-    # If we have a last price and amount min only
-    if last_price is not None and amt_min is not None:
-        try:
-            return float(amt_min) * float(last_price)
-        except Exception:
-            pass
-
+            return None
     return None
 
-def _symbol_quote(symbol: str) -> str:
-    # Kraken symbols look like "ABC/USD" or "XBT/USDT"
-    try:
-        return symbol.split("/")[1]
-    except Exception:
-        return ""
+# -----------------------------------------------------------------------------
+# take-profit & stop-loss helpers
+# -----------------------------------------------------------------------------
+def place_stop_loss(exchange: ccxt.Exchange, symbol: str, base_qty: float, fill_price: float):
+    if STOP_LOSS_PCT <= 0 or base_qty <= 0:
+        return
+    stop_price  = fill_price * (1.0 - STOP_LOSS_PCT / 100.0)
 
-def _is_restricted_for_wa(error_msg: str) -> bool:
-    return "restricted for US:WA" in (error_msg or "")
-
-# We'll keep a run-local ban list for WA-restricted symbols
-_run_ban_symbols = set()
-
-def banned_this_run(symbol: str) -> bool:
-    return symbol in _run_ban_symbols
-
-def ban_for_run(symbol: str, reason: str):
-    if symbol not in _run_ban_symbols:
-        _run_ban_symbols.add(symbol)
-        log.warning("Jurisdiction block for %s; banning this symbol for the rest of this run. Msg: %s", symbol, reason)
-
-def place_guarded_market_buy(exchange: ccxt.Exchange, symbol: str, last_price: float) -> bool:
-    """
-    Pre-flight checks to avoid errors:
-      - skip if symbol is WA-restricted already this run
-      - enforce user MIN_NOTIONAL_FLOOR_USD
-      - enforce available USD + buffer check
-      - auto bump to exchange minimum if AUTO_TOP_UP_MIN is on
-    """
-    if banned_this_run(symbol):
-        return False
-
-    quote = _symbol_quote(symbol)
-    if quote not in ("USD", "USDT"):
-        log.info("Skip BUY for %s: quote %s is not USD/USDT", symbol, quote)
-        return False
-
-    # User floor
-    notional = TRADE_AMOUNT
-    if notional < MIN_NOTIONAL_FLOOR_USD:
-        log.info("Skip BUY for %s: notional $%.2f below user floor $%.2f", symbol, notional, MIN_NOTIONAL_FLOOR_USD)
-        return False
-
-    # Exchange min
-    min_ex_notional = _min_notional_usd(exchange, symbol, last_price)
-    if min_ex_notional:
-        target = max(notional, min_ex_notional)
+    if STOP_LOSS_USE_LIMIT:
+        # nudge limit slightly below trigger to improve fill probability
+        limit_delta = (STOP_LOSS_LIMIT_OFFSET_BP / 10000.0) * fill_price
+        limit_price = stop_price - limit_delta
+        params = {"trigger": "last", "stopPrice": exchange.price_to_precision(symbol, stop_price)}
+        # Kraken understands stop-loss-limit on spot
+        exchange.create_order(symbol, "stop-loss-limit", "sell",
+                              amount=base_qty,
+                              price=exchange.price_to_precision(symbol, limit_price),
+                              params=params)
+        log.info("Placed stop-loss-limit %.4f -> %.4f for %s", stop_price, limit_price, symbol)
     else:
-        target = notional
+        params = {"trigger": "last", "stopPrice": exchange.price_to_precision(symbol, stop_price)}
+        exchange.create_order(symbol, "stop-loss", "sell", amount=base_qty, price=None, params=params)
+        log.info("Placed stop-loss (market) at %.4f for %s", stop_price, symbol)
 
-    cost = target + MIN_ORDER_BUFFER_USD
+def place_take_profit_limit(exchange: ccxt.Exchange, symbol: str, base_qty: float, fill_price: float):
+    """
+    Simple TP as a resting limit sell at +TAKE_PROFIT_PCT%.  Works everywhere and shows up
+    under Kraken → 'Closed/Open orders' (not 'Conditional orders').
+    """
+    if TAKE_PROFIT_PCT <= 0 or base_qty <= 0:
+        return
+    tp_price = fill_price * (1.0 + TAKE_PROFIT_PCT / 100.0)
+    tp_price = float(exchange.price_to_precision(symbol, tp_price))
+    base_qty = float(exchange.amount_to_precision(symbol, base_qty))
+    exchange.create_limit_sell_order(symbol, base_qty, tp_price)
+    log.info("Placed take-profit limit at %.4f (+%.2f%%) for %s", tp_price, TAKE_PROFIT_PCT, symbol)
 
-    # Balance check (USD)
-    bal = {}
-    if not SKIP_BALANCE_PING:
-        try:
-            bal = exchange.fetch_balance()
-        except Exception:
-            log.exception("Balance ping failed; continuing with caution.")
-    free_usd = 0.0
-    if bal:
-        # Kraken cash balances: 'USD' key, 'free' or 'total' fields
-        try:
-            free_usd = float(((bal.get("USD") or {}).get("free")) or 0.0)
-        except Exception:
-            free_usd = 0.0
+# -----------------------------------------------------------------------------
+# jurisdiction/message based bans within a single run
+# -----------------------------------------------------------------------------
+jurisdiction_ban = set()    # symbols we must not attempt again this run
 
-    if free_usd < cost:
-        log.info("Skip BUY for %s: need $%.2f (incl. buffer), but free USD is $%.2f", symbol, cost, free_usd)
+def should_ban_for_wa(msg: str) -> bool:
+    if not msg:
         return False
+    m = msg.lower()
+    # Kraken style messages seen in your logs
+    return ("invalid permissions" in m and "restricted for us:wa" in m) or ("for us:wa." in m)
 
-    # Compute market amount
-    if last_price <= 0:
-        log.info("Skip BUY for %s: bad last price %.8f", symbol, last_price)
+def should_ban_volume_min_not_met(msg: str) -> bool:
+    if not msg:
         return False
+    return "volume minimum not met" in msg.lower() or "minimum not met" in msg.lower()
 
-    amount = target / last_price
+# -----------------------------------------------------------------------------
+# daily cap window
+# -----------------------------------------------------------------------------
+def start_of_today_tz(tz_name: str) -> datetime:
+    now = datetime.now(ZoneInfo(tz_name))
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    if DRY_RUN:
-        log.info("[DRY_RUN] Would place market BUY %s for notional ≈ $%.2f (amount %.8f)", symbol, target, amount)
-        return True
-
-    try:
-        order = exchange.create_market_buy_order(symbol, amount)
-        log.info("Placed BUY: %s  notional≈$%.2f amount=%.8f  id=%s", symbol, target, amount, order.get("id"))
-        return True
-    except ccxt.BaseError as e:
-        msg = str(e)
-        if _is_restricted_for_wa(msg):
-            ban_for_run(symbol, f"kraken {msg}")
-            return False
-        log.error("BUY failed for %s: kraken error: %s", symbol, msg)
-        return False
-    except Exception as e:
-        log.error("BUY failed for %s: %s", symbol, e)
-        return False
-
-# --------------- Core loop -----------------
+# -----------------------------------------------------------------------------
+# main
+# -----------------------------------------------------------------------------
 def main():
     log.info("=== START TRADING OUTPUT ===")
-    log.info("Python %s", PYTHON_VERSION)
+    log.info("Python %s", ".".join(map(str, list(map(int, tuple(map(int, os.getenv('PYTHON_VERSION', '3.11').split('.')))))))))
 
-    if not KRAKEN_API_KEY or not KRAKEN_SECRET:
-        log.error("[ERROR] Missing API key/secret. Set KRAKEN_API_KEY and KRAKEN_SECRET.")
-        return
+    exchange = make_exchange()
+    exchange.load_markets()
 
-    exchange = ccxt.kraken({
-        "apiKey": KRAKEN_API_KEY,
-        "secret": KRAKEN_SECRET,
-        "enableRateLimit": True,
-        # safer order precision
-        "options": {"trading": {"reduceOnly": False}},
-    })
+    # daily cap accounting (very simple: count quote cost we *intend* to spend)
+    window_start = start_of_today_tz(DAILY_CAP_TZ)
+    log.info("Daily-cap window start (local %s): %s", DAILY_CAP_TZ, window_start.isoformat())
 
-    try:
-        exchange.load_markets()
-    except Exception:
-        log.exception("Failed to load markets")
-        return
-
-    # Optional balance ping (don’t print full balance)
-    if SKIP_BALANCE_PING:
-        log.info("Skipping balance ping (SKIP_BALANCE_PING=true).")
-    else:
-        try:
-            exchange.fetch_balance()
-            log.info("Fetched balance (skipping details in log).")
-        except Exception:
-            log.exception("Balance fetch failed; continuing.")
-
-    # Daily-cap window
-    start = midnight_of_today(DAILY_CAP_TZ)
-    log.info("Daily-cap window start (local %s): %s", DAILY_CAP_TZ, start.isoformat())
-
+    # balance
+    balance = exchange.fetch_balance() if not SKIP_BALANCE_PING else {"free": {}}
+    free_usd = float(balance.get("free", {}).get("USD", 0.0)) if not SKIP_BALANCE_PING else None
+    if not SKIP_BALANCE_PING:
+        log.info("Fetched balance (skipping details in log).")
     spent_today = 0.0
     log.info("Daily spend so far ≈ $%.2f. Remaining ≈ $%.2f.", spent_today, max(0.0, DAILY_CAP - spent_today))
 
-    # Build candidate list (keep simple: scan all USD/USDT spot markets, drop by %)
-    # You can replace this with your smarter scanner later
+    # Build a quick universe using exchange markets and tickers
+    # We'll prefer quotes in PREFERRED_QUOTES, drop tiny prices, and keep a large basket
+    tickers = exchange.fetch_tickers()
     symbols = []
-    for s, m in exchange.markets.items():
-        if not m.get("active", True):
+    for sym, t in tickers.items():
+        if "/" not in sym:
             continue
-        if m.get("spot") is False:
+        base, quote = sym.split("/")
+        quote = quote.upper()
+        if quote not in PREFERRED_QUOTES:
             continue
-        q = _symbol_quote(s)
-        if q not in PREFERRED_QUOTES:
+        if sym in EXCLUDE:
             continue
-        if s in EXCLUDE:
+        last = _to_float(t.get("last") or t.get("close") or t.get("bid") or t.get("ask"))
+        if last is None or last < MIN_PRICE:
             continue
-        symbols.append(s)
+        symbols.append((sym, last))
 
-    # Trim to UNIVERSE_SIZE
-    symbols = symbols[:UNIVERSE_SIZE]
-    log.info("Eligible candidates: %d", len(symbols))
+    # Rank by 24h change (biggest losers first) so we try oversold first
+    ranked = []
+    for sym, last in symbols:
+        t = tickers.get(sym, {})
+        chg = _to_float(t.get("percentage"), 0.0)  # 24h pct change
+        ranked.append((chg, sym, last))
+    ranked.sort(key=lambda x: x[0])  # most negative first
 
-    # VERY simple “drop” filter: pick a few that were recently red (this is a stub)
-    # In a real bot, compute real drops; here we just try a handful to demonstrate guards.
-    try_list = symbols[:20]
+    eligible = 0
+    for chg, symbol, last in ranked[:UNIVERSE_SIZE]:
+        if symbol in jurisdiction_ban:
+            continue
 
-    for symbol in try_list:
-        if spent_today >= DAILY_CAP:
-            log.info("Daily cap reached. Spent today ≈ $%.2f / cap $%.2f. Skipping buys.", spent_today, DAILY_CAP)
+        # quick drop/whitelist logic
+        if WHITELIST and symbol not in WHITELIST:
+            continue
+        if chg is None or chg > -abs(DROP_PCT):
+            continue
+
+        eligible += 1
+
+    log.info("Eligible candidates: %d", eligible)
+
+    # walk again and try to buy one that passes funds & min-notional
+    for chg, symbol, last in ranked[:UNIVERSE_SIZE]:
+        if symbol in jurisdiction_ban:
+            continue
+        if WHITELIST and symbol not in WHITELIST:
+            continue
+        if chg is None or chg > -abs(DROP_PCT):
+            continue
+
+        # determine notional we need for this pair
+        pair_min = min_notional_usd(exchange, symbol, last) or 0.0
+        min_needed = max(MIN_NOTIONAL_FLOOR_USD, pair_min)
+        notional = TRADE_AMOUNT
+        if AUTO_TOP_UP_MIN and notional < min_needed:
+            notional = min_needed
+
+        # ensure we still respect daily cap
+        if spent_today + notional > DAILY_CAP + 1e-9:
+            log.info("Stop scanning; daily cap would be exceeded by %s", symbol)
             break
 
-        # get last price
+        # check free USD (if we loaded balance)
+        if not SKIP_BALANCE_PING:
+            free_usd = float(exchange.fetch_balance().get("free", {}).get("USD", 0.0))
+            if free_usd < (notional + MIN_ORDER_BUFFER_USD):
+                log.info("Skip BUY for %s: need $%.2f (incl. buffer), but free USD is $%.2f",
+                         symbol, notional + MIN_ORDER_BUFFER_USD, free_usd)
+                continue
+
+        # market buy (Kraken supports 'cost' param for quote amount buys)
         try:
-            ticker = exchange.fetch_ticker(symbol)
-            last = float(ticker.get("last") or 0.0)
-        except Exception:
-            log.exception("Failed to fetch ticker for %s", symbol)
+            log.info("Placing market buy: $%.6f %s @ market (notional ≈ $%.2f)",
+                     notional / max(last, 1e-12), symbol, notional)
+            if DRY_RUN:
+                order = {"amount": notional / last, "average": last}
+            else:
+                order = exchange.create_market_buy_order(symbol, amount=None, params={"cost": notional})
+            base_filled = _to_float(order.get("amount"), notional / last) or (notional / last)
+            avg_price  = _to_float(order.get("average") or order.get("price") or last, last)
+
+            # place protective stop-loss
+            try:
+                if not DRY_RUN:
+                    place_stop_loss(exchange, symbol, base_filled, avg_price)
+            except Exception as e:
+                log.warning("Stop-loss placement failed for %s: %s", symbol, e)
+
+            # place take-profit limit
+            try:
+                if not DRY_RUN and TAKE_PROFIT_PCT > 0:
+                    place_take_profit_limit(exchange, symbol, base_filled, avg_price)
+            except Exception as e:
+                log.warning("Take-profit placement failed for %s: %s", symbol, e)
+
+            spent_today += notional
+            break  # one buy per run
+
+        except ccxt.BaseError as e:
+            msg = str(e)
+            if should_ban_for_wa(msg):
+                log.warning("Jurisdiction block for %s; banning this symbol for the rest of this run. Msg: %s",
+                            symbol, msg)
+                jurisdiction_ban.add(symbol)
+                continue
+            if should_ban_volume_min_not_met(msg):
+                log.warning("Volume min not met for %s; banning this symbol for this run. Msg: %s",
+                            symbol, msg)
+                jurisdiction_ban.add(symbol)
+                continue
+            if "insufficient funds" in msg.lower():
+                log.error("BUY failed for %s: %s", symbol, msg)
+                # don’t ban; we may free funds later
+                continue
+            log.error("BUY failed for %s: %s", symbol, msg)
+            log.debug("Trace:\n%s", traceback.format_exc())
             continue
 
-        # place guarded buy
-        ok = place_guarded_market_buy(exchange, symbol, last)
-        if ok:
-            spent_today += TRADE_AMOUNT  # conservative accounting
-
     log.info("=== END TRADING OUTPUT ===")
+
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        traceback.print_exc()
-        log.error("Fatal error in main()")
+    except Exception as e:
+        log.error("Fatal: %s", e)
+        log.debug("Trace:\n%s", traceback.format_exc())
+        raise
