@@ -16,6 +16,9 @@ env:
   STOP_LOSS_PCT: "2.0"
   STOP_LOSS_USE_LIMIT: "true"
   STOP_LOSS_LIMIT_OFFSET_BP: "10"
+  
+  # --- Take-profit knob ---
+  TAKE_PROFIT_PCT: "5.0"       # sell winner at +5% via a limit order
 
   # --- Live knobs ---
   DRY_RUN: "false"
