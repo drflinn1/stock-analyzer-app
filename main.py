@@ -2,30 +2,33 @@
 # -*- coding: utf-8 -*-
 
 """
-Minimal-safe crypto live runner for Kraken via CCXT.
+Crypto live runner for Kraken via CCXT — with auto-pick.
 
-Env knobs (strings; not case-sensitive):
-- DRY_RUN:            "true" / "false"                (default "true")
-- TRADE_AMOUNT:       dollars per buy (e.g. "10")     (default "10")
-- TAKE_PROFIT_PCT:    e.g. "0.05" for +5%             (default "0.05")
-- DROP_PCT:           gate for simple dip-buy logic   (default "0.00")  # 0 disables the gate
-- MAX_TRADES_PER_RUN: cap buys this run               (default "1")
-- SYMBOLS:            comma list "BTC/USD,ETH/USD"    (default "BTC/USD,ETH/USD")
-- MIN_NOTIONAL_BUFFER: e.g. "1.00" spare USD          (default "1.00")
+New:
+- Auto-pick: From SYMBOLS, compute dip% = (cur - SMA10)/SMA10 * 100.
+  Pick the *most negative* (biggest dip) among eligible pairs.
+- Respects min-notional and available USD before selecting.
+- MAX_TRADES_PER_RUN: buys top-N candidates by dip order.
 
-Secrets (required for live trading):
-- KRAKEN_API_KEY
-- KRAKEN_API_SECRET
+Env knobs:
+- DRY_RUN: "true"/"false"
+- TRADE_AMOUNT: e.g., "10"
+- TAKE_PROFIT_PCT: e.g., "0.02" (+2%)
+- DROP_PCT: dip gate (0.00 disables) – still applied, but auto-pick uses the actual dip% to sort
+- MAX_TRADES_PER_RUN: "1" (or more)
+- SYMBOLS: "BTC/USD,ETH/USD,DOGE/USD,XRP/USD,ADA/USD" (order doesn’t matter now)
+- MIN_NOTIONAL_BUFFER: e.g., "1.00"
+
+Secrets (for live):
+- KRAKEN_API_KEY, KRAKEN_API_SECRET
 """
 
 import os
 import sys
 import time
-import math
 import traceback
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-
 import ccxt  # type: ignore
 import logging
 
@@ -50,15 +53,14 @@ def env_decimal(name: str, default: str) -> Decimal:
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-# Clean + robust Python-version log (fixes prior SyntaxError)
 pyver = ".".join(map(str, sys.version_info[:3]))
 log.info("Python %s", pyver)
 
 # ---------- read env ----------
 DRY_RUN            = env_bool("DRY_RUN", True)
 TRADE_AMOUNT_USD   = env_decimal("TRADE_AMOUNT", "10")
-TAKE_PROFIT_PCT    = env_decimal("TAKE_PROFIT_PCT", "0.05")   # +5%
-DROP_PCT           = env_decimal("DROP_PCT", "0.00")          # 0 disables dip-gate
+TAKE_PROFIT_PCT    = env_decimal("TAKE_PROFIT_PCT", "0.02")
+DROP_PCT           = env_decimal("DROP_PCT", "0.00")
 MAX_TRADES_PER_RUN = int(env_str("MAX_TRADES_PER_RUN", "1"))
 MIN_NOTIONAL_BUFFER= env_decimal("MIN_NOTIONAL_BUFFER", "1.00")
 
@@ -78,20 +80,17 @@ def build_exchange() -> ccxt.kraken:
         "enableRateLimit": True,
         "options": {"adjustForTimeDifference": True},
     }
-    # Attach keys only for live
     if not DRY_RUN:
         if not API_KEY or not API_SECRET:
             raise RuntimeError("Live trading requires KRAKEN_API_KEY and KRAKEN_API_SECRET.")
         kwargs.update({"apiKey": API_KEY, "secret": API_SECRET})
     return ccxt.kraken(kwargs)
 
-# ---------- simple indicators ----------
 def pct_change(a: Decimal, b: Decimal) -> Decimal:
     if a == 0:
         return Decimal("0")
     return (b - a) / a
 
-# ---------- trading core ----------
 def fetch_min_notional_usd(ex: ccxt.Exchange, symbol: str) -> Decimal:
     m = ex.market(symbol)
     amount_min = None
@@ -121,14 +120,9 @@ def fetch_min_notional_usd(ex: ccxt.Exchange, symbol: str) -> Decimal:
     return Decimal("3")
 
 def ensure_free_usd(ex: ccxt.Exchange) -> Decimal:
-    """
-    Returns free USD. In DRY_RUN without API keys, simulates a large balance so
-    we avoid hitting private/auth endpoints and can still test the logic.
-    """
     if DRY_RUN and (not API_KEY or not API_SECRET):
         log.info("No API keys (DRY_RUN) — simulating plentiful USD for testing.")
-        return Decimal("1000000000")  # effectively unlimited for dry-run
-
+        return Decimal("1000000000")
     try:
         bal = ex.fetch_free_balance()
         return Decimal(str(bal.get("USD", 0)))
@@ -137,29 +131,24 @@ def ensure_free_usd(ex: ccxt.Exchange) -> Decimal:
             log.info("Auth error fetching balance in DRY_RUN; simulating USD.")
             return Decimal("1000000000")
         raise
-    except Exception as e:
-        if DRY_RUN:
-            log.info("Balance fetch skipped in DRY_RUN: %s (simulating USD).", e)
-            return Decimal("1000000000")
-        raise
 
-def simple_dip_gate(ex: ccxt.Exchange, symbol: str, drop_pct: Decimal) -> bool:
-    if drop_pct <= 0:
-        return True
+def simple_dip_metrics(ex: ccxt.Exchange, symbol: str):
+    """
+    Returns (cur, sma10, dip_pct) where dip_pct is negative if price is below SMA10.
+    If data missing, returns None.
+    """
     try:
         ohlcv = ex.fetch_ohlcv(symbol, timeframe="30m", limit=24)
         closes = [Decimal(str(c[4])) for c in ohlcv if c and c[4] is not None]
-        if len(closes) < 5:
-            return True
+        if len(closes) < 10:
+            return None
         cur = closes[-1]
-        sma = sum(closes[-10:]) / Decimal(len(closes[-10:]))
-        drop = pct_change(sma, cur) * Decimal("100")
-        log.info("%s dip-gate: cur=%s | sma10=%s | change=%.2f%% | gate=%.2f%%",
-                 symbol, cur, sma, float(drop), float(-drop_pct))
-        return drop <= (-drop_pct)
+        sma = sum(closes[-10:]) / Decimal(10)
+        dip_pct = pct_change(sma, cur) * Decimal("100")  # negative = dipped
+        return (cur, sma, dip_pct)
     except Exception as e:
-        log.warning("dip-gate check failed for %s: %s (allowing buy)", symbol, e)
-        return True
+        log.warning("metrics failed for %s: %s", symbol, e)
+        return None
 
 def notional_to_amount(ex: ccxt.Exchange, symbol: str, notional_usd: Decimal) -> Decimal:
     t = ex.fetch_ticker(symbol)
@@ -197,13 +186,11 @@ def run_once():
     free_usd = ensure_free_usd(ex)
     log.info("Free USD: %s", free_usd)
 
-    trades_placed = 0
-
+    # Build candidate list with metrics & eligibility checks
+    candidates = []
     for symbol in SYMBOLS:
-        if trades_placed >= MAX_TRADES_PER_RUN:
-            break
         if symbol not in ex.markets:
-            log.warning("Skipping %s (not found on exchange)", symbol)
+            log.info("Skip %s: not on exchange.", symbol)
             continue
 
         min_notional = fetch_min_notional_usd(ex, symbol)
@@ -215,12 +202,44 @@ def run_once():
                      symbol, wanted, min_notional)
             continue
         if free_usd < need:
-            log.info("Insufficient free USD for %s: need >= %s (amount + buffer); have %s. Skipping.",
+            log.info("Insufficient free USD for %s: need >= %s; have %s. Skipping.",
                      symbol, need, free_usd)
             continue
 
-        if not simple_dip_gate(ex, symbol, DROP_PCT):
-            log.info("%s did not meet DROP_PCT gate (%.2f%%). Skipping.", symbol, float(DROP_PCT))
+        metrics = simple_dip_metrics(ex, symbol)
+        if metrics is None:
+            log.info("Skip %s: not enough data for SMA10.", symbol)
+            continue
+        cur, sma, dip_pct = metrics
+        # Optional gate
+        if DROP_PCT > 0 and dip_pct > (-DROP_PCT):
+            log.info("%s did not meet DROP_PCT gate (%.2f%%). dip=%.2f%%", symbol, float(DROP_PCT), float(dip_pct))
+            continue
+        log.info("%s metrics: cur=%s | sma10=%s | dip=%.2f%%", symbol, cur, sma, float(dip_pct))
+        candidates.append((symbol, dip_pct, cur))
+
+    if not candidates:
+        log.info("No eligible candidates this run.")
+        log.info("Run complete. trades_placed=0 in %.2fs | DRY_RUN=%s", time.time()-start, DRY_RUN)
+        log.info("=== END TRADING OUTPUT ===")
+        return
+
+    # Sort by most negative dip (biggest dip first)
+    candidates.sort(key=lambda x: x[1])  # dip_pct asc (negative first)
+    to_trade = candidates[:max(1, MAX_TRADES_PER_RUN)]
+
+    trades_placed = 0
+    for symbol, dip_pct, _cur in to_trade:
+        if trades_placed >= MAX_TRADES_PER_RUN:
+            break
+
+        # Re-check balance before each order
+        min_notional = fetch_min_notional_usd(ex, symbol)
+        wanted = TRADE_AMOUNT_USD
+        need = wanted + MIN_NOTIONAL_BUFFER
+        if wanted < min_notional or free_usd < need:
+            log.info("Skipping %s at order time (need>=%s; free=%s; min_notional=%s).",
+                     symbol, need, free_usd, min_notional)
             continue
 
         amt = notional_to_amount(ex, symbol, wanted)
@@ -229,10 +248,10 @@ def run_once():
         notional = (amt * entry_price).quantize(Decimal("0.01"))
 
         if DRY_RUN:
-            log.info("[DRY_RUN] Would BUY %s amount=%s (~$%s at %s)", symbol, amt, notional, entry_price)
+            log.info("[DRY_RUN] BUY %s amount=%s (~$%s at %s) | dip=%.2f%%", symbol, amt, notional, entry_price, float(dip_pct))
             place_tp_limit(ex, symbol, amt, entry_price, TAKE_PROFIT_PCT, dry_run=True)
         else:
-            log.info("BUY %s amount=%s (~$%s at %s)", symbol, amt, notional, entry_price)
+            log.info("BUY %s amount=%s (~$%s at %s) | dip=%.2f%%", symbol, amt, notional, entry_price, float(dip_pct))
             order = ex.create_market_buy_order(symbol, float(amt))
             log.info("Buy order id=%s status=%s", order.get("id"), order.get("status"))
             place_tp_limit(ex, symbol, amt, entry_price, TAKE_PROFIT_PCT, dry_run=False)
@@ -244,7 +263,6 @@ def run_once():
     log.info("Run complete. trades_placed=%s in %.2fs | DRY_RUN=%s", trades_placed, took, DRY_RUN)
     log.info("=== END TRADING OUTPUT ===")
 
-# ---------- entry ----------
 if __name__ == "__main__":
     try:
         run_once()
