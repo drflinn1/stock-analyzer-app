@@ -19,12 +19,12 @@ env:
   KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
   DRY_RUN: "false"
-  TRADE_AMOUNT: "6"           # fits your $6.91 free USD
-  TAKE_PROFIT_PCT: "0.02"     # +2%
-  DROP_PCT: "0.00"            # disable gate for first fill
-  MAX_TRADES_PER_RUN: "1"     # allow one buy
-  MIN_NOTIONAL_BUFFER: "0.25" # smaller buffer given small balance
-  SYMBOLS: "ETH/USD"          # ETH has a lower min than BTC
+  TRADE_AMOUNT: "5"                 # okay for DOGE/XRP/ADA
+  TAKE_PROFIT_PCT: "0.02"
+  DROP_PCT: "0.00"                  # let auto-pick choose without gating at first
+  MAX_TRADES_PER_RUN: "1"
+  MIN_NOTIONAL_BUFFER: "0.50"
+  SYMBOLS: "DOGE/USD,XRP/USD,ADA/USD,ETH/USD,BTC/USD"
   PYTHON_VERSION: "3.11"
 
 
