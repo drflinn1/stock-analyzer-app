@@ -1,47 +1,38 @@
 name: Crypto Live (Every 15 min)
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"
   workflow_dispatch:
+  # Enable the schedule after you confirm manual runs are green.
+  # schedule:
+  #   - cron: "*/15 * * * *"
 
 concurrency:
   group: crypto-live
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   PYTHON_VERSION: "3.11"
 
-  # --- Stop-loss knobs ---
-  STOP_LOSS_PCT: "2.0"
-  STOP_LOSS_USE_LIMIT: "true"
-  STOP_LOSS_LIMIT_OFFSET_BP: "10"
-  
-  # --- Take-profit knob ---
-  TAKE_PROFIT_PCT: "5.0"       # sell winner at +5% via a limit order
+  # ------- REQUIRED: these must exist in repo Settings → Secrets → Actions -------
+  KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+  KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-  # --- Live knobs ---
-  DRY_RUN: "true"
-  SKIP_BALANCE_PING: "false"
-  TRADE_AMOUNT: "20"
-  AUTO_TOP_UP_MIN: "true"
-  MIN_ORDER_BUFFER_USD: "0.50"
-  MIN_NOTIONAL_FLOOR_USD: "20"
-  DAILY_CAP: "50"
-  DAILY_CAP_TZ: "America/Los_Angeles"
-
-  # --- Selection / universe ---
-  DROP_PCT: "1.5"
-  UNIVERSE_SIZE: "200"
-  PREFERRED_QUOTES: "USD"
-  MIN_DOLLAR_VOL_24H: "200000"
-  MIN_PRICE: "0.01"
-  EXCLUDE: "U/USD"
-  WHITELIST: ""
+  # ------- SAFE STARTER SETTINGS -------
+  DRY_RUN: "false"            # we’re testing live connection (no buys due to MAX_TRADES_PER_RUN=0)
+  TRADE_AMOUNT: "10"          # raise later if min-notional blocks a pair
+  TAKE_PROFIT_PCT: "0.02"     # +2% take-profit
+  DROP_PCT: "0.00"            # disable dip gate for the first test/fill
+  MAX_TRADES_PER_RUN: "0"     # <<< credentials/balance test only (no orders)
+  MIN_NOTIONAL_BUFFER: "1.00"
+  SYMBOLS: "BTC/USD,ETH/USD"
 
 jobs:
-  run:
+  live:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -55,29 +46,31 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install ccxt
+          fi
 
       - name: Echo live env
         run: |
           echo "DRY_RUN=${DRY_RUN}"
-          echo "SKIP_BALANCE_PING=${SKIP_BALANCE_PING}"
           echo "TRADE_AMOUNT=${TRADE_AMOUNT}"
-          echo "AUTO_TOP_UP_MIN=${AUTO_TOP_UP_MIN}"
-          echo "MIN_ORDER_BUFFER_USD=${MIN_ORDER_BUFFER_USD}"
-          echo "DAILY_CAP=${DAILY_CAP}"
-          echo "DAILY_CAP_TZ=${DAILY_CAP_TZ}"
+          echo "TAKE_PROFIT_PCT=${TAKE_PROFIT_PCT}"
           echo "DROP_PCT=${DROP_PCT}"
-          echo "UNIVERSE_SIZE=${UNIVERSE_SIZE}"
-          echo "PREFERRED_QUOTES=${PREFERRED_QUOTES}"
-          echo "MIN_DOLLAR_VOL_24H=${MIN_DOLLAR_VOL_24H}"
-          echo "MIN_PRICE=${MIN_PRICE}"
-          echo "EXCLUDE=${EXCLUDE}"
-          echo "WHITELIST=${WHITELIST}"
+          echo "MAX_TRADES_PER_RUN=${MAX_TRADES_PER_RUN}"
+          echo "SYMBOLS=${SYMBOLS}"
+          echo "Secrets present: KRAKEN_API_KEY=$([ -n "${KRAKEN_API_KEY}" ] && echo set || echo missing), KRAKEN_API_SECRET=$([ -n "${KRAKEN_API_SECRET}" ] && echo set || echo missing)"
 
       - name: Run trader
-        env:
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
+          set -e
           python -V
-          python main.py
+          if [ -f "main.py" ]; then
+            python main.py
+          elif [ -f "stock-analyzer-app/main.py" ]; then
+            python stock-analyzer-app/main.py
+          else
+            echo "main.py not found at repo root or stock-analyzer-app/main.py"
+            exit 1
+          fi
