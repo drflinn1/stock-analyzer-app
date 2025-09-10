@@ -10,8 +10,8 @@ Env knobs (strings; not case-sensitive):
 - TAKE_PROFIT_PCT:    e.g. "0.05" for +5%             (default "0.05")
 - DROP_PCT:           gate for simple dip-buy logic   (default "0.00")  # 0 disables the gate
 - MAX_TRADES_PER_RUN: cap buys this run               (default "1")
-- SYMBOLS:            comma list like "BTC/USD,ETH/USD" (default "BTC/USD,ETH/USD")
-- MIN_NOTIONAL_BUFFER: e.g. "1.00" to leave spare USD (default "1.00")
+- SYMBOLS:            comma list "BTC/USD,ETH/USD"    (default "BTC/USD,ETH/USD")
+- MIN_NOTIONAL_BUFFER: e.g. "1.00" spare USD          (default "1.00")
 
 Secrets (required for live trading):
 - KRAKEN_API_KEY
@@ -21,21 +21,15 @@ Secrets (required for live trading):
 import os
 import sys
 import time
-import json
 import math
 import traceback
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
-# 3rd party
 import ccxt  # type: ignore
-
-# ---------- logging ----------
 import logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("trader")
 
 # ---------- helpers ----------
@@ -56,7 +50,7 @@ def env_decimal(name: str, default: str) -> Decimal:
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-# Clean + robust Python-version log (fixes your SyntaxError)
+# Clean + robust Python-version log (fixes prior SyntaxError)
 pyver = ".".join(map(str, sys.version_info[:3]))
 log.info("Python %s", pyver)
 
@@ -80,33 +74,26 @@ log.info("Symbols: %s", ", ".join(SYMBOLS))
 
 # ---------- exchange ----------
 def build_exchange() -> ccxt.kraken:
-    # Use safe defaults; only attach keys if live
     kwargs = {
         "enableRateLimit": True,
-        "options": {
-            "adjustForTimeDifference": True,
-        },
+        "options": {"adjustForTimeDifference": True},
     }
+    # Attach keys only for live
     if not DRY_RUN:
         if not API_KEY or not API_SECRET:
             raise RuntimeError("Live trading requires KRAKEN_API_KEY and KRAKEN_API_SECRET.")
         kwargs.update({"apiKey": API_KEY, "secret": API_SECRET})
-
-    ex = ccxt.kraken(kwargs)
-    return ex
+    return ccxt.kraken(kwargs)
 
 # ---------- simple indicators ----------
 def pct_change(a: Decimal, b: Decimal) -> Decimal:
-    # change from a to b ( (b - a) / a )
     if a == 0:
         return Decimal("0")
     return (b - a) / a
 
 # ---------- trading core ----------
 def fetch_min_notional_usd(ex: ccxt.Exchange, symbol: str) -> Decimal:
-    """Approximate per-order min notional using market limits if available."""
     m = ex.market(symbol)
-    # Kraken often provides 'limits' with amount/min; we multiply by last price to get a notional estimate
     amount_min = None
     try:
         amount_min = m.get("limits", {}).get("amount", {}).get("min")
@@ -115,8 +102,8 @@ def fetch_min_notional_usd(ex: ccxt.Exchange, symbol: str) -> Decimal:
 
     price = Decimal("0")
     try:
-        ticker = ex.fetch_ticker(symbol)
-        price = Decimal(str(ticker["last"] or ticker["close"] or 0))
+        t = ex.fetch_ticker(symbol)
+        price = Decimal(str(t["last"] or t["close"] or 0))
     except Exception:
         pass
 
@@ -124,10 +111,8 @@ def fetch_min_notional_usd(ex: ccxt.Exchange, symbol: str) -> Decimal:
         try:
             return Decimal(str(amount_min)) * price
         except Exception:
-            return Decimal("5")  # fallback
+            return Decimal("5")
 
-    # Fallback if limits not present; use a conservative guess
-    # Many majors are ~$5–$10 minimum on Kraken
     base = symbol.split("/")[0]
     if base in ("BTC",):
         return Decimal("10")
@@ -136,22 +121,36 @@ def fetch_min_notional_usd(ex: ccxt.Exchange, symbol: str) -> Decimal:
     return Decimal("3")
 
 def ensure_free_usd(ex: ccxt.Exchange) -> Decimal:
-    bal = ex.fetch_free_balance()
-    # Kraken sometimes uses "USD" key for cash dollars
-    usd = Decimal(str(bal.get("USD", 0)))
-    return usd
+    """
+    Returns free USD. In DRY_RUN without API keys, simulates a large balance so
+    we avoid hitting private/auth endpoints and can still test the logic.
+    """
+    if DRY_RUN and (not API_KEY or not API_SECRET):
+        log.info("No API keys (DRY_RUN) — simulating plentiful USD for testing.")
+        return Decimal("1000000000")  # effectively unlimited for dry-run
+
+    try:
+        bal = ex.fetch_free_balance()
+        return Decimal(str(bal.get("USD", 0)))
+    except ccxt.AuthenticationError:
+        if DRY_RUN:
+            log.info("Auth error fetching balance in DRY_RUN; simulating USD.")
+            return Decimal("1000000000")
+        raise
+    except Exception as e:
+        if DRY_RUN:
+            log.info("Balance fetch skipped in DRY_RUN: %s (simulating USD).", e)
+            return Decimal("1000000000")
+        raise
 
 def simple_dip_gate(ex: ccxt.Exchange, symbol: str, drop_pct: Decimal) -> bool:
-    """Allow buy only if current price is below a short SMA by >= drop_pct.
-       If drop_pct == 0, always allow."""
     if drop_pct <= 0:
         return True
     try:
-        # 30m bars, last ~24 bars (=12 hours)
         ohlcv = ex.fetch_ohlcv(symbol, timeframe="30m", limit=24)
         closes = [Decimal(str(c[4])) for c in ohlcv if c and c[4] is not None]
         if len(closes) < 5:
-            return True  # not enough data—don’t block
+            return True
         cur = closes[-1]
         sma = sum(closes[-10:]) / Decimal(len(closes[-10:]))
         drop = pct_change(sma, cur) * Decimal("100")
@@ -163,12 +162,11 @@ def simple_dip_gate(ex: ccxt.Exchange, symbol: str, drop_pct: Decimal) -> bool:
         return True
 
 def notional_to_amount(ex: ccxt.Exchange, symbol: str, notional_usd: Decimal) -> Decimal:
-    ticker = ex.fetch_ticker(symbol)
-    price = Decimal(str(ticker["last"] or ticker["close"]))
+    t = ex.fetch_ticker(symbol)
+    price = Decimal(str(t["last"] or t["close"]))
     if price <= 0:
         raise RuntimeError(f"No valid price for {symbol}.")
-    amount = (notional_usd / price).quantize(Decimal("0.00000001"))  # plenty of precision
-    # Respect min amount if provided
+    amount = (notional_usd / price).quantize(Decimal("0.00000001"))
     m = ex.market(symbol)
     amt_min = None
     try:
@@ -186,7 +184,6 @@ def place_tp_limit(ex: ccxt.Exchange, symbol: str, base_amount: Decimal, entry_p
     if dry_run:
         log.info("[DRY_RUN] Would place TP: %s sell %s @ %s (+%s%%)", symbol, base_amount, target_price, float(tp_pct*100))
         return
-    # Kraken spot: a simple limit sell above entry works as a take-profit
     log.info("Placing TP limit: %s sell %s @ %s", symbol, base_amount, target_price)
     ex.create_limit_sell_order(symbol, float(base_amount), float(target_price))
 
@@ -205,15 +202,14 @@ def run_once():
     for symbol in SYMBOLS:
         if trades_placed >= MAX_TRADES_PER_RUN:
             break
-
         if symbol not in ex.markets:
             log.warning("Skipping %s (not found on exchange)", symbol)
             continue
 
-        # Check min notional and buffers
         min_notional = fetch_min_notional_usd(ex, symbol)
         wanted = TRADE_AMOUNT_USD
         need = wanted + MIN_NOTIONAL_BUFFER
+
         if wanted < min_notional:
             log.info("Bump needed for %s: TRADE_AMOUNT(%s) < min_notional(~%s). Skipping.",
                      symbol, wanted, min_notional)
@@ -223,29 +219,23 @@ def run_once():
                      symbol, need, free_usd)
             continue
 
-        # Optional dip gate
         if not simple_dip_gate(ex, symbol, DROP_PCT):
             log.info("%s did not meet DROP_PCT gate (%.2f%%). Skipping.", symbol, float(DROP_PCT))
             continue
 
-        # Compute amount and place market buy (or simulate)
         amt = notional_to_amount(ex, symbol, wanted)
-        ticker = ex.fetch_ticker(symbol)
-        entry_price = Decimal(str(ticker["last"] or ticker["close"]))
+        t = ex.fetch_ticker(symbol)
+        entry_price = Decimal(str(t["last"] or t["close"]))
         notional = (amt * entry_price).quantize(Decimal("0.01"))
 
         if DRY_RUN:
             log.info("[DRY_RUN] Would BUY %s amount=%s (~$%s at %s)", symbol, amt, notional, entry_price)
-            # Simulate TP placement too
             place_tp_limit(ex, symbol, amt, entry_price, TAKE_PROFIT_PCT, dry_run=True)
         else:
             log.info("BUY %s amount=%s (~$%s at %s)", symbol, amt, notional, entry_price)
             order = ex.create_market_buy_order(symbol, float(amt))
             log.info("Buy order id=%s status=%s", order.get("id"), order.get("status"))
-            # For TP, we place a limit sell above entry
             place_tp_limit(ex, symbol, amt, entry_price, TAKE_PROFIT_PCT, dry_run=False)
-
-            # Update free USD
             free_usd = ensure_free_usd(ex)
 
         trades_placed += 1
