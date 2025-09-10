@@ -14,20 +14,19 @@ permissions:
   contents: read
 
 env:
-  PYTHON_VERSION: "3.11"
 
-  # ------- REQUIRED: these must exist in repo Settings → Secrets → Actions -------
   KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
   KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-  # ------- SAFE STARTER SETTINGS -------
-  DRY_RUN: "false"            # we’re testing live connection (no buys due to MAX_TRADES_PER_RUN=0)
-  TRADE_AMOUNT: "10"          # raise later if min-notional blocks a pair
-  TAKE_PROFIT_PCT: "0.02"     # +2% take-profit
-  DROP_PCT: "0.00"            # disable dip gate for the first test/fill
-  MAX_TRADES_PER_RUN: "0"     # <<< credentials/balance test only (no orders)
-  MIN_NOTIONAL_BUFFER: "1.00"
-  SYMBOLS: "BTC/USD,ETH/USD"
+  DRY_RUN: "false"
+  TRADE_AMOUNT: "5"           # fits your $6.91 free USD
+  TAKE_PROFIT_PCT: "0.02"     # +2%
+  DROP_PCT: "0.00"            # disable gate for first fill
+  MAX_TRADES_PER_RUN: "1"     # allow one buy
+  MIN_NOTIONAL_BUFFER: "0.50" # smaller buffer given small balance
+  SYMBOLS: "ETH/USD"          # ETH has a lower min than BTC
+  PYTHON_VERSION: "3.11"
+
 
 jobs:
   live:
