@@ -2,9 +2,8 @@ name: Crypto Live (Every 15 min)
 
 on:
   workflow_dispatch:
-  # Enable the schedule after you confirm manual runs are green.
-  # schedule:
-  #   - cron: "*/15 * * * *"
+  schedule:
+    - cron: "*/15 * * * *"  # every 15 minutes
 
 concurrency:
   group: crypto-live
@@ -14,22 +13,22 @@ permissions:
   contents: read
 
 env:
+  PYTHON_VERSION: "3.11"
 
+  # --- Secrets (already set in repo Settings → Secrets → Actions) ---
   KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
   KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
+  # --- Strategy knobs ---
   DRY_RUN: "false"
-  TRADE_AMOUNT: "10"           # >= $10 so ETH/BTC can trade
-  TAKE_PROFIT_PCT: "0.02"      # +2% TP
-  STOP_LOSS_PCT: "0.03"        # -3% hard stop
-  TRAILING_STOP_PCT: "0.02"    # 2% below run-up high
-  STALE_TP_DAYS: "5"           # refresh older TPs
-  MAX_TRADES_PER_RUN: "2"      # top-2 by dip each run
+  TRADE_AMOUNT: "10"         # >= $10 so ETH/BTC can trade
+  TAKE_PROFIT_PCT: "0.02"    # +2% TP
+  STOP_LOSS_PCT: "0.03"      # -3% soft stop-loss (market exit)
+  TRAILING_STOP_PCT: "0.02"  # 2% below run-up high (market exit)
+  STALE_TP_DAYS: "5"         # refresh any TP older than N days
+  MAX_TRADES_PER_RUN: "2"    # top 2 by dip% each run if funds allow
   MIN_NOTIONAL_BUFFER: "1.00"
   SYMBOLS: "DOGE/USD,XRP/USD,ADA/USD,ETH/USD,BTC/USD"
-  PYTHON_VERSION: "3.11"
-
-
 
 jobs:
   live:
@@ -54,14 +53,12 @@ jobs:
             pip install ccxt
           fi
 
-      - name: Echo live env
+      - name: Echo env
         run: |
           echo "DRY_RUN=${DRY_RUN}"
           echo "TRADE_AMOUNT=${TRADE_AMOUNT}"
-          echo "TAKE_PROFIT_PCT=${TAKE_PROFIT_PCT}"
-          echo "DROP_PCT=${DROP_PCT}"
-          echo "MAX_TRADES_PER_RUN=${MAX_TRADES_PER_RUN}"
-          echo "SYMBOLS=${SYMBOLS}"
+          echo "TP=${TAKE_PROFIT_PCT} | SL=${STOP_LOSS_PCT} | TRAIL=${TRAILING_STOP_PCT}"
+          echo "MAX_TRADES_PER_RUN=${MAX_TRADES_PER_RUN} | SYMBOLS=${SYMBOLS}"
           echo "Secrets present: KRAKEN_API_KEY=$([ -n "${KRAKEN_API_KEY}" ] && echo set || echo missing), KRAKEN_API_SECRET=$([ -n "${KRAKEN_API_SECRET}" ] && echo set || echo missing)"
 
       - name: Run trader
@@ -73,6 +70,5 @@ jobs:
           elif [ -f "stock-analyzer-app/main.py" ]; then
             python stock-analyzer-app/main.py
           else
-            echo "main.py not found at repo root or stock-analyzer-app/main.py"
-            exit 1
+            echo "main.py not found at repo root or stock-analyzer-app/main.py"; exit 1
           fi
