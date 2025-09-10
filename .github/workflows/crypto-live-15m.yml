@@ -19,13 +19,16 @@ env:
   KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
   DRY_RUN: "false"
-  TRADE_AMOUNT: "10"                 # okay for DOGE/XRP/ADA
-  TAKE_PROFIT_PCT: "0.02"
-  DROP_PCT: "0.00"                  # let auto-pick choose without gating at first
-  MAX_TRADES_PER_RUN: "1"
+  TRADE_AMOUNT: "10"           # >= $10 so ETH/BTC can trade
+  TAKE_PROFIT_PCT: "0.02"      # +2% TP
+  STOP_LOSS_PCT: "0.03"        # -3% hard stop
+  TRAILING_STOP_PCT: "0.02"    # 2% below run-up high
+  STALE_TP_DAYS: "5"           # refresh older TPs
+  MAX_TRADES_PER_RUN: "2"      # top-2 by dip each run
   MIN_NOTIONAL_BUFFER: "1.00"
   SYMBOLS: "DOGE/USD,XRP/USD,ADA/USD,ETH/USD,BTC/USD"
   PYTHON_VERSION: "3.11"
+
 
 
 jobs:
