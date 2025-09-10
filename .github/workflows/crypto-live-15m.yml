@@ -21,12 +21,12 @@ env:
 
   # --- Strategy knobs ---
   DRY_RUN: "false"
-  TRADE_AMOUNT: "10"         # >= $10 so ETH/BTC can trade
-  TAKE_PROFIT_PCT: "0.02"    # +2% TP
-  STOP_LOSS_PCT: "0.03"      # -3% soft stop-loss (market exit)
-  TRAILING_STOP_PCT: "0.02"  # 2% below run-up high (market exit)
-  STALE_TP_DAYS: "5"         # refresh any TP older than N days
-  MAX_TRADES_PER_RUN: "2"    # top 2 by dip% each run if funds allow
+  TRADE_AMOUNT: "15"
+  TAKE_PROFIT_PCT: "0.015"     # +1.5% for quicker flips
+  STOP_LOSS_PCT: "0.03"
+  TRAILING_STOP_PCT: "0.02"
+  STALE_TP_DAYS: "5"
+  MAX_TRADES_PER_RUN: "3"
   MIN_NOTIONAL_BUFFER: "1.00"
   SYMBOLS: "DOGE/USD,XRP/USD,ADA/USD,ETH/USD,BTC/USD"
 
