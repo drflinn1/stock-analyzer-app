@@ -21,7 +21,7 @@ env:
   TAKE_PROFIT_PCT: "5.0"       # sell winner at +5% via a limit order
 
   # --- Live knobs ---
-  DRY_RUN: "false"
+  DRY_RUN: "true"
   SKIP_BALANCE_PING: "false"
   TRADE_AMOUNT: "20"
   AUTO_TOP_UP_MIN: "true"
