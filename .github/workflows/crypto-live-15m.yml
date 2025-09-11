@@ -5,36 +5,28 @@ on:
   schedule:
     - cron: "*/15 * * * *"   # every 15 minutes
 
-concurrency:
-  group: crypto-live
-  cancel-in-progress: true   # prevents overlapping runs from double-trading
-
-permissions:
-  contents: read
-
-env:
-  # --- Python ---
-  PYTHON_VERSION: "3.11"
-
-  # --- Exchange secrets (already set in repo Settings → Secrets → Actions) ---
-  KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-  KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-
-  # --- Strategy knobs (safer profile) ---
-  DRY_RUN: "false"
-  TRADE_AMOUNT: "10"          # per-trade notional in USD
-  TAKE_PROFIT_PCT: "0.015"    # +1.5% target for quicker exits
-  STOP_LOSS_PCT: "0.03"       # -3% soft stop-loss (market exit)
-  TRAILING_STOP_PCT: "0.02"   # trail 2% below run-up high (market exit)
-  STALE_TP_DAYS: "5"          # refresh old TPs
-  MAX_TRADES_PER_RUN: "2"     # cap simultaneous new entries per run
-  MIN_NOTIONAL_BUFFER: "1.00" # per-trade buffer for fees/ticks
-  SYMBOLS: "DOGE/USD,XRP/USD,ADA/USD,ETH/USD,BTC/USD"
-
 jobs:
   live:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    env:
+      # --- Safety & knobs ---
+      DRY_RUN: "false"                # "true" for testing, "false" for live
+      TRADE_AMOUNT: "10"
+      MAX_TRADES_PER_RUN: "2"
+      TP: "0.015"                     # 1.5% take-profit marker (logic reserved for future)
+      SL: "0.03"                      # 3.0% stop-loss marker (logic reserved for future)
+      TRAIL: "0.02"                   # 2.0% trailing buffer (logic reserved for future)
+      DROP_PCT: "0.01"                # buy if price is >=1% below SMA10
+      MIN_NOTIONAL_BUFFER: "1.0"      # cushion added to required-per-run math
+      TIMEFRAME: "5m"
+      SMA_LEN: "10"
+      SYMBOLS: "DOGE/USD,XRP/USD,ADA/USD,ETH/USD,BTC/USD"
+
+      # ccxt/kraken envs from Actions secrets
+      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+      KRAKEN_SECRET:  ${{ secrets.KRAKEN_SECRET }}
 
     steps:
       - name: Checkout
@@ -43,31 +35,15 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
+          python-version: "3.11"
 
-      - name: Install deps (minimal)
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade ccxt
-
-      - name: Echo env
-        run: |
-          echo "DRY_RUN=${DRY_RUN}"
-          echo "TRADE_AMOUNT=${TRADE_AMOUNT}"
-          echo "TP=${TAKE_PROFIT_PCT} | SL=${STOP_LOSS_PCT} | TRAIL=${TRAILING_STOP_PCT}"
-          echo "MAX_TRADES_PER_RUN=${MAX_TRADES_PER_RUN} | MIN_NOTIONAL_BUFFER=${MIN_NOTIONAL_BUFFER}"
-          echo "SYMBOLS=${SYMBOLS}"
-          echo "Secrets present: KRAKEN_API_KEY=$([ -n "${KRAKEN_API_KEY}" ] && echo set || echo missing), KRAKEN_API_SECRET=$([ -n "${KRAKEN_API_SECRET}" ] && echo set || echo missing)"
+          pip install ccxt
 
       - name: Run trader
         run: |
           set -e
-          python -V
-          if [ -f "main.py" ]; then
-            python main.py
-          elif [ -f "stock-analyzer-app/main.py" ]; then
-            python stock-analyzer-app/main.py
-          else
-            echo "main.py not found at repo root or stock-analyzer-app/main.py"; exit 1
-          fi
+          python --version
+          python main.py
