@@ -18,7 +18,7 @@ jobs:
       TP: "0.015"                     # 1.5% take-profit marker (logic reserved for future)
       SL: "0.03"                      # 3.0% stop-loss marker (logic reserved for future)
       TRAIL: "0.02"                   # 2.0% trailing buffer (logic reserved for future)
-      DROP_PCT: "0.01"                # buy if price is >=1% below SMA10
+      DROP_PCT: "0.005"                # buy if price is >=1% below SMA10
       MIN_NOTIONAL_BUFFER: "1.0"      # cushion added to required-per-run math
       TIMEFRAME: "5m"
       SMA_LEN: "10"
