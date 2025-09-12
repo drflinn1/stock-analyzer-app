@@ -1,7 +1,9 @@
 name: Crypto Live (Aggressive — 15m)
 
 on:
-  workflow_dispatch:  # manual only (no schedule)
+  workflow_dispatch:   # manual only (no schedule)
+  # schedule:
+  #   - cron: "*/15 * * * *"   # <— make sure this whole block is removed or commented
 
 concurrency:
   group: crypto-live-aggressive
