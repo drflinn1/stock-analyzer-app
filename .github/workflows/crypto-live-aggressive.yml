@@ -1,26 +1,59 @@
-name: Crypto Live (Aggressive)
+name: Crypto Live (Aggressive — 15m)
 
 on:
-  workflow_dispatch:           # manual trigger only
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes
 
 jobs:
-  trade:
+  aggressive:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      # Live trading
+      DRY_RUN: "false"
+
+      # Position sizing
+      TRADE_AMOUNT: "15"           # larger than live
+      MAX_TRADES_PER_RUN: "3"      # allow more concurrent entries
+
+      # Exits (now active in main.py)
+      TP: "0.020"                   # take profit at +2.0%
+      SL: "0.030"                   # stop loss at -3.0%
+      TRAIL: "0.02"                 # reserved (not enforced yet)
+
+      # Entries
+      DROP_PCT: "0.002"             # buy if >=0.2% under SMA10 (frequent)
+
+      # Safety math
+      MIN_NOTIONAL_BUFFER: "1.0"
+
+      # Indicators / universe
+      TIMEFRAME: "5m"
+      SMA_LEN: "10"
+      SYMBOLS: "DOGE/USD,XRP/USD,ADA/USD,ETH/USD,BTC/USD"
+
+      # Secrets for Kraken
+      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+      KRAKEN_SECRET:  ${{ secrets.KRAKEN_SECRET }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Run aggressive live trading
-        env:
-          MODE: live
-          DRY_RUN: "true"
-          PROFILE: aggressive
-          DROP_PCT: "2.0"            # safer buy gate (2%+ dip required)
-          TRADE_SIZE: "15"
-          DAILY_CAP: "25"
-          EXCLUDE: "U/USD"
-        run: python main.py
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt
+
+      - name: Run trader (AGGRESSIVE)
+        run: |
+          set -e
+          python --version
+          python main.py
