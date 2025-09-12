@@ -12,7 +12,7 @@ concurrency:
 env:
   # --- Runtime ---
   PYTHON_VERSION: "3.11"
-  DRY_RUN: "true"                       # keep true while verifying balances
+  DRY_RUN: "false"                       # keep true while verifying balances
 
   # --- Picker (Balanced) ---
   DROP_PCT: "2.5"
