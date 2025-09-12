@@ -13,6 +13,12 @@ env:
   # --- Runtime ---
   PYTHON_VERSION: "3.11"
   DRY_RUN: "true"                    # flip to "false" only after you confirm logs look right
+  
+  # --- Picker (Balanced) ---
+  DROP_PCT: "2.5"
+  ENABLE_RSI: "true"
+  RSI_LEN: "14"
+  RSI_MAX: "35"
 
   # --- Fixed Take-Profit / Stop-Loss (used by main.py) ---
   TAKE_PROFIT_PCT: "3.0"             # +3% take-profit
