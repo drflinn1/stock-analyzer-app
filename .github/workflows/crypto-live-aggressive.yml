@@ -1,59 +1,60 @@
 name: Crypto Live (Aggressive — 15m)
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes
+  workflow_dispatch:  # manual only (no schedule)
+
+concurrency:
+  group: crypto-live-aggressive
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+
+  # Safety: keep manual runs in DRY mode unless you explicitly flip it.
+  DRY_RUN: "true"
+
+  # Exits (main.py reads these)
+  TAKE_PROFIT_PCT: "3.0"
+  STOP_LOSS_PCT: "2.0"
+  TRAIL_START_PCT: "3.0"
+  TRAIL_OFFSET_PCT: "1.0"
+
+  # Aggressive picker (looser gates)
+  DROP_PCT: "1.5"
+  ENABLE_RSI: "false"      # aggressive = drop-only; turn "true" if you want RSI too
+  RSI_LEN: "14"
+  RSI_MAX: "40"
+
+  # Sizing & caps
+  POSITION_SIZE_USD: "10"
+  DAILY_SPEND_CAP_USD: "15"
+  MAX_OPEN_TRADES: "3"
+  MIN_BALANCE_USD: "5"
+
+  SYMBOLS: "BTC/USD,ETH/USD,DOGE/USD"
 
 jobs:
-  aggressive:
+  run:
+    name: Run trader (AGGRESSIVE - manual)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    env:
-      # Live trading
-      DRY_RUN: "false"
-
-      # Position sizing
-      TRADE_AMOUNT: "15"           # larger than live
-      MAX_TRADES_PER_RUN: "3"      # allow more concurrent entries
-
-      # Exits (now active in main.py)
-      TP: "0.020"                   # take profit at +2.0%
-      SL: "0.030"                   # stop loss at -3.0%
-      TRAIL: "0.02"                 # reserved (not enforced yet)
-
-      # Entries
-      DROP_PCT: "0.002"             # buy if >=0.2% under SMA10 (frequent)
-
-      # Safety math
-      MIN_NOTIONAL_BUFFER: "1.0"
-
-      # Indicators / universe
-      TIMEFRAME: "5m"
-      SMA_LEN: "10"
-      SYMBOLS: "DOGE/USD,XRP/USD,ADA/USD,ETH/USD,BTC/USD"
-
-      # Secrets for Kraken
-      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_SECRET:  ${{ secrets.KRAKEN_SECRET }}
-
     steps:
-      - name: Checkout
+      - name: Check out repo
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install ccxt
 
-      - name: Run trader (AGGRESSIVE)
+      - name: Run trader
+        env:
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           set -e
-          python --version
           python main.py
