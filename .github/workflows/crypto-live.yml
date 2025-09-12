@@ -1,44 +1,43 @@
-name: Crypto Live
+name: Crypto Live (Every 15 min — LIVE)
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes
 
 concurrency:
   group: crypto-live
   cancel-in-progress: true
 
 env:
+  # --- Runtime ---
   PYTHON_VERSION: "3.11"
+  DRY_RUN: "true"                    # flip to "false" only after you confirm logs look right
 
-  # --- Stop-loss knobs ---
-  STOP_LOSS_PCT: "2.0"
-  STOP_LOSS_USE_LIMIT: "true"
-  STOP_LOSS_LIMIT_OFFSET_BP: "10"
+  # --- Fixed Take-Profit / Stop-Loss (used by main.py) ---
+  TAKE_PROFIT_PCT: "3.0"             # +3% take-profit
+  STOP_LOSS_PCT: "2.0"               # -2% stop-loss
 
-  # --- Live knobs ---
-  DRY_RUN: "false"
-  SKIP_BALANCE_PING: "true"          # NEW: silence balance permission warning
-  TRADE_AMOUNT: "25"
-  DAILY_CAP: "75"
-  DAILY_CAP_TZ: "America/Los_Angeles"
+  # --- Trailing Profit add-on (used by main.py) ---
+  TRAIL_START_PCT: "3.0"             # start trailing once PnL ≥ +3%
+  TRAIL_OFFSET_PCT: "1.0"            # exit if drawdown from peak ≥ 1%
 
-  # --- Selection / universe ---
-  DROP_PCT: "2.0"
-  UNIVERSE_SIZE: "100"
-  PREFERRED_QUOTES: "USD,USDT"
-  MIN_DOLLAR_VOL_24H: "500000"
-  MIN_PRICE: "0.01"
+  # --- Buy controls (still honored even with buys disabled in code) ---
+  POSITION_SIZE_USD: "10"
+  DAILY_SPEND_CAP_USD: "15"
+  MAX_OPEN_TRADES: "3"
+  MIN_BALANCE_USD: "5"
 
-  # --- Symbol controls ---
-  EXCLUDE: "U/USD"
-  # WHITELIST: "BTC/USD,ETH/USD,SOL/USD"
+  # --- Universe (if/when you re-enable buys) ---
+  SYMBOLS: "BTC/USD,ETH/USD,DOGE/USD"
 
 jobs:
   run:
+    name: Run trader (LIVE)
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Check out repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -49,48 +48,24 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          (test -f requirements.txt && pip install -r requirements.txt) || true
           pip install ccxt
 
-      - name: Show runtime knobs
-        run: |
-          echo "DRY_RUN=${DRY_RUN}"
-          echo "SKIP_BALANCE_PING=${SKIP_BALANCE_PING}"
-          echo "TRADE_AMOUNT=${TRADE_AMOUNT}"
-          echo "DAILY_CAP=${DAILY_CAP}"
-          echo "DAILY_CAP_TZ=${DAILY_CAP_TZ}"
-          echo "STOP_LOSS_PCT=${STOP_LOSS_PCT}"
-          echo "STOP_LOSS_USE_LIMIT=${STOP_LOSS_USE_LIMIT}"
-          echo "STOP_LOSS_LIMIT_OFFSET_BP=${STOP_LOSS_LIMIT_OFFSET_BP}"
-          echo "DROP_PCT=${DROP_PCT}"
-          echo "UNIVERSE_SIZE=${UNIVERSE_SIZE}"
-          echo "PREFERRED_QUOTES=${PREFERRED_QUOTES}"
-          echo "MIN_DOLLAR_VOL_24H=${MIN_DOLLAR_VOL_24H}"
-          echo "MIN_PRICE=${MIN_PRICE}"
-          echo "EXCLUDE=${EXCLUDE}"
-          echo "WHITELIST=${WHITELIST}"
-
-      - name: Run trader (Kraken)
+      - name: Run trader
         env:
-          DRY_RUN: ${{ env.DRY_RUN }}
-          SKIP_BALANCE_PING: ${{ env.SKIP_BALANCE_PING }}
-          TRADE_AMOUNT: ${{ env.TRADE_AMOUNT }}
-          DAILY_CAP: ${{ env.DAILY_CAP }}
-          DAILY_CAP_TZ: ${{ env.DAILY_CAP_TZ }}
-          STOP_LOSS_PCT: ${{ env.STOP_LOSS_PCT }}
-          STOP_LOSS_USE_LIMIT: ${{ env.STOP_LOSS_USE_LIMIT }}
-          STOP_LOSS_LIMIT_OFFSET_BP: ${{ env.STOP_LOSS_LIMIT_OFFSET_BP }}
-          DROP_PCT: ${{ env.DROP_PCT }}
-          UNIVERSE_SIZE: ${{ env.UNIVERSE_SIZE }}
-          PREFERRED_QUOTES: ${{ env.PREFERRED_QUOTES }}
-          MIN_DOLLAR_VOL_24H: ${{ env.MIN_DOLLAR_VOL_24H }}
-          MIN_PRICE: ${{ env.MIN_PRICE }}
-          EXCLUDE: ${{ env.EXCLUDE }}
-          WHITELIST: ${{ env.WHITELIST }}
-
-          # Exchange credentials
+          # Needed for balances / live orders (prices work without keys).
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          # Pass through all env for clarity (optional, but explicit):
+          DRY_RUN: ${{ env.DRY_RUN }}
+          TAKE_PROFIT_PCT: ${{ env.TAKE_PROFIT_PCT }}
+          STOP_LOSS_PCT: ${{ env.STOP_LOSS_PCT }}
+          TRAIL_START_PCT: ${{ env.TRAIL_START_PCT }}
+          TRAIL_OFFSET_PCT: ${{ env.TRAIL_OFFSET_PCT }}
+          POSITION_SIZE_USD: ${{ env.POSITION_SIZE_USD }}
+          DAILY_SPEND_CAP_USD: ${{ env.DAILY_SPEND_CAP_USD }}
+          MAX_OPEN_TRADES: ${{ env.MAX_OPEN_TRADES }}
+          MIN_BALANCE_USD: ${{ env.MIN_BALANCE_USD }}
+          SYMBOLS: ${{ env.SYMBOLS }}
         run: |
-          python -V
+          set -e
           python main.py
