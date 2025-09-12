@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-import os, json, time, math, sys, traceback
+import os, json, sys, traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ========== Config / ENV ==========
+# =========================
+# ENV / KNOBS
+# =========================
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
+# Sell rules
 TAKE_PROFIT_PCT   = float(os.getenv("TAKE_PROFIT_PCT", "3.0"))   # +3% TP
 STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT", "2.0"))     # -2% SL
 
 # Trailing profit add-on
 TRAIL_START_PCT   = float(os.getenv("TRAIL_START_PCT", "3.0"))   # start trailing when PnL ≥ this
-TRAIL_OFFSET_PCT  = float(os.getenv("TRAIL_OFFSET_PCT", "1.0"))  # trail by this amount
+TRAIL_OFFSET_PCT  = float(os.getenv("TRAIL_OFFSET_PCT", "1.0"))  # exit when drawdown from peak ≥ this
 
 # Buy controls
 POSITION_SIZE_USD    = float(os.getenv("POSITION_SIZE_USD", "10"))
@@ -19,28 +22,49 @@ DAILY_SPEND_CAP_USD  = float(os.getenv("DAILY_SPEND_CAP_USD", "15"))
 MAX_OPEN_TRADES      = int(os.getenv("MAX_OPEN_TRADES", "3"))
 MIN_BALANCE_USD      = float(os.getenv("MIN_BALANCE_USD", "5"))
 
+# Best-candidate dip picker
+DROP_PCT_GATE        = float(os.getenv("DROP_PCT", "2.0"))       # e.g., buy if 15m change ≤ -2.0%
+TIMEFRAME            = os.getenv("CANDLES_TIMEFRAME", "15m")     # 15m scan
+
+# Universe
 SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USD,ETH/USD,DOGE/USD").split(",") if s.strip()]
 
-# Kraken/CCXT keys (balances & live orders use these)
+# Kraken keys (balances & live orders use these)
 KRAKEN_KEY    = os.getenv("KRAKEN_API_KEY", "")
 KRAKEN_SECRET = os.getenv("KRAKEN_API_SECRET", "")
 
-# State for entry_avg & trailing
+# =========================
+# STATE (entry avg, trailing, daily spend)
+# =========================
 STATE_PATH = Path("state/trade_state.json")
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-# ========== Helpers ==========
 def load_state():
     if STATE_PATH.exists():
         try:
             return json.loads(STATE_PATH.read_text())
         except Exception:
             pass
-    return {"positions": {}}
+    # positions[symbol] = {"entry_avg": float, "peak_pnl_pct": float, "trail_active": bool}
+    # spend[YYYYMMDD] = float usd_spent
+    return {"positions": {}, "spend": {}}
 
 def save_state(state):
     STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True))
 
+def today_key():
+    return datetime.now(timezone.utc).astimezone().strftime("%Y%m%d")
+
+def add_daily_spend(state, usd):
+    k = today_key()
+    state["spend"][k] = float(state["spend"].get(k, 0.0) + float(usd))
+
+def spent_today(state):
+    return float(state["spend"].get(today_key(), 0.0))
+
+# =========================
+# Utils
+# =========================
 def now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -50,23 +74,19 @@ def pct(a, b):
     return (a - b) / b * 100.0
 
 def fmt2(x): return f"{x:.2f}"
+def fmt4(x): return f"{x:.4f}"
 
-# ========== Exchange via CCXT (Kraken) ==========
-# Requires ccxt installed in your workflow step (you already had this earlier).
+# =========================
+# CCXT / Kraken
+# =========================
 import ccxt
+EX = None
 
 def kraken_client():
-    # Public endpoints (prices) don’t need keys.
-    # Private endpoints (balance, orders) do.
-    conf = {
-        "enableRateLimit": True,
-        "timeout": 20000
-    }
+    conf = {"enableRateLimit": True, "timeout": 20000}
     if KRAKEN_KEY and KRAKEN_SECRET:
         conf.update({"apiKey": KRAKEN_KEY, "secret": KRAKEN_SECRET})
     return ccxt.kraken(conf)
-
-EX = None
 
 def init_exchange():
     global EX
@@ -74,7 +94,6 @@ def init_exchange():
         EX = kraken_client()
 
 def price(symbol: str) -> float:
-    # ccxt uses unified symbols; Kraken supports BTC/USD, ETH/USD, DOGE/USD, etc.
     init_exchange()
     t = EX.fetch_ticker(symbol)
     last = t.get("last") or t.get("close")
@@ -82,62 +101,86 @@ def price(symbol: str) -> float:
         raise RuntimeError(f"No last price for {symbol}")
     return float(last)
 
-def get_cash_available_usd() -> float:
-    # Needs keys; otherwise returns 0.0.
+def change_pct_15m(symbol: str) -> float:
+    """
+    Estimate 15m change: prev close (previous 15m candle) vs current last.
+    Kraken supports 15m timeframe.
+    """
     init_exchange()
     try:
-        bal = EX.fetch_balance()
-        free_usd = bal.get("free", {}).get("USD", 0.0)
-        return float(free_usd or 0.0)
+        ohlcv = EX.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=2)
+        # ohlcv item: [timestamp, open, high, low, close, volume]
+        if not ohlcv or len(ohlcv) < 1:
+            # fallback to ticker open vs last
+            t = EX.fetch_ticker(symbol)
+            o = t.get("open")
+            l = t.get("last") or t.get("close")
+            if o and l:
+                return pct(float(l), float(o))
+            return 0.0
+        prev_close = float(ohlcv[-1][4]) if len(ohlcv) == 1 else float(ohlcv[-2][4])
+        cur_last   = price(symbol)
+        return pct(cur_last, prev_close)
     except Exception:
+        # very safe fallback
+        try:
+            t = EX.fetch_ticker(symbol)
+            o = t.get("open")
+            l = t.get("last") or t.get("close")
+            if o and l:
+                return pct(float(l), float(o))
+        except Exception:
+            pass
         return 0.0
+
+def balances():
+    init_exchange()
+    try:
+        return EX.fetch_balance()
+    except Exception:
+        return {"free": {}}
+
+def usd_free():
+    bal = balances()
+    return float(bal.get("free", {}).get("USD", 0.0))
 
 def base_from_symbol(symbol: str) -> str:
     return symbol.split("/")[0]
 
-def get_coin_position_qty(symbol: str) -> float:
-    # Needs keys; returns 0.0 without keys.
-    init_exchange()
-    base = base_from_symbol(symbol)
-    try:
-        bal = EX.fetch_balance()
-        qty = bal.get("free", {}).get(base, 0.0)
-        return float(qty or 0.0)
-    except Exception:
-        return 0.0
+def qty_free(symbol: str) -> float:
+    bal = balances()
+    return float(bal.get("free", {}).get(base_from_symbol(symbol), 0.0))
 
 def place_buy(symbol: str, usd_amount: float, px: float):
-    amt = max(usd_amount / px, 0.0)
-    amt = float(f"{amt:.6f}")  # trim for Kraken
-    if amt <= 0:
-        print(f"[SKIP] BUY {symbol} amount <= 0")
+    amount = max(usd_amount / px, 0.0)
+    amount = float(f"{amount:.6f}")  # precision trim for Kraken
+    if amount <= 0:
+        print(f"[SKIP] BUY {symbol} amount<=0")
         return {"status": "skip"}
-
     if DRY_RUN:
-        print(f"[DRY] BUY {symbol} ${fmt2(usd_amount)} @ {fmt2(px)} (amount≈{amt})")
-        return {"status": "dry", "symbol": symbol, "filled": amt}
-
+        print(f"[DRY] BUY {symbol} ${fmt2(usd_amount)} @ {fmt2(px)} (≈{amount})")
+        return {"status": "dry", "symbol": symbol, "filled": amount}
     init_exchange()
-    o = EX.create_order(symbol=symbol, type="market", side="buy", amount=amt)
-    print(f"[LIVE] BUY {symbol} market amount={amt} (order id {o.get('id')})")
-    return {"status": "ok", "symbol": symbol, "filled": amt, "order": o}
+    o = EX.create_order(symbol=symbol, type="market", side="buy", amount=amount)
+    print(f"[LIVE] BUY {symbol} market amount={amount} (order {o.get('id')})")
+    return {"status": "ok", "symbol": symbol, "filled": amount, "order": o}
 
 def place_sell(symbol: str, qty: float, px: float):
     qty = float(f"{qty:.6f}")
     if qty <= 0:
-        print(f"[SKIP] SELL {symbol} qty <= 0")
+        print(f"[SKIP] SELL {symbol} qty<=0")
         return {"status": "skip"}
-
     if DRY_RUN:
         print(f"[DRY] SELL {symbol} qty={qty:.6f} @ {fmt2(px)}")
         return {"status": "dry", "symbol": symbol, "filled": qty}
-
     init_exchange()
     o = EX.create_order(symbol=symbol, type="market", side="sell", amount=qty)
-    print(f"[LIVE] SELL {symbol} market qty={qty:.6f} (order id {o.get('id')})")
+    print(f"[LIVE] SELL {symbol} market qty={qty:.6f} (order {o.get('id')})")
     return {"status": "ok", "symbol": symbol, "filled": qty, "order": o}
 
-# ========== Trailing helpers ==========
+# =========================
+# Trailing helpers
+# =========================
 def ensure_entry(state, symbol, entry_avg):
     pos = state["positions"].setdefault(symbol, {})
     if "entry_avg" not in pos or pos["entry_avg"] <= 0:
@@ -164,25 +207,25 @@ def decide_sell(pnl_pct):
     if pnl_pct <= -STOP_LOSS_PCT:  return "SL"
     return None
 
-# ========== Core run ==========
+# =========================
+# Core run
+# =========================
 def run_once():
     print("=== START TRADING OUTPUT ===")
-    print(f"{now_iso()} | run started | DRY_RUN={DRY_RUN} | TP={fmt2(TAKE_PROFIT_PCT)}% | SL={fmt2(STOP_LOSS_PCT)}% | TRAIL_START={fmt2(TRAIL_START_PCT)}% | TRAIL_OFFSET={fmt2(TRAIL_OFFSET_PCT)}%")
+    print(f"{now_iso()} | run started | DRY_RUN={DRY_RUN} | TP={fmt2(TAKE_PROFIT_PCT)}% | SL={fmt2(STOP_LOSS_PCT)}% | TRAIL_START={fmt2(TRAIL_START_PCT)}% | TRAIL_OFFSET={fmt2(TRAIL_OFFSET_PCT)}% | DROP_GATE={fmt2(DROP_PCT_GATE)}% | TF={TIMEFRAME}")
 
     state = load_state()
-
     buys_placed = 0
     sells_placed = 0
 
-    # ----- SELL CHECK for held coins -----
+    # ---------- SELL CHECK ----------
     for sym in SYMBOLS:
-        qty = get_coin_position_qty(sym)
+        qty = qty_free(sym)
         if qty <= 0:
             continue
 
         px = price(sym)
-        # If no stored entry, assume current (prevents forced-sell surprises)
-        ensure_entry(state, sym, entry_avg=px)
+        ensure_entry(state, sym, entry_avg=px)  # if missing, assume current to avoid forced exit
         entry_avg = state["positions"][sym]["entry_avg"]
         pnl_pct = pct(px, entry_avg)
         maybe_activate_trailing(state, sym, pnl_pct)
@@ -204,34 +247,67 @@ def run_once():
             if sym in state["positions"]:
                 del state["positions"][sym]
 
-    # ----- BUY WINDOW (still OFF to avoid surprises) -----
-    remaining_cap = DAILY_SPEND_CAP_USD
-    cash = get_cash_available_usd()
+    # ---------- BUY WINDOW (best-candidate dip) ----------
+    # budget guardrails
+    usd = usd_free()
+    daily_remaining = max(0.0, DAILY_SPEND_CAP_USD - spent_today(state))
+    can_spend = min(usd, daily_remaining)
 
-    for sym in SYMBOLS:
-        if remaining_cap < POSITION_SIZE_USD or cash < max(MIN_BALANCE_USD, POSITION_SIZE_USD):
-            break
-        if get_coin_position_qty(sym) > 0:
-            continue
+    # count open trades as number of symbols with qty>0 among universe
+    open_trades = sum(1 for s in SYMBOLS if qty_free(s) > 0)
 
-        px = price(sym)
+    print(f"{now_iso()} | budget | usd_free=${fmt2(usd)} | daily_remaining=${fmt2(daily_remaining)} | open_trades={open_trades}/{MAX_OPEN_TRADES}")
 
-        # Replace this with your real candidate/signal logic
-        should_buy = False
-        if should_buy:
-            r = place_buy(sym, POSITION_SIZE_USD, px)
-            buys_placed += 1
-            remaining_cap -= POSITION_SIZE_USD
-            # record entry for trailing later
-            st = load_state()
-            ensure_entry(st, sym, entry_avg=px)
-            save_state(st)
+    if can_spend >= max(MIN_BALANCE_USD, POSITION_SIZE_USD) and open_trades < MAX_OPEN_TRADES:
+        # Scan universe for 15m drop
+        drops = []
+        for sym in SYMBOLS:
+            if qty_free(sym) > 0:
+                continue  # already holding
+            chg = change_pct_15m(sym)
+            drops.append((sym, chg))
+        # sort by most negative change first
+        drops.sort(key=lambda x: x[1])
+
+        # pick the biggest (most negative) drop that passes gate
+        picked = None
+        for sym, chg in drops:
+            # Gate: must be ≤ -DROP_PCT_GATE (i.e., drop at least that much)
+            if chg <= -abs(DROP_PCT_GATE):
+                picked = (sym, chg)
+                break
+
+        if picked:
+            psym, pchg = picked
+            px = price(psym)
+            print(f"{now_iso()} | Best candidate | {psym} 15m_change={fmt2(pchg)}% (gate {fmt2(-abs(DROP_PCT_GATE))}%) → BUY ${fmt2(POSITION_SIZE_USD)} @ {fmt2(px)}")
+            r = place_buy(psym, POSITION_SIZE_USD, px)
+            if r.get("status") in ("ok", "dry"):
+                buys_placed += 1
+                add_daily_spend(state, POSITION_SIZE_USD)
+                # record entry for trailing / PnL later
+                ensure_entry(state, psym, entry_avg=px)
+        else:
+            if drops:
+                sym0, chg0 = drops[0]
+                print(f"{now_iso()} | Best candidate | {sym0} 15m_change={fmt2(chg0)}% (did not pass gate {fmt2(-abs(DROP_PCT_GATE))}%) → NO BUY")
+            else:
+                print(f"{now_iso()} | Best candidate | (none) → NO BUY (no candidates found)")
+    else:
+        reason = []
+        if can_spend < max(MIN_BALANCE_USD, POSITION_SIZE_USD):
+            reason.append("insufficient budget")
+        if open_trades >= MAX_OPEN_TRADES:
+            reason.append("max open trades reached")
+        print(f"{now_iso()} | BUY window skipped ({', '.join(reason) if reason else 'guardrail'})")
 
     save_state(state)
     print(f"Run complete. buys_placed={buys_placed} | sells_placed={sells_placed} | DRY_RUN={DRY_RUN}")
     print("=== END TRADING OUTPUT ===")
 
-# ========== Main ==========
+# =========================
+# Main
+# =========================
 if __name__ == "__main__":
     try:
         run_once()
