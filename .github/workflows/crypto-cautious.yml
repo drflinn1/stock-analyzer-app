@@ -1,9 +1,7 @@
-name: Crypto Live (Cautious - 15m)
+name: Crypto Live (Cautious - On Demand)
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes
+  workflow_dispatch:   # manual only; no auto schedule
 
 jobs:
   cautious:
@@ -11,18 +9,22 @@ jobs:
     timeout-minutes: 15
 
     env:
-      DRY_RUN: "true"                # cautious default: dry-run until you flip this
+      # SAFETY: stays dry-run by default
+      DRY_RUN: "true"
       TRADE_AMOUNT: "10"
       MAX_TRADES_PER_RUN: "2"
+
+      # Strategy knobs
       TP: "0.015"
       SL: "0.03"
       TRAIL: "0.02"
-      DROP_PCT: "0.01"
+      DROP_PCT: "0.01"            # stricter than live
       MIN_NOTIONAL_BUFFER: "1.0"
       TIMEFRAME: "5m"
       SMA_LEN: "10"
       SYMBOLS: "DOGE/USD,XRP/USD,ADA/USD,ETH/USD,BTC/USD"
 
+      # ccxt/kraken from repo secrets
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_SECRET:  ${{ secrets.KRAKEN_SECRET }}
 
@@ -40,7 +42,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt
 
-      - name: Run trader
+      - name: Run trader (cautious)
         run: |
           set -e
           python --version
