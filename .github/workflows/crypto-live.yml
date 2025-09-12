@@ -12,29 +12,28 @@ concurrency:
 env:
   # --- Runtime ---
   PYTHON_VERSION: "3.11"
-  DRY_RUN: "true"                    # flip to "false" only after you confirm logs look right
-  
+  DRY_RUN: "true"                       # flip to "false" only after logs look right
+
   # --- Picker (Balanced) ---
   DROP_PCT: "2.5"
   ENABLE_RSI: "true"
   RSI_LEN: "14"
   RSI_MAX: "35"
+  CANDLES_TIMEFRAME: "15m"
 
-  # --- Fixed Take-Profit / Stop-Loss (used by main.py) ---
-  TAKE_PROFIT_PCT: "3.0"             # +3% take-profit
-  STOP_LOSS_PCT: "2.0"               # -2% stop-loss
+  # --- Exits ---
+  TAKE_PROFIT_PCT: "3.0"
+  STOP_LOSS_PCT: "2.0"
+  TRAIL_START_PCT: "3.0"
+  TRAIL_OFFSET_PCT: "1.0"
 
-  # --- Trailing Profit add-on (used by main.py) ---
-  TRAIL_START_PCT: "3.0"             # start trailing once PnL ≥ +3%
-  TRAIL_OFFSET_PCT: "1.0"            # exit if drawdown from peak ≥ 1%
-
-  # --- Buy controls (still honored even with buys disabled in code) ---
+  # --- Sizing & caps ---
   POSITION_SIZE_USD: "10"
   DAILY_SPEND_CAP_USD: "15"
   MAX_OPEN_TRADES: "3"
   MIN_BALANCE_USD: "5"
 
-  # --- Universe (if/when you re-enable buys) ---
+  # --- Universe ---
   SYMBOLS: "BTC/USD,ETH/USD,DOGE/USD"
 
 jobs:
@@ -58,11 +57,20 @@ jobs:
 
       - name: Run trader
         env:
-          # Needed for balances / live orders (prices work without keys).
+          # Kraken secrets (create in Settings → Secrets and variables → Actions)
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          # Pass through all env for clarity (optional, but explicit):
+
+          # Optional for DRY tests: simulate quote cash (e.g., USD)
+          # SIM_BALANCE_QUOTE: "100"
+
+          # pass-through of knobs (explicit)
           DRY_RUN: ${{ env.DRY_RUN }}
+          DROP_PCT: ${{ env.DROP_PCT }}
+          ENABLE_RSI: ${{ env.ENABLE_RSI }}
+          RSI_LEN: ${{ env.RSI_LEN }}
+          RSI_MAX: ${{ env.RSI_MAX }}
+          CANDLES_TIMEFRAME: ${{ env.CANDLES_TIMEFRAME }}
           TAKE_PROFIT_PCT: ${{ env.TAKE_PROFIT_PCT }}
           STOP_LOSS_PCT: ${{ env.STOP_LOSS_PCT }}
           TRAIL_START_PCT: ${{ env.TRAIL_START_PCT }}
