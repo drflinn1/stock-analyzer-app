@@ -12,7 +12,7 @@ concurrency:
 env:
   # --- Runtime ---
   PYTHON_VERSION: "3.11"
-  DRY_RUN: "true"                       # flip to "false" only after logs look right
+  DRY_RUN: "true"                       # keep true while verifying balances
 
   # --- Picker (Balanced) ---
   DROP_PCT: "2.5"
@@ -55,16 +55,29 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt
 
+      # --- sanity: make sure secrets are actually present (no secret values printed) ---
+      - name: Sanity — Kraken keys present?
+        env:
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        run: |
+          if [ -z "${KRAKEN_API_KEY}" ] || [ -z "${KRAKEN_API_SECRET}" ]; then
+            echo "❌ Kraken keys are missing. Add KRAKEN_API_KEY and KRAKEN_API_SECRET in repo Settings → Secrets → Actions."
+            exit 1
+          else
+            echo "✅ Kraken keys detected."
+          fi
+
       - name: Run trader
         env:
-          # Kraken secrets (optional while DRY; required for live/private_api=ON)
+          # Kraken secrets (now required for private_api=ON)
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-          # >>> Simulated quote cash for DRY runs (lets the bot buy even with private_api=OFF)
-          SIM_BALANCE_QUOTE: "100"
+          # If you previously added SIM_BALANCE_QUOTE, remove/comment it now so real balances show
+          # SIM_BALANCE_QUOTE: "100"
 
-          # pass-through knobs (explicit)
+          # pass-through knobs
           DRY_RUN: ${{ env.DRY_RUN }}
           DROP_PCT: ${{ env.DROP_PCT }}
           ENABLE_RSI: ${{ env.ENABLE_RSI }}
