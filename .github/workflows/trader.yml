@@ -1,112 +1,21 @@
-name: headless-trader
+name: headless-trader [RETIRED]
 
 on:
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Run in dry-run mode? (true/false)"
-        required: true
-        default: "true"
-      symbols:
-        description: "Comma-separated symbols"
-        required: true
-        default: "AAPL,BTC-USD"
-      start:
-        description: "Start date (YYYY-MM-DD)"
-        required: true
-        default: "2023-01-01"
-      end:
-        description: "End date (YYYY-MM-DD, empty=today)"
-        required: false
-        default: ""
-      equity_dollars:
-        description: "EQUITY dollars per trade (override)"
-        required: false
-        default: "200"
-      crypto_dollars:
-        description: "CRYPTO dollars per trade (override)"
-        required: false
-        default: "10"
-      force_side:
-        description: "Force side for crypto (buy/sell or empty)"
-        required: false
-        default: ""
-      crypto_autopick:
-        description: "Autopick crypto top movers? (true/false)"
-        required: false
-        default: "false"
-      equity_autopick:
-        description: "Autopick equities top movers? (true/false)"
-        required: false
-        default: "false"
-      autopick_overrides:
-        description: "Optional JSON for advanced settings (see notes)"
-        required: false
-        default: ""
+  workflow_dispatch:   # manual only — no schedule
 
-  schedule:
-    - cron: "35 13 * * 1-5" # ~9:35 AM ET
-    - cron: "50 19 * * 1-5" # ~3:50 PM ET
+concurrency:
+  group: headless-trader-retired
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  DRY_RUN: "true"      # belt & suspenders so it can’t trade if clicked
 
 jobs:
-  run:
+  noop:
+    name: Retired workflow
     runs-on: ubuntu-latest
-
-    # Guard every input so cron/push runs still work (inputs.* doesn't exist there)
-    env:
-      DRY_RUN:                      ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run)               || 'true' }}
-      SYMBOLS:                      ${{ (github.event_name == 'workflow_dispatch' && inputs.symbols)               || 'AAPL,BTC-USD' }}
-      START:                        ${{ (github.event_name == 'workflow_dispatch' && inputs.start)                 || '2023-01-01' }}
-      END:                          ${{ (github.event_name == 'workflow_dispatch' && inputs.end)                   || '' }}
-      EQUITY_DOLLARS_PER_TRADE:     ${{ (github.event_name == 'workflow_dispatch' && inputs.equity_dollars)        || '200' }}
-      CRYPTO_DOLLARS_PER_TRADE:     ${{ (github.event_name == 'workflow_dispatch' && inputs.crypto_dollars)        || '10' }}
-      FORCE_SIDE:                   ${{ (github.event_name == 'workflow_dispatch' && inputs.force_side)            || '' }}
-      CRYPTO_AUTOPICK:              ${{ (github.event_name == 'workflow_dispatch' && inputs.crypto_autopick)       || 'false' }}
-      EQUITY_AUTOPICK:              ${{ (github.event_name == 'workflow_dispatch' && inputs.equity_autopick)       || 'false' }}
-      AUTOPICK_OVERRIDES:           ${{ (github.event_name == 'workflow_dispatch' && inputs.autopick_overrides)    || '' }}
-
-      OUT_DIR: out
-      EQUITY_BROKER: robinhood
-
-      # Exchange/broker config
-      CRYPTO_EXCHANGE:        ${{ vars.CRYPTO_EXCHANGE }}
-      RH_USERNAME:            ${{ secrets.RH_USERNAME }}
-      RH_PASSWORD:            ${{ secrets.RH_PASSWORD }}
-      RH_TOTP_SECRET:         ${{ secrets.RH_TOTP_SECRET }}
-      CRYPTO_API_KEY:         ${{ secrets.CRYPTO_API_KEY }}
-      CRYPTO_API_SECRET:      ${{ secrets.CRYPTO_API_SECRET }}
-      CRYPTO_API_PASSPHRASE:  ${{ secrets.CRYPTO_API_PASSPHRASE }}
-
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
+      - name: Show message
         run: |
-          pip install -r requirements.txt
-
-      - name: Run bot
-        run: |
-          echo "CONFIG:"
-          echo "  dry_run=$DRY_RUN"
-          echo "  symbols=$SYMBOLS"
-          echo "  start=$START end=$END"
-          echo "  crypto_autopick=$CRYPTO_AUTOPICK equity_autopick=$EQUITY_AUTOPICK"
-          echo "  force_side=$FORCE_SIDE"
-          python main.py
-
-      - name: List out
-        if: always()
-        run: |
-          echo "Listing out/:"
-          ls -la out || true
-
-      - name: Upload outputs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: trade-outputs.zip
-          path: out/
+          echo "This workflow is retired. Use '.github/workflows/crypto-live.yml' for the live bot."
