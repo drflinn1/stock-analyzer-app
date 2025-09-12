@@ -20,6 +20,7 @@ env:
   RSI_LEN: "14"
   RSI_MAX: "35"
   CANDLES_TIMEFRAME: "15m"
+  MIN_ACTIVE_POSITION_USD: "2"
 
   # --- Exits ---
   TAKE_PROFIT_PCT: "3.0"
