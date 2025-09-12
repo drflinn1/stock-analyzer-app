@@ -57,14 +57,14 @@ jobs:
 
       - name: Run trader
         env:
-          # Kraken secrets (create in Settings → Secrets and variables → Actions)
+          # Kraken secrets (optional while DRY; required for live/private_api=ON)
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-          # Optional for DRY tests: simulate quote cash (e.g., USD)
-          # SIM_BALANCE_QUOTE: "100"
+          # >>> Simulated quote cash for DRY runs (lets the bot buy even with private_api=OFF)
+          SIM_BALANCE_QUOTE: "100"
 
-          # pass-through of knobs (explicit)
+          # pass-through knobs (explicit)
           DRY_RUN: ${{ env.DRY_RUN }}
           DROP_PCT: ${{ env.DROP_PCT }}
           ENABLE_RSI: ${{ env.ENABLE_RSI }}
