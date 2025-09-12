@@ -1,49 +1,21 @@
-name: Crypto Live (Every 15 min — LIVE)
+name: Crypto Live (Every 15 min — LIVE) [RETIRED]
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes
+  workflow_dispatch:   # manual only — no schedule
+
+concurrency:
+  group: crypto-live-retired
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  DRY_RUN: "true"      # belt & suspenders so it can’t trade if clicked
 
 jobs:
-  live:
+  noop:
+    name: Retired workflow
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    env:
-      # --- Safety & knobs ---
-      DRY_RUN: "false"                # "true" for testing, "false" for live
-      TRADE_AMOUNT: "10"
-      MAX_TRADES_PER_RUN: "2"
-      TP: "0.015"                     # 1.5% take-profit marker (future expansion)
-      SL: "0.03"                      # 3.0% stop-loss marker (future expansion)
-      TRAIL: "0.02"                   # 2.0% trailing buffer (future expansion)
-      DROP_PCT: "0.005"               # buy if price is ≥0.5% below SMA10
-      MIN_NOTIONAL_BUFFER: "1.0"      # cushion added to required-per-run math
-      TIMEFRAME: "5m"
-      SMA_LEN: "10"
-      SYMBOLS: "DOGE/USD,XRP/USD,ADA/USD,ETH/USD,BTC/USD"
-
-      # ccxt/kraken envs from Actions secrets
-      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_SECRET:  ${{ secrets.KRAKEN_SECRET }}
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
+      - name: Show message
         run: |
-          python -m pip install --upgrade pip
-          pip install ccxt
-
-      - name: Run trader (LIVE)
-        run: |
-          set -e
-          python --version
-          python main.py
+          echo "This workflow is retired. Use '.github/workflows/crypto-live.yml' instead."
