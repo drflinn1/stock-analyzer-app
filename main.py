@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, json, sys, traceback
+import os, json, sys, traceback, math
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -8,11 +8,11 @@ from pathlib import Path
 # =========================
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
-# Sell rules
+# Sells
 TAKE_PROFIT_PCT   = float(os.getenv("TAKE_PROFIT_PCT", "3.0"))   # +3% TP
 STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT", "2.0"))     # -2% SL
 
-# Trailing profit add-on
+# Trailing profit
 TRAIL_START_PCT   = float(os.getenv("TRAIL_START_PCT", "3.0"))   # start trailing when PnL ≥ this
 TRAIL_OFFSET_PCT  = float(os.getenv("TRAIL_OFFSET_PCT", "1.0"))  # exit when drawdown from peak ≥ this
 
@@ -22,16 +22,21 @@ DAILY_SPEND_CAP_USD  = float(os.getenv("DAILY_SPEND_CAP_USD", "15"))
 MAX_OPEN_TRADES      = int(os.getenv("MAX_OPEN_TRADES", "3"))
 MIN_BALANCE_USD      = float(os.getenv("MIN_BALANCE_USD", "5"))
 
-# Best-candidate dip picker
-DROP_PCT_GATE        = float(os.getenv("DROP_PCT", "2.0"))       # e.g., buy if 15m change ≤ -2.0%
-TIMEFRAME            = os.getenv("CANDLES_TIMEFRAME", "15m")     # 15m scan
+# Best-candidate picker (Balanced defaults)
+DROP_PCT_GATE        = float(os.getenv("DROP_PCT", "2.5"))       # buy if 15m change ≤ -2.5%
+TIMEFRAME            = os.getenv("CANDLES_TIMEFRAME", "15m")
+
+# RSI filter (Balanced = enabled, 14-period, max 35)
+ENABLE_RSI           = os.getenv("ENABLE_RSI", "true").lower() == "true"
+RSI_LEN              = int(os.getenv("RSI_LEN", "14"))
+RSI_MAX              = float(os.getenv("RSI_MAX", "35.0"))
 
 # Universe
 SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USD,ETH/USD,DOGE/USD").split(",") if s.strip()]
 
-# Kraken keys (balances & live orders use these)
-KRAKEN_KEY    = os.getenv("KRAKEN_API_KEY", "")
-KRAKEN_SECRET = os.getenv("KRAKEN_API_SECRET", "")
+# Kraken keys (for balances & live orders)
+KRAKEN_API_KEY    = os.getenv("KRAKEN_API_KEY", "")
+KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET", "")
 
 # =========================
 # STATE (entry avg, trailing, daily spend)
@@ -45,8 +50,6 @@ def load_state():
             return json.loads(STATE_PATH.read_text())
         except Exception:
             pass
-    # positions[symbol] = {"entry_avg": float, "peak_pnl_pct": float, "trail_active": bool}
-    # spend[YYYYMMDD] = float usd_spent
     return {"positions": {}, "spend": {}}
 
 def save_state(state):
@@ -74,7 +77,6 @@ def pct(a, b):
     return (a - b) / b * 100.0
 
 def fmt2(x): return f"{x:.2f}"
-def fmt4(x): return f"{x:.4f}"
 
 # =========================
 # CCXT / Kraken
@@ -84,8 +86,8 @@ EX = None
 
 def kraken_client():
     conf = {"enableRateLimit": True, "timeout": 20000}
-    if KRAKEN_KEY and KRAKEN_SECRET:
-        conf.update({"apiKey": KRAKEN_KEY, "secret": KRAKEN_SECRET})
+    if KRAKEN_API_KEY and KRAKEN_API_SECRET:
+        conf.update({"apiKey": KRAKEN_API_KEY, "secret": KRAKEN_API_SECRET})
     return ccxt.kraken(conf)
 
 def init_exchange():
@@ -101,37 +103,23 @@ def price(symbol: str) -> float:
         raise RuntimeError(f"No last price for {symbol}")
     return float(last)
 
-def change_pct_15m(symbol: str) -> float:
-    """
-    Estimate 15m change: prev close (previous 15m candle) vs current last.
-    Kraken supports 15m timeframe.
-    """
+def fetch_closes(symbol: str, timeframe: str, limit: int):
     init_exchange()
-    try:
-        ohlcv = EX.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=2)
-        # ohlcv item: [timestamp, open, high, low, close, volume]
-        if not ohlcv or len(ohlcv) < 1:
-            # fallback to ticker open vs last
-            t = EX.fetch_ticker(symbol)
-            o = t.get("open")
-            l = t.get("last") or t.get("close")
-            if o and l:
-                return pct(float(l), float(o))
-            return 0.0
-        prev_close = float(ohlcv[-1][4]) if len(ohlcv) == 1 else float(ohlcv[-2][4])
-        cur_last   = price(symbol)
+    ohlcv = EX.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    return [float(c[4]) for c in ohlcv]  # close prices
+
+def change_pct_15m(symbol: str) -> float:
+    init_exchange()
+    ohlcv = EX.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=2)
+    if ohlcv and len(ohlcv) >= 2:
+        prev_close = float(ohlcv[-2][4])
+        cur_last   = float(ohlcv[-1][4])
         return pct(cur_last, prev_close)
-    except Exception:
-        # very safe fallback
-        try:
-            t = EX.fetch_ticker(symbol)
-            o = t.get("open")
-            l = t.get("last") or t.get("close")
-            if o and l:
-                return pct(float(l), float(o))
-        except Exception:
-            pass
-        return 0.0
+    # fallback
+    t = EX.fetch_ticker(symbol)
+    o = t.get("open")
+    l = t.get("last") or t.get("close")
+    return pct(float(l), float(o)) if (o and l) else 0.0
 
 def balances():
     init_exchange()
@@ -153,7 +141,7 @@ def qty_free(symbol: str) -> float:
 
 def place_buy(symbol: str, usd_amount: float, px: float):
     amount = max(usd_amount / px, 0.0)
-    amount = float(f"{amount:.6f}")  # precision trim for Kraken
+    amount = float(f"{amount:.6f}")  # Kraken precision
     if amount <= 0:
         print(f"[SKIP] BUY {symbol} amount<=0")
         return {"status": "skip"}
@@ -177,6 +165,39 @@ def place_sell(symbol: str, qty: float, px: float):
     o = EX.create_order(symbol=symbol, type="market", side="sell", amount=qty)
     print(f"[LIVE] SELL {symbol} market qty={qty:.6f} (order {o.get('id')})")
     return {"status": "ok", "symbol": symbol, "filled": qty, "order": o}
+
+# =========================
+# RSI (pure python, Wilder’s smoothing)
+# =========================
+def compute_rsi(closes, length: int) -> float:
+    if len(closes) < length + 1:
+        return 50.0  # neutral if not enough data
+    gains = []
+    losses = []
+    # seed with first length changes
+    for i in range(1, length + 1):
+        ch = closes[i] - closes[i-1]
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
+    avg_gain = sum(gains) / length
+    avg_loss = sum(losses) / length
+
+    # Wilder smoothing through the rest
+    for i in range(length + 1, len(closes)):
+        ch = closes[i] - closes[i-1]
+        gain = max(ch, 0.0)
+        loss = max(-ch, 0.0)
+        avg_gain = (avg_gain * (length - 1) + gain) / length
+        avg_loss = (avg_loss * (length - 1) + loss) / length
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def rsi_now(symbol: str, length: int) -> float:
+    closes = fetch_closes(symbol, TIMEFRAME, limit=length + 50)  # buffer
+    return compute_rsi(closes, length)
 
 # =========================
 # Trailing helpers
@@ -212,7 +233,7 @@ def decide_sell(pnl_pct):
 # =========================
 def run_once():
     print("=== START TRADING OUTPUT ===")
-    print(f"{now_iso()} | run started | DRY_RUN={DRY_RUN} | TP={fmt2(TAKE_PROFIT_PCT)}% | SL={fmt2(STOP_LOSS_PCT)}% | TRAIL_START={fmt2(TRAIL_START_PCT)}% | TRAIL_OFFSET={fmt2(TRAIL_OFFSET_PCT)}% | DROP_GATE={fmt2(DROP_PCT_GATE)}% | TF={TIMEFRAME}")
+    print(f"{now_iso()} | run started | DRY_RUN={DRY_RUN} | TP={fmt2(TAKE_PROFIT_PCT)}% | SL={fmt2(STOP_LOSS_PCT)}% | TRAIL_START={fmt2(TRAIL_START_PCT)}% | TRAIL_OFFSET={fmt2(TRAIL_OFFSET_PCT)}% | DROP_GATE={fmt2(DROP_PCT_GATE)}% | TF={TIMEFRAME} | RSI({RSI_LEN}) {'ON' if ENABLE_RSI else 'OFF'} max≤{fmt2(RSI_MAX)}")
 
     state = load_state()
     buys_placed = 0
@@ -225,7 +246,7 @@ def run_once():
             continue
 
         px = price(sym)
-        ensure_entry(state, sym, entry_avg=px)  # if missing, assume current to avoid forced exit
+        ensure_entry(state, sym, entry_avg=px)  # if missing, assume current to avoid forced exits
         entry_avg = state["positions"][sym]["entry_avg"]
         pnl_pct = pct(px, entry_avg)
         maybe_activate_trailing(state, sym, pnl_pct)
@@ -242,63 +263,60 @@ def run_once():
         print(log)
 
         if reason:
-            r = place_sell(sym, qty, px)
+            place_sell(sym, qty, px)
             sells_placed += 1
-            if sym in state["positions"]:
-                del state["positions"][sym]
+            state["positions"].pop(sym, None)
 
-    # ---------- BUY WINDOW (best-candidate dip) ----------
-    # budget guardrails
+    # ---------- BUY WINDOW (best-candidate dip + optional RSI) ----------
     usd = usd_free()
     daily_remaining = max(0.0, DAILY_SPEND_CAP_USD - spent_today(state))
     can_spend = min(usd, daily_remaining)
-
-    # count open trades as number of symbols with qty>0 among universe
     open_trades = sum(1 for s in SYMBOLS if qty_free(s) > 0)
 
     print(f"{now_iso()} | budget | usd_free=${fmt2(usd)} | daily_remaining=${fmt2(daily_remaining)} | open_trades={open_trades}/{MAX_OPEN_TRADES}")
 
     if can_spend >= max(MIN_BALANCE_USD, POSITION_SIZE_USD) and open_trades < MAX_OPEN_TRADES:
-        # Scan universe for 15m drop
-        drops = []
+        candidates = []
         for sym in SYMBOLS:
             if qty_free(sym) > 0:
-                continue  # already holding
-            chg = change_pct_15m(sym)
-            drops.append((sym, chg))
-        # sort by most negative change first
-        drops.sort(key=lambda x: x[1])
+                continue  # skip holdings
+            chg15 = change_pct_15m(sym)
+            rsi = rsi_now(sym, RSI_LEN) if ENABLE_RSI else None
+            ok_drop = (chg15 <= -abs(DROP_PCT_GATE))
+            ok_rsi  = (True if not ENABLE_RSI else (rsi is not None and rsi <= RSI_MAX))
+            candidates.append((sym, chg15, rsi, ok_drop and ok_rsi))
 
-        # pick the biggest (most negative) drop that passes gate
+        # pick the strongest qualifying dip (most negative 15m change)
         picked = None
-        for sym, chg in drops:
-            # Gate: must be ≤ -DROP_PCT_GATE (i.e., drop at least that much)
-            if chg <= -abs(DROP_PCT_GATE):
-                picked = (sym, chg)
+        for sym, chg, rsi, ok in sorted(candidates, key=lambda x: x[1]):  # ascending: most negative first
+            if ok:
+                picked = (sym, chg, rsi)
                 break
 
         if picked:
-            psym, pchg = picked
+            psym, pchg, prsi = picked
             px = price(psym)
-            print(f"{now_iso()} | Best candidate | {psym} 15m_change={fmt2(pchg)}% (gate {fmt2(-abs(DROP_PCT_GATE))}%) → BUY ${fmt2(POSITION_SIZE_USD)} @ {fmt2(px)}")
+            rsi_txt = f", RSI={fmt2(prsi)}" if ENABLE_RSI else ""
+            print(f"{now_iso()} | Best candidate | {psym} 15m_change={fmt2(pchg)}% (gate {fmt2(-abs(DROP_PCT_GATE))}%){rsi_txt} → BUY ${fmt2(POSITION_SIZE_USD)} @ {fmt2(px)}")
             r = place_buy(psym, POSITION_SIZE_USD, px)
             if r.get("status") in ("ok", "dry"):
                 buys_placed += 1
                 add_daily_spend(state, POSITION_SIZE_USD)
-                # record entry for trailing / PnL later
                 ensure_entry(state, psym, entry_avg=px)
         else:
-            if drops:
-                sym0, chg0 = drops[0]
-                print(f"{now_iso()} | Best candidate | {sym0} 15m_change={fmt2(chg0)}% (did not pass gate {fmt2(-abs(DROP_PCT_GATE))}%) → NO BUY")
+            # Show top non-qualifier for transparency
+            if candidates:
+                sym0, chg0, rsi0, ok0 = sorted(candidates, key=lambda x: x[1])[0]
+                reasons = []
+                if chg0 > -abs(DROP_PCT_GATE): reasons.append(f"drop {fmt2(chg0)}% > gate")
+                if ENABLE_RSI and (rsi0 is None or rsi0 > RSI_MAX): reasons.append(f"RSI {fmt2(rsi0 or 0)} > {fmt2(RSI_MAX)}")
+                print(f"{now_iso()} | Best candidate | {sym0} (did not pass: {', '.join(reasons) or 'gate'}) → NO BUY")
             else:
-                print(f"{now_iso()} | Best candidate | (none) → NO BUY (no candidates found)")
+                print(f"{now_iso()} | Best candidate | none → NO BUY")
     else:
         reason = []
-        if can_spend < max(MIN_BALANCE_USD, POSITION_SIZE_USD):
-            reason.append("insufficient budget")
-        if open_trades >= MAX_OPEN_TRADES:
-            reason.append("max open trades reached")
+        if can_spend < max(MIN_BALANCE_USD, POSITION_SIZE_USD): reason.append("insufficient budget")
+        if open_trades >= MAX_OPEN_TRADES: reason.append("max open trades reached")
         print(f"{now_iso()} | BUY window skipped ({', '.join(reason) if reason else 'guardrail'})")
 
     save_state(state)
