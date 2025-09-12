@@ -1,341 +1,225 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+import os, json, time, math, sys, traceback
+from datetime import datetime, timezone
+from pathlib import Path
 
-import os
-import time
-import logging
-from datetime import datetime, timedelta, timezone
+# ========== Config / ENV ==========
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
-import ccxt  # type: ignore
+TAKE_PROFIT_PCT   = float(os.getenv("TAKE_PROFIT_PCT", "3.0"))   # e.g., 3.0 = +3%
+STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT", "2.0"))     # e.g., 2.0 = -2%
 
+# Trailing profit add-on:
+TRAIL_START_PCT   = float(os.getenv("TRAIL_START_PCT", "3.0"))   # when PnL ≥ this, start trailing
+TRAIL_OFFSET_PCT  = float(os.getenv("TRAIL_OFFSET_PCT", "1.0"))  # trail by this amount
 
-# -------------------- logging --------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("trader")
+# Basic buy controls (you already had these envs in workflows; keeping here for completeness)
+POSITION_SIZE_USD    = float(os.getenv("POSITION_SIZE_USD", "10"))
+DAILY_SPEND_CAP_USD  = float(os.getenv("DAILY_SPEND_CAP_USD", "15"))
+MAX_OPEN_TRADES      = int(os.getenv("MAX_OPEN_TRADES", "3"))
+MIN_BALANCE_USD      = float(os.getenv("MIN_BALANCE_USD", "5"))
 
+# Symbols universe (bot may pick among these if your selection logic does that)
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USD,ETH/USD,DOGE/USD").split(",") if s.strip()]
 
-# -------------------- env helpers --------------------
-def env_str(name: str, default: str) -> str:
-    return os.getenv(name, default)
+# State file to remember entry_avg and trailing stop data for bot-managed coins
+STATE_PATH = Path("state/trade_state.json")
+STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-
-def env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except Exception:
-        return default
-
-
-def env_int(name: str, default: int) -> int:
-    try:
-        return int(float(os.getenv(name, str(default))))
-    except Exception:
-        return default
-
-
-def env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "y")
-
-
-# -------------------- configuration --------------------
-DRY_RUN = env_bool("DRY_RUN", True)
-TRADE_AMOUNT = env_float("TRADE_AMOUNT", 10.0)     # USD per BUY
-TAKE_PROFIT = env_float("TP", 0.015)               # +1.5% TP
-STOP_LOSS = env_float("SL", 0.03)                  # -3% SL
-TRAIL = env_float("TRAIL", 0.02)                   # reserved for later
-MAX_TRADES_PER_RUN = env_int("MAX_TRADES_PER_RUN", 2)
-
-DROP_PCT = env_float("DROP_PCT", 0.005)            # dip under SMA10 to BUY
-MIN_NOTIONAL_BUFFER = env_float("MIN_NOTIONAL_BUFFER", 1.0)
-
-SYMBOLS = env_str("SYMBOLS", "DOGE/USD,XRP/USD,ADA/USD,ETH/USD,BTC/USD").replace(" ", "").split(",")
-KRAKEN_API_KEY = env_str("KRAKEN_API_KEY", "")
-KRAKEN_SECRET  = env_str("KRAKEN_SECRET", "")
-
-TIMEFRAME = env_str("TIMEFRAME", "5m")
-SMA_LEN = env_int("SMA_LEN", 10)
-
-
-# -------------------- exchange setup --------------------
-def make_exchange() -> ccxt.Exchange:
-    ex = ccxt.kraken({
-        "apiKey": KRAKEN_API_KEY,
-        "secret": KRAKEN_SECRET,
-        "enableRateLimit": True,
-        "options": {"adjustForTimeDifference": True},
-    })
-    return ex
-
-
-# -------------------- indicators --------------------
-def fetch_ohlcv_safe(exchange: ccxt.Exchange, symbol: str, timeframe: str, limit: int):
-    for attempt in range(3):
+# ========== Helpers ==========
+def load_state():
+    if STATE_PATH.exists():
         try:
-            return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        except Exception as e:
-            if attempt == 2:
-                raise
-            log.warning("fetch_ohlcv retry %s/%s for %s due to %s", attempt + 1, 3, symbol, e)
-            time.sleep(1 + attempt)
+            return json.loads(STATE_PATH.read_text())
+        except Exception:
+            pass
+    return {"positions": {}}  # positions[symbol] = {"entry_avg": float, "peak_pnl_pct": float, "trail_active": bool}
 
+def save_state(state):
+    STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True))
 
-def sma(values, n: int) -> float:
-    if not values or len(values) < n:
-        return float("nan")
-    return sum(values[-n:]) / float(n)
+def now_iso():
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
+def pct(a, b):
+    if b == 0:
+        return 0.0
+    return (a - b) / b * 100.0
 
-# -------------------- balances / positions --------------------
-def log_funding_status(exchange, trade_amount, max_trades_per_run, min_notional_buffer=1.0, tag="pre"):
+def fmt2(x):
+    return f"{x:.2f}"
+
+# ========== Exchange Adapter (stubbed for simplicity) ==========
+# Replace these with your existing exchange adapter calls if you already have them.
+# The shapes are kept intentionally simple so you can swap in your real functions.
+
+class DummyPriceFeed:
+    # In your real code, replace with ccxt Kraken calls:
+    #   - fetch_balance() for USD + coin balances
+    #   - fetch_ticker(symbol)["last"] for prices
+    #   - create_order(...) for buys/sells (when not DRY_RUN)
+    def __init__(self):
+        # You will replace with actual CCXT client if you already have it wired
+        self.prices = {}  # runtime-populated
+    def price(self, symbol: str) -> float:
+        # TODO: replace with real price fetch; for now raise if unset
+        if symbol not in self.prices:
+            raise RuntimeError(f"No price for {symbol}. Wire your price fetch here.")
+        return float(self.prices[symbol])
+    def set_price(self, symbol: str, px: float):
+        self.prices[symbol] = float(px)
+
+def get_cash_available_usd() -> float:
+    # Replace with real USD balance fetch
     try:
-        bal = exchange.fetch_balance()
-        free_usd = float(bal.get("free", {}).get("USD", 0.0) or 0.0)
-        held_usd = float(bal.get("used", {}).get("USD", 0.0) or 0.0)
-        required = (float(trade_amount) + float(min_notional_buffer)) * int(max_trades_per_run)
-        ok = free_usd >= required
-        logging.info(
-            "Funding(%s) | free_usd=%.2f | held_in_orders=%.2f | required_per_run=%.2f | OK=%s",
-            tag, free_usd, held_usd, required, ok,
-        )
-    except Exception as e:
-        logging.warning("Funding(%s) | could not fetch balance: %s", tag, e)
+        return float(os.getenv("SIM_BALANCE_USD", "100.0"))
+    except:
+        return 0.0
 
+def get_coin_position_qty(symbol: str) -> float:
+    # Replace with your real coin balance fetch (spot)
+    # For safety here, return 0 so we don't accidentally "sell" in stub mode.
+    return 0.0
 
-def snapshot_free_balances(exchange: ccxt.Exchange):
-    try:
-        bal = exchange.fetch_balance()
-        return bal.get("free", {}) or {}
-    except Exception as e:
-        log.warning("balance snapshot failed: %s", e)
-        return {}
+def place_buy(symbol: str, usd_amount: float, price: float):
+    if DRY_RUN:
+        print(f"[DRY] BUY {symbol} ${fmt2(usd_amount)} @ {fmt2(price)}")
+        return {"status": "dry", "symbol": symbol, "filled": usd_amount/price}
+    # TODO: replace with real exchange order
+    print(f"[LIVE] BUY {symbol} ${fmt2(usd_amount)} @ {fmt2(price)}")
+    return {"status": "ok", "symbol": symbol, "filled": usd_amount/price}
 
+def place_sell(symbol: str, qty: float, price: float):
+    if DRY_RUN:
+        print(f"[DRY] SELL {symbol} qty={qty:.8f} @ {fmt2(price)}")
+        return {"status": "dry", "symbol": symbol, "filled": qty}
+    # TODO: replace with real exchange order
+    print(f"[LIVE] SELL {symbol} qty={qty:.8f} @ {fmt2(price)}")
+    return {"status": "ok", "symbol": symbol, "filled": qty}
 
-def get_position_sizes(exchange: ccxt.Exchange):
-    """
-    Returns dict of BASE -> free amount (spot).
-    """
-    sizes = {}
-    try:
-        free = snapshot_free_balances(exchange)
-        for k, v in (free.items() if free else []):
-            try:
-                amt = float(v or 0.0)
-            except Exception:
-                amt = 0.0
-            if amt > 0:
-                sizes[k.upper()] = amt
-    except Exception as e:
-        log.warning("position size fetch failed: %s", e)
-    return sizes
+# ========== Core Logic ==========
+def ensure_entry(state, symbol, entry_avg):
+    pos = state["positions"].setdefault(symbol, {})
+    if "entry_avg" not in pos or pos["entry_avg"] <= 0:
+        pos["entry_avg"] = float(entry_avg)
+    pos.setdefault("peak_pnl_pct", 0.0)
+    pos.setdefault("trail_active", False)
 
+def maybe_activate_trailing(state, symbol, pnl_pct):
+    pos = state["positions"][symbol]
+    # track peak pnl
+    if pnl_pct > pos["peak_pnl_pct"]:
+        pos["peak_pnl_pct"] = float(pnl_pct)
+    # activate trailing at threshold
+    if not pos["trail_active"] and pnl_pct >= TRAIL_START_PCT:
+        pos["trail_active"] = True
 
-def base_from_symbol(symbol: str) -> str:
-    return symbol.split("/")[0].upper()
+def should_trail_exit(state, symbol, pnl_pct):
+    pos = state["positions"][symbol]
+    if not pos["trail_active"]:
+        return False
+    # compute drawdown from the peak
+    drawdown = pos["peak_pnl_pct"] - pnl_pct
+    return drawdown >= TRAIL_OFFSET_PCT
 
+def decide_sell(pnl_pct):
+    # Fixed TP/SL cut first
+    if pnl_pct >= TAKE_PROFIT_PCT:
+        return "TP"
+    if pnl_pct <= -STOP_LOSS_PCT:
+        return "SL"
+    return None
 
-def quote_from_symbol(symbol: str) -> str:
-    return symbol.split("/")[-1].upper()
-
-
-# -------------------- cost basis from trade history --------------------
-def fetch_avg_entry_price(exchange: ccxt.Exchange, symbol: str, lookback_days: int = 30) -> float:
-    """
-    Compute average entry price for current net long position from recent trade history.
-    - We fetch myTrades over a lookback window (default ~30 days).
-    - Aggregate buys (positive base) and sells (negative).
-    - If net base > 0, return weighted average cost for the remaining units.
-    """
-    since = int((datetime.now(timezone.utc) - timedelta(days=lookback_days)).timestamp() * 1000)
-    try:
-        trades = exchange.fetch_my_trades(symbol, since=since)
-    except Exception as e:
-        log.warning("fetch_my_trades failed for %s: %s", symbol, e)
-        return float("nan")
-
-    net_base = 0.0
-    total_cost_quote_for_net = 0.0  # USD spent for the units still held
-
-    # Process trades oldest->newest so sells reduce earlier buys' inventory
-    trades = sorted(trades, key=lambda t: t.get("timestamp", 0))
-    inventory = []  # list of (base_units, unit_cost_quote)
-    for t in trades:
-        side = t.get("side", "")
-        amount = float(t.get("amount") or 0.0)
-        price = float(t.get("price") or 0.0)
-        cost = float(t.get("cost") or (amount * price))
-        fee = t.get("fee") or {}
-        fee_cost = float(fee.get("cost") or 0.0)
-        # treat fee in quote currency (USD) if that’s the case
-        cost_with_fee = cost + (fee_cost if (fee.get("currency", "").upper() in ("USD", "")) else 0.0)
-
-        if side == "buy":
-            inventory.append([amount, cost_with_fee / max(amount, 1e-12)])
-            net_base += amount
-        elif side == "sell":
-            # remove from inventory FIFO
-            to_sell = amount
-            while to_sell > 1e-12 and inventory:
-                units, unit_cost = inventory[0]
-                take = min(units, to_sell)
-                units -= take
-                to_sell -= take
-                net_base -= take
-                if units <= 1e-12:
-                    inventory.pop(0)
-                else:
-                    inventory[0][0] = units
-        else:
-            continue
-
-    if net_base <= 1e-12:
-        return float("nan")  # no net long position
-
-    # Weighted average cost of remaining inventory
-    for units, unit_cost in inventory:
-        total_cost_quote_for_net += units * unit_cost
-
-    avg_entry = total_cost_quote_for_net / max(net_base, 1e-12)
-    return avg_entry
-
-
-# -------------------- order helpers --------------------
-def place_market_buy(exchange: ccxt.Exchange, symbol: str, usd_amount: float):
-    ticker = exchange.fetch_ticker(symbol)
-    price = float(ticker["last"])
-    size = usd_amount / price
-    size = float(exchange.amount_to_precision(symbol, size))
-    return exchange.create_market_buy_order(symbol, size, {})
-
-
-def place_market_sell(exchange: ccxt.Exchange, symbol: str, base_amount: float):
-    size = float(exchange.amount_to_precision(symbol, base_amount))
-    return exchange.create_market_sell_order(symbol, size, {})
-
-
-# -------------------- strategy --------------------
 def run_once():
-    log.info("Python %s.%s.%s", *os.sys.version_info[:3])
-    log.info("Config | DRY_RUN=%s | TRADE_AMOUNT=%.2f | TP=%.3f | SL=%.3f | TRAIL=%.3f | MAX_TRADES=%d",
-             DRY_RUN, TRADE_AMOUNT, TAKE_PROFIT, STOP_LOSS, TRAIL, MAX_TRADES_PER_RUN)
-    log.info("Symbols: %s", ",".join(SYMBOLS))
-    log.info("=== START TRADING OUTPUT ===")
+    print("=== START TRADING OUTPUT ===")
+    print(f"{now_iso()} | run started | DRY_RUN={DRY_RUN} | TP={fmt2(TAKE_PROFIT_PCT)}% | SL={fmt2(STOP_LOSS_PCT)}% | TRAIL_START={fmt2(TRAIL_START_PCT)}% | TRAIL_OFFSET={fmt2(TRAIL_OFFSET_PCT)}%")
 
-    ex = make_exchange()
+    state = load_state()
+    feed = DummyPriceFeed()
+
+    # TODO: Replace these with real price fetches per symbol
+    # For safety, require the caller to inject runtime prices via env like PRICE_BTC_USD, PRICE_ETH_USD, etc., when testing.
+    # In your production code, delete this block and fetch from exchange.
+    for sym in SYMBOLS:
+        env_key = "PRICE_" + sym.replace("/", "_").replace("-", "_")
+        px_env = os.getenv(env_key)
+        if px_env:
+            feed.set_price(sym, float(px_env))
+
     buys_placed = 0
     sells_placed = 0
 
-    # Pre-run funding snapshot
-    log_funding_status(ex, TRADE_AMOUNT, MAX_TRADES_PER_RUN, MIN_NOTIONAL_BUFFER, tag="pre")
+    # ===== SELL CHECK for held coins =====
+    for sym in SYMBOLS:
+        qty = get_coin_position_qty(sym)
+        if qty <= 0:
+            continue  # nothing to evaluate
 
-    # current positions
-    positions = get_position_sizes(ex)
+        price = feed.price(sym)
+        # If we don't have an entry price on file (e.g., bot didn't open it), assume current (prevents false forced sells).
+        ensure_entry(state, sym, entry_avg=price)
+        entry_avg = state["positions"][sym]["entry_avg"]
+        pnl_pct = pct(price, entry_avg)
+        maybe_activate_trailing(state, sym, pnl_pct)
 
-    for symbol in SYMBOLS:
-        base = base_from_symbol(symbol)
-        quote = quote_from_symbol(symbol)
-        assert quote == "USD", f"Only USD quote supported, got {symbol}"
+        reason = decide_sell(pnl_pct)
+        trailed = False
+        if reason is None and should_trail_exit(state, sym, pnl_pct):
+            reason = "TRAIL"
+            trailed = True
 
-        # Fetch current price + SMA
-        try:
-            ohlcv = fetch_ohlcv_safe(ex, symbol, timeframe=TIMEFRAME, limit=max(SMA_LEN, 20))
-            closes = [float(c[4]) for c in ohlcv]
-            cur = closes[-1]
-            s10 = sma(closes, SMA_LEN)
-            dip = (cur - s10) / s10 if s10 and s10 == s10 else 0.0
-        except Exception as e:
-            log.warning("%s metrics error: %s", symbol, e)
-            continue
+        # log line as promised:
+        log = f"{now_iso()} | {sym} | entry_avg={fmt2(entry_avg)} | last={fmt2(price)} | PnL={('+' if pnl_pct>=0 else '')}{fmt2(pnl_pct)}% "
+        if state["positions"][sym]["trail_active"]:
+            log += f"| trail_on peak={fmt2(state['positions'][sym]['peak_pnl_pct'])}% "
+        if reason:
+            log += f"| SELL ({reason})"
+        print(log)
 
-        held = float(positions.get(base, 0.0))
+        if reason:
+            # Place sell
+            r = place_sell(sym, qty, price)
+            sells_placed += 1
+            # Clear position tracking (bot is flat now)
+            if sym in state["positions"]:
+                del state["positions"][sym]
 
-        # -------- EXIT LOGIC (TP/SL) --------
-        if held > 0:
-            # Compute average entry price from trade history (last 30 days)
-            avg_entry = fetch_avg_entry_price(ex, symbol, lookback_days=30)
-            if avg_entry == avg_entry:  # not NaN
-                change = (cur - avg_entry) / avg_entry
-                log.info(
-                    "%s position maintained | held=%.8f | cur=%.6f | entry_avg=%.6f | PnL=%+.2f%% | sma10=%.6f | dip=%+.2f%%",
-                    symbol, held, cur, avg_entry, 100.0 * change, s10, 100.0 * dip
-                )
+    # ===== BUY WINDOW (stub) =====
+    # Your existing “best candidate” dip-buy logic should be here.
+    # Below is a minimal skeleton honoring spend caps and DRY_RUN,
+    # but it does NOT select candidates. Replace with your real logic.
+    remaining_cap = DAILY_SPEND_CAP_USD  # you probably track daily spend elsewhere; keep this simple here
+    cash = get_cash_available_usd()
 
-                should_take_profit = change >= TAKE_PROFIT
-                should_stop_loss = change <= -abs(STOP_LOSS)
+    # Example: try to buy the first symbol if we have no position and enough cash (replace with your signal logic)
+    for sym in SYMBOLS:
+        if remaining_cap < POSITION_SIZE_USD or cash < max(MIN_BALANCE_USD, POSITION_SIZE_USD):
+            break
+        qty = get_coin_position_qty(sym)
+        if qty > 0:
+            continue  # already holding
 
-                if (should_take_profit or should_stop_loss) and not DRY_RUN:
-                    try:
-                        reason = "TP" if should_take_profit else "SL"
-                        log.info("SELL %s %s | amount=%.8f | cur=%.6f | entry=%.6f | change=%+.2f%%",
-                                 symbol, reason, held, cur, avg_entry, 100.0 * change)
-                        order = place_market_sell(ex, symbol, held)
-                        oid = order.get("id") or order.get("clientOrderId") or "?"
-                        status = order.get("status", "?")
-                        log.info("Sell order id=%s status=%s", oid, status)
-                        sells_placed += 1
-                        # after selling, no buy in the same symbol this loop
-                        continue
-                    except Exception as e:
-                        log.error("Exit failed for %s: %s", symbol, e)
-                        # fall through to buy logic if desired (but usually continue)
-                        continue
-                elif (should_take_profit or should_stop_loss) and DRY_RUN:
-                    reason = "TP" if should_take_profit else "SL"
-                    log.info("DRYRUN SELL %s %s | amount=%.8f | cur=%.6f | entry=%.6f | change=%+.2f%%",
-                             symbol, reason, held, cur, avg_entry, 100.0 * change)
-                    sells_placed += 1
-                    continue
-            else:
-                log.info(
-                    "%s position maintained | held=%.8f | cur=%.6f | sma10=%.6f | dip=%+.2f%% | entry_avg=NA",
-                    symbol, held, cur, s10, 100.0 * dip
-                )
-            # We already hold, so we skip fresh buys for this symbol this run
-            continue
+        # Use price if available
+        price = feed.price(sym)
+        # *** Replace this condition with your real signal (RSI/dip rule/etc.) ***
+        should_buy = False  # default: off, so we don't buy unexpectedly
+        if should_buy:
+            r = place_buy(sym, POSITION_SIZE_USD, price)
+            buys_placed += 1
+            remaining_cap -= POSITION_SIZE_USD
+            # Set entry for trailing logic later
+            ensure_entry(load_state(), sym, entry_avg=price)
 
-        # -------- ENTRY LOGIC (BUY on dip vs SMA) --------
-        log.info("%s metrics: cur=%.6f | sma10=%.6f | dip=%+.2f%%", symbol, cur, s10, 100.0 * dip)
+    save_state(state)
 
-        if buys_placed >= MAX_TRADES_PER_RUN:
-            continue
+    print(f"Run complete. buys_placed={buys_placed} | sells_placed={sells_placed} | DRY_RUN={DRY_RUN}")
+    print("=== END TRADING OUTPUT ===")
 
-        if dip <= -abs(DROP_PCT):
-            # Check free USD
-            try:
-                bal = ex.fetch_balance()
-                free_usd = float(bal.get("free", {}).get("USD", 0.0) or 0.0)
-            except Exception as e:
-                log.warning("could not fetch balance before order: %s", e)
-                free_usd = 0.0
-
-            required_per_order = TRADE_AMOUNT + MIN_NOTIONAL_BUFFER
-            if free_usd < required_per_order:
-                log.info("BUY %s skipped: free_usd=%.2f < required=%.2f", symbol, free_usd, required_per_order)
-                continue
-
-            usd_to_spend = TRADE_AMOUNT
-            if DRY_RUN:
-                size = usd_to_spend / cur
-                log.info("DRYRUN BUY %s amount=%.8f (~$%.2f @ %.6f)", symbol, size, usd_to_spend, cur)
-                buys_placed += 1
-            else:
-                try:
-                    log.info("BUY %s amount≈$%.2f (@ ~%.6f)", symbol, usd_to_spend, cur)
-                    order = place_market_buy(ex, symbol, usd_to_spend)
-                    oid = order.get("id") or order.get("clientOrderId") or "?"
-                    status = order.get("status", "?")
-                    log.info("Buy order id=%s status=%s", oid, status)
-                    buys_placed += 1
-                except Exception as e:
-                    log.error("Entry failed for %s: %s", symbol, e)
-                    continue
-
-    log.info("Run complete. buys_placed=%d | sells_placed=%d | DRY_RUN=%s", buys_placed, sells_placed, DRY_RUN)
-    log_funding_status(ex, TRADE_AMOUNT, MAX_TRADES_PER_RUN, MIN_NOTIONAL_BUFFER, tag="post")
-    log.info("=== END TRADING OUTPUT ===")
-
-
+# ========== Main ==========
 if __name__ == "__main__":
-    run_once()
+    try:
+        run_once()
+    except Exception as e:
+        print("ERROR:", e)
+        traceback.print_exc()
+        sys.exit(1)
