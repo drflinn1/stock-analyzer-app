@@ -1,4 +1,4 @@
-name: Crypto Live (Every 15 min)
+name: Crypto Live (Every 15 min — LIVE)
 
 on:
   workflow_dispatch:
@@ -15,10 +15,10 @@ jobs:
       DRY_RUN: "false"                # "true" for testing, "false" for live
       TRADE_AMOUNT: "10"
       MAX_TRADES_PER_RUN: "2"
-      TP: "0.015"                     # 1.5% take-profit marker (logic reserved for future)
-      SL: "0.03"                      # 3.0% stop-loss marker (logic reserved for future)
-      TRAIL: "0.02"                   # 2.0% trailing buffer (logic reserved for future)
-      DROP_PCT: "0.005"                # buy if price is >=1% below SMA10
+      TP: "0.015"                     # 1.5% take-profit marker (future expansion)
+      SL: "0.03"                      # 3.0% stop-loss marker (future expansion)
+      TRAIL: "0.02"                   # 2.0% trailing buffer (future expansion)
+      DROP_PCT: "0.005"               # buy if price is ≥0.5% below SMA10
       MIN_NOTIONAL_BUFFER: "1.0"      # cushion added to required-per-run math
       TIMEFRAME: "5m"
       SMA_LEN: "10"
@@ -42,7 +42,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt
 
-      - name: Run trader
+      - name: Run trader (LIVE)
         run: |
           set -e
           python --version
