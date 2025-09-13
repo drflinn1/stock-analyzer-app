@@ -4,7 +4,7 @@
 """
 Crypto bot with:
 - Auto-universe (top-N USD pairs by 24h USD volume) or manual symbol list
-- Balanced/Active picker via env knobs (DROP %, RSI, timeframe)
+- Picker via env knobs (DROP %, RSI, timeframe) + preview of top-5 candidates each run
 - TP/SL + trailing exits
 - Daily spend cap, max concurrent positions
 - Dust ignore threshold so tiny holdings don't block buys
@@ -23,7 +23,7 @@ DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
 # Picker
 TIMEFRAME          = os.getenv("CANDLES_TIMEFRAME", "15m")
-DROP_PCT_GATE      = float(os.getenv("DROP_PCT", "2.5"))   # requires 15m/5m change <= -DROP_PCT_GATE
+DROP_PCT_GATE      = float(os.getenv("DROP_PCT", "2.5"))   # requires change <= -DROP_PCT_GATE on chosen TF
 ENABLE_RSI         = os.getenv("ENABLE_RSI", "true").lower() == "true"
 RSI_LEN            = int(os.getenv("RSI_LEN", "14"))
 RSI_MAX            = float(os.getenv("RSI_MAX", "35"))
@@ -43,20 +43,20 @@ MIN_ACTIVE_POSITION_USD = float(os.getenv("MIN_ACTIVE_POSITION_USD", "2"))  # "d
 
 # Universe controls
 UNIVERSE_MODE     = os.getenv("UNIVERSE_MODE", "manual").lower()  # "auto" or "manual"
-QUOTE_CCY         = os.getenv("QUOTE", "USD").upper()              # target quote for auto mode
-TOP_N_SYMBOLS     = int(os.getenv("TOP_N_SYMBOLS", "12"))         # auto mode: take top N by USD 24h vol
-MIN_USD_VOL       = float(os.getenv("MIN_USD_VOL", "1000000"))    # auto mode: min 24h USD volume
+QUOTE_CCY         = os.getenv("QUOTE", "USD").upper()
+TOP_N_SYMBOLS     = int(os.getenv("TOP_N_SYMBOLS", "12"))
+MIN_USD_VOL       = float(os.getenv("MIN_USD_VOL", "1000000"))
 EXCLUDE_SYMBOLS   = [s.strip() for s in os.getenv("EXCLUDE_SYMBOLS", "").split(",") if s.strip()]
 INCLUDE_SYMBOLS   = [s.strip() for s in os.getenv("INCLUDE_SYMBOLS", "").split(",") if s.strip()]
 
-# Manual fallback list (also used when UNIVERSE_MODE="manual")
+# Manual fallback list
 SYMBOLS_MANUAL = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USD,ETH/USD,DOGE/USD").split(",") if s.strip()]
 
-# Exchange credentials (Kraken)
+# Exchange credentials
 KRAKEN_API_KEY    = os.getenv("KRAKEN_API_KEY", "")
 KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET", "")
 
-# Optional: sim quote cash only for DRY testing if you don't have private balances
+# Optional DRY sim quote balance
 SIM_BALANCE_QUOTE = os.getenv("SIM_BALANCE_QUOTE")
 
 # =========================
@@ -73,32 +73,19 @@ def load_state():
             pass
     return {"positions": {}, "spend": {}}
 
-def save_state(st):
-    STATE_PATH.write_text(json.dumps(st, indent=2, sort_keys=True))
-
-def today_key():
-    return datetime.now(timezone.utc).astimezone().strftime("%Y%m%d")
-
+def save_state(st): STATE_PATH.write_text(json.dumps(st, indent=2, sort_keys=True))
+def today_key():    return datetime.now(timezone.utc).astimezone().strftime("%Y%m%d")
 def add_daily_spend(st, usd):
     k = today_key()
     st["spend"][k] = float(st["spend"].get(k, 0.0) + float(usd))
-
-def spent_today(st):
-    return float(st["spend"].get(today_key(), 0.0))
+def spent_today(st): return float(st["spend"].get(today_key(), 0.0))
 
 # =========================
 # UTILS
 # =========================
-def now_iso():
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
-
-def pct(a, b):
-    if b == 0:
-        return 0.0
-    return (a - b) / b * 100.0
-
+def now_iso(): return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+def pct(a, b): return 0.0 if b == 0 else (a - b) / b * 100.0
 def fmt2(x): return f"{float(x):.2f}"
-
 def base(sym): return sym.split("/")[0]
 def quote(sym): return sym.split("/")[1] if "/" in sym else "USD"
 
@@ -130,10 +117,9 @@ def price(symbol: str) -> float:
 def fetch_closes(symbol: str, timeframe: str, limit: int):
     init_exchange()
     ohlcv = EX.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    return [float(c[4]) for c in ohlcv]  # close prices only
+    return [float(c[4]) for c in ohlcv]
 
 def change_pct_tf(symbol: str) -> float:
-    """Percent change for last bar vs previous bar on chosen timeframe."""
     init_exchange()
     ohlcv = EX.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=2)
     if ohlcv and len(ohlcv) >= 2:
@@ -141,8 +127,7 @@ def change_pct_tf(symbol: str) -> float:
         cur_last   = float(ohlcv[-1][4])
         return pct(cur_last, prev_close)
     t = EX.fetch_ticker(symbol)
-    o = t.get("open")
-    l = t.get("last") or t.get("close")
+    o = t.get("open"); l = t.get("last") or t.get("close")
     return pct(float(l), float(o)) if (o and l) else 0.0
 
 def balances():
@@ -157,23 +142,17 @@ def qty_free(sym: str) -> float:
     return float(bal.get("free", {}).get(base(sym), 0.0))
 
 def free_balance_for_quote(q: str) -> float:
-    """Handle Kraken aliases for fiat (USD/ZUSD) and allow DRY sim if needed."""
-    bal = balances()
-    free = bal.get("free", {}) or {}
+    bal = balances(); free = bal.get("free", {}) or {}
     candidates = [q, q.upper()]
     if len(q) == 3:
         candidates += [f"Z{q.upper()}", f"X{q.upper()}"]
     for k in candidates:
         if k in free:
-            try:
-                return float(free[k])
-            except Exception:
-                pass
+            try: return float(free[k])
+            except Exception: pass
     if DRY_RUN and SIM_BALANCE_QUOTE:
-        try:
-            return float(SIM_BALANCE_QUOTE)
-        except Exception:
-            pass
+        try: return float(SIM_BALANCE_QUOTE)
+        except Exception: pass
     return 0.0
 
 # =========================
@@ -262,15 +241,10 @@ def place_sell(symbol: str, qty: float, px: float):
 # Auto-universe builder
 # =========================
 def usd_volume_from_ticker(t, last_fallback=0.0):
-    """
-    Try quoteVolume first (already in quote ccy). If absent, use baseVolume * last.
-    """
     qv = t.get("quoteVolume")
     if qv is not None:
-        try:
-            return float(qv)
-        except Exception:
-            pass
+        try: return float(qv)
+        except Exception: pass
     bv = t.get("baseVolume")
     last = t.get("last") or t.get("close") or last_fallback
     try:
@@ -281,38 +255,23 @@ def usd_volume_from_ticker(t, last_fallback=0.0):
     return 0.0
 
 def build_universe() -> list:
-    """
-    Returns list of symbols to scan this run.
-    Modes:
-      - manual: use SYMBOLS_MANUAL
-      - auto:   fetch all USD/ZUSD spot pairs, rank by 24h USD volume, keep TOP_N_SYMBOLS
-    """
     if UNIVERSE_MODE != "auto":
         return SYMBOLS_MANUAL
 
     init_exchange()
-    # Load markets once (ensures symbol mapping)
     EX.load_markets()
-    # gather all spot USD-like symbols
     usd_aliases = {QUOTE_CCY.upper(), f"Z{QUOTE_CCY.upper()}", f"X{QUOTE_CCY.upper()}"}
     all_syms = [m["symbol"] for m in EX.markets.values()
-                if (m.get("spot", True)
-                    and m.get("active", True)
+                if (m.get("spot", True) and m.get("active", True)
                     and m.get("quote", "").upper() in usd_aliases)]
-
-    # Fetch tickers in one shot if supported (Kraken supports fetchTickers with symbols list)
     tickers = {}
     try:
-        tickers = EX.fetch_tickers(all_syms)  # dict keyed by symbol
+        tickers = EX.fetch_tickers(all_syms)
     except Exception:
-        # Fallback: fetch per-symbol (slower, but robust)
         for s in all_syms:
-            try:
-                tickers[s] = EX.fetch_ticker(s)
-            except Exception:
-                pass
+            try: tickers[s] = EX.fetch_ticker(s)
+            except Exception: pass
 
-    # Compute USD volumes and filter
     ranked = []
     for s in all_syms:
         t = tickers.get(s, {})
@@ -320,20 +279,15 @@ def build_universe() -> list:
         vol_usd = usd_volume_from_ticker(t, last_fallback=last or 0.0)
         if vol_usd >= MIN_USD_VOL:
             ranked.append((s, vol_usd))
-
-    # Sort by volume desc and keep top-N
     ranked.sort(key=lambda x: x[1], reverse=True)
     picked = [s for (s, v) in ranked[:max(1, TOP_N_SYMBOLS)]]
 
-    # Apply exclude / include
     excl = set(EXCLUDE_SYMBOLS)
     inc  = [s for s in INCLUDE_SYMBOLS if s not in picked and s in EX.markets]
     final = [s for s in picked if s not in excl] + inc
-
-    # If nothing made the cut, fall back to manual list (safe guard)
     if not final:
         final = SYMBOLS_MANUAL
-    return list(dict.fromkeys(final))  # unique, preserve order
+    return list(dict.fromkeys(final))
 
 # =========================
 # CORE
@@ -346,7 +300,6 @@ def run_once():
           f"DROP_GATE={fmt2(DROP_PCT_GATE)}% | TF={TIMEFRAME} | RSI({RSI_LEN}) {'ON' if ENABLE_RSI else 'OFF'} "
           f"max≤{fmt2(RSI_MAX)} | private_api={'ON' if private_api else 'OFF'}")
 
-    # Universe (auto or manual)
     universe = build_universe()
     if UNIVERSE_MODE == "auto":
         print(f"{now_iso()} | universe_mode=auto | quote={QUOTE_CCY} | top_n={TOP_N_SYMBOLS} | min_usd_vol={fmt2(MIN_USD_VOL)}")
@@ -358,7 +311,6 @@ def run_once():
     buys_placed = 0
     sells_placed = 0
 
-    # Price cache
     px_cache = {}
     def get_px(sym):
         if sym not in px_cache:
@@ -400,12 +352,11 @@ def run_once():
             state["positions"].pop(sym, None)
 
     # ---------- BUY WINDOW ----------
-    q = QUOTE_CCY  # auto universe uses single quote by design
+    q = QUOTE_CCY
     quote_free = free_balance_for_quote(q)
     daily_remaining = max(0.0, DAILY_SPEND_CAP_USD - spent_today(state))
     can_spend = min(quote_free, daily_remaining)
 
-    # Count only non-dust holdings as open trades
     open_trades = 0
     for s in universe:
         qf = qty_free(s)
@@ -419,7 +370,6 @@ def run_once():
     if can_spend >= max(MIN_BALANCE_USD, POSITION_SIZE_USD) and open_trades < MAX_OPEN_TRADES:
         candidates = []
         for sym in universe:
-            # skip if already holding non-dust
             qf = qty_free(sym)
             if qf > 0 and (qf * get_px(sym)) >= MIN_ACTIVE_POSITION_USD:
                 continue
@@ -429,8 +379,17 @@ def run_once():
             ok_rsi  = (True if not ENABLE_RSI else (rsi is not None and rsi <= RSI_MAX))
             candidates.append((sym, chg, rsi, ok_drop and ok_rsi))
 
+        # Preview top-5 by most negative change
+        preview = sorted(candidates, key=lambda x: x[1])[:5]
+        if preview:
+            rows = []
+            for (sym, chg, rsi, ok) in preview:
+                rsi_txt = "-" if (rsi is None) else fmt2(rsi)
+                rows.append(f"{sym} Δ{fmt2(chg)}% rsi={rsi_txt} {'✓' if ok else '×'}")
+            print(f"{now_iso()} | preview_top5 = [{'; '.join(rows)}]")
+
         picked = None
-        for sym, chg, rsi, ok in sorted(candidates, key=lambda x: x[1]):  # most negative first
+        for sym, chg, rsi, ok in sorted(candidates, key=lambda x: x[1]):
             if ok:
                 picked = (sym, chg, rsi)
                 break
@@ -464,9 +423,6 @@ def run_once():
     print(f"Run complete. buys_placed={buys_placed} | sells_placed={sells_placed} | DRY_RUN={DRY_RUN}")
     print("=== END TRADING OUTPUT ===")
 
-# =========================
-# Entrypoint
-# =========================
 if __name__ == "__main__":
     try:
         run_once()
