@@ -1,51 +1,66 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Crypto bot with:
+- Auto-universe (top-N USD pairs by 24h USD volume) or manual symbol list
+- Balanced/Active picker via env knobs (DROP %, RSI, timeframe)
+- TP/SL + trailing exits
+- Daily spend cap, max concurrent positions
+- Dust ignore threshold so tiny holdings don't block buys
+"""
+
 import os, json, sys, traceback
-from datetime import datetime, timezone
 from pathlib import Path
+from datetime import datetime, timezone
 
 # =========================
 # ENV / KNOBS
 # =========================
+
+# Runtime
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
+# Picker
+TIMEFRAME          = os.getenv("CANDLES_TIMEFRAME", "15m")
+DROP_PCT_GATE      = float(os.getenv("DROP_PCT", "2.5"))   # requires 15m/5m change <= -DROP_PCT_GATE
+ENABLE_RSI         = os.getenv("ENABLE_RSI", "true").lower() == "true"
+RSI_LEN            = int(os.getenv("RSI_LEN", "14"))
+RSI_MAX            = float(os.getenv("RSI_MAX", "35"))
+
 # Exits
-TAKE_PROFIT_PCT   = float(os.getenv("TAKE_PROFIT_PCT", "3.0"))
-STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT", "2.0"))
+TAKE_PROFIT_PCT    = float(os.getenv("TAKE_PROFIT_PCT", "3.0"))
+STOP_LOSS_PCT      = float(os.getenv("STOP_LOSS_PCT", "2.0"))
+TRAIL_START_PCT    = float(os.getenv("TRAIL_START_PCT", "3.0"))
+TRAIL_OFFSET_PCT   = float(os.getenv("TRAIL_OFFSET_PCT", "1.0"))
 
-# Trailing profit
-TRAIL_START_PCT   = float(os.getenv("TRAIL_START_PCT", "3.0"))
-TRAIL_OFFSET_PCT  = float(os.getenv("TRAIL_OFFSET_PCT", "1.0"))
+# Sizing / caps
+POSITION_SIZE_USD       = float(os.getenv("POSITION_SIZE_USD", "10"))
+DAILY_SPEND_CAP_USD     = float(os.getenv("DAILY_SPEND_CAP_USD", "15"))
+MAX_OPEN_TRADES         = int(os.getenv("MAX_OPEN_TRADES", "3"))
+MIN_BALANCE_USD         = float(os.getenv("MIN_BALANCE_USD", "5"))
+MIN_ACTIVE_POSITION_USD = float(os.getenv("MIN_ACTIVE_POSITION_USD", "2"))  # "dust" floor
 
-# Buy controls
-POSITION_SIZE_USD    = float(os.getenv("POSITION_SIZE_USD", "10"))
-DAILY_SPEND_CAP_USD  = float(os.getenv("DAILY_SPEND_CAP_USD", "15"))
-MAX_OPEN_TRADES      = int(os.getenv("MAX_OPEN_TRADES", "3"))
-MIN_BALANCE_USD      = float(os.getenv("MIN_BALANCE_USD", "5"))
+# Universe controls
+UNIVERSE_MODE     = os.getenv("UNIVERSE_MODE", "manual").lower()  # "auto" or "manual"
+QUOTE_CCY         = os.getenv("QUOTE", "USD").upper()              # target quote for auto mode
+TOP_N_SYMBOLS     = int(os.getenv("TOP_N_SYMBOLS", "12"))         # auto mode: take top N by USD 24h vol
+MIN_USD_VOL       = float(os.getenv("MIN_USD_VOL", "1000000"))    # auto mode: min 24h USD volume
+EXCLUDE_SYMBOLS   = [s.strip() for s in os.getenv("EXCLUDE_SYMBOLS", "").split(",") if s.strip()]
+INCLUDE_SYMBOLS   = [s.strip() for s in os.getenv("INCLUDE_SYMBOLS", "").split(",") if s.strip()]
 
-# NEW: Ignore dust positions below this USD value
-MIN_ACTIVE_POSITION_USD = float(os.getenv("MIN_ACTIVE_POSITION_USD", "2.0"))
+# Manual fallback list (also used when UNIVERSE_MODE="manual")
+SYMBOLS_MANUAL = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USD,ETH/USD,DOGE/USD").split(",") if s.strip()]
 
-# Picker (Balanced)
-DROP_PCT_GATE        = float(os.getenv("DROP_PCT", "2.5"))
-TIMEFRAME            = os.getenv("CANDLES_TIMEFRAME", "15m")
-
-# RSI filter
-ENABLE_RSI           = os.getenv("ENABLE_RSI", "true").lower() == "true"
-RSI_LEN              = int(os.getenv("RSI_LEN", "14"))
-RSI_MAX              = float(os.getenv("RSI_MAX", "35"))
-
-# Universe
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USD,ETH/USD,DOGE/USD").split(",") if s.strip()]
-
-# Kraken keys
+# Exchange credentials (Kraken)
 KRAKEN_API_KEY    = os.getenv("KRAKEN_API_KEY", "")
 KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET", "")
 
-# Optional simulated balance (quote currency) for DRY runs
+# Optional: sim quote cash only for DRY testing if you don't have private balances
 SIM_BALANCE_QUOTE = os.getenv("SIM_BALANCE_QUOTE")
 
 # =========================
-# STATE
+# PERSISTED STATE
 # =========================
 STATE_PATH = Path("state/trade_state.json")
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -58,21 +73,21 @@ def load_state():
             pass
     return {"positions": {}, "spend": {}}
 
-def save_state(state):
-    STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True))
+def save_state(st):
+    STATE_PATH.write_text(json.dumps(st, indent=2, sort_keys=True))
 
 def today_key():
     return datetime.now(timezone.utc).astimezone().strftime("%Y%m%d")
 
-def add_daily_spend(state, usd):
+def add_daily_spend(st, usd):
     k = today_key()
-    state["spend"][k] = float(state["spend"].get(k, 0.0) + float(usd))
+    st["spend"][k] = float(st["spend"].get(k, 0.0) + float(usd))
 
-def spent_today(state):
-    return float(state["spend"].get(today_key(), 0.0))
+def spent_today(st):
+    return float(st["spend"].get(today_key(), 0.0))
 
 # =========================
-# Utils
+# UTILS
 # =========================
 def now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -83,6 +98,9 @@ def pct(a, b):
     return (a - b) / b * 100.0
 
 def fmt2(x): return f"{float(x):.2f}"
+
+def base(sym): return sym.split("/")[0]
+def quote(sym): return sym.split("/")[1] if "/" in sym else "USD"
 
 # =========================
 # CCXT / Kraken
@@ -112,9 +130,10 @@ def price(symbol: str) -> float:
 def fetch_closes(symbol: str, timeframe: str, limit: int):
     init_exchange()
     ohlcv = EX.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    return [float(c[4]) for c in ohlcv]  # close prices
+    return [float(c[4]) for c in ohlcv]  # close prices only
 
-def change_pct_15m(symbol: str) -> float:
+def change_pct_tf(symbol: str) -> float:
+    """Percent change for last bar vs previous bar on chosen timeframe."""
     init_exchange()
     ohlcv = EX.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=2)
     if ohlcv and len(ohlcv) >= 2:
@@ -133,18 +152,12 @@ def balances():
     except Exception:
         return {"free": {}}
 
-def base(sym: str) -> str:
-    return sym.split("/")[0]
-
-def quote(sym: str) -> str:
-    return sym.split("/")[1] if "/" in sym else "USD"
-
 def qty_free(sym: str) -> float:
     bal = balances()
     return float(bal.get("free", {}).get(base(sym), 0.0))
 
 def free_balance_for_quote(q: str) -> float:
-    """Handle Kraken fiat aliases like ZUSD and allow DRY simulation."""
+    """Handle Kraken aliases for fiat (USD/ZUSD) and allow DRY sim if needed."""
     bal = balances()
     free = bal.get("free", {}) or {}
     candidates = [q, q.upper()]
@@ -162,6 +175,58 @@ def free_balance_for_quote(q: str) -> float:
         except Exception:
             pass
     return 0.0
+
+# =========================
+# RSI (Wilder)
+# =========================
+def compute_rsi(closes, length: int) -> float:
+    if len(closes) < length + 1:
+        return 50.0
+    gains, losses = [], []
+    for i in range(1, length + 1):
+        ch = closes[i] - closes[i-1]
+        gains.append(max(ch, 0.0)); losses.append(max(-ch, 0.0))
+    avg_gain = sum(gains) / length; avg_loss = sum(losses) / length
+    for i in range(length + 1, len(closes)):
+        ch = closes[i] - closes[i-1]
+        g = max(ch, 0.0); l = max(-ch, 0.0)
+        avg_gain = (avg_gain * (length - 1) + g) / length
+        avg_loss = (avg_loss * (length - 1) + l) / length
+    if avg_loss == 0: return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def rsi_now(symbol: str, length: int) -> float:
+    closes = fetch_closes(symbol, TIMEFRAME, limit=length + 50)
+    return compute_rsi(closes, length)
+
+# =========================
+# Trailing / entries / exits
+# =========================
+def ensure_entry(state, symbol, entry_avg):
+    pos = state["positions"].setdefault(symbol, {})
+    if "entry_avg" not in pos or pos["entry_avg"] <= 0:
+        pos["entry_avg"] = float(entry_avg)
+    pos.setdefault("peak_pnl_pct", 0.0)
+    pos.setdefault("trail_active", False)
+
+def maybe_activate_trailing(state, symbol, pnl_pct):
+    pos = state["positions"][symbol]
+    if pnl_pct > pos["peak_pnl_pct"]:
+        pos["peak_pnl_pct"] = float(pnl_pct)
+    if not pos["trail_active"] and pnl_pct >= TRAIL_START_PCT:
+        pos["trail_active"] = True
+
+def should_trail_exit(state, symbol, pnl_pct):
+    pos = state["positions"][symbol]
+    if not pos["trail_active"]:
+        return False
+    return (pos["peak_pnl_pct"] - pnl_pct) >= TRAIL_OFFSET_PCT
+
+def decide_sell(pnl_pct):
+    if pnl_pct >= TAKE_PROFIT_PCT: return "TP"
+    if pnl_pct <= -STOP_LOSS_PCT:  return "SL"
+    return None
 
 # =========================
 # Orders
@@ -194,75 +259,107 @@ def place_sell(symbol: str, qty: float, px: float):
     return {"status": "ok", "symbol": symbol, "filled": qty, "order": o}
 
 # =========================
-# RSI (Wilder)
+# Auto-universe builder
 # =========================
-def compute_rsi(closes, length: int) -> float:
-    if len(closes) < length + 1:
-        return 50.0
-    gains, losses = [], []
-    for i in range(1, length + 1):
-        ch = closes[i] - closes[i-1]
-        gains.append(max(ch, 0.0)); losses.append(max(-ch, 0.0))
-    avg_gain = sum(gains) / length; avg_loss = sum(losses) / length
-    for i in range(length + 1, len(closes)):
-        ch = closes[i] - closes[i-1]
-        g = max(ch, 0.0); l = max(-ch, 0.0)
-        avg_gain = (avg_gain * (length - 1) + g) / length
-        avg_loss = (avg_loss * (length - 1) + l) / length
-    if avg_loss == 0: return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+def usd_volume_from_ticker(t, last_fallback=0.0):
+    """
+    Try quoteVolume first (already in quote ccy). If absent, use baseVolume * last.
+    """
+    qv = t.get("quoteVolume")
+    if qv is not None:
+        try:
+            return float(qv)
+        except Exception:
+            pass
+    bv = t.get("baseVolume")
+    last = t.get("last") or t.get("close") or last_fallback
+    try:
+        if bv is not None and last is not None:
+            return float(bv) * float(last)
+    except Exception:
+        pass
+    return 0.0
 
-def rsi_now(symbol: str, length: int) -> float:
-    closes = fetch_closes(symbol, TIMEFRAME, limit=length + 50)
-    return compute_rsi(closes, length)
+def build_universe() -> list:
+    """
+    Returns list of symbols to scan this run.
+    Modes:
+      - manual: use SYMBOLS_MANUAL
+      - auto:   fetch all USD/ZUSD spot pairs, rank by 24h USD volume, keep TOP_N_SYMBOLS
+    """
+    if UNIVERSE_MODE != "auto":
+        return SYMBOLS_MANUAL
+
+    init_exchange()
+    # Load markets once (ensures symbol mapping)
+    EX.load_markets()
+    # gather all spot USD-like symbols
+    usd_aliases = {QUOTE_CCY.upper(), f"Z{QUOTE_CCY.upper()}", f"X{QUOTE_CCY.upper()}"}
+    all_syms = [m["symbol"] for m in EX.markets.values()
+                if (m.get("spot", True)
+                    and m.get("active", True)
+                    and m.get("quote", "").upper() in usd_aliases)]
+
+    # Fetch tickers in one shot if supported (Kraken supports fetchTickers with symbols list)
+    tickers = {}
+    try:
+        tickers = EX.fetch_tickers(all_syms)  # dict keyed by symbol
+    except Exception:
+        # Fallback: fetch per-symbol (slower, but robust)
+        for s in all_syms:
+            try:
+                tickers[s] = EX.fetch_ticker(s)
+            except Exception:
+                pass
+
+    # Compute USD volumes and filter
+    ranked = []
+    for s in all_syms:
+        t = tickers.get(s, {})
+        last = t.get("last") or t.get("close")
+        vol_usd = usd_volume_from_ticker(t, last_fallback=last or 0.0)
+        if vol_usd >= MIN_USD_VOL:
+            ranked.append((s, vol_usd))
+
+    # Sort by volume desc and keep top-N
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    picked = [s for (s, v) in ranked[:max(1, TOP_N_SYMBOLS)]]
+
+    # Apply exclude / include
+    excl = set(EXCLUDE_SYMBOLS)
+    inc  = [s for s in INCLUDE_SYMBOLS if s not in picked and s in EX.markets]
+    final = [s for s in picked if s not in excl] + inc
+
+    # If nothing made the cut, fall back to manual list (safe guard)
+    if not final:
+        final = SYMBOLS_MANUAL
+    return list(dict.fromkeys(final))  # unique, preserve order
 
 # =========================
-# Trailing + exit helpers
-# =========================
-def ensure_entry(state, symbol, entry_avg):
-    pos = state["positions"].setdefault(symbol, {})
-    if "entry_avg" not in pos or pos["entry_avg"] <= 0:
-        pos["entry_avg"] = float(entry_avg)
-    pos.setdefault("peak_pnl_pct", 0.0)
-    pos.setdefault("trail_active", False)
-
-def maybe_activate_trailing(state, symbol, pnl_pct):
-    pos = state["positions"][symbol]
-    if pnl_pct > pos["peak_pnl_pct"]:
-        pos["peak_pnl_pct"] = float(pnl_pct)
-    if not pos["trail_active"] and pnl_pct >= TRAIL_START_PCT:
-        pos["trail_active"] = True
-
-def should_trail_exit(state, symbol, pnl_pct):
-    pos = state["positions"][symbol]
-    if not pos["trail_active"]:
-        return False
-    return (pos["peak_pnl_pct"] - pnl_pct) >= TRAIL_OFFSET_PCT
-
-def decide_sell(pnl_pct):
-    if pnl_pct >= TAKE_PROFIT_PCT: return "TP"
-    if pnl_pct <= -STOP_LOSS_PCT:  return "SL"
-    return None
-
-# =========================
-# Core run
+# CORE
 # =========================
 def run_once():
     private_api = bool(KRAKEN_API_KEY and KRAKEN_API_SECRET)
     print("=== START TRADING OUTPUT ===")
     print(f"{now_iso()} | run started | DRY_RUN={DRY_RUN} | TP={fmt2(TAKE_PROFIT_PCT)}% | SL={fmt2(STOP_LOSS_PCT)}% | "
           f"TRAIL_START={fmt2(TRAIL_START_PCT)}% | TRAIL_OFFSET={fmt2(TRAIL_OFFSET_PCT)}% | "
-          f"DROP_GATE={fmt2(DROP_PCT_GATE)}% | TF={TIMEFRAME} | RSI({RSI_LEN}) {'ON' if ENABLE_RSI else 'OFF'} max≤{fmt2(RSI_MAX)} | "
-          f"private_api={'ON' if private_api else 'OFF'}")
+          f"DROP_GATE={fmt2(DROP_PCT_GATE)}% | TF={TIMEFRAME} | RSI({RSI_LEN}) {'ON' if ENABLE_RSI else 'OFF'} "
+          f"max≤{fmt2(RSI_MAX)} | private_api={'ON' if private_api else 'OFF'}")
+
+    # Universe (auto or manual)
+    universe = build_universe()
+    if UNIVERSE_MODE == "auto":
+        print(f"{now_iso()} | universe_mode=auto | quote={QUOTE_CCY} | top_n={TOP_N_SYMBOLS} | min_usd_vol={fmt2(MIN_USD_VOL)}")
+    else:
+        print(f"{now_iso()} | universe_mode=manual")
+    print(f"{now_iso()} | scanning={universe}")
 
     state = load_state()
     buys_placed = 0
     sells_placed = 0
 
-    # Price cache to avoid double-fetching
+    # Price cache
     px_cache = {}
-
     def get_px(sym):
         if sym not in px_cache:
             px_cache[sym] = price(sym)
@@ -270,11 +367,10 @@ def run_once():
 
     # ---------- SELL CHECK ----------
     dust_ignored = 0
-    for sym in SYMBOLS:
+    for sym in universe:
         qty = qty_free(sym)
         if qty <= 0:
             continue
-
         px = get_px(sym)
         value_usd = qty * px
         if value_usd < MIN_ACTIVE_POSITION_USD:
@@ -304,14 +400,14 @@ def run_once():
             state["positions"].pop(sym, None)
 
     # ---------- BUY WINDOW ----------
-    q = quote(SYMBOLS[0]) if SYMBOLS else "USD"
+    q = QUOTE_CCY  # auto universe uses single quote by design
     quote_free = free_balance_for_quote(q)
     daily_remaining = max(0.0, DAILY_SPEND_CAP_USD - spent_today(state))
     can_spend = min(quote_free, daily_remaining)
 
     # Count only non-dust holdings as open trades
     open_trades = 0
-    for s in SYMBOLS:
+    for s in universe:
         qf = qty_free(s)
         if qf > 0:
             vx = qf * get_px(s)
@@ -322,17 +418,16 @@ def run_once():
 
     if can_spend >= max(MIN_BALANCE_USD, POSITION_SIZE_USD) and open_trades < MAX_OPEN_TRADES:
         candidates = []
-        for sym in SYMBOLS:
+        for sym in universe:
+            # skip if already holding non-dust
             qf = qty_free(sym)
-            if qf > 0:
-                # skip holdings only if they're not dust
-                if qf * get_px(sym) >= MIN_ACTIVE_POSITION_USD:
-                    continue
-            chg15 = change_pct_15m(sym)
+            if qf > 0 and (qf * get_px(sym)) >= MIN_ACTIVE_POSITION_USD:
+                continue
+            chg = change_pct_tf(sym)
             rsi = rsi_now(sym, RSI_LEN) if ENABLE_RSI else None
-            ok_drop = (chg15 <= -abs(DROP_PCT_GATE))
+            ok_drop = (chg <= -abs(DROP_PCT_GATE))
             ok_rsi  = (True if not ENABLE_RSI else (rsi is not None and rsi <= RSI_MAX))
-            candidates.append((sym, chg15, rsi, ok_drop and ok_rsi))
+            candidates.append((sym, chg, rsi, ok_drop and ok_rsi))
 
         picked = None
         for sym, chg, rsi, ok in sorted(candidates, key=lambda x: x[1]):  # most negative first
@@ -344,7 +439,7 @@ def run_once():
             psym, pchg, prsi = picked
             px = get_px(psym)
             rsi_txt = f", RSI={fmt2(prsi)}" if ENABLE_RSI else ""
-            print(f"{now_iso()} | Best candidate | {psym} 15m_change={fmt2(pchg)}% (gate {fmt2(-abs(DROP_PCT_GATE))}%){rsi_txt} → BUY ${fmt2(POSITION_SIZE_USD)} @ {fmt2(px)}")
+            print(f"{now_iso()} | Best candidate | {psym} {TIMEFRAME}_change={fmt2(pchg)}% (gate {fmt2(-abs(DROP_PCT_GATE))}%){rsi_txt} → BUY ${fmt2(POSITION_SIZE_USD)} @ {fmt2(px)}")
             r = place_buy(psym, POSITION_SIZE_USD, px)
             if r.get("status") in ("ok", "dry"):
                 buys_placed += 1
@@ -370,7 +465,7 @@ def run_once():
     print("=== END TRADING OUTPUT ===")
 
 # =========================
-# Main
+# Entrypoint
 # =========================
 if __name__ == "__main__":
     try:
