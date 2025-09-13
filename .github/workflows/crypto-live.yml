@@ -12,7 +12,7 @@ concurrency:
 env:
   # --- Runtime ---
   PYTHON_VERSION: "3.11"
-  DRY_RUN: "false"                 # flip to "true" to pause live trading
+  DRY_RUN: "true"                 # flip to "true" to pause live trading
 
   # --- Entry gates (more active than Option-B) ---
   CANDLES_TIMEFRAME: "5m"
