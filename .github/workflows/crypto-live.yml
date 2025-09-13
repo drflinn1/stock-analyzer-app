@@ -1,4 +1,4 @@
-name: Crypto Live (Active — 5m, Auto-Universe)
+name: Crypto Live (5m, Auto-Universe, Active+)
 
 on:
   workflow_dispatch:
@@ -12,37 +12,37 @@ concurrency:
 env:
   # --- Runtime ---
   PYTHON_VERSION: "3.11"
-  DRY_RUN: "false"                 # set to "true" to pause live trading
+  DRY_RUN: "false"                 # flip to "true" to pause live trading
 
-  # --- Picker (Active) ---
+  # --- Picker (Active+) ---
   CANDLES_TIMEFRAME: "5m"
-  DROP_PCT: "1.5"                  # looser than 2.5 → more entries
+  DROP_PCT: "1.0"                  # looser than 1.5 → more entries
   ENABLE_RSI: "true"
   RSI_LEN: "14"
-  RSI_MAX: "45"                    # looser than 35 → more entries
+  RSI_MAX: "50"                    # looser than 45 → more entries
 
   # --- Exits ---
   TAKE_PROFIT_PCT: "3.0"
   STOP_LOSS_PCT: "2.0"
-  TRAIL_START_PCT: "2.5"           # earlier trailing
-  TRAIL_OFFSET_PCT: "0.8"          # tighter lock-in
+  TRAIL_START_PCT: "2.5"
+  TRAIL_OFFSET_PCT: "0.8"
 
   # --- Sizing & caps ---
   POSITION_SIZE_USD: "10"
-  DAILY_SPEND_CAP_USD: "40"        # daily cap
+  DAILY_SPEND_CAP_USD: "40"
   MAX_OPEN_TRADES: "5"
   MIN_BALANCE_USD: "5"
-  MIN_ACTIVE_POSITION_USD: "2"     # ignore dust < $2 so it won't block buys
+  MIN_ACTIVE_POSITION_USD: "2"     # ignore dust < $2
 
-  # --- Universe ---
-  # Choose mode: "auto" (top-N by 24h USD volume) or "manual"
+  # --- Universe (auto) ---
   UNIVERSE_MODE: "auto"
   QUOTE: "USD"
-  TOP_N_SYMBOLS: "12"
-  MIN_USD_VOL: "1000000"           # only consider pairs with ≥ $1M 24h USD vol
+  TOP_N_SYMBOLS: "20"              # scan more pairs each run
+  MIN_USD_VOL: "500000"            # include down to $500k/day volume
   EXCLUDE_SYMBOLS: ""              # e.g., "XRP/USD,SHIB/USD"
-  INCLUDE_SYMBOLS: "BTC/USD,ETH/USD"   # force-include favorites
-  # Manual list is only used if UNIVERSE_MODE="manual" or auto yields nothing
+  INCLUDE_SYMBOLS: "BTC/USD,ETH/USD"   # always include favorites
+
+  # Manual list used if UNIVERSE_MODE="manual" or auto yields nothing
   SYMBOLS: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD,LTC/USD,LINK/USD,AVAX/USD,ADA/USD,DOT/USD"
 
 jobs:
@@ -64,7 +64,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt
 
-      # sanity: ensure Kraken keys are wired
       - name: Sanity — Kraken keys present?
         env:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || vars.KRAKEN_API_KEY }}
@@ -79,7 +78,7 @@ jobs:
 
       - name: Run trader
         env:
-          # Kraken credentials
+          # credentials
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || vars.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || vars.KRAKEN_API_SECRET }}
 
@@ -106,7 +105,7 @@ jobs:
           MIN_BALANCE_USD: ${{ env.MIN_BALANCE_USD }}
           MIN_ACTIVE_POSITION_USD: ${{ env.MIN_ACTIVE_POSITION_USD }}
 
-          # universe controls
+          # universe
           UNIVERSE_MODE: ${{ env.UNIVERSE_MODE }}
           QUOTE: ${{ env.QUOTE }}
           TOP_N_SYMBOLS: ${{ env.TOP_N_SYMBOLS }}
