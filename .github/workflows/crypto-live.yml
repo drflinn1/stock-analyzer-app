@@ -14,12 +14,12 @@ env:
   PYTHON_VERSION: "3.11"
   DRY_RUN: "false"                 # flip to "true" to pause live trading
 
-  # --- Picker (a bit looser than Option-B) ---
+  # --- Entry gates (more active than Option-B) ---
   CANDLES_TIMEFRAME: "5m"
-  DROP_PCT: "0.9"                  # was 1.0 → slightly more entries
+  DROP_PCT: "0.6"                  # looser drop gate (was 0.9)
   ENABLE_RSI: "true"
   RSI_LEN: "14"
-  RSI_MAX: "55"                    # was 50 → slightly more entries
+  RSI_MAX: "60"                    # looser RSI cap (was 55)
 
   # --- Exits ---
   TAKE_PROFIT_PCT: "3.0"
@@ -37,8 +37,8 @@ env:
   # --- Universe (auto) ---
   UNIVERSE_MODE: "auto"
   QUOTE: "USD"
-  TOP_N_SYMBOLS: "24"              # scan more pairs each run
-  MIN_USD_VOL: "2000000"           # raise floor to avoid fringe/odd coins
+  TOP_N_SYMBOLS: "30"              # scan more pairs each run
+  MIN_USD_VOL: "1000000"           # $1M/day floor
   EXCLUDE_SYMBOLS: "USDT/USD,USDC/USD,DAI/USD,EUR/USD"
   INCLUDE_SYMBOLS: "BTC/USD,ETH/USD"   # always include favorites
 
@@ -70,7 +70,7 @@ jobs:
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || vars.KRAKEN_API_SECRET }}
         run: |
           if [ -z "${KRAKEN_API_KEY}" ] || [ -z "${KRAKEN_API_SECRET}" ]; then
-            echo "❌ Kraken keys are missing. Add KRAKEN_API_KEY and KRAKEN_API_SECRET under Settings → Secrets → Actions."
+            echo "❌ Kraken keys are missing. Add KRAKEN_API_KEY and KRAKEN_API_SECRET in Settings → Secrets → Actions."
             exit 1
           else
             echo "✅ Kraken keys detected."
