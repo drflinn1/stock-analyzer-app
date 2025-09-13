@@ -12,43 +12,40 @@ concurrency:
 env:
   # --- Runtime ---
   PYTHON_VERSION: "3.11"
-  DRY_RUN: "true"                 # flip to "true" to pause live trading
+  DRY_RUN: "false"            # <— LIVE
+  PRIVATE_API: "ON"           # use Kraken authenticated endpoints
 
-  # --- Entry gates (more active than Option-B) ---
+  # --- Entry gates (active profile) ---
   CANDLES_TIMEFRAME: "5m"
-  DROP_PCT: "0.6"                  # looser drop gate (was 0.9)
+  DROP_PCT: "0.6"
   ENABLE_RSI: "true"
   RSI_LEN: "14"
-  RSI_MAX: "60"                    # looser RSI cap (was 55)
+  RSI_MAX: "60"
 
-  # --- Exits ---
+  # --- Risk / exits ---
   TAKE_PROFIT_PCT: "3.0"
   STOP_LOSS_PCT: "2.0"
   TRAIL_START_PCT: "2.5"
   TRAIL_OFFSET_PCT: "0.8"
 
-  # --- Sizing & caps ---
-  POSITION_SIZE_USD: "10"
+  # --- Sizing / budget ---
+  BUY_SIZE_USD: "10"               # small live probe
   DAILY_SPEND_CAP_USD: "40"
   MAX_OPEN_TRADES: "5"
   MIN_BALANCE_USD: "5"
-  MIN_ACTIVE_POSITION_USD: "2"     # ignore dust < $2
+  MIN_ACTIVE_POSITION_USD: "2"
 
-  # --- Universe (auto) ---
+  # --- Universe (auto from market liquidity) ---
   UNIVERSE_MODE: "auto"
   QUOTE: "USD"
-  TOP_N_SYMBOLS: "30"              # scan more pairs each run
-  MIN_USD_VOL: "1000000"           # $1M/day floor
-  EXCLUDE_SYMBOLS: "USDT/USD,USDC/USD,DAI/USD,EUR/USD"
-  INCLUDE_SYMBOLS: "BTC/USD,ETH/USD"   # always include favorites
-
-  # Manual list used if auto yields nothing
-  SYMBOLS: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD,LTC/USD,LINK/USD,AVAX/USD,ADA/USD,DOT/USD"
+  TOP_N_SYMBOLS: "30"
+  MIN_USD_VOL: "1000000"           # ≥ $1M 24h USD volume
+  EXCLUDE_SYMBOLS: ""              # comma-separated list if you want exclusions
 
 jobs:
-  run:
-    name: Run trader (LIVE)
+  live:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Check out repo
@@ -62,57 +59,25 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ccxt
+          pip install -r requirements.txt
 
       - name: Sanity — Kraken keys present?
         env:
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || vars.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || vars.KRAKEN_API_SECRET }}
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           if [ -z "${KRAKEN_API_KEY}" ] || [ -z "${KRAKEN_API_SECRET}" ]; then
-            echo "❌ Kraken keys are missing. Add KRAKEN_API_KEY and KRAKEN_API_SECRET in Settings → Secrets → Actions."
+            echo "❌ Kraken keys are missing. Add KRAKEN_API_KEY and KRAKEN_API_SECRET in repo Settings → Secrets → Actions."
             exit 1
-          else
-            echo "✅ Kraken keys detected."
           fi
+          echo "✅ Kraken keys detected."
 
-      - name: Run trader
+      - name: Run trader (LIVE)
         env:
-          # credentials
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || vars.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || vars.KRAKEN_API_SECRET }}
-
-          # runtime
-          DRY_RUN: ${{ env.DRY_RUN }}
-
-          # picker
-          CANDLES_TIMEFRAME: ${{ env.CANDLES_TIMEFRAME }}
-          DROP_PCT: ${{ env.DROP_PCT }}
-          ENABLE_RSI: ${{ env.ENABLE_RSI }}
-          RSI_LEN: ${{ env.RSI_LEN }}
-          RSI_MAX: ${{ env.RSI_MAX }}
-
-          # exits
-          TAKE_PROFIT_PCT: ${{ env.TAKE_PROFIT_PCT }}
-          STOP_LOSS_PCT: ${{ env.STOP_LOSS_PCT }}
-          TRAIL_START_PCT: ${{ env.TRAIL_START_PCT }}
-          TRAIL_OFFSET_PCT: ${{ env.TRAIL_OFFSET_PCT }}
-
-          # sizing / caps
-          POSITION_SIZE_USD: ${{ env.POSITION_SIZE_USD }}
-          DAILY_SPEND_CAP_USD: ${{ env.DAILY_SPEND_CAP_USD }}
-          MAX_OPEN_TRADES: ${{ env.MAX_OPEN_TRADES }}
-          MIN_BALANCE_USD: ${{ env.MIN_BALANCE_USD }}
-          MIN_ACTIVE_POSITION_USD: ${{ env.MIN_ACTIVE_POSITION_USD }}
-
-          # universe
-          UNIVERSE_MODE: ${{ env.UNIVERSE_MODE }}
-          QUOTE: ${{ env.QUOTE }}
-          TOP_N_SYMBOLS: ${{ env.TOP_N_SYMBOLS }}
-          MIN_USD_VOL: ${{ env.MIN_USD_VOL }}
-          EXCLUDE_SYMBOLS: ${{ env.EXCLUDE_SYMBOLS }}
-          INCLUDE_SYMBOLS: ${{ env.INCLUDE_SYMBOLS }}
-          SYMBOLS: ${{ env.SYMBOLS }}
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           set -e
+          echo "=== START TRADING OUTPUT ==="
           python main.py
+          echo "=== END TRADING OUTPUT ==="
