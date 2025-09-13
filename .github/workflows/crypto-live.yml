@@ -1,4 +1,4 @@
-name: Crypto Live (Active — 5m LIVE)
+name: Crypto Live (Active — 5m, Auto-Universe)
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ concurrency:
 env:
   # --- Runtime ---
   PYTHON_VERSION: "3.11"
-  DRY_RUN: "false"                 # set to "true" if you want to pause live trading
+  DRY_RUN: "false"                 # set to "true" to pause live trading
 
   # --- Picker (Active) ---
   CANDLES_TIMEFRAME: "5m"
@@ -29,12 +29,20 @@ env:
 
   # --- Sizing & caps ---
   POSITION_SIZE_USD: "10"
-  DAILY_SPEND_CAP_USD: "40"        # was 15
-  MAX_OPEN_TRADES: "5"             # was 3
+  DAILY_SPEND_CAP_USD: "40"        # daily cap
+  MAX_OPEN_TRADES: "5"
   MIN_BALANCE_USD: "5"
   MIN_ACTIVE_POSITION_USD: "2"     # ignore dust < $2 so it won't block buys
 
-  # --- Universe (more liquid USD pairs) ---
+  # --- Universe ---
+  # Choose mode: "auto" (top-N by 24h USD volume) or "manual"
+  UNIVERSE_MODE: "auto"
+  QUOTE: "USD"
+  TOP_N_SYMBOLS: "12"
+  MIN_USD_VOL: "1000000"           # only consider pairs with ≥ $1M 24h USD vol
+  EXCLUDE_SYMBOLS: ""              # e.g., "XRP/USD,SHIB/USD"
+  INCLUDE_SYMBOLS: "BTC/USD,ETH/USD"   # force-include favorites
+  # Manual list is only used if UNIVERSE_MODE="manual" or auto yields nothing
   SYMBOLS: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD,LTC/USD,LINK/USD,AVAX/USD,ADA/USD,DOT/USD"
 
 jobs:
@@ -71,9 +79,11 @@ jobs:
 
       - name: Run trader
         env:
+          # Kraken credentials
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || vars.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || vars.KRAKEN_API_SECRET }}
 
+          # runtime
           DRY_RUN: ${{ env.DRY_RUN }}
 
           # picker
@@ -96,7 +106,13 @@ jobs:
           MIN_BALANCE_USD: ${{ env.MIN_BALANCE_USD }}
           MIN_ACTIVE_POSITION_USD: ${{ env.MIN_ACTIVE_POSITION_USD }}
 
-          # universe
+          # universe controls
+          UNIVERSE_MODE: ${{ env.UNIVERSE_MODE }}
+          QUOTE: ${{ env.QUOTE }}
+          TOP_N_SYMBOLS: ${{ env.TOP_N_SYMBOLS }}
+          MIN_USD_VOL: ${{ env.MIN_USD_VOL }}
+          EXCLUDE_SYMBOLS: ${{ env.EXCLUDE_SYMBOLS }}
+          INCLUDE_SYMBOLS: ${{ env.INCLUDE_SYMBOLS }}
           SYMBOLS: ${{ env.SYMBOLS }}
         run: |
           set -e
