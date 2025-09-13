@@ -1,4 +1,4 @@
-name: Crypto Live (5m, Auto-Universe, Active+)
+name: Crypto Live (5m, Auto-Universe, Active++)
 
 on:
   workflow_dispatch:
@@ -14,12 +14,12 @@ env:
   PYTHON_VERSION: "3.11"
   DRY_RUN: "false"                 # flip to "true" to pause live trading
 
-  # --- Picker (Active+) ---
+  # --- Picker (a bit looser than Option-B) ---
   CANDLES_TIMEFRAME: "5m"
-  DROP_PCT: "1.0"                  # looser than 1.5 → more entries
+  DROP_PCT: "0.9"                  # was 1.0 → slightly more entries
   ENABLE_RSI: "true"
   RSI_LEN: "14"
-  RSI_MAX: "50"                    # looser than 45 → more entries
+  RSI_MAX: "55"                    # was 50 → slightly more entries
 
   # --- Exits ---
   TAKE_PROFIT_PCT: "3.0"
@@ -37,12 +37,12 @@ env:
   # --- Universe (auto) ---
   UNIVERSE_MODE: "auto"
   QUOTE: "USD"
-  TOP_N_SYMBOLS: "20"              # scan more pairs each run
-  MIN_USD_VOL: "500000"            # include down to $500k/day volume
-  EXCLUDE_SYMBOLS: ""              # e.g., "XRP/USD,SHIB/USD"
+  TOP_N_SYMBOLS: "24"              # scan more pairs each run
+  MIN_USD_VOL: "2000000"           # raise floor to avoid fringe/odd coins
+  EXCLUDE_SYMBOLS: "USDT/USD,USDC/USD,DAI/USD,EUR/USD"
   INCLUDE_SYMBOLS: "BTC/USD,ETH/USD"   # always include favorites
 
-  # Manual list used if UNIVERSE_MODE="manual" or auto yields nothing
+  # Manual list used if auto yields nothing
   SYMBOLS: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD,LTC/USD,LINK/USD,AVAX/USD,ADA/USD,DOT/USD"
 
 jobs:
