@@ -1,6 +1,8 @@
 name: Crypto Live (Every 15 min) — LIVE
 
 on:
+  schedule:
+    - cron: "*/15 * * * *"     # run every 15 minutes
   workflow_dispatch:
     inputs:
       DRY_RUN:
@@ -19,100 +21,86 @@ on:
         description: 'Max total spend per run/day slice (USD)'
         required: true
         default: "15"
-      DROP_PCT:
-        description: 'Require 5m change <= -DROP_PCT (e.g., 0.60 for -0.60%)'
+      DROP_GATE:
+        description: 'Buy threshold (% drop needed to consider a buy)'
         required: true
         default: "0.60"
-      RSI_MAX:
-        description: 'Only buy if RSI <= RSI_MAX'
+      TAKE_PROFIT_PCT:
+        description: 'Take-profit percent (sell if gain ≥ this). Set "" to disable.'
         required: true
-        default: "60"
-      TOP_N:
-        description: 'Top N USD pairs by 24h volume to scan'
+        default: "3.0"
+      STOP_LOSS_PCT:
+        description: 'Stop-loss percent (sell if loss ≥ this). Set "" to disable.'
         required: true
-        default: "30"
-      MIN_USD_VOL:
-        description: 'Minimum 24h USD quote volume'
+        default: "2.0"
+      TRAIL_START_PCT:
+        description: 'Start trailing once profit ≥ this percent. Set "" to disable.'
         required: true
-        default: "1000000"
-      TIMEFRAME:
-        description: 'Candle timeframe'
+        default: "3.0"
+      TRAIL_OFFSET_PCT:
+        description: 'Trail distance percent once trailing is active.'
         required: true
-        default: "5m"
+        default: "1.0"
+      TF_MINUTES:
+        description: 'Analysis timeframe in minutes'
+        required: true
+        default: "15"
       UNIVERSE:
-        description: 'Optional manual universe (e.g., BTC/USD,ETH/USD); leave empty for auto'
-        required: false
-        default: ""
-
-  schedule:
-    - cron: "*/15 * * * *"
-
-concurrency:
-  group: crypto-live-15m
-  cancel-in-progress: false
-
-permissions:
-  contents: read
+        description: 'Comma-separated symbols to scan (e.g., BTC/USD,ETH/USD,DOGE/USD)'
+        required: true
+        default: "BTC/USD,ETH/USD,DOGE/USD"
 
 jobs:
-  run:
-    name: Run trader (LIVE)
+  trade:
     runs-on: ubuntu-latest
 
-    env:
-      # --- Runtime ---
-      PYTHON_VERSION: "3.11"
-      EXCHANGE: "kraken"
-
-      # --- Live/Paused + private endpoints ---
-      DRY_RUN:      ${{ inputs.DRY_RUN      || 'false' }}
-      PRIVATE_API:  ${{ inputs.PRIVATE_API  || 'true'  }}
-
-      # --- Exchange credentials (must exist in repo secrets) ---
-      API_KEY:     ${{ secrets.KRAKEN_API_KEY }}
-      API_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}
-
-      # --- Safety caps ---
-      PER_TRADE_USD: ${{ inputs.PER_TRADE_USD || '10' }}
-      DAILY_CAP_USD: ${{ inputs.DAILY_CAP_USD || '15' }}
-
-      # --- Strategy knobs ---
-      TOP_N:        ${{ inputs.TOP_N        || '30' }}
-      MIN_USD_VOL:  ${{ inputs.MIN_USD_VOL  || '1000000' }}
-      TIMEFRAME:    ${{ inputs.TIMEFRAME    || '5m' }}
-      RSI_LEN:      "14"
-      RSI_MAX:      ${{ inputs.RSI_MAX      || '60' }}
-      DROP_PCT:     ${{ inputs.DROP_PCT     || '0.60' }}
-      UNIVERSE:     ${{ inputs.UNIVERSE     || '' }}
-
     steps:
-      - name: Check out repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ccxt
+          pip install -r requirements.txt
 
+      # Quick guard so live runs fail fast if secrets are missing.
       - name: Sanity — Keys present if live
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.DRY_RUN == 'false' || github.event_name == 'schedule' }}
         run: |
-          if [ "${DRY_RUN}" != "true" ] && [ "${PRIVATE_API}" = "true" ]; then
-            if [ -z "${API_KEY}" ] || [ -z "${API_SECRET}" ]; then
-              echo "ERROR: Live+private requested but KRAKEN_API_KEY / KRAKEN_API_SECRET not set."
-              exit 1
-            fi
-          fi
-          echo "Sanity OK."
+          test -n "${{ secrets.KRAKEN_API_KEY }}" || (echo "Missing KRAKEN_API_KEY" && exit 1)
+          test -n "${{ secrets.KRAKEN_API_SECRET }}" || (echo "Missing KRAKEN_API_SECRET" && exit 1)
+          echo "Secrets look present."
 
-      - name: Run trader (LIVE)
-        shell: bash
+      - name: Run trader (LIVE/DRY)
+        env:
+          # core toggles
+          DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'false' }}
+          PRIVATE_API: ${{ github.event.inputs.PRIVATE_API || 'true' }}
+
+          # budgets
+          PER_TRADE_USD: ${{ github.event.inputs.PER_TRADE_USD || '10' }}
+          DAILY_CAP_USD: ${{ github.event.inputs.DAILY_CAP_USD || '15' }}
+
+          # strategy knobs
+          DROP_GATE: ${{ github.event.inputs.DROP_GATE || '0.60' }}
+          TAKE_PROFIT_PCT: ${{ github.event.inputs.TAKE_PROFIT_PCT || '3.0' }}
+          STOP_LOSS_PCT: ${{ github.event.inputs.STOP_LOSS_PCT || '2.0' }}
+          TRAIL_START_PCT: ${{ github.event.inputs.TRAIL_START_PCT || '3.0' }}
+          TRAIL_OFFSET_PCT: ${{ github.event.inputs.TRAIL_OFFSET_PCT || '1.0' }}
+          TF_MINUTES: ${{ github.event.inputs.TF_MINUTES || '15' }}
+          UNIVERSE: ${{ github.event.inputs.UNIVERSE || 'BTC/USD,ETH/USD,DOGE/USD' }}
+
+          # exchange
+          EXCHANGE: "kraken"
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
         run: |
-          set -e
           echo "=== START TRADING OUTPUT ==="
           python main.py
           echo "=== END TRADING OUTPUT ==="
