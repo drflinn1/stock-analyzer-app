@@ -1,13 +1,16 @@
 name: Crypto Live (Every 15 min) — LIVE
 
 on:
-  # Manual trigger with safe, overridable inputs
   workflow_dispatch:
     inputs:
       DRY_RUN:
         description: '"false" = live trading, "true" = simulate'
         required: true
         default: "false"
+      PRIVATE_API:
+        description: 'Use private endpoints (balance/orders) — "true"/"false"'
+        required: true
+        default: "true"
       PER_TRADE_USD:
         description: 'Spend per buy (USD)'
         required: true
@@ -32,21 +35,26 @@ on:
         description: 'Minimum 24h USD quote volume'
         required: true
         default: "1000000"
+      # Some versions of your code use TF; some use TIMEFRAME — we set both.
+      TF:
+        description: 'Candle timeframe (alias for TIMEFRAME)'
+        required: true
+        default: "5m"
       TIMEFRAME:
         description: 'Candle timeframe'
         required: true
         default: "5m"
-      PRIVATE_API:
-        description: 'Use private endpoints (balance/orders) — "true"/"false"'
-        required: true
-        default: "true"
+      # If empty, code will switch to auto-universe; if you want manual, comma-separate pairs
+      UNIVERSE:
+        description: 'Optional manual universe (e.g., BTC/USD,ETH/USD); leave empty for auto'
+        required: false
+        default: ""
 
-  # Auto schedule every 15 minutes
   schedule:
     - cron: "*/15 * * * *"
 
 concurrency:
-  group: crypto-live
+  group: crypto-live-15m
   cancel-in-progress: false
 
 permissions:
@@ -57,33 +65,32 @@ jobs:
     name: Run trader (LIVE)
     runs-on: ubuntu-latest
 
-    # All env the bot reads. Inputs can be overridden in Run dialog.
     env:
       # --- Runtime ---
       PYTHON_VERSION: "3.11"
+      EXCHANGE: "kraken"
 
-      # --- Live/Paused switch ---
-      DRY_RUN: ${{ inputs.DRY_RUN || 'false' }}         # set "true" to pause live trading
+      # --- Live/Paused + private endpoints ---
+      DRY_RUN:      ${{ inputs.DRY_RUN      || 'false' }}
+      PRIVATE_API:  ${{ inputs.PRIVATE_API  || 'true'  }}
 
-      # --- Exchange credentials (repo secrets) ---
-      API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-      API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+      # --- Exchange credentials (must exist in repo secrets) ---
+      API_KEY:     ${{ secrets.KRAKEN_API_KEY }}
+      API_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}
 
       # --- Safety caps ---
       PER_TRADE_USD: ${{ inputs.PER_TRADE_USD || '10' }}
       DAILY_CAP_USD: ${{ inputs.DAILY_CAP_USD || '15' }}
 
       # --- Strategy knobs ---
-      TOP_N: ${{ inputs.TOP_N || '30' }}
-      MIN_USD_VOL: ${{ inputs.MIN_USD_VOL || '1000000' }}
-      TIMEFRAME: ${{ inputs.TIMEFRAME || '5m' }}
-      RSI_LEN: "14"
-      RSI_MAX: ${{ inputs.RSI_MAX || '60' }}
-      DROP_PCT: ${{ inputs.DROP_PCT || '0.60' }}
-      PRIVATE_API: ${{ inputs.PRIVATE_API || 'true' }}
-
-      # --- Exchange selection (keep kraken for now) ---
-      EXCHANGE: "kraken"
+      TOP_N:        ${{ inputs.TOP_N        || '30' }}
+      MIN_USD_VOL:  ${{ inputs.MIN_USD_VOL  || '1000000' }}
+      TF:           ${{ inputs.TF           || '5m' }}
+      TIMEFRAME:    ${{ inputs.TIMEFRAME    || '5m' }}
+      RSI_LEN:      "14"
+      RSI_MAX:      ${{ inputs.RSI_MAX      || '60' }}
+      DROP_PCT:     ${{ inputs.DROP_PCT     || '0.60' }}
+      UNIVERSE:     ${{ inputs.UNIVERSE     || '' }}
 
     steps:
       - name: Check out repo
@@ -99,13 +106,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt
 
-      - name: Sanity — Kraken keys present?
+      - name: Sanity — Keys present if live
         run: |
-          if [ "${DRY_RUN}" != "true" ] && { [ -z "${API_KEY}" ] || [ -z "${API_SECRET}" ]; }; then
-            echo "ERROR: Live trading requested but KRAKEN_API_KEY / KRAKEN_API_SECRET not set."
-            exit 1
+          if [ "${DRY_RUN}" != "true" ] && [ "${PRIVATE_API}" = "true" ]; then
+            if [ -z "${API_KEY}" ] || [ -z "${API_SECRET}" ]; then
+              echo "ERROR: Live+private requested but KRAKEN_API_KEY / KRAKEN_API_SECRET not set."
+              exit 1
+            fi
           fi
-          echo "Keys detected or DRY_RUN=true — proceeding."
+          echo "Sanity OK."
 
       - name: Run trader (LIVE)
         shell: bash
