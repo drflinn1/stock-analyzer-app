@@ -41,10 +41,6 @@ on:
         description: "Trail offset %"
         required: true
         default: "1.0"
-      TF_MINUTES:
-        description: "Timeframe minutes"
-        required: true
-        default: "15"
       UNIVERSE:
         description: "Symbols, comma-separated"
         required: true
@@ -77,7 +73,7 @@ jobs:
 
       - name: Run trader
         env:
-          # toggles (defaults for schedule; inputs override for manual)
+          # toggles
           DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'false' }}
           PRIVATE_API: ${{ github.event.inputs.PRIVATE_API || 'true' }}
 
@@ -91,7 +87,7 @@ jobs:
           STOP_LOSS_PCT: ${{ github.event.inputs.STOP_LOSS_PCT || '2.0' }}
           TRAIL_START_PCT: ${{ github.event.inputs.TRAIL_START_PCT || '3.0' }}
           TRAIL_OFFSET_PCT: ${{ github.event.inputs.TRAIL_OFFSET_PCT || '1.0' }}
-          TF_MINUTES: ${{ github.event.inputs.TF_MINUTES || '15' }}
+          TF_MINUTES: "15"
           UNIVERSE: ${{ github.event.inputs.UNIVERSE || 'BTC/USD,ETH/USD,DOGE/USD' }}
 
           # exchange
