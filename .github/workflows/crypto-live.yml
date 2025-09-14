@@ -29,8 +29,8 @@ env:
   TRAIL_OFFSET_PCT: "0.8"
 
   # --- Sizing / budget ---
-  BUY_SIZE_USD: "10"               # small live probe
-  DAILY_SPEND_CAP_USD: "20"
+  BUY_SIZE_USD: "20"                # up from 10 to clear most min notionals
+  DAILY_SPEND_CAP_USD: "20"         # so we can only place one $20 order today
   MAX_OPEN_TRADES: "1"
   MIN_BALANCE_USD: "5"
   MIN_ACTIVE_POSITION_USD: "2"
