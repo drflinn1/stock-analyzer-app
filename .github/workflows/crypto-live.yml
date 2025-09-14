@@ -30,8 +30,8 @@ env:
 
   # --- Sizing / budget ---
   BUY_SIZE_USD: "10"               # small live probe
-  DAILY_SPEND_CAP_USD: "40"
-  MAX_OPEN_TRADES: "5"
+  DAILY_SPEND_CAP_USD: "20"
+  MAX_OPEN_TRADES: "1"
   MIN_BALANCE_USD: "5"
   MIN_ACTIVE_POSITION_USD: "2"
 
