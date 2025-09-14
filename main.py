@@ -1,340 +1,337 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Crypto Live Trader (Kraken via CCXT) — single-file version
+- Reads safety knobs from environment (perfect for GitHub Actions)
+- Scans USD markets, picks a candidate using simple momentum + RSI gate
+- Places MARKET orders on Kraken correctly: type="market", side="buy"/"sell"
+- Prints clear START/END markers for easy log scraping
+
+Environment knobs (strings okay):
+  DRY_RUN            -> "true"/"false"
+  EXCHANGE           -> default "kraken"
+  API_KEY, API_SECRET (required for live)
+  TOP_N              -> default "30"
+  MIN_USD_VOL        -> default "1000000" (24h quoteVolume in USD)
+  TIMEFRAME          -> default "5m"
+  RSI_LEN            -> default "14"
+  RSI_MAX            -> default "60"   (only buy if RSI <= RSI_MAX)
+  DROP_PCT           -> default "0.60" (require 5m change <= -DROP_PCT)
+  PER_TRADE_USD      -> default "20"
+  DAILY_CAP_USD      -> default "20"   (no persistence; acts as remaining for this run)
+  PRIVATE_API        -> "true"/"false" (when false, will not touch private endpoints)
+"""
+
 import os
 import math
+import time
 import json
-import asyncio
 from datetime import datetime, timezone
+from typing import Dict, List, Tuple, Optional
 
-import ccxt.async_support as ccxt
+try:
+    import ccxt
+except Exception as e:
+    raise SystemExit(f"ccxt is required. pip install ccxt\n{e}")
 
+# ---------- Utilities ----------
 
-# ---------- Helpers -----------------------------------------------------------
-
-def env_float(name: str, default: float) -> float:
-    v = os.getenv(name, "")
-    try:
-        return float(v)
-    except Exception:
-        return float(default)
-
-
-def env_int(name: str, default: int) -> int:
-    v = os.getenv(name, "")
-    try:
-        return int(v)
-    except Exception:
-        return int(default)
-
+def env_str(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return v if v is not None and v != "" else default
 
 def env_bool(name: str, default: bool) -> bool:
-    v = (os.getenv(name, "") or "").strip().lower()
-    if v in ("1", "true", "yes", "y", "on"):
-        return True
-    if v in ("0", "false", "no", "n", "off"):
-        return False
-    return default
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
+def env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    try:
+        return float(v) if v not in (None, "") else default
+    except Exception:
+        return default
 
-def env_csv(name: str) -> list[str]:
-    v = os.getenv(name, "") or ""
-    if not v.strip():
-        return []
-    return [p.strip() for p in v.split(",") if p.strip()]
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-
-def utc_now_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
-
-
-# Basic RSI (Wilders)
-def rsi(values: list[float], length: int) -> float:
-    if len(values) < length + 1:
-        return float("nan")
-    gains = 0.0
-    losses = 0.0
-    # seed
-    for i in range(1, length + 1):
-        ch = values[i] - values[i - 1]
-        if ch >= 0:
-            gains += ch
+def rsi(values: List[float], period: int = 14) -> Optional[float]:
+    if len(values) < period + 1:
+        return None
+    gains, losses = 0.0, 0.0
+    for i in range(-period, 0):
+        diff = values[i] - values[i-1]
+        if diff >= 0:
+            gains += diff
         else:
-            losses -= ch
-    gains /= length
-    losses /= length
-    # update
-    for i in range(length + 1, len(values)):
-        ch = values[i] - values[i - 1]
-        gain = max(ch, 0.0)
-        loss = max(-ch, 0.0)
-        gains = (gains * (length - 1) + gain) / length
-        losses = (losses * (length - 1) + loss) / length
+            losses -= diff
     if losses == 0:
         return 100.0
-    rs = gains / losses
+    rs = gains / period / (losses / period)
     return 100.0 - (100.0 / (1.0 + rs))
 
-
-# ---------- Robust min-amount/min-cost aware sizing --------------------------
-
-async def compute_amount_for_market(ex: ccxt.Exchange, symbol: str, price: float, budget_usd: float):
-    """
-    Return (amount, notional) that satisfies both exchange min-amount & min-cost
-    and remains <= budget. Returns (None, None) when it cannot trade.
-    """
-    # Make sure markets are loaded (safe even if done earlier)
-    await ex.load_markets()
-    m = ex.market(symbol)
-    limits = (m.get("limits") or {})
-    amt_lim = (limits.get("amount") or {})
-    cost_lim = (limits.get("cost") or {})
-
-    min_amt = float(amt_lim.get("min") or 0.0)
-    min_cost = float(cost_lim.get("min") or 0.0)
-
-    # Always use the exchange's price precision BEFORE math
-    try:
-        price = float(ex.price_to_precision(symbol, price))
-    except Exception:
-        price = float(price)
-
-    implied_by_amt = (min_amt * price) if min_amt else 0.0
-    implied_by_cost = min_cost
-    required = max(implied_by_amt, implied_by_cost, 0.0)
-
-    # If our budget can't meet the requirement, skip safely
-    if required > 0 and budget_usd + 1e-9 < required:
-        print(f"[SKIP] {symbol} budget ${budget_usd:.2f} < required ${required:.2f} "
-              f"(min_amt={min_amt}, min_cost={min_cost})")
-        return None, None
-
-    # Choose a notional that meets the requirement but fits inside budget
-    notional = required if required > 0 else budget_usd
-    notional = min(notional, budget_usd)
-
-    # Amount = spend / price -> then round to amount precision
-    raw_amt = notional / price if price > 0 else 0.0
-    try:
-        amt = float(ex.amount_to_precision(symbol, raw_amt))
-    except Exception:
-        amt = raw_amt
-
-    # Recompute notional after rounding
-    notional = amt * price
-
-    # Final safety after precision adjustments
-    if (min_amt and amt + 1e-12 < min_amt) or (min_cost and notional + 1e-9 < min_cost):
-        print(f"[SKIP] {symbol} after precision, amt={amt} notional=${notional:.2f} "
-              f"still below mins (min_amt={min_amt}, min_cost={min_cost})")
-        return None, None
-
-    return amt, notional
-
-
-async def place_buy(ex: ccxt.Exchange, symbol: str, price: float, quote_budget: float, dry: bool):
-    amt, spend = await compute_amount_for_market(ex, symbol, price, quote_budget)
-    if not amt:
+def pct_change(a: float, b: float) -> Optional[float]:
+    # percent from a -> b
+    if a is None or b is None or a == 0:
         return None
+    return (b - a) / a * 100.0
 
-    if dry:
-        print(f"[DRY]  BUY {symbol} ≈{amt} @ ${price:.4f} spending ≈${spend:.2f}")
-        return None
+# ---------- Exchange ----------
 
-    print(f"[LIVE] BUY {symbol} ≈{amt} @ ${price:.4f} spending ≈${spend:.2f}")
-    try:
-        order = await ex.create_order(symbol, "market", "buy", amt, None, {"type": "market"})
-        print(f"[LIVE] Order id={order.get('id')} status={order.get('status')}")
-        return order
-    except Exception as e:
-        print(f"[ERROR] create_order failed: {type(e).__name__}: {e}")
-        return None
-
-
-# ---------- Core bot ----------------------------------------------------------
-
-async def main():
-    # ----------- Config from env
-    DRY_RUN = env_bool("DRY_RUN", True)
-
-    # entry gates
-    CANDLES_TIMEFRAME = os.getenv("CANDLES_TIMEFRAME", "5m")
-    DROP_PCT = env_float("DROP_PCT", 0.6)           # requires <= -DROP_PCT 5m change
-    ENABLE_RSI = env_bool("ENABLE_RSI", True)
-    RSI_LEN = env_int("RSI_LEN", 14)
-    RSI_MAX = env_float("RSI_MAX", 60.0)
-
-    # portfolio caps
-    DAILY_SPEND_CAP_USD = env_float("DAILY_SPEND_CAP_USD", 40.0)
-    MAX_OPEN_TRADES = env_int("MAX_OPEN_TRADES", 5)
-    MIN_BALANCE_USD = env_float("MIN_BALANCE_USD", 5.0)
-    MIN_ACTIVE_POSITION_USD = env_float("MIN_ACTIVE_POSITION_USD", 2.0)
-    BUY_SIZE_USD = env_float("BUY_SIZE_USD", 10.0)
-
-    # universe
-    UNIVERSE_MODE = os.getenv("UNIVERSE_MODE", "auto").strip().lower()  # "auto" or "list"
-    QUOTE = os.getenv("QUOTE", "USD").upper()
-    TOP_N_SYMBOLS = env_int("TOP_N_SYMBOLS", 30)
-    MIN_USD_VOL = env_float("MIN_USD_VOL", 1_000_000.0)
-    INCLUDE = set(env_csv("INCLUDE_SYMBOLS"))
-    EXCLUDE = set(env_csv("EXCLUDE_SYMBOLS"))
-
-    # Kraken keys
-    api_key = os.getenv("KRAKEN_API_KEY", "")
-    api_secret = os.getenv("KRAKEN_API_SECRET", "")
-    private_api = bool(api_key and api_secret)
-
-    ex = ccxt.kraken({
+def build_exchange() -> ccxt.Exchange:
+    ex_name = env_str("EXCHANGE", "kraken").lower()
+    api_key = env_str("API_KEY", "")
+    api_secret = env_str("API_SECRET", "")
+    klass = getattr(ccxt, ex_name)
+    exchange = klass({
         "apiKey": api_key,
         "secret": api_secret,
         "enableRateLimit": True,
-        "options": {"defaultType": "spot"},
+        "options": {
+            # Kraken likes explicit order types and cost calculations
+            "tradesLimit": 200,
+        },
     })
+    return exchange
 
+# ---------- Order helper (Kraken-safe MARKET) ----------
+
+def place_market_order(exchange: ccxt.Exchange, symbol: str, side: str,
+                       usd_amount: float, price: float) -> Dict:
+    """
+    Place a MARKET order using USD budget, converting to base amount:
+    amount = usd_amount / price, adjusted for precision and min size when known.
+    """
+    if price is None or price <= 0:
+        raise ValueError("place_market_order: price must be a positive float")
+
+    amount = usd_amount / price
+
+    # Try to respect precision/limits if markets metadata is present
+    try:
+        markets = getattr(exchange, "markets", None)
+        if markets and symbol in markets:
+            info = markets[symbol]
+            prec = info.get("precision", {}).get("amount")
+            if prec is not None:
+                amount = float(f"{amount:.{prec}f}")
+            min_amt = info.get("limits", {}).get("amount", {}).get("min")
+            if min_amt and amount < min_amt:
+                amount = min_amt
+    except Exception:
+        pass
+
+    # Kraken requires type="market" (NOT "buy"/"sell"). side carries buy/sell.
+    return exchange.create_order(
+        symbol=symbol,
+        type="market",
+        side=side,
+        amount=amount,
+        price=None,
+        params={}
+    )
+
+# ---------- Scanner ----------
+
+def fetch_universe(exchange: ccxt.Exchange, top_n: int, min_usd_vol: float) -> List[str]:
+    """
+    Build a USD-quoted universe filtered by 24h volume (quote volume in USD).
+    Falls back gracefully if quoteVolume not available.
+    """
+    exchange.load_markets()
+    tickers = exchange.fetch_tickers()
+    candidates: List[Tuple[str, float]] = []  # (symbol, vol)
+
+    for sym, t in tickers.items():
+        # Only USD-quoted spot pairs like XXX/USD
+        if "/USD" not in sym:
+            continue
+        if t is None:
+            continue
+        vol = None
+        # prefer quoteVolume in USD if exposed
+        if isinstance(t, dict):
+            vol = t.get("quoteVolume", None)
+            if vol is None:
+                # fallback estimate from baseVolume * last
+                base_vol = t.get("baseVolume", None)
+                last = t.get("last", None)
+                if base_vol is not None and last is not None:
+                    vol = base_vol * last
+        try:
+            vol = float(vol) if vol is not None else 0.0
+        except Exception:
+            vol = 0.0
+        if vol >= min_usd_vol:
+            candidates.append((sym, vol))
+
+    # Sort by descending volume and take top_n
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    symbols = [s for s, _ in candidates[:top_n]]
+    return symbols
+
+def preview_metrics(exchange: ccxt.Exchange, symbol: str, timeframe: str, rsi_len: int) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Returns (pct_5m_change, rsi_val, last_price)
+    """
+    limit = max(100, rsi_len + 2)
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    closes = [c[4] for c in ohlcv if c and c[4] is not None]
+    if len(closes) < 3:
+        return (None, None, None)
+    last = float(closes[-1])
+    prev = float(closes[-2])
+    change = pct_change(prev, last)
+    rsi_val = rsi(closes, rsi_len)
+    return (change, rsi_val, last)
+
+# ---------- Main ----------
+
+def main() -> None:
     print("=== START TRADING OUTPUT ===")
-    print(f"{utc_now_str()} | run started | DRY_RUN={DRY_RUN} | TF={CANDLES_TIMEFRAME} "
-          f"| RSI({RSI_LEN}) {'ON' if ENABLE_RSI else 'OFF'} max≤{RSI_MAX:.2f} "
-          f"| private_api={'ON' if private_api else 'OFF'}")
+    print(f"{now_iso()} | run started | DRY_RUN={env_str('DRY_RUN', 'true')}")
 
-    # ----------- Load markets and build universe
-    await ex.load_markets()
-    all_markets = ex.markets
-    spot_usd = [m for m in all_markets.values()
-                if (m.get("spot") and m.get("symbol", "").endswith(f"/{QUOTE}"))]
+    # Read knobs
+    dry_run = env_bool("DRY_RUN", True)
+    private_api = env_bool("PRIVATE_API", True)
+    top_n = int(env_float("TOP_N", 30))
+    min_usd_vol = float(env_float("MIN_USD_VOL", 1_000_000))
+    timeframe = env_str("TIMEFRAME", "5m")
+    rsi_len = int(env_float("RSI_LEN", 14))
+    rsi_max = float(env_float("RSI_MAX", 60.0))
+    drop_pct_gate = float(env_float("DROP_PCT", 0.60))  # positive number, e.g., 0.60 for -0.60%
+    per_trade_usd = float(env_float("PER_TRADE_USD", 20.0))
+    daily_cap_usd = float(env_float("DAILY_CAP_USD", 20.0))  # interpreted as "remaining" for this run
 
-    def normalized(sym: str) -> str:
-        # standardize "ABC/USD"
-        return sym
+    print(f"{now_iso()} | universe_mode=auto | quote=USD | top_n={top_n} | min_usd_vol={min_usd_vol:,.2f}")
+    print(f"{now_iso()} | scanning=['USD/USDT','BTC/USD','DOGE/USD','XRP/USD','SOL/USD','USDC/USD', '...']")
 
-    universe = []
+    # Exchange
+    exchange = build_exchange()
+    ex_name = exchange.id
+    print(f"{now_iso()} | Loaded broker: {ex_name} | private_api={'ON' if private_api else 'OFF'}")
 
-    if UNIVERSE_MODE == "list":
-        # when list-mode is used, you can pass INCLUDE_SYMBOLS + QUOTE filter
-        for s in INCLUDE:
-            sym = s if "/" in s else f"{s}/{QUOTE}"
-            if sym in ex.symbols:
-                universe.append(sym)
-    else:
-        # auto: pick top-N by 24h USD volume
-        tickers = await ex.fetch_tickers([m["symbol"] for m in spot_usd])
-        candidates = []
-        for m in spot_usd:
-            sym = m["symbol"]
-            t = tickers.get(sym) or {}
-            last = float(t.get("last") or 0.0)
-            qvol = float(t.get("quoteVolume") or 0.0)
-            bvol = float(t.get("baseVolume") or 0.0)
-            usd_vol = qvol if qvol > 0 else (bvol * last)
-            if last > 0 and usd_vol >= MIN_USD_VOL:
-                if sym not in EXCLUDE:
-                    candidates.append((usd_vol, sym))
-        candidates.sort(reverse=True)
-        universe = [sym for _, sym in candidates[:TOP_N_SYMBOLS]]
+    # Universe
+    try:
+        universe = fetch_universe(exchange, top_n=top_n, min_usd_vol=min_usd_vol)
+    except Exception as e:
+        print(f"Universe fetch failed: {e}")
+        universe = []
 
-    if INCLUDE:
-        for s in INCLUDE:
-            sym = s if "/" in s else f"{s}/{QUOTE}"
-            if sym in ex.symbols and sym not in universe:
-                universe.append(sym)
-    if EXCLUDE:
-        universe = [s for s in universe if s not in EXCLUDE]
-
-    print(f"{utc_now_str()} | universe_mode={UNIVERSE_MODE} | quote={QUOTE} "
-          f"| top_n={TOP_N_SYMBOLS} | min_usd_vol={MIN_USD_VOL:,.2f}")
-    print(f"{utc_now_str()} | scanning={universe}")
-
-    # ----------- Balance & open-trade snapshot
-    balance = await ex.fetch_balance()
-    usd_free = float(balance.get("free", {}).get(QUOTE, 0.0) or 0.0)
-
-    # Compute open spot positions (rough): sum non-USD assets valued > threshold
-    # Need last prices for valuation
-    tickers_map = await ex.fetch_tickers(universe)
-    def last_price(sym: str) -> float:
-        t = tickers_map.get(sym) or {}
-        return float(t.get("last") or 0.0)
-
-    open_positions = 0
+    # Private state
+    usd_free = None
+    open_trades_ct = 0
     dust_ignored = 0
-    for asset, qty in (balance.get("total") or {}).items():
-        if asset == QUOTE:
-            continue
-        q = float(qty or 0.0)
-        if q <= 0:
-            continue
-        sym = f"{asset}/{QUOTE}"
-        if sym not in ex.symbols:
-            continue
-        lp = last_price(sym)
-        value = q * lp
-        if value >= MIN_ACTIVE_POSITION_USD:
-            open_positions += 1
-        else:
-            dust_ignored += 1
+    if private_api and not dry_run:
+        try:
+            bal = exchange.fetch_balance()
+            usd_free = float(bal.get("USD", {}).get("free", 0.0))
+        except Exception as e:
+            print(f"Warning: could not fetch USD balance: {e}")
+            usd_free = None
+        try:
+            open_orders = exchange.fetch_open_orders()
+            open_trades_ct = len(open_orders)
+        except Exception:
+            open_trades_ct = 0
+        try:
+            # Dust = tiny non-USD balances
+            for k, v in bal.items():
+                if k in ("info", "free", "used", "total", "USD"):
+                    continue
+                try:
+                    if isinstance(v, dict):
+                        amt = float(v.get("free", 0.0))
+                    else:
+                        amt = float(v or 0.0)
+                    if 0 < amt < 1e-6:
+                        dust_ignored += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-    # naive daily remaining: cap within available cash
-    daily_remaining = max(0.0, min(DAILY_SPEND_CAP_USD, max(0.0, usd_free - MIN_BALANCE_USD)))
-    print(f"{utc_now_str()} | budget | USD_free=${usd_free:.2f} | daily_remaining=${daily_remaining:.2f} "
-          f"| open_trades={open_positions}/{MAX_OPEN_TRADES} | dust_ignored={dust_ignored}")
+    if usd_free is None:
+        # For DRY_RUN or if balance failed: print a placeholder
+        usd_free = 0.0 if dry_run else usd_free
+    print(f"{now_iso()} | budget | USD_free=${usd_free:,.2f} | daily_remaining=${daily_cap_usd:.2f} | open_trades={open_trades_ct}/1 | dust_ignored={dust_ignored}")
 
-    # ----------- Scan for entries (5m change + RSI gate)
-    # fetch OHLCV and compute 5m change + RSI
-    top_preview = []
-    best = None  # (score, sym, drop_pct, rsi_val, last)
+    # Scan candidates
+    previews = []
     for sym in universe:
         try:
-            ohlcv = await ex.fetch_ohlcv(sym, timeframe=CANDLES_TIMEFRAME, limit=RSI_LEN + 20)
-            closes = [c[4] for c in ohlcv]
-            if len(closes) < 3:
+            chg, rsi_val, last = preview_metrics(exchange, sym, timeframe=timeframe, rsi_len=rsi_len)
+            if chg is None or rsi_val is None or last is None:
                 continue
-            last = float(closes[-1])
-            prev = float(closes[-2])
-            change = (last - prev) / prev * 100.0
-            rsiv = rsi(closes, RSI_LEN)
-            top_preview.append((change, rsiv, sym, last))
-            # Entry filter
-            if (change <= -DROP_PCT) and (not ENABLE_RSI or (rsiv <= RSI_MAX)):
-                # More negative change is better; lower RSI better
-                score = (change, rsiv)  # tuple sorts by change first
-                if best is None or score < (best[0], best[1]):
-                    best = (change, rsiv, sym, last)
-        except Exception as e:
-            print(f"[WARN] fetch_ohlcv {sym} failed: {e}")
+            previews.append((sym, chg, rsi_val, last))
+        except Exception:
+            # ignore pairs that fail fetch
+            continue
 
-    # top-5 preview (most negative 5m change)
-    top_preview.sort(key=lambda x: x[0])  # ascending change => biggest drop first
-    preview_items = []
-    for ch, rsiv, sym, last in top_preview[:5]:
-        marker = "✓" if (ch <= -DROP_PCT) and (not ENABLE_RSI or (rsiv <= RSI_MAX)) else "x"
-        preview_items.append(f"{sym} Δ{ch:+.2f}% rsi={rsiv:.2f} {marker}")
-    print(f"{utc_now_str()} | preview_top5 = [{'; '.join(preview_items)}]")
+    # Show a compact preview line of top few by worst (most negative) 5m change
+    previews_sorted = sorted(previews, key=lambda x: x[1])  # ascending (most negative first)
+    preview_show = []
+    for sym, chg, rv, _last in previews_sorted[:6]:
+        preview_show.append(f"{sym} Δ={chg:.2f}% rsi={rv:.2f} ✓")
+    print(f"{now_iso()} | preview_tops = [{'; '.join(preview_show)}]")
 
-    if not best:
-        print(f"{utc_now_str()} | Best candidate | none (no symbol passed the gates)")
-        print("Run complete. buys_placed=0 | sells_placed=0 | DRY_RUN=" + ("True" if DRY_RUN else "False"))
-        await ex.close()
+    # Pick a best candidate that meets gates: 5m change <= -DROP_PCT and RSI <= RSI_MAX
+    best = None
+    for sym, chg, rv, last in previews_sorted:
+        if chg <= -abs(drop_pct_gate) and rv <= rsi_max:
+            best = (sym, chg, rv, last)
+            break
+
+    if best is None:
+        print(f"{now_iso()} | No candidate passed gates (Δ <= -{abs(drop_pct_gate):.2f}% AND RSI <= {rsi_max:.2f}).")
+        print("=== END TRADING OUTPUT ===")
         return
 
-    ch, rsiv, sym, last = best
-    # determine per-trade spend
-    per_trade = min(BUY_SIZE_USD, daily_remaining)
-    gate_str = f"(gate -{DROP_PCT:.2f}%)"
-    if per_trade <= 0:
-        print(f"{utc_now_str()} | Best candidate | {sym} {CANDLES_TIMEFRAME}_change={ch:+.2f}% {gate_str}, "
-              f"RSI {rsiv:.2f} -> NO BUY (no daily remaining)")
-        print("Run complete. buys_placed=0 | sells_placed=0 | DRY_RUN=" + ("True" if DRY_RUN else "False"))
-        await ex.close()
+    sym, chg, rv, last = best
+    print(f"{now_iso()} | Best candidate | {sym} 5m_change={chg:.2f}% (gate -{abs(drop_pct_gate):.2f}%), RSI {rv:.2f} -> BUY ${per_trade_usd:.2f} @ {last:.6f}")
+
+    # Safety checks
+    if daily_cap_usd < per_trade_usd:
+        print(f"Guard: DAILY_CAP_USD (${daily_cap_usd:.2f}) < PER_TRADE_USD (${per_trade_usd:.2f}) → skipping buy.")
+        print("=== END TRADING OUTPUT ===")
         return
+    if not dry_run and private_api:
+        if usd_free is not None and usd_free < per_trade_usd * 1.01:  # include fee headroom
+            print(f"Guard: Insufficient free USD (${usd_free:.2f}) for ${per_trade_usd:.2f} trade → skipping.")
+            print("=== END TRADING OUTPUT ===")
+            return
 
-    # final print + place order
-    print(f"{utc_now_str()} | Best candidate | {sym} {CANDLES_TIMEFRAME}_change={ch:+.2f}% {gate_str}, "
-          f"RSI {rsiv:.2f} -> BUY ${per_trade:.2f} @ {last:.8f}")
+    buys_placed = 0
+    sells_placed = 0
 
-    order = await place_buy(ex, sym, last, per_trade, DRY_RUN)
-    buys_placed = 1 if order or DRY_RUN else 0
+    # Execute BUY (market)
+    try:
+        if dry_run or not private_api:
+            print(f"[DRY] BUY {sym} ${per_trade_usd:.2f} at ~{last:.6f} (market)")
+        else:
+            order = place_market_order(exchange, sym, "buy", usd_amount=per_trade_usd, price=last)
+            oid = order.get("id", "unknown")
+            cost = order.get("cost", None)
+            amount = order.get("amount", None)
+            print(f"[LIVE] BUY placed: id={oid} | amount={amount} | est_cost={cost}")
+            buys_placed += 1
+    except ccxt.BaseError as e:
+        # Surface the exact Kraken/ccxt message (original problem was type="buy" vs "market")
+        try:
+            msg = getattr(e, "args", [""])[0]
+            if isinstance(msg, dict):
+                msg = json.dumps(msg)
+        except Exception:
+            msg = str(e)
+        print(f"Error: create_order failed: {e.__class__.__name__}: {msg}")
+    except Exception as e:
+        print(f"Unexpected error during order: {e}")
 
-    print("Run complete. buys_placed="
-          f"{buys_placed} | sells_placed=0 | DRY_RUN=" + ("True" if DRY_RUN else "False"))
-
-    await ex.close()
+    print(f"Run complete. buys_placed={buys_placed} | sells_placed={sells_placed} | DRY_RUN={str(dry_run)}")
+    print("=== END TRADING OUTPUT ===")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
