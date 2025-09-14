@@ -1,51 +1,89 @@
-name: Crypto Live (5m, Auto-Universe, Active++)
+name: Crypto Live (Every 15 min) — LIVE
 
 on:
+  # Manual trigger with safe, overridable inputs
   workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: '"false" = live trading, "true" = simulate'
+        required: true
+        default: "false"
+      PER_TRADE_USD:
+        description: 'Spend per buy (USD)'
+        required: true
+        default: "10"
+      DAILY_CAP_USD:
+        description: 'Max total spend per run/day slice (USD)'
+        required: true
+        default: "15"
+      DROP_PCT:
+        description: 'Require 5m change <= -DROP_PCT (e.g., 0.60 for -0.60%)'
+        required: true
+        default: "0.60"
+      RSI_MAX:
+        description: 'Only buy if RSI <= RSI_MAX'
+        required: true
+        default: "60"
+      TOP_N:
+        description: 'Top N USD pairs by 24h volume to scan'
+        required: true
+        default: "30"
+      MIN_USD_VOL:
+        description: 'Minimum 24h USD quote volume'
+        required: true
+        default: "1000000"
+      TIMEFRAME:
+        description: 'Candle timeframe'
+        required: true
+        default: "5m"
+      PRIVATE_API:
+        description: 'Use private endpoints (balance/orders) — "true"/"false"'
+        required: true
+        default: "true"
+
+  # Auto schedule every 15 minutes
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes
+    - cron: "*/15 * * * *"
 
 concurrency:
   group: crypto-live
-  cancel-in-progress: true
+  cancel-in-progress: false
 
-env:
-  # --- Runtime ---
-  PYTHON_VERSION: "3.11"
-  DRY_RUN: "false"            # <— LIVE
-  PRIVATE_API: "ON"           # use Kraken authenticated endpoints
-
-  # --- Entry gates (active profile) ---
-  CANDLES_TIMEFRAME: "5m"
-  DROP_PCT: "0.6"
-  ENABLE_RSI: "true"
-  RSI_LEN: "14"
-  RSI_MAX: "60"
-
-  # --- Risk / exits ---
-  TAKE_PROFIT_PCT: "3.0"
-  STOP_LOSS_PCT: "2.0"
-  TRAIL_START_PCT: "2.5"
-  TRAIL_OFFSET_PCT: "0.8"
-
-  # --- Sizing / budget ---
-  BUY_SIZE_USD: "20"                # up from 10 to clear most min notionals
-  DAILY_SPEND_CAP_USD: "20"         # so we can only place one $20 order today
-  MAX_OPEN_TRADES: "1"
-  MIN_BALANCE_USD: "5"
-  MIN_ACTIVE_POSITION_USD: "2"
-
-  # --- Universe (auto from market liquidity) ---
-  UNIVERSE_MODE: "auto"
-  QUOTE: "USD"
-  TOP_N_SYMBOLS: "30"
-  MIN_USD_VOL: "1000000"           # ≥ $1M 24h USD volume
-  EXCLUDE_SYMBOLS: ""              # comma-separated list if you want exclusions
+permissions:
+  contents: read
 
 jobs:
-  live:
+  run:
+    name: Run trader (LIVE)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+
+    # All env the bot reads. Inputs can be overridden in Run dialog.
+    env:
+      # --- Runtime ---
+      PYTHON_VERSION: "3.11"
+
+      # --- Live/Paused switch ---
+      DRY_RUN: ${{ inputs.DRY_RUN || 'false' }}         # set "true" to pause live trading
+
+      # --- Exchange credentials (repo secrets) ---
+      API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+      API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
+      # --- Safety caps ---
+      PER_TRADE_USD: ${{ inputs.PER_TRADE_USD || '10' }}
+      DAILY_CAP_USD: ${{ inputs.DAILY_CAP_USD || '15' }}
+
+      # --- Strategy knobs ---
+      TOP_N: ${{ inputs.TOP_N || '30' }}
+      MIN_USD_VOL: ${{ inputs.MIN_USD_VOL || '1000000' }}
+      TIMEFRAME: ${{ inputs.TIMEFRAME || '5m' }}
+      RSI_LEN: "14"
+      RSI_MAX: ${{ inputs.RSI_MAX || '60' }}
+      DROP_PCT: ${{ inputs.DROP_PCT || '0.60' }}
+      PRIVATE_API: ${{ inputs.PRIVATE_API || 'true' }}
+
+      # --- Exchange selection (keep kraken for now) ---
+      EXCHANGE: "kraken"
 
     steps:
       - name: Check out repo
@@ -56,26 +94,21 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install ccxt
 
       - name: Sanity — Kraken keys present?
-        env:
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
-          if [ -z "${KRAKEN_API_KEY}" ] || [ -z "${KRAKEN_API_SECRET}" ]; then
-            echo "❌ Kraken keys are missing. Add KRAKEN_API_KEY and KRAKEN_API_SECRET in repo Settings → Secrets → Actions."
+          if [ "${DRY_RUN}" != "true" ] && { [ -z "${API_KEY}" ] || [ -z "${API_SECRET}" ]; }; then
+            echo "ERROR: Live trading requested but KRAKEN_API_KEY / KRAKEN_API_SECRET not set."
             exit 1
           fi
-          echo "✅ Kraken keys detected."
+          echo "Keys detected or DRY_RUN=true — proceeding."
 
       - name: Run trader (LIVE)
-        env:
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        shell: bash
         run: |
           set -e
           echo "=== START TRADING OUTPUT ==="
