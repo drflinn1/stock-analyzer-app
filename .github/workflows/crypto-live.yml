@@ -1,52 +1,52 @@
-name: Crypto Live (Every 15 min) — LIVE
+name: Crypto Live (Every 15 min) LIVE
 
 on:
   schedule:
-    - cron: "*/15 * * * *"     # run every 15 minutes
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: '"false" = live trading, "true" = simulate'
+        description: "false=live, true=simulate"
         required: true
         default: "false"
       PRIVATE_API:
-        description: 'Use private endpoints (balance/orders) — "true"/"false"'
+        description: "Use private endpoints (balance/orders)"
         required: true
         default: "true"
       PER_TRADE_USD:
-        description: 'Spend per buy (USD)'
+        description: "Spend per buy (USD)"
         required: true
         default: "10"
       DAILY_CAP_USD:
-        description: 'Max total spend per run/day slice (USD)'
+        description: "Daily spend cap (USD)"
         required: true
         default: "15"
       DROP_GATE:
-        description: 'Buy threshold (% drop needed to consider a buy)'
+        description: "Buy threshold % drop"
         required: true
         default: "0.60"
       TAKE_PROFIT_PCT:
-        description: 'Take-profit percent (sell if gain ≥ this). Set "" to disable.'
+        description: "Take profit % (blank to disable)"
         required: true
         default: "3.0"
       STOP_LOSS_PCT:
-        description: 'Stop-loss percent (sell if loss ≥ this). Set "" to disable.'
+        description: "Stop loss % (blank to disable)"
         required: true
         default: "2.0"
       TRAIL_START_PCT:
-        description: 'Start trailing once profit ≥ this percent. Set "" to disable.'
+        description: "Start trailing at % gain (blank to disable)"
         required: true
         default: "3.0"
       TRAIL_OFFSET_PCT:
-        description: 'Trail distance percent once trailing is active.'
+        description: "Trail offset %"
         required: true
         default: "1.0"
       TF_MINUTES:
-        description: 'Analysis timeframe in minutes'
+        description: "Timeframe minutes"
         required: true
         default: "15"
       UNIVERSE:
-        description: 'Comma-separated symbols to scan (e.g., BTC/USD,ETH/USD,DOGE/USD)'
+        description: "Symbols, comma-separated"
         required: true
         default: "BTC/USD,ETH/USD,DOGE/USD"
 
@@ -68,17 +68,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Quick guard so live runs fail fast if secrets are missing.
       - name: Sanity — Keys present if live
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.DRY_RUN == 'false' || github.event_name == 'schedule' }}
+        if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.DRY_RUN == 'false') || github.event_name == 'schedule' }}
         run: |
           test -n "${{ secrets.KRAKEN_API_KEY }}" || (echo "Missing KRAKEN_API_KEY" && exit 1)
           test -n "${{ secrets.KRAKEN_API_SECRET }}" || (echo "Missing KRAKEN_API_SECRET" && exit 1)
           echo "Secrets look present."
 
-      - name: Run trader (LIVE/DRY)
+      - name: Run trader
         env:
-          # core toggles
+          # toggles (defaults for schedule; inputs override for manual)
           DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'false' }}
           PRIVATE_API: ${{ github.event.inputs.PRIVATE_API || 'true' }}
 
@@ -86,7 +85,7 @@ jobs:
           PER_TRADE_USD: ${{ github.event.inputs.PER_TRADE_USD || '10' }}
           DAILY_CAP_USD: ${{ github.event.inputs.DAILY_CAP_USD || '15' }}
 
-          # strategy knobs
+          # strategy
           DROP_GATE: ${{ github.event.inputs.DROP_GATE || '0.60' }}
           TAKE_PROFIT_PCT: ${{ github.event.inputs.TAKE_PROFIT_PCT || '3.0' }}
           STOP_LOSS_PCT: ${{ github.event.inputs.STOP_LOSS_PCT || '2.0' }}
