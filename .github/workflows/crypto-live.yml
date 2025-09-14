@@ -35,16 +35,10 @@ on:
         description: 'Minimum 24h USD quote volume'
         required: true
         default: "1000000"
-      # Some versions of your code use TF; some use TIMEFRAME — we set both.
-      TF:
-        description: 'Candle timeframe (alias for TIMEFRAME)'
-        required: true
-        default: "5m"
       TIMEFRAME:
         description: 'Candle timeframe'
         required: true
         default: "5m"
-      # If empty, code will switch to auto-universe; if you want manual, comma-separate pairs
       UNIVERSE:
         description: 'Optional manual universe (e.g., BTC/USD,ETH/USD); leave empty for auto'
         required: false
@@ -85,7 +79,6 @@ jobs:
       # --- Strategy knobs ---
       TOP_N:        ${{ inputs.TOP_N        || '30' }}
       MIN_USD_VOL:  ${{ inputs.MIN_USD_VOL  || '1000000' }}
-      TF:           ${{ inputs.TF           || '5m' }}
       TIMEFRAME:    ${{ inputs.TIMEFRAME    || '5m' }}
       RSI_LEN:      "14"
       RSI_MAX:      ${{ inputs.RSI_MAX      || '60' }}
