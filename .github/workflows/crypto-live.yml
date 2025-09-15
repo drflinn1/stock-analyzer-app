@@ -12,18 +12,25 @@ jobs:
 
     env:
       EXCHANGE: "kraken"
-      DRY_RUN: "false"                # set "true" to paper trade
-      SYMBOLS: "BTC/USDT,ETH/USDT,DOGE/USDT,XRP/USDT,ADA/USDT"
+      DRY_RUN: "true"                # flip to "false" when ready for live orders
+      PRIVATE_API: "true"
 
+      # Spend controls
       PER_TRADE_USD: "10"
       DAILY_CAP_USD: "15"
       MIN_NOTIONAL_USD: "5"
 
+      # Simple buy gate (leave 0.0 to always allow buys)
       BUY_GATE_PCT: "0.0"
 
-      TRAIL_ACTIVATE_PCT: "3.0"       # start trailing after +3%
-      TRAIL_OFFSET_PCT: "1.0"         # sell if -1% from the anchor
+      # Trailing profit
+      TRAIL_ACTIVATE_PCT: "3.0"
+      TRAIL_OFFSET_PCT: "1.0"
 
+      # Use USD pairs on Kraken (you have USD, not USDT)
+      SYMBOLS: "BTC/USD,ETH/USD,DOGE/USD,ADA/USD,XRP/USD"
+
+      # Secrets
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
@@ -31,7 +38,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Restore latest .state (positions/trails/daily_spend) from cache
       - name: Restore .state cache
         uses: actions/cache/restore@v4
         with:
@@ -50,13 +56,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt
 
+      - name: Sanity — Keys present if live
+        if: env.DRY_RUN == 'false'
+        run: |
+          test -n "${KRAKEN_API_KEY}" || (echo "Missing KRAKEN_API_KEY" && exit 1)
+          test -n "${KRAKEN_API_SECRET}" || (echo "Missing KRAKEN_API_SECRET" && exit 1)
+          echo "Secrets look present."
+
       - name: Run trader
         run: |
           echo "=== START TRADING OUTPUT ==="
           python main.py
           echo "=== END TRADING OUTPUT ==="
 
-      # Save updated .state so the next run remembers positions & trails
       - name: Save .state cache
         if: always()
         uses: actions/cache/save@v4
