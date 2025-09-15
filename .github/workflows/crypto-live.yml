@@ -12,20 +12,14 @@ jobs:
 
     env:
       EXCHANGE: "kraken"
-
-      # LIVE orders:
       DRY_RUN: "false"
 
-      # One-time toggle: set to "true" for a single run to clear stale paper state,
-      # then set back to "false".
-      RESET_STATE: "true"
-
-      # Use USD markets (matches your Kraken balance)
+      # Use your USD balance
       SYMBOLS: "BTC/USD,ETH/USD,DOGE/USD,ADA/USD,XRP/USD"
 
-      # Option A — opened up a bit
-      PER_TRADE_USD: "20"
-      DAILY_CAP_USD: "100"
+      # Raised sizing to satisfy BTC/ETH minimums (+fees/rounding)
+      PER_TRADE_USD: "25"
+      DAILY_CAP_USD: "125"
       MIN_NOTIONAL_USD: "5"
       BUY_GATE_PCT: "0.0"
 
@@ -48,13 +42,6 @@ jobs:
           key: state-${{ github.run_id }}
           restore-keys: |
             state-
-
-      # >>> One-time purge of local state when flipping from DRY to LIVE
-      - name: Reset state (one-time)
-        if: env.RESET_STATE == 'true'
-        run: |
-          rm -rf .state
-          echo "Purged .state (positions/trails/daily spend)"
 
       - name: Setup Python
         uses: actions/setup-python@v5
