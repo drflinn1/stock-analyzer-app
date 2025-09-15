@@ -18,7 +18,7 @@ jobs:
 
       # One-time toggle: set to "true" for a single run to clear stale paper state,
       # then set back to "false".
-      RESET_STATE: "false"
+      RESET_STATE: "true"
 
       # Use USD markets (matches your Kraken balance)
       SYMBOLS: "BTC/USD,ETH/USD,DOGE/USD,ADA/USD,XRP/USD"
