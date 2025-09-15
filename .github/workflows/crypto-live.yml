@@ -1,46 +1,45 @@
-name: "Crypto Live (Every 15 min) - LIVE"
+name: Crypto Live (Every 15 min — LIVE)
 
 on:
-  workflow_dispatch:
   schedule:
     - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: "Dry run (no real orders): true/false"
+        required: true
+        default: "false"
+      PER_TRADE_USD:
+        description: "Per-trade USD notional"
+        required: true
+        default: "15"
+      DAILY_CAP_USD:
+        description: "Daily USD cap for this workflow run"
+        required: true
+        default: "30"
+      FORCE_SELL:
+        description: "One-time force sell list (e.g. DOGE,ADA or DOGE/USD,ADA/USD)"
+        required: false
+        default: ""
+      AUTO_UNIVERSE_SIZE:
+        description: "How many USD pairs to consider"
+        required: true
+        default: "500"
+      MIN_NOTIONAL_USD:
+        description: "Minimum notional to avoid dust rejections"
+        required: true
+        default: "0.50"
 
 jobs:
   trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
-
-    env:
-      # SAFETY / MODE
-      DRY_RUN: "false"              # set "true" to simulate only
-      EXCHANGE: "kraken"
-
-      # RISK KNOBS
-      PER_TRADE_USD: "15"
-      DAILY_CAP_USD: "30"
-      MAX_OPEN_POSITIONS: "6"
-
-      # SIGNAL / SELL KNOBS
-      AUTO_UNIVERSE: "true"
-      UNIVERSE_SIZE: "500"
-      DROP_PCT: "0.8"
-      TAKE_PROFIT_PCT: "1.2"        # +1.2% take-profit
-      TRAIL_PROFIT_PCT: "0.6"       # 0.6% trailing from peak
-      STOP_LOSS_PCT: "0.0"          # 0=off; e.g., "3.0" for -3% hard stop
-      SELL_FRACTION: "1.0"          # 1.0=sell all on a hit
-
-      # ONE-TIME FORCE SELL (this run only; then it won't repeat)
-      FORCE_SELL_ONCE: "ALL"        # "ALL" to liquidate all non-USD coins once; or "DOGE,XRP"
-      FORCE_TOKEN: "cleanup-2025-09-15-01"  # change string to run another one-time sell in the future
-
-      MANUAL_SYMBOLS: ""            # e.g. "BTC/USD,ETH/USD"
-      VERBOSE: "1"
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -48,41 +47,44 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install ccxt pandas numpy
-
-      - name: Sanity - Keys present if live
-        if: env.DRY_RUN == 'false'
-        run: |
-          test -n "${{ secrets.KRAKEN_API_KEY }}" || (echo "Missing KRAKEN_API_KEY" && exit 1)
-          test -n "${{ secrets.KRAKEN_API_SECRET }}" || (echo "Missing KRAKEN_API_SECRET" && exit 1)
-
-      # Restore state (entries/peaks + force-sell history)
-      - name: Restore .state cache
-        uses: actions/cache/restore@v4
-        with:
-          path: .state/state.json
-          key: state-${{ runner.os }}-${{ github.ref_name }}-latest
-          restore-keys: |
-            state-${{ runner.os }}-${{ github.ref_name }}-
-            state-
+          pip install ccxt
 
       - name: Ensure state folder exists
-        run: |
-          mkdir -p .state
-          [ -f .state/state.json ] || echo "{}" > .state/state.json
+        run: mkdir -p .state
 
       - name: Run trader
         env:
+          # Secrets for Kraken (set in repo Settings → Secrets and variables → Actions)
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
+          # Exchange + toggles
+          EXCHANGE: "kraken"
+          DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'false' }}
+
+          # Budgets
+          PER_TRADE_USD: ${{ github.event.inputs.PER_TRADE_USD || '15' }}
+          DAILY_CAP_USD: ${{ github.event.inputs.DAILY_CAP_USD || '30' }}
+
+          # Universe & thresholds
+          AUTO_UNIVERSE_SIZE: ${{ github.event.inputs.AUTO_UNIVERSE_SIZE || '500' }}
+          MIN_NOTIONAL_USD: ${{ github.event.inputs.MIN_NOTIONAL_USD || '0.50' }}
+
+          # One-time force sell (clears automatically since inputs are per-run)
+          FORCE_SELL: ${{ github.event.inputs.FORCE_SELL || '' }}
+
+          # (Optional future) TP/SL/trailing envs
+          TAKE_PROFIT_PCT: ${{ vars.TAKE_PROFIT_PCT || '2.0' }}
+          TRAIL_PCT: ${{ vars.TRAIL_PCT || '1.0' }}
+          STOP_LOSS_PCT: ${{ vars.STOP_LOSS_PCT || '' }}
         run: |
           echo "=== START TRADING OUTPUT ==="
-          python main.py
+          python -u main.py
           echo "=== END TRADING OUTPUT ==="
 
       - name: Save .state cache
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: .state/state.json
-          key: state-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          path: .state
+          key: state-${{ github.run_id }}
