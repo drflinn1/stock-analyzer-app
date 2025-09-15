@@ -46,6 +46,11 @@ on:
         required: false
         default: ""
 
+# 👉 ensure only one run at a time (new run cancels the previous)
+concurrency:
+  group: crypto-live-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   trade:
     runs-on: ubuntu-latest
@@ -78,28 +83,23 @@ jobs:
 
       - name: Run trader
         env:
-          # Secrets (Settings → Secrets and variables → Actions)
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
           EXCHANGE: "kraken"
           DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'false' }}
 
-          # Budgets
           PER_TRADE_USD: ${{ github.event.inputs.PER_TRADE_USD || '15' }}
           DAILY_CAP_USD: ${{ github.event.inputs.DAILY_CAP_USD || '60' }}
 
-          # Universe / thresholds
           AUTO_UNIVERSE_SIZE: ${{ github.event.inputs.AUTO_UNIVERSE_SIZE || '500' }}
           MIN_NOTIONAL_USD: ${{ github.event.inputs.MIN_NOTIONAL_USD || '0.50' }}
 
-          # Sells
           TAKE_PROFIT_PCT: ${{ github.event.inputs.TAKE_PROFIT_PCT || '2.0' }}
           TRAIL_PCT: ${{ github.event.inputs.TRAIL_PCT || '1.0' }}
           MIN_PROFIT_TO_TRAIL: ${{ github.event.inputs.MIN_PROFIT_TO_TRAIL || '0.5' }}
           STOP_LOSS_PCT: ${{ github.event.inputs.STOP_LOSS_PCT || '' }}
 
-          # One-time force sell
           FORCE_SELL: ${{ github.event.inputs.FORCE_SELL || '' }}
         run: |
           echo "=== START TRADING OUTPUT ==="
