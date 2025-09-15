@@ -1,4 +1,4 @@
-import os, json, math, time
+import os, json, math, time, hashlib
 from typing import List, Tuple, Optional, Dict, Any
 import ccxt
 
@@ -14,11 +14,14 @@ AUTO_UNIVERSE = os.getenv("AUTO_UNIVERSE", "true").lower() == "true"
 UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "500"))
 MANUAL_SYMBOLS = [s.strip() for s in os.getenv("MANUAL_SYMBOLS", "").split(",") if s.strip()]
 
-DROP_PCT = float(os.getenv("DROP_PCT", "0.8"))  # placeholder gate; buy criteria is minimal here
+DROP_PCT = float(os.getenv("DROP_PCT", "0.8"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "1.2"))
 TRAIL_PROFIT_PCT = float(os.getenv("TRAIL_PROFIT_PCT", "0.6"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.0"))   # 0 disables
-SELL_FRACTION = float(os.getenv("SELL_FRACTION", "1.0"))   # 0-1 portion to sell on hits
+SELL_FRACTION = float(os.getenv("SELL_FRACTION", "1.0"))
+
+FORCE_SELL_ONCE = os.getenv("FORCE_SELL_ONCE", "").strip()   # "ALL" or comma list: "DOGE,XRP"
+FORCE_TOKEN = os.getenv("FORCE_TOKEN", "").strip()            # any string; used to ensure one-time behavior
 
 VERBOSE = os.getenv("VERBOSE", "1") == "1"
 
@@ -78,7 +81,7 @@ def fetch_free_usd(exchange) -> float:
         return 0.0
 
 def fetch_balances(exchange) -> Dict[str, float]:
-    """Return tradeable (free) balances keyed by currency symbol (e.g., 'XRP', 'DOGE')."""
+    """Return tradeable (free) balances keyed by currency symbol, e.g., {'XRP':24.0,'DOGE':298.0,'USD':4.58}."""
     out = {}
     try:
         bal = exchange.fetch_balance()
@@ -101,7 +104,7 @@ def fetch_ticker(exchange, sym: str) -> Optional[dict]:
             log(f"WARN fetch_ticker {sym}: {e}")
         return None
 
-def get_min_cost_usd(market: dict, ask: float) -> Optional[float]:
+def get_min_cost_usd(market: dict, price: float) -> Optional[float]:
     lim = market.get("limits", {})
     cmin = lim.get("cost", {}).get("min")
     if cmin:
@@ -110,9 +113,9 @@ def get_min_cost_usd(market: dict, ask: float) -> Optional[float]:
         except Exception:
             pass
     amin = lim.get("amount", {}).get("min")
-    if amin and ask:
+    if amin and price:
         try:
-            return float(amin) * float(ask)
+            return float(amin) * float(price)
         except Exception:
             pass
     return None
@@ -129,13 +132,49 @@ def pick_universe(exchange, markets) -> List[str]:
         return [s for s in MANUAL_SYMBOLS if s in symbols]
     return ["BTC/USD","ETH/USD","SOL/USD","XRP/USD","DOGE/USD"]
 
-# === BUY ===
+# === State helpers ===
+def ensure_state_symbol(state: Dict[str, Any], symbol: str, entry: float):
+    s = state.setdefault("positions", {}).setdefault(symbol, {})
+    if "entry" not in s:
+        s["entry"] = entry
+    if "peak" not in s:
+        s["peak"] = entry
+
+def update_peak(state: Dict[str, Any], symbol: str, price: float):
+    s = state.get("positions", {}).get(symbol, None)
+    if not s: return
+    if price > s.get("peak", s.get("entry", price)):
+        s["peak"] = price
+
+def clear_or_reduce_state(state: Dict[str, Any], symbol: str, sold_fraction: float):
+    s = state.get("positions", {}).get(symbol, None)
+    if not s: return
+    if sold_fraction >= 0.999:
+        state["positions"].pop(symbol, None)
+    else:
+        s["peak"] = s.get("entry", s.get("peak", 0.0))
+
+def reconcile_state_with_balances(state: Dict[str, Any], balances: Dict[str, float]):
+    """Drop any symbols from state that have zero balance now (e.g., after manual/forced sell)."""
+    have = set()
+    for ccy, qty in balances.items():
+        if ccy in ("USD",): 
+            continue
+        have.add(f"{ccy}/USD")
+    to_remove = []
+    for sym in list(state.get("positions", {}).keys()):
+        if sym not in have:
+            to_remove.append(sym)
+    for sym in to_remove:
+        state["positions"].pop(sym, None)
+        log(f"{sym}: reconciled — removed from state (no balance).")
+
+# === Buy sizing ===
 def size_buy(exchange, market, ask: float, daily_left: float) -> Tuple[str, float, float]:
     target = min(PER_TRADE_USD, daily_left)
     mc = get_min_cost_usd(market, ask)
     if mc and target + 1e-9 < mc:
         return ("SKIP: below min notional ${:.2f} < ${:.2f}".format(target, mc), 0.0, 0.0)
-
     qty_raw = target / ask
     qty = round_to_precision(exchange, market, qty_raw)
     notional = qty * ask
@@ -152,7 +191,6 @@ def place_market_buy(exchange, symbol: str, qty: float) -> Tuple[bool, str]:
     except ccxt.BaseError as e:
         return False, f"order rejected ({str(e)})"
 
-# === SELL ===
 def place_market_sell(exchange, symbol: str, qty: float) -> Tuple[bool, str]:
     if DRY_RUN:
         return True, "[DRY_RUN] sell placed"
@@ -162,49 +200,84 @@ def place_market_sell(exchange, symbol: str, qty: float) -> Tuple[bool, str]:
     except ccxt.BaseError as e:
         return False, f"order rejected ({str(e)})"
 
-def ensure_state_symbol(state: Dict[str, Any], symbol: str, entry: float):
-    """Create state for symbol if missing."""
-    s = state.setdefault("positions", {}).setdefault(symbol, {})
-    if "entry" not in s:
-        s["entry"] = entry
-    if "peak" not in s:
-        s["peak"] = entry
-
-def update_peak(state: Dict[str, Any], symbol: str, price: float):
-    s = state.get("positions", {}).get(symbol, None)
-    if not s: return
-    if price > s.get("peak", s.get("entry", price)):
-        s["peak"] = price
-
-def clear_or_reduce_state(state: Dict[str, Any], symbol: str, sold_fraction: float):
-    s = state.get("positions", {}).get(symbol, None)
-    if not s: return
-    if sold_fraction >= 0.999:   # sold everything
-        state["positions"].pop(symbol, None)
-    else:
-        # keep entry, reset peak to current entry to avoid instant resell; simple approach
-        s["peak"] = s.get("entry", s.get("peak", 0.0))
-
+# === Sell rule evaluation ===
 def evaluate_sell_rules(symbol: str, price: float, s: Dict[str, Any]) -> Optional[str]:
-    """
-    Returns reason string if a sell should happen, else None.
-    """
     entry = s.get("entry", price)
     peak = s.get("peak", entry)
-
     # Take-profit
     if TAKE_PROFIT_PCT > 0 and price >= entry * (1 + TAKE_PROFIT_PCT/100.0):
         return "TAKE_PROFIT"
-
-    # Trailing profit (only meaningful when above entry)
+    # Trailing-stop (only after above entry)
     if TRAIL_PROFIT_PCT > 0 and peak > entry and price <= peak * (1 - TRAIL_PROFIT_PCT/100.0):
         return "TRAILING_STOP"
-
     # Optional stop-loss
     if STOP_LOSS_PCT > 0 and price <= entry * (1 - STOP_LOSS_PCT/100.0):
         return "STOP_LOSS"
-
     return None
+
+# === Force-sell (one time) ===
+def parse_force_list(force_value: str, balances: Dict[str, float]) -> List[str]:
+    """Return list of symbols 'XXX/USD' to liquidate now."""
+    if not force_value:
+        return []
+    if force_value.upper() == "ALL":
+        return [f"{ccy}/USD" for ccy in balances.keys() if ccy not in ("USD",)]
+    parts = [p.strip().upper() for p in force_value.split(",") if p.strip()]
+    syms = []
+    for p in parts:
+        if p.endswith("/USD"):
+            syms.append(p)
+        else:
+            syms.append(f"{p}/USD")
+    return syms
+
+def force_sell_once(exchange, markets, balances, state):
+    if not FORCE_SELL_ONCE:
+        return
+    token_src = (FORCE_SELL_ONCE + "|" + FORCE_TOKEN).encode("utf-8")
+    token = hashlib.sha1(token_src).hexdigest()
+    done = state.setdefault("force_done", {})
+    if done.get(token):
+        log(f"FORCE_SELL: token already executed ({FORCE_TOKEN}); skipping.")
+        return
+
+    targets = parse_force_list(FORCE_SELL_ONCE, balances)
+    if not targets:
+        return
+    log(f"FORCE_SELL: one-time liquidation for {targets} (token {FORCE_TOKEN})")
+
+    for sym in targets:
+        ccy = sym.split("/")[0]
+        qty = float(balances.get(ccy, 0.0))
+        if qty <= 0:
+            log(f"{sym}: SKIP FORCE SELL — no balance.")
+            continue
+        if sym not in markets:
+            log(f"{sym}: SKIP FORCE SELL — market unavailable.")
+            continue
+        t = fetch_ticker(exchange, sym)
+        if not t or not t.get("bid"):
+            log(f"{sym}: SKIP FORCE SELL — no quote.")
+            continue
+        price = float(t["bid"])
+        m = markets[sym]
+        sell_qty = round_to_precision(exchange, m, qty * SELL_FRACTION)
+        notional = sell_qty * price
+        mc = get_min_cost_usd(m, price)
+        if mc and notional + 1e-9 < mc:
+            log(f"{sym}: SKIP FORCE SELL — below min notional ${notional:.2f} < ${mc:.2f}")
+            continue
+        ok, info = place_market_sell(exchange, sym, sell_qty)
+        if ok:
+            log(f"SELL {sym}: FORCE_SELL sold {sell_qty} ~${notional:.2f} ({info})")
+            # clear from state
+            clear_or_reduce_state(state, sym, 1.0)
+        else:
+            log(f"{sym}: SKIP FORCE SELL — {info}")
+        time.sleep(0.25)
+
+    # mark as executed so it won't repeat
+    done[token] = True
 
 # === MAIN ===
 def main():
@@ -214,51 +287,54 @@ def main():
     ex = connect_exchange()
     markets = ex.load_markets()
 
-    # --- SELL PHASE (self-funding) ---
-    balances = fetch_balances(ex)  # e.g., {"XRP": 24.0, "DOGE": 298.0, "USD": 4.58, ...}
+    # --- BALANCES + RECONCILE ---
+    balances = fetch_balances(ex)
+    reconcile_state_with_balances(state, balances)
+
+    # --- ONE-TIME FORCE SELL (if configured and not yet executed) ---
+    force_sell_once(ex, markets, balances, state)
+
+    # refresh balances after force sells
+    balances = fetch_balances(ex)
     usd_free = float(balances.get("USD", 0.0))
-    # Convert CCY balances to /USD symbols we can trade
+
+    # --- NORMAL SELL PHASE (self-funding) ---
     for ccy, qty in sorted(balances.items()):
-        if ccy in ("USD",):  # skip cash here
+        if ccy in ("USD",):
             continue
-        symbol = f"{ccy}/USD"
-        if symbol not in markets:
-            continue  # ignore non-USD markets
-        t = fetch_ticker(ex, symbol)
+        sym = f"{ccy}/USD"
+        if sym not in markets:
+            continue
+        t = fetch_ticker(ex, sym)
         if not t or not t.get("bid"):
             continue
         price = float(t["bid"])
-        ensure_state_symbol(state, symbol, price)
-        update_peak(state, symbol, price)
-        reason = evaluate_sell_rules(symbol, price, state["positions"][symbol])
+        ensure_state_symbol(state, sym, price)
+        update_peak(state, sym, price)
+        reason = evaluate_sell_rules(sym, price, state["positions"][sym])
         if not reason:
             continue
 
-        # size sell
-        m = markets[symbol]
-        sell_qty_raw = qty * SELL_FRACTION
-        sell_qty = round_to_precision(ex, m, sell_qty_raw)
+        m = markets[sym]
+        sell_qty = round_to_precision(ex, m, qty * SELL_FRACTION)
         notional = sell_qty * price
         mc = get_min_cost_usd(m, price)
         if mc and notional + 1e-9 < mc:
-            log(f"{symbol}: SKIP SELL — below min notional ${notional:.2f} < ${mc:.2f}")
+            log(f"{sym}: SKIP SELL — below min notional ${notional:.2f} < ${mc:.2f}")
             continue
         if sell_qty <= 0:
-            log(f"{symbol}: SKIP SELL — qty too small after precision")
+            log(f"{sym}: SKIP SELL — qty too small after precision")
             continue
 
-        ok, info = place_market_sell(ex, symbol, sell_qty)
+        ok, info = place_market_sell(ex, sym, sell_qty)
         if ok:
-            log(f"SELL {symbol}: {reason} sold {sell_qty} ~${notional:.2f} ({info})")
-            sold_fraction = min(1.0, sell_qty_raw / max(qty, 1e-9))
-            clear_or_reduce_state(state, symbol, sold_fraction)
+            log(f"SELL {sym}: {reason} sold {sell_qty} ~${notional:.2f} ({info})")
+            clear_or_reduce_state(state, sym, 1.0 if SELL_FRACTION >= 0.999 else SELL_FRACTION)
         else:
-            log(f"{symbol}: SKIP SELL — {info}")
-
-        # small pause for rate limits
+            log(f"{sym}: SKIP SELL — {info}")
         time.sleep(0.25)
 
-    # refresh USD after sells (for buys)
+    # refresh USD after sells
     usd_free = fetch_free_usd(ex)
 
     # --- BUY PHASE ---
@@ -266,7 +342,6 @@ def main():
     universe_markets = [markets[s] for s in universe_syms if s in markets]
 
     daily_left = DAILY_CAP_USD
-    # Global free-USD guard (fees headroom ~1%)
     if usd_free < PER_TRADE_USD * 1.01:
         log(f"SKIP_ALL_BUYS: free_usd=${usd_free:.2f} < gate=${PER_TRADE_USD*1.01:.2f} — no buy attempts this run.")
         save_state(state)
@@ -302,11 +377,9 @@ def main():
             spent = min(PER_TRADE_USD, daily_left)
             daily_left -= spent
             usd_free -= spent
-            # Seed state (entry & peak) so sells can trigger later
             ensure_state_symbol(state, sym, ask)
         else:
             log(f"{sym}: SKIP BUY — {info}")
-
         time.sleep(0.25)
 
     if buys == 0:
