@@ -11,28 +11,29 @@ jobs:
     timeout-minutes: 12
 
     env:
-      # Exchange
       EXCHANGE: "kraken"
 
-      # Live vs paper — set "false" to place real orders
+      # LIVE orders:
       DRY_RUN: "false"
 
-      # Use your USD balance (not USDT)
+      # One-time toggle: set to "true" for a single run to clear stale paper state,
+      # then set back to "false".
+      RESET_STATE: "true"
+
+      # Use USD markets (matches your Kraken balance)
       SYMBOLS: "BTC/USD,ETH/USD,DOGE/USD,ADA/USD,XRP/USD"
 
-      # Option A — throttle opened up
-      PER_TRADE_USD: "20"      # each new buy ≈ $20
-      DAILY_CAP_USD: "100"     # up to ~$100 of new buys per day
+      # Option A — opened up a bit
+      PER_TRADE_USD: "20"
+      DAILY_CAP_USD: "100"
       MIN_NOTIONAL_USD: "5"
-
-      # Simple buy gate (0 = always allowed by this minimal logic)
       BUY_GATE_PCT: "0.0"
 
-      # Trailing profit engine
-      TRAIL_ACTIVATE_PCT: "3.0"   # begin trailing after +3% unrealized P&L
-      TRAIL_OFFSET_PCT: "1.0"     # sell if price falls 1% from anchor
+      # Trailing profit
+      TRAIL_ACTIVATE_PCT: "3.0"
+      TRAIL_OFFSET_PCT: "1.0"
 
-      # Kraken API secrets (must be set in repo → Settings → Secrets and variables → Actions)
+      # Secrets
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
@@ -40,7 +41,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Restore last run's local state (positions, trails, daily spend)
       - name: Restore .state cache
         uses: actions/cache/restore@v4
         with:
@@ -48,6 +48,13 @@ jobs:
           key: state-${{ github.run_id }}
           restore-keys: |
             state-
+
+      # >>> One-time purge of local state when flipping from DRY to LIVE
+      - name: Reset state (one-time)
+        if: env.RESET_STATE == 'true'
+        run: |
+          rm -rf .state
+          echo "Purged .state (positions/trails/daily spend)"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -59,7 +66,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt
 
-      # If running live, verify secrets exist
       - name: Sanity — Keys present if live
         if: env.DRY_RUN == 'false'
         run: |
@@ -73,7 +79,6 @@ jobs:
           python main.py
           echo "=== END TRADING OUTPUT ==="
 
-      # Save updated state so the next run remembers everything
       - name: Save .state cache
         if: always()
         uses: actions/cache/save@v4
