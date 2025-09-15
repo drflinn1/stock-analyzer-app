@@ -16,7 +16,7 @@ jobs:
       EXCHANGE: "kraken"
 
       # RISK KNOBS
-      PER_TRADE_USD: "10"           # raise to 15 later if you want BTC/ETH more often
+      PER_TRADE_USD: "15"           # ⬅️ raised from 10 so BTC/ETH/SOL can buy
       DAILY_CAP_USD: "30"
       MAX_OPEN_POSITIONS: "6"
 
