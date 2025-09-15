@@ -2,7 +2,7 @@ name: Crypto Live (Every 15 min — LIVE)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/20 * * * *"
   workflow_dispatch:
     inputs:
       DRY_RUN:
@@ -49,7 +49,7 @@ on:
 # 👉 ensure only one run at a time (new run cancels the previous)
 concurrency:
   group: crypto-live-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   trade:
