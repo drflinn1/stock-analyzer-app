@@ -67,7 +67,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --- NEW: build a daily cache key and restore state/daily.json ---
       - name: Get UTC date
         id: date
         run: echo "today=$(date -u +%Y-%m-%d)" >> $GITHUB_OUTPUT
@@ -80,6 +79,10 @@ jobs:
           restore-keys: |
             crypto-state-${{ steps.date.outputs.today }}-
 
+      # Ensure the directory exists so cache-save never warns
+      - name: Ensure state dir
+        run: mkdir -p state
+
       - name: Sanity — Keys present if live
         if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.DRY_RUN == 'false') || github.event_name == 'schedule' }}
         run: |
@@ -89,15 +92,12 @@ jobs:
 
       - name: Run trader
         env:
-          # toggles
           DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'false' }}
           PRIVATE_API: ${{ github.event.inputs.PRIVATE_API || 'true' }}
 
-          # budgets
           PER_TRADE_USD: ${{ github.event.inputs.PER_TRADE_USD || '10' }}
           DAILY_CAP_USD: ${{ github.event.inputs.DAILY_CAP_USD || '15' }}
 
-          # strategy
           DROP_GATE: ${{ github.event.inputs.DROP_GATE || '0.60' }}
           TAKE_PROFIT_PCT: ${{ github.event.inputs.TAKE_PROFIT_PCT || '3.0' }}
           STOP_LOSS_PCT: ${{ github.event.inputs.STOP_LOSS_PCT || '2.0' }}
@@ -106,11 +106,9 @@ jobs:
           TF_MINUTES: "15"
           UNIVERSE: ${{ github.event.inputs.UNIVERSE || 'BTC/USD,ETH/USD,DOGE/USD,SOL/USD,XRP/USD,ADA/USD,LTC/USD,DOT/USD,LINK/USD,BCH/USD,ATOM/USD,MATIC/USD,AVAX/USD,UNI/USD,TRX/USD,XLM/USD,H/USD' }}
 
-          # extra knobs (no input so we stay <=10)
           RSI_MAX: "60"
           MAX_OPEN_POSITIONS: "3"
 
-          # exchange
           EXCHANGE: "kraken"
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
@@ -119,7 +117,6 @@ jobs:
           python main.py
           echo "=== END TRADING OUTPUT ==="
 
-      # --- NEW: save updated daily state so the next run sees new spent_usd ---
       - name: Save daily state
         if: always()
         uses: actions/cache/save@v4
