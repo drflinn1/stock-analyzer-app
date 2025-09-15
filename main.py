@@ -1,11 +1,12 @@
 # main.py
 # Live/DRY crypto loop with:
 #  - BUY + SELL (TP/SL)
-#  - Persistent DAILY cap across runs (UTC) via state/daily.json
+#  - Trailing stop with persistent per-position state (state/trails.json)
+#  - Persistent DAILY cap across runs (UTC) (state/daily.json)
 #  - Max open positions gate
 #  - UNIVERSE from env (comma-separated), RSI gate, drop gate
 #
-# Works with GitHub Actions cache steps in crypto-live.yml.
+# Works with the GitHub Actions workflow in .github/workflows/crypto-live.yml.
 
 import os, time, json
 from pathlib import Path
@@ -84,11 +85,11 @@ DAILY_CAP_USD      = env_float("DAILY_CAP_USD", 15.0)
 DROP_GATE          = env_float("DROP_GATE", 0.60)          # need drop <= -DROP_GATE
 TAKE_PROFIT_PCT    = env_float("TAKE_PROFIT_PCT", 3.0)     # SELL if pnl% >= TP
 STOP_LOSS_PCT      = env_float("STOP_LOSS_PCT", 2.0)       # SELL if pnl% <= -SL
-TRAIL_START_PCT    = env_float("TRAIL_START_PCT", 3.0)     # (reserved; not used here)
-TRAIL_OFFSET_PCT   = env_float("TRAIL_OFFSET_PCT", 1.0)    # (reserved; not used here)
+TRAIL_START_PCT    = env_float("TRAIL_START_PCT", 3.0)     # ACTIVATE trailing when gain >= this
+TRAIL_OFFSET_PCT   = env_float("TRAIL_OFFSET_PCT", 1.0)    # Once active, sell if drawdown >= this
 TF_MINUTES         = env_int("TF_MINUTES", 15)
-RSI_MAX            = env_float("RSI_MAX", 60.0)            # loosened a bit
-MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 3)      # cap concurrent holdings
+RSI_MAX            = env_float("RSI_MAX", 60.0)
+MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 3)
 
 EXCHANGE_ID        = os.getenv("EXCHANGE", "kraken")
 UNIVERSE, UNIVERSE_MODE = parse_universe()
@@ -96,31 +97,60 @@ UNIVERSE, UNIVERSE_MODE = parse_universe()
 DUST_USD = 2.00  # display-only dust threshold
 
 
-# -------------------- persistent daily cap --------------------
+# -------------------- persistent state --------------------
 
-STATE_DIR  = Path("state")
-STATE_FILE = STATE_DIR / "daily.json"
+STATE_DIR          = Path("state")
+STATE_FILE_DAILY   = STATE_DIR / "daily.json"
+STATE_FILE_TRAILS  = STATE_DIR / "trails.json"
 
 def utc_today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+def load_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return default
+
+def save_json(path: Path, data: Any) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2))
+
 def load_daily_state() -> Dict[str, Any]:
     today = utc_today_str()
-    try:
-        data = json.loads(STATE_FILE.read_text())
-        if data.get("date") == today and isinstance(data.get("spent_usd"), (int, float)):
-            return {"date": today, "spent_usd": float(data["spent_usd"])}
-    except Exception:
-        pass
+    data = load_json(STATE_FILE_DAILY, {})
+    if data.get("date") == today and isinstance(data.get("spent_usd"), (int, float)):
+        return {"date": today, "spent_usd": float(data["spent_usd"])}
     return {"date": today, "spent_usd": 0.0}
 
-def save_daily_state(state: Dict[str, Any]) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+def load_trails_state() -> Dict[str, Dict[str, float]]:
+    """
+    { "SYMBOL": {"active": bool, "anchor": float } }
+    """
+    raw = load_json(STATE_FILE_TRAILS, {})
+    # normalize
+    norm = {}
+    for sym, rec in (raw or {}).items():
+        try:
+            norm[sym] = {
+                "active": bool(rec.get("active", False)),
+                "anchor": float(rec.get("anchor", 0.0)),
+            }
+        except Exception:
+            continue
+    return norm
 
-daily_state = load_daily_state()
-# Ensure the path/file exists even if we make no buys this run
+def save_daily_state(s: Dict[str, Any]) -> None:
+    save_json(STATE_FILE_DAILY, s)
+
+def save_trails_state(s: Dict[str, Dict[str, float]]) -> None:
+    save_json(STATE_FILE_TRAILS, s)
+
+daily_state  = load_daily_state()
+trails_state = load_trails_state()
+# Ensure files/dirs exist even if we make no changes this run
 save_daily_state(daily_state)
+save_trails_state(trails_state)
 
 
 # -------------------- connect --------------------
@@ -146,6 +176,7 @@ print(
 )
 print(f"{now} | universe_mode={UNIVERSE_MODE}")
 print(f"{now} | scanning={UNIVERSE}")
+print(f"{now} | trails_loaded={len(trails_state)} symbols")
 
 
 # -------------------- balance, positions & dust --------------------
@@ -204,7 +235,7 @@ print(
 )
 
 
-# -------------------- SELL pass (TP/SL) --------------------
+# -------------------- SELL pass (TP/SL + Trailing) --------------------
 
 def estimate_entry_price(symbol: str, target_qty: float) -> Optional[float]:
     try:
@@ -236,11 +267,38 @@ def estimate_entry_price(symbol: str, target_qty: float) -> Optional[float]:
         return cost / got
     return None
 
+def trails_get(sym: str) -> Dict[str, float]:
+    return trails_state.get(sym, {"active": False, "anchor": 0.0})
+
+def trails_set(sym: str, active: bool, anchor: float) -> None:
+    trails_state[sym] = {"active": bool(active), "anchor": float(anchor)}
+
+def maybe_sell(symbol: str, reason: str) -> bool:
+    """Returns True if a sell was placed."""
+    global sells_placed
+    try:
+        if DRY_RUN:
+            print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | DRY_RUN SELL {symbol} all ({reason})")
+        else:
+            broker.market_sell_all(symbol)
+            print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | SELL placed {symbol} all ({reason})")
+        sells_placed += 1
+        # clear trail state after exit
+        if symbol in trails_state:
+            del trails_state[symbol]
+        return True
+    except Exception as e:
+        print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | SELL error {symbol}: {e}")
+        return False
+
 sells_placed = 0
 for sym in UNIVERSE:
     base = sym.split("/")[0]
     pos_qty = float((free_map.get(base) or 0.0))
     if pos_qty <= 0:
+        # If we don't hold it, drop any stale trail state.
+        if sym in trails_state:
+            del trails_state[sym]
         continue
 
     try:
@@ -256,22 +314,37 @@ for sym in UNIVERSE:
         continue
 
     pnl_pct = (lp - entry) / entry * 100.0
-    reason = None
-    if pnl_pct <= -abs(STOP_LOSS_PCT):
-        reason = f"stop-loss {pnl_pct:.2f}% ≤ -{STOP_LOSS_PCT:.2f}%"
-    elif pnl_pct >= abs(TAKE_PROFIT_PCT):
-        reason = f"take-profit {pnl_pct:.2f}% ≥ {TAKE_PROFIT_PCT:.2f}%"
 
-    if reason:
-        try:
-            if DRY_RUN:
-                print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | DRY_RUN SELL {sym} all ({reason})")
-            else:
-                broker.market_sell_all(sym)
-                print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | SELL placed {sym} all ({reason})")
-                sells_placed += 1
-        except Exception as e:
-            print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | SELL error {sym}: {e}")
+    # 1) Hard SL/TP first
+    if pnl_pct <= -abs(STOP_LOSS_PCT):
+        if maybe_sell(sym, f"stop-loss {pnl_pct:.2f}% ≤ -{STOP_LOSS_PCT:.2f}%"):
+            continue
+    if pnl_pct >= abs(TAKE_PROFIT_PCT):
+        if maybe_sell(sym, f"take-profit {pnl_pct:.2f}% ≥ {TAKE_PROFIT_PCT:.2f}%"):
+            continue
+
+    # 2) Trailing stop logic
+    trail = trails_get(sym)
+    if not trail["active"]:
+        # activate once gain >= TRAIL_START_PCT
+        if pnl_pct >= abs(TRAIL_START_PCT):
+            trails_set(sym, True, lp)
+            print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | TRAIL activate {sym} at {lp:.4f} (+{pnl_pct:.2f}% ≥ {TRAIL_START_PCT:.2f}%)")
+    else:
+        # update anchor (new high)
+        if lp > trail["anchor"]:
+            trails_set(sym, True, lp)
+            print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | TRAIL new high {sym} anchor {lp:.4f}")
+        # check drawdown from anchor
+        anchor = trails_state[sym]["anchor"]
+        if anchor > 0:
+            drawdown_pct = (anchor - lp) / anchor * 100.0
+            if drawdown_pct >= abs(TRAIL_OFFSET_PCT):
+                if maybe_sell(sym, f"trailing-stop drawdown {drawdown_pct:.2f}% ≥ {TRAIL_OFFSET_PCT:.2f}% from anchor {anchor:.4f}"):
+                    continue
+
+# persist trail state after SELL pass updates
+save_trails_state(trails_state)
 
 
 # -------------------- BUY scan --------------------
@@ -336,14 +409,15 @@ else:
             broker.place_market_notional(symbol, PER_TRADE_USD)
             print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | BUY placed {symbol} for ~${PER_TRADE_USD:.2f} (drop={best['drop']:.2f}% rsi={best['rsi']:.2f})")
             buys_placed += 1
-            # persist spend
+            # persist daily spend
             ds = {"date": utc_today_str(), "spent_usd": float(daily_state.get("spent_usd", 0.0)) + PER_TRADE_USD}
             save_daily_state(ds)
     except Exception as e:
         print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | BUY error {symbol}: {e}")
 
-# End-of-run: ensure the file exists (already saved above, but double-safe)
+# End-of-run: ensure state files exist
 save_daily_state(load_daily_state())
+save_trails_state(trails_state)
 
 print(f"Run complete. buys_placed={buys_placed} | sells_placed={sells_placed} | DRY_RUN={'True' if DRY_RUN else 'False'}")
 print("=== END TRADING OUTPUT ===")
