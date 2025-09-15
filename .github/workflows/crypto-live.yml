@@ -11,26 +11,28 @@ jobs:
     timeout-minutes: 12
 
     env:
+      # Exchange
       EXCHANGE: "kraken"
-      DRY_RUN: "false"                # flip to "false" when ready for live orders
-      PRIVATE_API: "true"
 
-      # Spend controls
-      PER_TRADE_USD: "10"
-      DAILY_CAP_USD: "15"
-      MIN_NOTIONAL_USD: "5"
+      # Live vs paper — set "false" to place real orders
+      DRY_RUN: "false"
 
-      # Simple buy gate (leave 0.0 to always allow buys)
-      BUY_GATE_PCT: "0.0"
-
-      # Trailing profit
-      TRAIL_ACTIVATE_PCT: "3.0"
-      TRAIL_OFFSET_PCT: "1.0"
-
-      # Use USD pairs on Kraken (you have USD, not USDT)
+      # Use your USD balance (not USDT)
       SYMBOLS: "BTC/USD,ETH/USD,DOGE/USD,ADA/USD,XRP/USD"
 
-      # Secrets
+      # Option A — throttle opened up
+      PER_TRADE_USD: "20"      # each new buy ≈ $20
+      DAILY_CAP_USD: "100"     # up to ~$100 of new buys per day
+      MIN_NOTIONAL_USD: "5"
+
+      # Simple buy gate (0 = always allowed by this minimal logic)
+      BUY_GATE_PCT: "0.0"
+
+      # Trailing profit engine
+      TRAIL_ACTIVATE_PCT: "3.0"   # begin trailing after +3% unrealized P&L
+      TRAIL_OFFSET_PCT: "1.0"     # sell if price falls 1% from anchor
+
+      # Kraken API secrets (must be set in repo → Settings → Secrets and variables → Actions)
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
@@ -38,6 +40,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Restore last run's local state (positions, trails, daily spend)
       - name: Restore .state cache
         uses: actions/cache/restore@v4
         with:
@@ -56,6 +59,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt
 
+      # If running live, verify secrets exist
       - name: Sanity — Keys present if live
         if: env.DRY_RUN == 'false'
         run: |
@@ -69,6 +73,7 @@ jobs:
           python main.py
           echo "=== END TRADING OUTPUT ==="
 
+      # Save updated state so the next run remembers everything
       - name: Save .state cache
         if: always()
         uses: actions/cache/save@v4
