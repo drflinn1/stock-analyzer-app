@@ -1,90 +1,165 @@
-name: Crypto Live (Every 15 min) — LIVE
+import os, math, time
+from typing import List
+import ccxt
 
-on:
-  schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch:
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+EXCHANGE = os.getenv("EXCHANGE", "kraken").lower()
+PER_TRADE_USD = float(os.getenv("PER_TRADE_USD", "10"))
+DAILY_CAP_USD = float(os.getenv("DAILY_CAP_USD", "30"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
 
-jobs:
-  trade:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20   # was 12
+AUTO_UNIVERSE = os.getenv("AUTO_UNIVERSE", "true").lower() == "true"
+UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "500"))
+MANUAL_SYMBOLS = [s.strip() for s in os.getenv("MANUAL_SYMBOLS", "").split(",") if s.strip()]
 
-    env:
-      EXCHANGE: "kraken"
-      DRY_RUN: "false"
+DROP_PCT = float(os.getenv("DROP_PCT", "0.8"))             # placeholder gate
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "1.2"))
+TRAIL_PROFIT_PCT = float(os.getenv("TRAIL_PROFIT_PCT", "0.6"))
 
-      # ---- Auto-Universe ----
-      AUTO_UNIVERSE: "true"
-      UNIVERSE_TOP_N: "5"
-      QUOTE: "USD"
-      MIN_PRICE_USD: "0.00"
-      EXCLUDE_BASES: "USDT,USDC,DAI,USD,UST,EURT"
-      INCLUDE_BASES: ""
+VERBOSE = os.getenv("VERBOSE", "1") == "1"
 
-      # Fallback manual list if AUTO_UNIVERSE=false
-      SYMBOLS: "BTC/USD,ETH/USD,DOGE/USD,ADA/USD,XRP/USD"
+def log(msg): print(msg, flush=True)
 
-      # ---- Sizing & caps ----
-      PER_TRADE_USD: "25"
-      DAILY_CAP_USD: "125"
-      MIN_NOTIONAL_USD: "5"
-      BUY_GATE_PCT: "0.0"
+def connect_exchange():
+    if EXCHANGE != "kraken":
+        raise RuntimeError("Only kraken is wired right now.")
+    apiKey = os.getenv("KRAKEN_API_KEY", "")
+    secret = os.getenv("KRAKEN_API_SECRET", "")
+    kwargs = dict(enableRateLimit=True)
+    if not DRY_RUN:
+        kwargs.update(apiKey=apiKey, secret=secret)
+    return ccxt.kraken(kwargs)
 
-      # ---- Trailing profit ----
-      TRAIL_ACTIVATE_PCT: "3.0"
-      TRAIL_OFFSET_PCT: "1.0"
+def round_to_precision(exchange, market, amount):
+    # Use amount precision if present
+    prec = market.get("precision", {}).get("amount", None)
+    step = market.get("limits", {}).get("amount", {}).get("min", None)
+    if prec is not None:
+        q = float(exchange.amount_to_precision(market["symbol"], amount))
+    elif step:
+        q = math.floor(amount / step) * step
+    else:
+        q = float(f"{amount:.8f}")
+    return max(0.0, q)
 
-      # ---- Secrets ----
-      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+def pick_universe(exchange) -> List[str]:
+    markets = exchange.load_markets()
+    symbols = [s for s, m in markets.items() if s.endswith("/USD") and m.get("active", True)]
+    symbols.sort()
+    if AUTO_UNIVERSE:
+        # extremely simple sampler: first N USD markets (keeps it deterministic)
+        chosen = symbols[: min(UNIVERSE_SIZE, len(symbols))]
+        log(f"auto_universe: picked {len(chosen)} of {len(symbols)} candidates -> {chosen[:5] + (['...'] if len(chosen)>5 else [])}")
+        return chosen
+    if MANUAL_SYMBOLS:
+        return [s for s in MANUAL_SYMBOLS if s in symbols]
+    return ["BTC/USD","ETH/USD","SOL/USD","XRP/USD","DOGE/USD"]
 
-      RESET_STATE: "false"
+def get_free_usd(exchange):
+    try:
+        bal = exchange.fetch_balance()
+        # Kraken: 'USD' key is present when funded; otherwise 0
+        return float(bal.get("free", {}).get("USD", 0.0))
+    except Exception as e:
+        log(f"WARN fetch_balance failed: {e}")
+        return 0.0
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+def get_ticker(exchange, sym):
+    try:
+        return exchange.fetch_ticker(sym)
+    except Exception as e:
+        if VERBOSE: log(f"WARN fetch_ticker {sym}: {e}")
+        return None
 
-      - name: Restore .state cache
-        uses: actions/cache/restore@v4
-        with:
-          path: .state
-          key: state-${{ github.run_id }}
-          restore-keys: |
-            state-
+def min_cost(exchange, market):
+    # Prefer explicit cost.min if Kraken exposes it; else try to infer from amount.min * ask
+    lim = market.get("limits", {})
+    cmin = None
+    cost = lim.get("cost", {})
+    if "min" in cost and cost["min"]:
+        cmin = float(cost["min"])
+    return cmin
 
-      - name: Reset state (one-time)
-        if: env.RESET_STATE == 'true'
-        run: |
-          rm -rf .state
-          echo "Purged .state (positions/trails/daily spend)"
+def try_buy(exchange, market, free_usd, daily_left):
+    sym = market["symbol"]
+    t = get_ticker(exchange, sym)
+    if not t or not t.get("ask"):
+        return "SKIP", f"{sym}: no quote/ask"
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+    ask = float(t["ask"])
+    notional_target = min(PER_TRADE_USD, daily_left)
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install ccxt
+    # Hard global guard: if truly low funds, do not attempt orders at all.
+    if free_usd < PER_TRADE_USD * 1.02:
+        return "SKIP_ALL", f"Low USD ${free_usd:.2f} < gate ${PER_TRADE_USD*1.02:.2f}"
 
-      - name: Sanity — Keys present if live
-        if: env.DRY_RUN == 'false'
-        run: |
-          test -n "${KRAKEN_API_KEY}" || (echo "Missing KRAKEN_API_KEY" && exit 1)
-          test -n "${KRAKEN_API_SECRET}" || (echo "Missing KRAKEN_API_SECRET" && exit 1)
-          echo "Secrets look present."
+    # Market specific minimum notional
+    mc = min_cost(exchange, market)
+    if mc and notional_target + 1e-9 < mc:
+        return "SKIP", f"{sym}: below min notional (${notional_target:.2f} < ${mc:.2f})"
 
-      - name: Run trader
-        run: |
-          echo "=== START TRADING OUTPUT ==="
-          python main.py
-          echo "=== END TRADING OUTPUT ==="
+    qty_raw = notional_target / ask
+    qty = round_to_precision(exchange, market, qty_raw)
+    notional_chk = qty * ask
+    if qty <= 0 or notional_chk < 0.99 * notional_target:
+        return "SKIP", f"{sym}: qty too small after precision"
 
-      - name: Save .state cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: .state
-          key: state-${{ github.run_id }}
+    if not DRY_RUN:
+        try:
+            order = exchange.create_market_buy_order(sym, qty)
+            return "BUY", f"{sym}: bought {qty} ~${notional_chk:.2f} (order id: {order.get('id','?')})"
+        except ccxt.BaseError as e:
+            # Any exchange rejection becomes a clean SKIP with reason.
+            return "SKIP", f"{sym}: order not placed ({str(e)})"
+    else:
+        return "BUY_SIM", f"{sym}: [DRY_RUN] would buy {qty} ~${notional_chk:.2f}"
+
+def main():
+    log("=== START TRADING OUTPUT ===")
+    ex = connect_exchange()
+    markets = ex.load_markets()
+
+    # Universe
+    universe_syms = pick_universe(ex)
+    # Map symbols -> market dicts, filter out unknowns
+    uni = [markets[s] for s in universe_syms if s in markets]
+
+    free_usd = get_free_usd(ex)
+    daily_left = DAILY_CAP_USD
+
+    # Global low-funds bail
+    if free_usd < PER_TRADE_USD * 1.02:
+        log(f"SKIP_ALL_BUYS: free_usd=${free_usd:.2f} < gate=${PER_TRADE_USD*1.02:.2f} — no buy attempts this run.")
+        log("=== END TRADING OUTPUT ===")
+        return
+
+    # Naive loop (your real signal logic can live here; this just tries each until caps are used)
+    buys_made = 0
+    for m in uni:
+        if daily_left < PER_TRADE_USD * 0.99:
+            log(f"CAP_REACHED: daily remaining ~${daily_left:.2f}, stopping buys.")
+            break
+
+        status, reason = try_buy(ex, m, free_usd, daily_left)
+        if status == "SKIP_ALL":
+            log(reason)
+            break
+        elif status.startswith("BUY"):
+            log(reason)
+            spent = min(PER_TRADE_USD, daily_left)
+            daily_left -= spent
+            free_usd -= spent
+            buys_made += 1
+        else:
+            # SKIP (min-notional, qty too small, or exchange rejected)
+            log(reason)
+
+        # Gentle rate-limit
+        time.sleep(0.3)
+
+    if buys_made == 0:
+        log("No buys this run (likely min-notional or gates).")
+    log("=== END TRADING OUTPUT ===")
+
+if __name__ == "__main__":
+    main()
