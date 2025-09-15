@@ -16,7 +16,7 @@ jobs:
       EXCHANGE: "kraken"
 
       # RISK KNOBS
-      PER_TRADE_USD: "15"           # leave 15; bump down to 10 if cash is tight
+      PER_TRADE_USD: "15"
       DAILY_CAP_USD: "30"
       MAX_OPEN_POSITIONS: "6"
 
@@ -25,9 +25,14 @@ jobs:
       UNIVERSE_SIZE: "500"
       DROP_PCT: "0.8"
       TAKE_PROFIT_PCT: "1.2"        # +1.2% take-profit
-      TRAIL_PROFIT_PCT: "0.6"       # 0.6% trailing from peak after entry
-      STOP_LOSS_PCT: "0.0"          # 0 = disabled; e.g. "3.0" for -3% hard stop
-      SELL_FRACTION: "1.0"          # 1.0 = sell all when a rule hits
+      TRAIL_PROFIT_PCT: "0.6"       # 0.6% trailing from peak
+      STOP_LOSS_PCT: "0.0"          # 0=off; e.g., "3.0" for -3% hard stop
+      SELL_FRACTION: "1.0"          # 1.0=sell all on a hit
+
+      # ONE-TIME FORCE SELL (this run only; then it won't repeat)
+      FORCE_SELL_ONCE: "ALL"        # "ALL" to liquidate all non-USD coins once; or "DOGE,XRP"
+      FORCE_TOKEN: "cleanup-2025-09-15-01"  # change string to run another one-time sell in the future
+
       MANUAL_SYMBOLS: ""            # e.g. "BTC/USD,ETH/USD"
       VERBOSE: "1"
 
@@ -51,7 +56,7 @@ jobs:
           test -n "${{ secrets.KRAKEN_API_KEY }}" || (echo "Missing KRAKEN_API_KEY" && exit 1)
           test -n "${{ secrets.KRAKEN_API_SECRET }}" || (echo "Missing KRAKEN_API_SECRET" && exit 1)
 
-      # --- Restore bot state (entry prices, peaks) so sells work across runs ---
+      # Restore state (entries/peaks + force-sell history)
       - name: Restore .state cache
         uses: actions/cache/restore@v4
         with:
@@ -75,7 +80,6 @@ jobs:
           python main.py
           echo "=== END TRADING OUTPUT ==="
 
-      # --- Save updated state for next run ---
       - name: Save .state cache
         if: always()
         uses: actions/cache/save@v4
