@@ -67,6 +67,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # --- NEW: build a daily cache key and restore state/daily.json ---
+      - name: Get UTC date
+        id: date
+        run: echo "today=$(date -u +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+      - name: Restore daily state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: crypto-state-${{ steps.date.outputs.today }}-${{ github.run_id }}
+          restore-keys: |
+            crypto-state-${{ steps.date.outputs.today }}-
+
       - name: Sanity — Keys present if live
         if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.DRY_RUN == 'false') || github.event_name == 'schedule' }}
         run: |
@@ -95,13 +108,21 @@ jobs:
 
           # extra knobs (no input so we stay <=10)
           RSI_MAX: "60"
+          MAX_OPEN_POSITIONS: "3"
 
           # exchange
           EXCHANGE: "kraken"
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-
         run: |
           echo "=== START TRADING OUTPUT ==="
           python main.py
           echo "=== END TRADING OUTPUT ==="
+
+      # --- NEW: save updated daily state so the next run sees new spent_usd ---
+      - name: Save daily state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: crypto-state-${{ steps.date.outputs.today }}-${{ github.run_id }}
