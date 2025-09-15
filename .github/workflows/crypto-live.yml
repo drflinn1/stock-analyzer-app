@@ -1,124 +1,65 @@
-name: Crypto Live (Every 15 min) LIVE
+name: Crypto Live (Every 15 min) — LIVE
 
 on:
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
-    inputs:
-      DRY_RUN:
-        description: "false=live, true=simulate"
-        required: true
-        default: "false"
-      PRIVATE_API:
-        description: "Use private endpoints (balance/orders)"
-        required: true
-        default: "true"
-      PER_TRADE_USD:
-        description: "Spend per buy (USD)"
-        required: true
-        default: "10"
-      DAILY_CAP_USD:
-        description: "Daily spend cap (USD)"
-        required: true
-        default: "15"
-      DROP_GATE:
-        description: "Buy threshold % drop"
-        required: true
-        default: "0.60"
-      TAKE_PROFIT_PCT:
-        description: "Take profit % (blank to disable)"
-        required: true
-        default: "3.0"
-      STOP_LOSS_PCT:
-        description: "Stop loss % (blank to disable)"
-        required: true
-        default: "2.0"
-      TRAIL_START_PCT:
-        description: "Start trailing at % gain (blank to disable)"
-        required: true
-        default: "3.0"
-      TRAIL_OFFSET_PCT:
-        description: "Trail offset %"
-        required: true
-        default: "1.0"
-      UNIVERSE:
-        description: "Symbols, comma-separated"
-        required: true
-        default: "BTC/USD,ETH/USD,DOGE/USD,SOL/USD,XRP/USD,ADA/USD,LTC/USD,DOT/USD,LINK/USD,BCH/USD,ATOM/USD,MATIC/USD,AVAX/USD,UNI/USD,TRX/USD,XLM/USD,H/USD"
 
 jobs:
   trade:
     runs-on: ubuntu-latest
-    concurrency:
-      group: crypto-live
-      cancel-in-progress: true
+    timeout-minutes: 12
+
+    env:
+      EXCHANGE: "kraken"
+      DRY_RUN: "false"                # set "true" to paper trade
+      SYMBOLS: "BTC/USDT,ETH/USDT,DOGE/USDT,XRP/USDT,ADA/USDT"
+
+      PER_TRADE_USD: "10"
+      DAILY_CAP_USD: "15"
+      MIN_NOTIONAL_USD: "5"
+
+      BUY_GATE_PCT: "0.0"
+
+      TRAIL_ACTIVATE_PCT: "3.0"       # start trailing after +3%
+      TRAIL_OFFSET_PCT: "1.0"         # sell if -1% from the anchor
+
+      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      # Restore latest .state (positions/trails/daily_spend) from cache
+      - name: Restore .state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: state-${{ github.run_id }}
+          restore-keys: |
+            state-
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Get UTC date
-        id: date
-        run: echo "today=$(date -u +%Y-%m-%d)" >> $GITHUB_OUTPUT
-
-      - name: Restore daily state
-        uses: actions/cache/restore@v4
-        with:
-          path: state
-          key: crypto-state-${{ steps.date.outputs.today }}-${{ github.run_id }}
-          restore-keys: |
-            crypto-state-${{ steps.date.outputs.today }}-
-
-      - name: Ensure state dir
-        run: mkdir -p state
-
-      - name: Sanity — Keys present if live
-        if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.DRY_RUN == 'false') || github.event_name == 'schedule' }}
-        run: |
-          test -n "${{ secrets.KRAKEN_API_KEY }}" || (echo "Missing KRAKEN_API_KEY" && exit 1)
-          test -n "${{ secrets.KRAKEN_API_SECRET }}" || (echo "Missing KRAKEN_API_SECRET" && exit 1)
-          echo "Secrets look present."
+          pip install ccxt
 
       - name: Run trader
-        env:
-          DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'false' }}
-          PRIVATE_API: ${{ github.event.inputs.PRIVATE_API || 'true' }}
-
-          PER_TRADE_USD: ${{ github.event.inputs.PER_TRADE_USD || '10' }}
-          DAILY_CAP_USD: ${{ github.event.inputs.DAILY_CAP_USD || '15' }}
-
-          DROP_GATE: ${{ github.event.inputs.DROP_GATE || '0.60' }}
-          TAKE_PROFIT_PCT: ${{ github.event.inputs.TAKE_PROFIT_PCT || '3.0' }}
-          STOP_LOSS_PCT: ${{ github.event.inputs.STOP_LOSS_PCT || '2.0' }}
-          TRAIL_START_PCT: ${{ github.event.inputs.TRAIL_START_PCT || '3.0' }}
-          TRAIL_OFFSET_PCT: ${{ github.event.inputs.TRAIL_OFFSET_PCT || '1.0' }}
-          TF_MINUTES: "15"
-          UNIVERSE: ${{ github.event.inputs.UNIVERSE || 'BTC/USD,ETH/USD,DOGE/USD,SOL/USD,XRP/USD,ADA/USD,LTC/USD,DOT/USD,LINK/USD,BCH/USD,ATOM/USD,MATIC/USD,AVAX/USD,UNI/USD,TRX/USD,XLM/USD,H/USD' }}
-
-          RSI_MAX: "60"
-          MAX_OPEN_POSITIONS: "3"
-
-          EXCHANGE: "kraken"
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           echo "=== START TRADING OUTPUT ==="
           python main.py
           echo "=== END TRADING OUTPUT ==="
 
-      - name: Save daily state
+      # Save updated .state so the next run remembers positions & trails
+      - name: Save .state cache
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: state
-          key: crypto-state-${{ steps.date.outputs.today }}-${{ github.run_id }}
+          path: .state
+          key: state-${{ github.run_id }}
