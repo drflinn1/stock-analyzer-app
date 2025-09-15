@@ -1,11 +1,15 @@
 # main.py
-# Live/DRY crypto loop with BUY + SELL (TP/SL) using CCXT on Kraken.
-# - Reads UNIVERSE from env.
-# - Sells positions if PnL <= -STOP_LOSS_PCT or PnL >= TAKE_PROFIT_PCT.
-# - Buys best candidate by drop% + RSI gate, honoring per-trade/daily caps.
+# Live/DRY crypto loop with:
+#  - BUY + SELL (TP/SL)
+#  - Persistent DAILY cap across runs (UTC) via state/daily.json
+#  - Max open positions gate
+#  - UNIVERSE from env (comma-separated), RSI gate, drop gate
+#
+# Works with GitHub Actions cache steps added in crypto-live.yml below.
 
-import os
-import time
+import os, time, json
+from pathlib import Path
+from datetime import datetime, timezone
 from typing import List, Tuple, Dict, Any, Optional
 
 from trader.broker_crypto_ccxt import CCXTCryptoBroker
@@ -80,11 +84,38 @@ STOP_LOSS_PCT      = env_float("STOP_LOSS_PCT", 2.0)       # SELL if pnl% <= -SL
 TRAIL_START_PCT    = env_float("TRAIL_START_PCT", 3.0)     # (reserved; not used here)
 TRAIL_OFFSET_PCT   = env_float("TRAIL_OFFSET_PCT", 1.0)    # (reserved; not used here)
 TF_MINUTES         = env_int("TF_MINUTES", 15)
-RSI_MAX            = env_float("RSI_MAX", 60.0)            # loosened so buys can happen tonight
-EXCHANGE_ID        = os.getenv("EXCHANGE", "kraken")
+RSI_MAX            = env_float("RSI_MAX", 60.0)            # loosened a bit
+MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 3)      # NEW: cap concurrent holdings
 
+EXCHANGE_ID        = os.getenv("EXCHANGE", "kraken")
 UNIVERSE, UNIVERSE_MODE = parse_universe()
+
 DUST_USD = 2.00  # display-only dust threshold
+
+# -------------------- persistent daily cap --------------------
+
+STATE_DIR  = Path("state")
+STATE_FILE = STATE_DIR / "daily.json"
+
+def utc_today_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def load_daily_state() -> Dict[str, Any]:
+    # new day → reset
+    today = utc_today_str()
+    try:
+        data = json.loads(STATE_FILE.read_text())
+        if data.get("date") == today and isinstance(data.get("spent_usd"), (int, float)):
+            return {"date": today, "spent_usd": float(data["spent_usd"])}
+    except Exception:
+        pass
+    return {"date": today, "spent_usd": 0.0}
+
+def save_daily_state(state: Dict[str, Any]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+daily_state = load_daily_state()
 
 # -------------------- connect --------------------
 
@@ -109,13 +140,16 @@ print(
 print(f"{now} | universe_mode={UNIVERSE_MODE}")
 print(f"{now} | scanning={UNIVERSE}")
 
-# -------------------- balance & dust print --------------------
+# -------------------- balance, positions & dust --------------------
 
 def last_price(symbol: str) -> float:
     t = exchange.fetch_ticker(symbol)
     return float(t.get("last") or t.get("close") or 0.0)
 
-def log_dust(symbol: str, free_map: Dict[str, float]) -> bool:
+def log_dust_and_count_positions(symbol: str, free_map: Dict[str, float]) -> Tuple[bool, bool]:
+    """
+    Returns (is_dust_printed, counts_as_position)
+    """
     base = symbol.split("/")[0]
     qty = float(free_map.get(base, 0) or 0.0)
     lp = 0.0
@@ -126,41 +160,44 @@ def log_dust(symbol: str, free_map: Dict[str, float]) -> bool:
     value = qty * lp if (qty and lp) else 0.0
     if value < DUST_USD:
         print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | {symbol} | qty={qty:.8f} | last={lp:.2f} | value=${value:.2f} < dust(${DUST_USD:.2f}) -> ignore")
-        return True
-    return False
+        return True, False
+    else:
+        # non-dust position counted
+        return False, qty > 0
 
 try:
     bal = exchange.fetch_balance() if PRIVATE_API else {"free": {}}
 except Exception:
     bal = {"free": {}}
 free_map = (bal.get("free") or {})
+
 dust_ignored = 0
+open_positions = 0
 for sym in UNIVERSE:
     try:
-        if log_dust(sym, free_map):
+        is_dust, counts_pos = log_dust_and_count_positions(sym, free_map)
+        if is_dust:
             dust_ignored += 1
+        if counts_pos:
+            open_positions += 1
     except Exception:
         print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | {sym} | dust-check error -> ignore")
 
-# -------------------- budget --------------------
+# -------------------- budget (persistent) --------------------
 
-open_trades = 0  # placeholder; wire to your position tracking if needed
-daily_remaining = DAILY_CAP_USD
 usd_key, usd_free_amt = broker.get_free_cash(prefer=broker.USD_KEYS)
+daily_spent = float(daily_state.get("spent_usd", 0.0))
+daily_remaining = max(0.0, DAILY_CAP_USD - daily_spent)
+
 print(
     f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | budget | USD_free=${usd_free_amt:.2f} | "
-    f"daily_remaining=${daily_remaining:.2f} | open_trades={open_trades}/3 | dust_ignored={dust_ignored}"
+    f"daily_spent=${daily_spent:.2f} | daily_remaining=${daily_remaining:.2f} | "
+    f"open_trades={open_positions}/{MAX_OPEN_POSITIONS} | dust_ignored={dust_ignored}"
 )
 
 # -------------------- SELL pass (TP/SL) --------------------
-# Estimate entry price from trade history and compute PnL% for each held symbol.
 
 def estimate_entry_price(symbol: str, target_qty: float) -> Optional[float]:
-    """
-    Estimate average entry for the current free quantity by walking back your trade
-    history (most recent first) and summing buy trades until we cover target_qty.
-    Returns VWAP entry price or None if not enough history.
-    """
     try:
         trades = exchange.fetch_my_trades(symbol, limit=200)
     except Exception:
@@ -172,12 +209,9 @@ def estimate_entry_price(symbol: str, target_qty: float) -> Optional[float]:
 
     cost = 0.0
     got = 0.0
-
-    # oldest->newest to build in chronological order, but we only need buys
     trades_sorted = sorted(trades, key=lambda t: t.get("timestamp", 0), reverse=True)
     for tr in trades_sorted:
         if str(tr.get("side", "")).lower() != "buy":
-            # sells reduce position; skip for entry calc (we aim to cover current free qty)
             continue
         amt = float(tr.get("amount") or 0.0)
         price = float(tr.get("price") or 0.0)
@@ -205,13 +239,11 @@ for sym in UNIVERSE:
     except Exception:
         continue
 
-    # Ignore dust in sell logic too
     if pos_qty * lp < DUST_USD:
         continue
 
     entry = estimate_entry_price(sym, pos_qty) if PRIVATE_API else None
     if entry is None or entry <= 0:
-        # No reliable entry; skip (we can bootstrap later)
         continue
 
     pnl_pct = (lp - entry) / entry * 100.0
@@ -234,6 +266,7 @@ for sym in UNIVERSE:
 
 # -------------------- BUY scan --------------------
 
+import ccxt  # used for OHLCV
 timeframe = f"{TF_MINUTES}m"
 rows: List[Dict[str, Any]] = []
 for sym in UNIVERSE:
@@ -250,27 +283,41 @@ for sym in UNIVERSE:
     except Exception:
         print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | {sym} | ohlcv error -> skip")
 
-# Rank: more negative drop first, then lower RSI
-rows_sorted = sorted(rows, key=lambda r: (r["drop"], r["rsi"]))
+rows_sorted = sorted(rows, key=lambda r: (r["drop"], r["rsi"]))  # more negative drop first
 
-# preview_top5
 if rows_sorted:
     preview = rows_sorted[:5]
     preview_fmt = [f"{r['symbol']} Δ={r['drop']:.2f}% rsi={r['rsi']:.2f} {'x' if r['rsi']>RSI_MAX else ''}" for r in preview]
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | preview_top5 = [{'; '.join(preview_fmt)}]")
 
-# choose best meeting gates
 best = rows_sorted[0] if rows_sorted else None
 will_buy = False
 reason = ""
 if best:
     drop_ok = (best["drop"] <= -abs(DROP_GATE))
     rsi_ok = (best["rsi"] <= RSI_MAX)
-    if drop_ok and rsi_ok:
-        will_buy = True
-        reason = "passed gates"
+    pos_ok = (open_positions < MAX_OPEN_POSITIONS)
+    cap_ok = (daily_remaining >= PER_TRADE_USD)
+    cash_ok = (usd_free_amt >= PER_TRADE_USD)
+
+    gates = []
+    gates.append(("drop", drop_ok))
+    gates.append(("rsi", rsi_ok))
+    gates.append(("pos", pos_ok))
+    gates.append(("cap", cap_ok))
+    gates.append(("cash", cash_ok))
+
+    will_buy = all(ok for _, ok in gates)
+    if not will_buy:
+        parts = []
+        if not drop_ok: parts.append(f"drop {best['drop']:.2f}% > -{DROP_GATE:.2f}%")
+        if not rsi_ok:  parts.append(f"RSI {best['rsi']:.2f} > {RSI_MAX:.2f}")
+        if not pos_ok:  parts.append(f"positions {open_positions}/{MAX_OPEN_POSITIONS} full")
+        if not cap_ok:  parts.append(f"daily_remaining ${daily_remaining:.2f} < ${PER_TRADE_USD:.2f}")
+        if not cash_ok: parts.append(f"USD_free ${usd_free_amt:.2f} < ${PER_TRADE_USD:.2f}")
+        reason = "; ".join(parts) if parts else "gates not met"
     else:
-        reason = f"did not pass: drop {best['drop']:.2f}% {'≤' if drop_ok else '>'} -{DROP_GATE:.2f}% gate, RSI {best['rsi']:.2f} {'≤' if rsi_ok else '>'} {RSI_MAX:.2f}"
+        reason = "passed gates"
 
 buys_placed = 0
 if not best:
@@ -279,21 +326,19 @@ elif not will_buy:
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | Best candidate | {best['symbol']} ({reason}) -> NO BUY")
 else:
     symbol = best["symbol"]
-    if daily_remaining < PER_TRADE_USD:
-        print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | BUY window skipped (budget ${daily_remaining:.2f} < per-trade ${PER_TRADE_USD:.2f})")
-    elif usd_free_amt < PER_TRADE_USD:
-        print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | BUY window skipped (insufficient USD: ${usd_free_amt:.2f})")
-    else:
-        try:
-            if DRY_RUN:
-                print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | DRY_RUN BUY {symbol} for ${PER_TRADE_USD:.2f} (drop={best['drop']:.2f}% rsi={best['rsi']:.2f})")
-            else:
-                broker.place_market_notional(symbol, PER_TRADE_USD)
-                print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | BUY placed {symbol} for ~${PER_TRADE_USD:.2f} (drop={best['drop']:.2f}% rsi={best['rsi']:.2f})")
-                buys_placed += 1
-                daily_remaining = max(0.0, daily_remaining - PER_TRADE_USD)
-        except Exception as e:
-            print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | BUY error {symbol}: {e}")
+    try:
+        if DRY_RUN:
+            print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | DRY_RUN BUY {symbol} for ${PER_TRADE_USD:.2f} (drop={best['drop']:.2f}% rsi={best['rsi']:.2f})")
+        else:
+            broker.place_market_notional(symbol, PER_TRADE_USD)
+            print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | BUY placed {symbol} for ~${PER_TRADE_USD:.2f} (drop={best['drop']:.2f}% rsi={best['rsi']:.2f})")
+            buys_placed += 1
+            # persist spend
+            daily_state["date"] = utc_today_str()
+            daily_state["spent_usd"] = float(daily_state.get("spent_usd", 0.0)) + PER_TRADE_USD
+            save_daily_state(daily_state)
+    except Exception as e:
+        print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | BUY error {symbol}: {e}")
 
 print(f"Run complete. buys_placed={buys_placed} | sells_placed={sells_placed} | DRY_RUN={'True' if DRY_RUN else 'False'}")
 print("=== END TRADING OUTPUT ===")
