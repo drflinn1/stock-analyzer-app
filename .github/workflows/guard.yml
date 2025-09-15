@@ -1,0 +1,64 @@
+name: Sell Logic Guard
+
+on:
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run guard checks
+        run: |
+          python - << 'PY'
+import sys, pathlib, re, json
+p = pathlib.Path("main.py")
+if not p.exists():
+    print("ERROR: main.py missing")
+    sys.exit(1)
+
+src = p.read_text(encoding="utf-8")
+errors = []
+
+# Must-have anchors
+anchors = {
+    "force_sell": r"\bdef\s+force_sell_if_requested\(",
+    "sell_rules": r"\bdef\s+apply_sell_rules\(",
+    "positions_save": r"\bsave_positions\(",
+    "positions_load": r"\bload_positions\(",
+}
+
+for name, pat in anchors.items():
+    if not re.search(pat, src):
+        errors.append(f"Missing required component: {name} ({pat})")
+
+# Make sure main loop calls these
+calls = {
+    "call_force": r"force_sell_if_requested\(",
+    "call_apply": r"apply_sell_rules\(",
+}
+for name, pat in calls.items():
+    if not re.search(pat, src):
+        errors.append(f"Main loop does not call: {name} ({pat})")
+
+# Ensure .state/positions.json usage exists
+if "positions.json" not in src:
+    errors.append("Missing positions persistence: 'positions.json' reference not found")
+
+if errors:
+    print("Guard failed:")
+    for e in errors:
+        print(" -", e)
+    sys.exit(2)
+
+print("Guard OK: sell logic & persistence present.")
+PY
