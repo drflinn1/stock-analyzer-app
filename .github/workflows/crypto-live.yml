@@ -15,7 +15,7 @@ jobs:
       EXCHANGE: "kraken"
 
       # Live vs paper — set "false" to place real orders
-      DRY_RUN: "true"
+      DRY_RUN: "false"
 
       # Use your USD balance (not USDT)
       SYMBOLS: "BTC/USD,ETH/USD,DOGE/USD,ADA/USD,XRP/USD"
