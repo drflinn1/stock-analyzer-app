@@ -16,9 +16,9 @@ on:
       DAILY_CAP_USD:
         description: "Daily USD cap for this workflow run"
         required: true
-        default: "30"
+        default: "60"
       FORCE_SELL:
-        description: "One-time force sell list (e.g. DOGE,ADA or DOGE/USD,ADA/USD)"
+        description: "One-time force sell list (DOGE,ADA or DOGE/USD,ADA/USD)"
         required: false
         default: ""
       AUTO_UNIVERSE_SIZE:
@@ -29,6 +29,22 @@ on:
         description: "Minimum notional to avoid dust rejections"
         required: true
         default: "0.50"
+      TAKE_PROFIT_PCT:
+        description: "Take-profit percent (e.g. 2.0)"
+        required: true
+        default: "2.0"
+      TRAIL_PCT:
+        description: "Trailing stop drawdown percent from peak (e.g. 1.0)"
+        required: true
+        default: "1.0"
+      MIN_PROFIT_TO_TRAIL:
+        description: "Only arm trailing after at least this profit %"
+        required: true
+        default: "0.5"
+      STOP_LOSS_PCT:
+        description: "Optional stop loss percent (blank disables)"
+        required: false
+        default: ""
 
 jobs:
   trade:
@@ -38,6 +54,14 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Restore .state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: state-${{ github.ref_name }}
+          restore-keys: |
+            state-
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -54,29 +78,29 @@ jobs:
 
       - name: Run trader
         env:
-          # Secrets for Kraken (set in repo Settings → Secrets and variables → Actions)
+          # Secrets (Settings → Secrets and variables → Actions)
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-          # Exchange + toggles
           EXCHANGE: "kraken"
           DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'false' }}
 
           # Budgets
           PER_TRADE_USD: ${{ github.event.inputs.PER_TRADE_USD || '15' }}
-          DAILY_CAP_USD: ${{ github.event.inputs.DAILY_CAP_USD || '30' }}
+          DAILY_CAP_USD: ${{ github.event.inputs.DAILY_CAP_USD || '60' }}
 
-          # Universe & thresholds
+          # Universe / thresholds
           AUTO_UNIVERSE_SIZE: ${{ github.event.inputs.AUTO_UNIVERSE_SIZE || '500' }}
           MIN_NOTIONAL_USD: ${{ github.event.inputs.MIN_NOTIONAL_USD || '0.50' }}
 
-          # One-time force sell (clears automatically since inputs are per-run)
-          FORCE_SELL: ${{ github.event.inputs.FORCE_SELL || '' }}
+          # Sells
+          TAKE_PROFIT_PCT: ${{ github.event.inputs.TAKE_PROFIT_PCT || '2.0' }}
+          TRAIL_PCT: ${{ github.event.inputs.TRAIL_PCT || '1.0' }}
+          MIN_PROFIT_TO_TRAIL: ${{ github.event.inputs.MIN_PROFIT_TO_TRAIL || '0.5' }}
+          STOP_LOSS_PCT: ${{ github.event.inputs.STOP_LOSS_PCT || '' }}
 
-          # (Optional future) TP/SL/trailing envs
-          TAKE_PROFIT_PCT: ${{ vars.TAKE_PROFIT_PCT || '2.0' }}
-          TRAIL_PCT: ${{ vars.TRAIL_PCT || '1.0' }}
-          STOP_LOSS_PCT: ${{ vars.STOP_LOSS_PCT || '' }}
+          # One-time force sell
+          FORCE_SELL: ${{ github.event.inputs.FORCE_SELL || '' }}
         run: |
           echo "=== START TRADING OUTPUT ==="
           python -u main.py
@@ -87,4 +111,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .state
-          key: state-${{ github.run_id }}
+          key: state-${{ github.ref_name }}-${{ github.run_id }}
