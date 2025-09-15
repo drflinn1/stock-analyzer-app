@@ -16,16 +16,18 @@ jobs:
       EXCHANGE: "kraken"
 
       # RISK KNOBS
-      PER_TRADE_USD: "15"           # ⬅️ raised from 10 so BTC/ETH/SOL can buy
+      PER_TRADE_USD: "15"           # leave 15; bump down to 10 if cash is tight
       DAILY_CAP_USD: "30"
       MAX_OPEN_POSITIONS: "6"
 
-      # SIGNAL KNOBS
+      # SIGNAL / SELL KNOBS
       AUTO_UNIVERSE: "true"
       UNIVERSE_SIZE: "500"
       DROP_PCT: "0.8"
-      TAKE_PROFIT_PCT: "1.2"
-      TRAIL_PROFIT_PCT: "0.6"
+      TAKE_PROFIT_PCT: "1.2"        # +1.2% take-profit
+      TRAIL_PROFIT_PCT: "0.6"       # 0.6% trailing from peak after entry
+      STOP_LOSS_PCT: "0.0"          # 0 = disabled; e.g. "3.0" for -3% hard stop
+      SELL_FRACTION: "1.0"          # 1.0 = sell all when a rule hits
       MANUAL_SYMBOLS: ""            # e.g. "BTC/USD,ETH/USD"
       VERBOSE: "1"
 
@@ -49,6 +51,21 @@ jobs:
           test -n "${{ secrets.KRAKEN_API_KEY }}" || (echo "Missing KRAKEN_API_KEY" && exit 1)
           test -n "${{ secrets.KRAKEN_API_SECRET }}" || (echo "Missing KRAKEN_API_SECRET" && exit 1)
 
+      # --- Restore bot state (entry prices, peaks) so sells work across runs ---
+      - name: Restore .state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .state/state.json
+          key: state-${{ runner.os }}-${{ github.ref_name }}-latest
+          restore-keys: |
+            state-${{ runner.os }}-${{ github.ref_name }}-
+            state-
+
+      - name: Ensure state folder exists
+        run: |
+          mkdir -p .state
+          [ -f .state/state.json ] || echo "{}" > .state/state.json
+
       - name: Run trader
         env:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
@@ -57,3 +74,11 @@ jobs:
           echo "=== START TRADING OUTPUT ==="
           python main.py
           echo "=== END TRADING OUTPUT ==="
+
+      # --- Save updated state for next run ---
+      - name: Save .state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state/state.json
+          key: state-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
