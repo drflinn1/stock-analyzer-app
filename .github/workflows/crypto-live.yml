@@ -8,40 +8,38 @@ on:
 jobs:
   trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 20   # was 12
 
     env:
-      # ===== Execution mode =====
       EXCHANGE: "kraken"
-      DRY_RUN: "false"           # set "true" to paper trade
+      DRY_RUN: "false"
 
-      # ===== Auto-Universe (top-N by 24h volume) =====
+      # ---- Auto-Universe ----
       AUTO_UNIVERSE: "true"
-      UNIVERSE_TOP_N: "5"        # how many symbols to trade each run
-      QUOTE: "USD"               # you hold USD on Kraken
-      MIN_PRICE_USD: "0.00"      # e.g., "0.01" to skip sub-penny coins
+      UNIVERSE_TOP_N: "5"
+      QUOTE: "USD"
+      MIN_PRICE_USD: "0.00"
       EXCLUDE_BASES: "USDT,USDC,DAI,USD,UST,EURT"
-      INCLUDE_BASES: ""          # optional allow-list; leave blank
+      INCLUDE_BASES: ""
 
-      # Fallback manual list (used only if AUTO_UNIVERSE=false)
+      # Fallback manual list if AUTO_UNIVERSE=false
       SYMBOLS: "BTC/USD,ETH/USD,DOGE/USD,ADA/USD,XRP/USD"
 
-      # ===== Sizing & caps =====
-      PER_TRADE_USD: "25"        # raised so BTC/ETH can pass minimums
+      # ---- Sizing & caps ----
+      PER_TRADE_USD: "25"
       DAILY_CAP_USD: "125"
       MIN_NOTIONAL_USD: "5"
-      BUY_GATE_PCT: "0.0"        # 0 = always allowed by minimal logic
+      BUY_GATE_PCT: "0.0"
 
-      # ===== Trailing profit =====
-      TRAIL_ACTIVATE_PCT: "3.0"  # start trailing after +3% unrealized
-      TRAIL_OFFSET_PCT: "1.0"    # sell if -1% from anchor
+      # ---- Trailing profit ----
+      TRAIL_ACTIVATE_PCT: "3.0"
+      TRAIL_OFFSET_PCT: "1.0"
 
-      # ===== Secrets =====
+      # ---- Secrets ----
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-      # Optional one-run toggle if you ever need to clear local state
-      RESET_STATE: "false"       # set to "true" for ONE run, then back to "false"
+      RESET_STATE: "false"
 
     steps:
       - name: Checkout
