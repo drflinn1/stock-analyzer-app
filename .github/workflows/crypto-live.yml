@@ -79,7 +79,6 @@ jobs:
           restore-keys: |
             crypto-state-${{ steps.date.outputs.today }}-
 
-      # Ensure the directory exists so cache-save never warns
       - name: Ensure state dir
         run: mkdir -p state
 
