@@ -12,7 +12,7 @@ jobs:
 
     env:
       EXCHANGE: "kraken"
-      DRY_RUN: "true"                # flip to "false" when ready for live orders
+      DRY_RUN: "false"                # flip to "false" when ready for live orders
       PRIVATE_API: "true"
 
       # Spend controls
