@@ -5,7 +5,7 @@
 #  - Max open positions gate
 #  - UNIVERSE from env (comma-separated), RSI gate, drop gate
 #
-# Works with GitHub Actions cache steps added in crypto-live.yml below.
+# Works with GitHub Actions cache steps in crypto-live.yml.
 
 import os, time, json
 from pathlib import Path
@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import List, Tuple, Dict, Any, Optional
 
 from trader.broker_crypto_ccxt import CCXTCryptoBroker
+
 
 # -------------------- env helpers --------------------
 
@@ -44,6 +45,7 @@ def parse_universe() -> Tuple[List[str], str]:
         return u, "manual"
     return default_universe, "default"
 
+
 # -------------------- indicators --------------------
 
 def rsi_14(closes: List[float]) -> Optional[float]:
@@ -72,6 +74,7 @@ def pct_drop_from_prev(closes: List[float]) -> Optional[float]:
         return None
     return (last - prev) / prev * 100.0
 
+
 # -------------------- config --------------------
 
 DRY_RUN            = env_bool("DRY_RUN", True)
@@ -85,12 +88,13 @@ TRAIL_START_PCT    = env_float("TRAIL_START_PCT", 3.0)     # (reserved; not used
 TRAIL_OFFSET_PCT   = env_float("TRAIL_OFFSET_PCT", 1.0)    # (reserved; not used here)
 TF_MINUTES         = env_int("TF_MINUTES", 15)
 RSI_MAX            = env_float("RSI_MAX", 60.0)            # loosened a bit
-MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 3)      # NEW: cap concurrent holdings
+MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 3)      # cap concurrent holdings
 
 EXCHANGE_ID        = os.getenv("EXCHANGE", "kraken")
 UNIVERSE, UNIVERSE_MODE = parse_universe()
 
 DUST_USD = 2.00  # display-only dust threshold
+
 
 # -------------------- persistent daily cap --------------------
 
@@ -101,7 +105,6 @@ def utc_today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 def load_daily_state() -> Dict[str, Any]:
-    # new day → reset
     today = utc_today_str()
     try:
         data = json.loads(STATE_FILE.read_text())
@@ -116,6 +119,9 @@ def save_daily_state(state: Dict[str, Any]) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 daily_state = load_daily_state()
+# Ensure the path/file exists even if we make no buys this run
+save_daily_state(daily_state)
+
 
 # -------------------- connect --------------------
 
@@ -125,6 +131,7 @@ broker = CCXTCryptoBroker(
     enable_private=PRIVATE_API,
 )
 exchange = broker.exchange
+
 
 # -------------------- banner --------------------
 
@@ -139,6 +146,7 @@ print(
 )
 print(f"{now} | universe_mode={UNIVERSE_MODE}")
 print(f"{now} | scanning={UNIVERSE}")
+
 
 # -------------------- balance, positions & dust --------------------
 
@@ -162,7 +170,6 @@ def log_dust_and_count_positions(symbol: str, free_map: Dict[str, float]) -> Tup
         print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | {symbol} | qty={qty:.8f} | last={lp:.2f} | value=${value:.2f} < dust(${DUST_USD:.2f}) -> ignore")
         return True, False
     else:
-        # non-dust position counted
         return False, qty > 0
 
 try:
@@ -183,6 +190,7 @@ for sym in UNIVERSE:
     except Exception:
         print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | {sym} | dust-check error -> ignore")
 
+
 # -------------------- budget (persistent) --------------------
 
 usd_key, usd_free_amt = broker.get_free_cash(prefer=broker.USD_KEYS)
@@ -194,6 +202,7 @@ print(
     f"daily_spent=${daily_spent:.2f} | daily_remaining=${daily_remaining:.2f} | "
     f"open_trades={open_positions}/{MAX_OPEN_POSITIONS} | dust_ignored={dust_ignored}"
 )
+
 
 # -------------------- SELL pass (TP/SL) --------------------
 
@@ -264,9 +273,10 @@ for sym in UNIVERSE:
         except Exception as e:
             print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | SELL error {sym}: {e}")
 
+
 # -------------------- BUY scan --------------------
 
-import ccxt  # used for OHLCV
+import ccxt  # for OHLCV
 timeframe = f"{TF_MINUTES}m"
 rows: List[Dict[str, Any]] = []
 for sym in UNIVERSE:
@@ -300,14 +310,7 @@ if best:
     cap_ok = (daily_remaining >= PER_TRADE_USD)
     cash_ok = (usd_free_amt >= PER_TRADE_USD)
 
-    gates = []
-    gates.append(("drop", drop_ok))
-    gates.append(("rsi", rsi_ok))
-    gates.append(("pos", pos_ok))
-    gates.append(("cap", cap_ok))
-    gates.append(("cash", cash_ok))
-
-    will_buy = all(ok for _, ok in gates)
+    will_buy = drop_ok and rsi_ok and pos_ok and cap_ok and cash_ok
     if not will_buy:
         parts = []
         if not drop_ok: parts.append(f"drop {best['drop']:.2f}% > -{DROP_GATE:.2f}%")
@@ -334,11 +337,13 @@ else:
             print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | BUY placed {symbol} for ~${PER_TRADE_USD:.2f} (drop={best['drop']:.2f}% rsi={best['rsi']:.2f})")
             buys_placed += 1
             # persist spend
-            daily_state["date"] = utc_today_str()
-            daily_state["spent_usd"] = float(daily_state.get("spent_usd", 0.0)) + PER_TRADE_USD
-            save_daily_state(daily_state)
+            ds = {"date": utc_today_str(), "spent_usd": float(daily_state.get("spent_usd", 0.0)) + PER_TRADE_USD}
+            save_daily_state(ds)
     except Exception as e:
         print(f"{time.strftime('%Y-%m-%dT%H:%M:%S+00:00')} | BUY error {symbol}: {e}")
+
+# End-of-run: ensure the file exists (already saved above, but double-safe)
+save_daily_state(load_daily_state())
 
 print(f"Run complete. buys_placed={buys_placed} | sells_placed={sells_placed} | DRY_RUN={'True' if DRY_RUN else 'False'}")
 print("=== END TRADING OUTPUT ===")
