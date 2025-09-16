@@ -17,18 +17,19 @@ jobs:
     env:
       # === TUNABLES (safe defaults) ===
       PER_TRADE_USD: "10"
-      DAILY_CAP_USD: "25"        # baseline cap; remaining is persisted across runs
-      LOW_BALANCE_USD: "5"       # if free USD < this, pause buys for this run
+      DAILY_CAP_USD: "25"
+      LOW_BALANCE_USD: "5"
       DROP_PCT: "2.0"
       EXCHANGE: "kraken"
       MODE: "live"
-      # Optional sell knobs (your main.py already supports these)
+
+      # Sells
       TAKE_PROFIT_PCT: "2.0"
       TRAILING_ACTIVATE_PCT: "1.0"
       TRAILING_DELTA_PCT: "1.0"
       STOP_LOSS_PCT: "0"
 
-      # Optional position rails (supported in updated main.py)
+      # Position rails
       MAX_POSITIONS: "50"
       PER_ASSET_CAP_USD: "50"
       COOLDOWN_MINUTES: "30"
@@ -59,7 +60,6 @@ jobs:
       - name: Ensure state folder exists
         run: mkdir -p .state
 
-      # Load or initialize today's remaining daily cap (UTC day)
       - name: Load daily cap state
         run: |
           python - <<'PY'
@@ -83,21 +83,23 @@ jobs:
           echo "DAILY_REMAINING=$REM" >> $GITHUB_ENV
           echo "::notice title=Daily Cap::Loaded remaining daily cap: $REM"
 
-      # Low-balance soft guard (non-fatal on first run / missing file)
+      # Low-balance soft guard (never fails the step)
       - name: Apply low-balance guard (soft)
         shell: bash
-        continue-on-error: true
         run: |
           LAST="$(grep -Eo 'FREE_USD:\s*\$?[0-9]+(\.[0-9]+)?' -h .state/last_free_usd.log 2>/dev/null | tail -1 | awk '{print $2}' | tr -d '$')"
           if [[ -n "$LAST" ]]; then
             echo "Last known FREE_USD: $LAST"
-            if awk -v a="$LAST" -v b="${LOW_BALANCE_USD:-5}" 'BEGIN{exit (a<b)?0:1}'; then
+            LOW=1
+            awk -v a="$LAST" -v b="${LOW_BALANCE_USD:-5}" 'BEGIN{exit (a<b)?0:1}'; LOW=$?
+            if [[ "$LOW" -eq 0 ]]; then
               echo "::warning title=Low Balance Guard::free USD < ${LOW_BALANCE_USD} — setting cap to 0 for this run (sell-only)."
               echo "DAILY_REMAINING=0" >> "$GITHUB_ENV"
             fi
           else
             echo "No prior FREE_USD reading; guard skipped this run."
           fi
+          exit 0  # <- always succeed
 
       - name: MARK
         run: echo "::notice title=MARK::Crypto Live run started at $(date -u) on $GITHUB_SHA"
@@ -107,7 +109,7 @@ jobs:
           MODE: ${{ env.MODE }}
           EXCHANGE: ${{ env.EXCHANGE }}
           PER_TRADE_USD: ${{ env.PER_TRADE_USD }}
-          DAILY_CAP_USD: ${{ env.DAILY_REMAINING }}   # use persisted remaining
+          DAILY_CAP_USD: ${{ env.DAILY_REMAINING }}
           DROP_PCT: ${{ env.DROP_PCT }}
           TAKE_PROFIT_PCT: ${{ env.TAKE_PROFIT_PCT }}
           TRAILING_ACTIVATE_PCT: ${{ env.TRAILING_ACTIVATE_PCT }}
@@ -123,10 +125,8 @@ jobs:
           python main.py 2>&1 | tee run.log
           echo "=== END TRADING OUTPUT ==="
 
-      # Persist FREE_USD + decrement daily cap from buys (non-fatal if run.log missing)
       - name: Update daily cap state from log
         if: always()
-        continue-on-error: true
         run: |
           grep -Eo 'FREE_USD:\s*\$?[0-9]+(\.[0-9]+)?' -h run.log | tail -1 >> .state/last_free_usd.log || true
           python - <<'PY'
