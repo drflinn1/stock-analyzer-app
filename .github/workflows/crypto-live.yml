@@ -49,7 +49,7 @@ on:
 # ensure only one run at a time (a new run cancels any in-progress one)
 concurrency:
   group: crypto-live-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false   
 
 jobs:
   trade:
