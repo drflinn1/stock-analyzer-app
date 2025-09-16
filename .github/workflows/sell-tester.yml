@@ -1,0 +1,90 @@
+name: Sell Tester (On-demand, safe)
+
+on:
+  workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: "Dry run (no real orders)?"
+        required: true
+        default: "true"
+      TAKE_PROFIT_PCT:
+        description: "Temp TP % (e.g., 0.8)"
+        required: true
+        default: "0.8"
+      TRAILING_ACTIVATE_PCT:
+        description: "Temp trailing activation % (e.g., 0.5)"
+        required: true
+        default: "0.5"
+      TRAILING_DELTA_PCT:
+        description: "Temp trailing pullback % (e.g., 0.3)"
+        required: true
+        default: "0.3"
+      STOP_LOSS_PCT:
+        description: "Temp stop-loss % (0 = disabled)"
+        required: true
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sell-tester
+  cancel-in-progress: false
+
+env:
+  MARKET: "CRYPTO"
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  EXCHANGE: "kraken"
+  MODE: "live"
+
+  # Tax reserve knobs (so tax logs fire on real sells)
+  TAX_RESERVE_RATE: "0.30"
+  STATE_TAX_RATE:  "0.00"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore .state and data caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .state
+            data
+          key: state-${{ github.ref_name }}-v1
+
+      - name: Install deps
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Apply temporary sell thresholds
+        run: |
+          echo "DRY_RUN=${{ github.event.inputs.DRY_RUN }}" >> $GITHUB_ENV
+          echo "TAKE_PROFIT_PCT=${{ github.event.inputs.TAKE_PROFIT_PCT }}" >> $GITHUB_ENV
+          echo "TRAILING_ACTIVATE_PCT=${{ github.event.inputs.TRAILING_ACTIVATE_PCT }}" >> $GITHUB_ENV
+          echo "TRAILING_DELTA_PCT=${{ github.event.inputs.TRAILING_DELTA_PCT }}" >> $GITHUB_ENV
+          echo "STOP_LOSS_PCT=${{ github.event.inputs.STOP_LOSS_PCT }}" >> $GITHUB_ENV
+
+      - name: Run trader (sell test only)
+        env:
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        run: |
+          mkdir -p .state data
+          python -u main.py | tee -a sell_test.log
+
+      - name: Save caches back
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .state
+            data
+          key: state-${{ github.ref_name }}-v1
