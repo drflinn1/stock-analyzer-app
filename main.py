@@ -11,26 +11,27 @@ MODE            = os.getenv("MODE", "live").lower()              # "live" or "dr
 DRY_RUN         = MODE != "live" or os.getenv("DRY_RUN", "false").lower() == "true"
 
 PER_TRADE_USD   = float(os.getenv("PER_TRADE_USD", "10"))
-DAILY_CAP_USD   = float(os.getenv("DAILY_CAP_USD", "25"))        # workflow may persist/override this
+DAILY_CAP_USD   = float(os.getenv("DAILY_CAP_USD", "25"))
 DROP_PCT        = float(os.getenv("DROP_PCT", "2.0"))
 
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "2.0"))     # e.g., 2.0%
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "2.0"))
 TRAIL_ACTIVATE  = float(os.getenv("TRAILING_ACTIVATE_PCT", "1.0"))
 TRAIL_DELTA     = float(os.getenv("TRAILING_DELTA_PCT", "1.0"))
-STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", "0"))         # 0 disables SL
+STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", "0"))
 
-MAX_POSITIONS   = int(os.getenv("MAX_POSITIONS", "50"))          # cap total concurrent holdings
-PER_ASSET_CAP   = float(os.getenv("PER_ASSET_CAP_USD", "50"))    # cap USD exposure per symbol
-COOLDOWN_MIN    = int(os.getenv("COOLDOWN_MINUTES", "30"))       # after a SELL, wait N minutes before rebuy
+MAX_POSITIONS   = int(os.getenv("MAX_POSITIONS", "50"))
+PER_ASSET_CAP   = float(os.getenv("PER_ASSET_CAP_USD", "50"))
+COOLDOWN_MIN    = int(os.getenv("COOLDOWN_MINUTES", "30"))
 
-AUTO_UNIV_COUNT = int(os.getenv("AUTO_UNIVERSE_COUNT", "500"))   # size of auto universe
+AUTO_UNIV_COUNT = int(os.getenv("AUTO_UNIVERSE_COUNT", "500"))
 QUOTE           = os.getenv("QUOTE", "USD").upper()
 
-MARKET          = os.getenv("MARKET", "crypto").lower()          # used in tax logs ("crypto"/"equities")
+MARKET          = os.getenv("MARKET", "crypto").lower()
+SELL_DEBUG      = int(os.getenv("SELL_DEBUG", "0"))
 
 STATE_DIR       = ".state"
-POSITIONS_FILE  = os.path.join(STATE_DIR, "positions.json")      # our simple ledger of entries
-COOLDOWN_FILE   = os.path.join(STATE_DIR, "cooldown.json")       # last-sell timestamps per symbol
+POSITIONS_FILE  = os.path.join(STATE_DIR, "positions.json")
+COOLDOWN_FILE   = os.path.join(STATE_DIR, "cooldown.json")
 
 os.makedirs(STATE_DIR, exist_ok=True)
 
@@ -45,12 +46,11 @@ def _save_json(path, obj):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False)
 
-positions: Dict[str, Any] = _load_json(POSITIONS_FILE, {})     # should be dict[str, list[dict]]
-cooldown: Dict[str, str]  = _load_json(COOLDOWN_FILE, {})      # sym -> iso timestamp
+positions: Dict[str, Any] = _load_json(POSITIONS_FILE, {})
+cooldown: Dict[str, str]  = _load_json(COOLDOWN_FILE, {})
 
-# ---------- Auto-heal legacy/invalid layouts ----------
+# ---------- Auto-heal ----------
 def _normalize_lot(x: Any):
-    """Return a valid lot dict or None."""
     if isinstance(x, dict) and "qty" in x and "cost" in x:
         try:
             return {
@@ -64,75 +64,57 @@ def _normalize_lot(x: Any):
     return None
 
 def normalize_positions():
-    """Ensure positions = {sym: [ {qty,cost,entry,_high?}, ... ]}."""
     changed = False
     if not isinstance(positions, dict):
-        print("WARN: positions.json invalid type; resetting")
+        print("WARN: positions.json invalid; resetting")
         positions.clear()
         _save_json(POSITIONS_FILE, positions)
         return
-
     to_delete = []
     for sym, lots in list(positions.items()):
         new_lots: List[dict] = []
-
         if isinstance(lots, str):
             try:
-                lots = json.loads(lots)
-                changed = True
+                lots = json.loads(lots); changed = True
             except Exception:
-                print(f"WARN: positions[{sym}] is a string and not JSON; dropping")
-                to_delete.append(sym)
-                continue
-
+                print(f"WARN: positions[{sym}] non-JSON string; dropping")
+                to_delete.append(sym); continue
         if isinstance(lots, dict):
-            lot = _normalize_lot(lots)
-            if lot: new_lots = [lot]
-            changed = True
+            lot = _normalize_lot(lots); 
+            if lot: new_lots = [lot]; changed = True
         elif isinstance(lots, list):
             for l in lots:
                 lot = _normalize_lot(l)
-                if lot:
-                    new_lots.append(lot)
-                else:
-                    changed = True
+                if lot: new_lots.append(lot)
+                else: changed = True
         else:
             print(f"WARN: positions[{sym}] unexpected type {type(lots)}; dropping")
-            to_delete.append(sym)
-            continue
-
-        if new_lots:
-            positions[sym] = new_lots
-        else:
-            to_delete.append(sym)
-
-    for sym in to_delete:
-        positions.pop(sym, None)
-
+            to_delete.append(sym); continue
+        if new_lots: positions[sym] = new_lots
+        else: to_delete.append(sym)
+    for sym in to_delete: positions.pop(sym, None)
     if changed or to_delete:
-        print("NOTE: normalized positions.json (healed legacy/invalid lots)")
+        print("NOTE: normalized positions.json")
         _save_json(POSITIONS_FILE, positions)
 
 normalize_positions()
 
 # =========================
-# Minimal market adapter (CCXT)
+# Exchange (CCXT)
 # =========================
 try:
     import ccxt  # type: ignore
-except Exception as e:
-    print("ccxt not available; install in requirements.txt", file=sys.stderr)
+except Exception:
+    print("ccxt not available; add to requirements.txt", file=sys.stderr)
     ccxt = None
 
 def mk_exchange():
-    kwargs = {}
     if EXCHANGE_NAME == "kraken":
-        kwargs = {
+        ex = ccxt.kraken({
             "apiKey": os.getenv("KRAKEN_API_KEY", ""),
             "secret": os.getenv("KRAKEN_API_SECRET", ""),
             "enableRateLimit": True,
-        }
-        ex = ccxt.kraken(kwargs)
+        })
     else:
         raise RuntimeError(f"Unsupported exchange: {EXCHANGE_NAME}")
     ex.load_markets()
@@ -141,30 +123,27 @@ def mk_exchange():
 exchange = mk_exchange() if ccxt else None
 
 def get_free_usd():
-    if not exchange:
-        return 0.0
+    if not exchange: return 0.0
     try:
         bal = exchange.fetch_free_balance()
         return float(bal.get(QUOTE, 0.0))
     except Exception:
         return 0.0
 
-def market_price(symbol):  # e.g., "ACH/USD"
+def market_price(symbol):
     if not exchange: return 0.0
-    ticker = exchange.fetch_ticker(symbol)
-    return float(ticker["last"] or ticker["close"] or 0.0)
+    t = exchange.fetch_ticker(symbol)
+    return float(t["last"] or t["close"] or 0.0)
 
 def list_tradeable_pairs():
-    markets = []
-    if not exchange:
-        return markets
-    for m in exchange.markets.values():
-        if m.get("spot") and m.get("active") and m.get("quote") == QUOTE:
-            markets.append(m["symbol"])
-    return sorted(set(markets))
+    if not exchange: return []
+    return sorted(set(
+        m["symbol"] for m in exchange.markets.values()
+        if m.get("spot") and m.get("active") and m.get("quote") == QUOTE
+    ))
 
 # =========================
-# Auto-universe (simple volume proxy)
+# Universe
 # =========================
 def autopick_universe(limit=AUTO_UNIV_COUNT):
     symbols = list_tradeable_pairs()
@@ -219,31 +198,25 @@ def mark_sold(sym):
     _save_json(COOLDOWN_FILE, cooldown)
 
 # =========================
-# Tax Ledger (per-lot after SELL)
+# Tax Ledger
 # =========================
 try:
     from tax_ledger import TaxLedger
-    _ledger = TaxLedger()  # reads TAX_RESERVE_RATE / STATE_TAX_RATE / TAX_LEDGER_PATH
+    _ledger = TaxLedger()
     print(f"[boot] TaxLedger ready → {_ledger.ledger_path}")
 except Exception as e:
     _ledger = None
     print(f"[warn] TaxLedger not available: {e}")
 
 def _maybe_tax_log_per_lot(sym: str, lots: List[dict], sell_px: float, order_id: Optional[str] = None):
-    """
-    Append one tax row per-lot sold, using blended proceeds at the same sell price.
-    Only runs when DRY_RUN is False and _ledger is available.
-    """
     if DRY_RUN or _ledger is None:
-        # In DRY mode we avoid writing real tax rows; still show a preview
-        if DRY_RUN:
+        if DRY_RUN and SELL_DEBUG:
             try:
                 profit_preview = sum(max(0.0, (sell_px - float(l["cost"])) * float(l["qty"])) for l in lots)
                 print(f"[tax][dry] preview (not recorded) potential profit ~${profit_preview:.2f}")
             except Exception:
                 pass
         return
-
     reserved_total = 0.0
     profit_total = 0.0
     for l in lots:
@@ -260,22 +233,14 @@ def _maybe_tax_log_per_lot(sym: str, lots: List[dict], sell_px: float, order_id:
                 except Exception:
                     hp_days = None
             res = _ledger.record_sell(
-                market=MARKET,
-                symbol=sym,
-                qty=qty,
-                avg_price_usd=sell_px,
-                proceeds_usd=proceeds,
-                cost_basis_usd=cost_basis,
-                fees_usd=0.0,
-                holding_period_days=hp_days,
-                run_id=os.getenv("GITHUB_RUN_ID"),
-                trade_id=order_id
+                market=MARKET, symbol=sym, qty=qty, avg_price_usd=sell_px,
+                proceeds_usd=proceeds, cost_basis_usd=cost_basis, fees_usd=0.0,
+                holding_period_days=hp_days, run_id=os.getenv("GITHUB_RUN_ID"), trade_id=order_id
             )
             profit_total += float(res.get("profit_usd", 0.0))
             reserved_total += float(res.get("reserved_usd", 0.0))
         except Exception as e:
             print(f"[tax][error] lot-record failed for {sym}: {e}")
-
     print(f"[tax] profit=${profit_total:.2f} reserved=${reserved_total:.2f} "
           f"(rate={getattr(_ledger,'reserve_rate',0):.2f}+{getattr(_ledger,'state_rate',0):.2f}) "
           f"→ {_ledger.ledger_path}")
@@ -304,26 +269,18 @@ def place_sell(sym, qty, reason):
     px = market_price(sym)
     if px <= 0: return False, 0.0, "bad_price"
     usd = qty * px
-
-    # Snapshot lots BEFORE we clear them so tax logging has the data
     lots_snapshot = [l for l in _lots(sym) if isinstance(l, dict) and "qty" in l and "cost" in l]
-
     if DRY_RUN:
         print(f"SELL {sym}: {reason} sold {qty:.6f} ~${usd:.2f}")
-        # tax: dry-run preview only (no CSV write)
         _maybe_tax_log_per_lot(sym, lots_snapshot, px, order_id=None)
-        clear_sym(sym)
-        mark_sold(sym)
+        clear_sym(sym); mark_sold(sym)
         return True, usd, "dry"
-
     try:
         order = exchange.create_market_sell_order(sym, qty)
         oid = order.get('id', '?')
         print(f"SELL {sym}: {reason} sold {qty:.6f} ~${usd:.2f} (order id {oid})")
-        # tax: write one row per lot actually sold
         _maybe_tax_log_per_lot(sym, lots_snapshot, px, order_id=str(oid))
-        clear_sym(sym)
-        mark_sold(sym)
+        clear_sym(sym); mark_sold(sym)
         return True, usd, "ok"
     except Exception as e:
         print(f"SELL ERROR {sym}: {e}")
@@ -335,47 +292,53 @@ def place_sell(sym, qty, reason):
 def evaluate_sells():
     realized = 0.0
     for sym, lots in list(positions.items()):
-        if not isinstance(lots, list) or not lots:
+        if not isinstance(lots, list) or not lots: 
             continue
-        # filter to valid lot dicts
         valid = [l for l in lots if isinstance(l, dict) and "qty" in l and "cost" in l]
-        if not valid:
+        if not valid: 
             continue
         qty = sum(float(l["qty"]) for l in valid)
-        if qty <= 0:
+        if qty <= 0: 
             continue
         avg_cost = sum(float(l["qty"])*float(l["cost"]) for l in valid)/qty
         px = market_price(sym)
-        if px <= 0:
+        if px <= 0: 
             continue
         chg_pct = (px - avg_cost) / avg_cost * 100.0
+
+        hi_key = "_high"
+        hi = max([float(l.get(hi_key, avg_cost)) for l in valid] + [avg_cost])
+        if px > hi:
+            for l in valid: l[hi_key] = px
+            positions[sym] = valid; _save_json(POSITIONS_FILE, positions)
+            hi = px
+        pullback = (hi - px) / hi * 100.0 if hi > 0 else 0.0
+
+        if SELL_DEBUG:
+            print(f"[sellchk] {sym} qty={qty:.6f} avg_cost={avg_cost:.8f} px={px:.8f} "
+                  f"chg={chg_pct:.2f}% hi={hi:.8f} pullback={pullback:.2f}% "
+                  f"TP>={TAKE_PROFIT_PCT:.2f}% TRAIL_ACT>={TRAIL_ACTIVATE:.2f}% "
+                  f"DELTA>={TRAIL_DELTA:.2f}% SL<={-abs(STOP_LOSS_PCT):.2f}%")
 
         # Take-profit
         if TAKE_PROFIT_PCT > 0 and chg_pct >= TAKE_PROFIT_PCT:
             ok, usd, _ = place_sell(sym, qty, f"TAKE_PROFIT {TAKE_PROFIT_PCT:.2f}%")
             realized += usd if ok else 0.0
+            if SELL_DEBUG: print(f"[sellchk] -> TAKE_PROFIT fired for {sym}")
             continue
 
-        # Trailing: watermark per-symbol
-        if TRAIL_ACTIVATE > 0 and chg_pct >= TRAIL_ACTIVATE:
-            high_key = "_high"
-            hi = max([float(l.get(high_key, avg_cost)) for l in valid] + [avg_cost])
-            if px > hi:
-                for l in valid:
-                    l[high_key] = px
-                positions[sym] = valid
-                _save_json(POSITIONS_FILE, positions)
-                hi = px
-            pullback = (hi - px) / hi * 100.0 if hi > 0 else 0.0
-            if pullback >= TRAIL_DELTA:
-                ok, usd, _ = place_sell(sym, qty, f"TRAIL_STOP {TRAIL_DELTA:.2f}% from peak")
-                realized += usd if ok else 0.0
-                continue
+        # Trailing
+        if TRAIL_ACTIVATE > 0 and chg_pct >= TRAIL_ACTIVATE and pullback >= TRAIL_DELTA:
+            ok, usd, _ = place_sell(sym, qty, f"TRAIL_STOP {TRAIL_DELTA:.2f}% from peak")
+            realized += usd if ok else 0.0
+            if SELL_DEBUG: print(f"[sellchk] -> TRAIL_STOP fired for {sym}")
+            continue
 
         # Stop-loss
         if STOP_LOSS_PCT > 0 and chg_pct <= -abs(STOP_LOSS_PCT):
             ok, usd, _ = place_sell(sym, qty, f"STOP_LOSS {STOP_LOSS_PCT:.2f}%")
             realized += usd if ok else 0.0
+            if SELL_DEBUG: print(f"[sellchk] -> STOP_LOSS fired for {sym}")
             continue
 
     if realized > 0:
@@ -386,47 +349,35 @@ def evaluate_sells():
 # Buy engine (with guards)
 # =========================
 def can_buy(sym, price, free_usd):
-    if cooldown_active(sym):
-        return False, "cooldown"
-    if total_positions_count() >= MAX_POSITIONS:
-        return False, "max_positions"
+    if cooldown_active(sym): return False, "cooldown"
+    if total_positions_count() >= MAX_POSITIONS: return False, "max_positions"
     exposure = position_usd_exposure(sym, price)
-    if exposure + PER_TRADE_USD > PER_ASSET_CAP:
-        return False, "per_asset_cap"
-    if DAILY_CAP_USD <= 0:
-        return False, "daily_cap_zero"
-    # placeholder for dip gate (DROP_PCT); allow for now
+    if exposure + PER_TRADE_USD > PER_ASSET_CAP: return False, "per_asset_cap"
+    if DAILY_CAP_USD <= 0: return False, "daily_cap_zero"
     return True, "ok"
 
 def run_cycle():
     print("=== START TRADING OUTPUT ===")
     print(f"Python {sys.version.split()[0]}")
 
-    # 1) sells first
     evaluate_sells()
 
-    # 2) universe
     uni = autopick_universe(AUTO_UNIV_COUNT)
 
-    # 3) free USD
     free_usd = get_free_usd()
     print(f"FREE_USD: ${free_usd:.2f}")
 
-    # 4) budget from daily cap
     budget = min(DAILY_CAP_USD, free_usd)
     buys_this_run = 0.0
 
-    # 5) buy loop
     for sym in uni:
-        if budget < PER_TRADE_USD:
-            break
+        if budget < PER_TRADE_USD: break
         try:
             price = market_price(sym)
         except Exception:
             continue
-        ok, why = can_buy(sym, price, free_usd)
-        if not ok:
-            continue
+        ok, _ = can_buy(sym, price, free_usd)
+        if not ok: continue
         success, qty, _ = place_buy(sym, PER_TRADE_USD)
         if success:
             buys_this_run += PER_TRADE_USD
