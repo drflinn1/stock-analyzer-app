@@ -15,10 +15,10 @@ jobs:
     timeout-minutes: 120
 
     env:
-      # TUNABLES (you can change these safely)
+      # TUNABLES
       PER_TRADE_USD: "10"
-      DAILY_CAP_USD: "25"          # baseline cap; we persist the remaining amount across runs
-      LOW_BALANCE_USD: "5"         # if free USD < this, we force today's cap to 0 (sell-only behavior)
+      DAILY_CAP_USD: "25"     # baseline cap; remaining is persisted across runs
+      LOW_BALANCE_USD: "5"    # if free USD < this, pause buys for this run
       DROP_PCT: "2.0"
       EXCHANGE: "kraken"
       MODE: "live"
@@ -48,9 +48,8 @@ jobs:
       - name: Ensure state folder exists
         run: mkdir -p .state
 
-      # Load or initialize today's remaining daily cap (UTC day boundary)
+      # Load or initialize today's remaining daily cap (UTC day)
       - name: Load daily cap state
-        id: loadcap
         run: |
           python - <<'PY'
           import json, os, pathlib, datetime
@@ -62,46 +61,30 @@ jobs:
             try:
               prior = json.loads(p.read_text())
               if prior.get("date") == today:
-                # same day: keep remaining
                 data["remaining"] = float(prior.get("remaining", base_cap))
             except Exception:
               pass
-          # clamp to [0, base_cap]
           data["remaining"] = max(0.0, min(base_cap, data["remaining"]))
           p.write_text(json.dumps(data))
-          # export to environment
-          print(f"REMAINING={data['remaining']}")
-          print(f"DATE={data['date']}")
+          print(f"Loaded remaining daily cap: {data['remaining']}")
           PY
-          REMAINING=$(grep -E '^REMAINING=' <<<"$(cat -n $0 2>/dev/null)" || true)
-          # The python block already printed variables; use a safer capture:
-          REMAINING=$(python - <<'PY'
-          import json
-          d=json.load(open(".state/daily_cap.json"))
-          print(d["remaining"])
-          PY
-          )
-          echo "DAILY_REMAINING=$REMAINING" >> $GITHUB_ENV
-          echo "::notice title=Daily Cap::Loaded remaining daily cap: $REMAINING"
+          # expose to later steps
+          REM=$(python -c "import json;print(json.load(open('.state/daily_cap.json'))['remaining'])")
+          echo "DAILY_REMAINING=$REM" >> $GITHUB_ENV
+          echo "::notice title=Daily Cap::Loaded remaining daily cap: $REM"
 
-      # Optional soft low-balance guard:
-      # If your app reports very low free USD, we zero today's cap so buys pause, sells still run.
-      # We implement this by overriding DAILY_REMAINING to 0 for this run only.
+      # Low-balance soft guard WITHOUT heredocs (YAML-safe)
       - name: Apply low-balance guard (soft)
+        shell: bash
         run: |
-          # If a prior run wrote the last known free USD, use it; otherwise skip.
-          # Your app should echo a line like: "FREE_USD: $12.34" (we'll start capturing that below).
-          LAST=$(grep -Eo 'FREE_USD:\s*\$?[0-9]+(\.[0-9]+)?' -h .state/last_free_usd.log 2>/dev/null | tail -1 | awk '{print $2}' | tr -d '$' || true)
-          if [ -n "$LAST" ]; then
+          # Read the last known FREE_USD from prior runs (if captured)
+          LAST="$(grep -Eo 'FREE_USD:\s*\$?[0-9]+(\.[0-9]+)?' -h .state/last_free_usd.log 2>/dev/null | tail -1 | awk '{print $2}' | tr -d '$')"
+          if [[ -n "$LAST" ]]; then
             echo "Last known FREE_USD: $LAST"
-            cmp=$(python - <<PY
-import os
-print(float("$LAST") < float(os.environ.get("LOW_BALANCE_USD","5")))
-PY
-)
-            if [ "$cmp" = "True" ]; then
-              echo "::warning title=Low Balance Guard::free USD <$LOW_BALANCE_USD — setting cap to 0 for this run (sell-only)."
-              echo "DAILY_REMAINING=0" >> $GITHUB_ENV
+            # float compare in awk: exit 0 if LAST < LOW, else 1
+            if awk -v a="$LAST" -v b="${LOW_BALANCE_USD:-5}" 'BEGIN{exit (a<b)?0:1}'; then
+              echo "::warning title=Low Balance Guard::free USD < ${LOW_BALANCE_USD} — setting cap to 0 for this run (sell-only)."
+              echo "DAILY_REMAINING=0" >> "$GITHUB_ENV"
             fi
           else
             echo "No prior FREE_USD reading; guard skipped this run."
@@ -115,40 +98,37 @@ PY
           MODE: ${{ env.MODE }}
           EXCHANGE: ${{ env.EXCHANGE }}
           PER_TRADE_USD: ${{ env.PER_TRADE_USD }}
-          # Use the persisted remaining as today's cap for this run:
-          DAILY_CAP_USD: ${{ env.DAILY_REMAINING }}
+          DAILY_CAP_USD: ${{ env.DAILY_REMAINING }}   # use persisted remaining
           DROP_PCT: ${{ env.DROP_PCT }}
         run: |
           echo "=== START TRADING OUTPUT ==="
           python -V
-          # Run and tee to a log file so we can parse BUYS and FREE_USD readings afterward
+          # Run and tee output for parsing
           python main.py 2>&1 | tee run.log
           echo "=== END TRADING OUTPUT ==="
 
-      # Persist: capture FREE_USD and decrement today's remaining cap by sum of BUYS seen in this run
       - name: Update daily cap state from log
         if: always()
         run: |
-          # Capture last seen FREE_USD (if your app prints it; optional)
+          # Persist the last FREE_USD seen this run (if your app prints it)
           grep -Eo 'FREE_USD:\s*\$?[0-9]+(\.[0-9]+)?' -h run.log | tail -1 >> .state/last_free_usd.log || true
-
+          # Decrement today's remaining cap by total dollars bought this run
           python - <<'PY'
           import re, json, pathlib
           pcap = pathlib.Path(".state/daily_cap.json")
           try:
             d=json.loads(pcap.read_text())
           except Exception:
-            print("no cap state, skipping")
             raise SystemExit(0)
           remaining=float(d.get("remaining",0))
           spent=0.0
-          # Sum all BUY lines like: "BUY XXX/USD: ... ~$10.00"
-          for m in re.finditer(r'^\s*BUY .*?~\$\s*([0-9]+(?:\.[0-9]+)?)', open("run.log","r",encoding="utf-8",errors="ignore").read(), re.M):
+          with open("run.log","r",encoding="utf-8",errors="ignore") as f:
+            txt=f.read()
+          for m in re.finditer(r'^\s*BUY .*?~\$\s*([0-9]+(?:\.[0-9]+)?)', txt, re.M):
             spent += float(m.group(1))
-          new_remaining = max(0.0, remaining - spent)
-          d["remaining"]= new_remaining
+          d["remaining"]= max(0.0, remaining - spent)
           pcap.write_text(json.dumps(d))
-          print(f"Spent this run: ${spent:.2f} | New remaining today: ${new_remaining:.2f}")
+          print(f"Spent this run: ${spent:.2f} | New remaining today: ${d['remaining']:.2f}")
           PY
 
       - name: Save .state cache
