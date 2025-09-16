@@ -23,6 +23,10 @@ on:
         description: "Temp stop-loss % (0 = disabled)"
         required: true
         default: "0"
+      SELL_DEBUG:
+        description: "Verbose sell checks? 1=yes, 0=no"
+        required: true
+        default: "1"
 
 permissions:
   contents: read
@@ -64,13 +68,14 @@ jobs:
         run: |
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Apply temporary sell thresholds
+      - name: Apply temporary sell thresholds + debug
         run: |
           echo "DRY_RUN=${{ github.event.inputs.DRY_RUN }}" >> $GITHUB_ENV
           echo "TAKE_PROFIT_PCT=${{ github.event.inputs.TAKE_PROFIT_PCT }}" >> $GITHUB_ENV
           echo "TRAILING_ACTIVATE_PCT=${{ github.event.inputs.TRAILING_ACTIVATE_PCT }}" >> $GITHUB_ENV
           echo "TRAILING_DELTA_PCT=${{ github.event.inputs.TRAILING_DELTA_PCT }}" >> $GITHUB_ENV
           echo "STOP_LOSS_PCT=${{ github.event.inputs.STOP_LOSS_PCT }}" >> $GITHUB_ENV
+          echo "SELL_DEBUG=${{ github.event.inputs.SELL_DEBUG }}" >> $GITHUB_ENV
 
       - name: Run trader (sell test only)
         env:
