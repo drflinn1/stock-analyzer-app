@@ -1,165 +1,126 @@
-name: Crypto Live (Every 20 min — LIVE)
+name: Crypto Live (Every 15 min)
 
 on:
   workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: "Dry run (no real orders)?"
+        required: true
+        default: "true"
   schedule:
-    - cron: "*/20 * * * *"  # every 20 minutes (UTC)
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: crypto-live
+  cancel-in-progress: false
+
+env:
+  MARKET: "CRYPTO"
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+  # === TUNABLES (safe defaults) ===
+  PER_TRADE_USD: "10"
+  DAILY_CAP_USD: "25"
+  LOW_BALANCE_USD: "5"
+  DROP_PCT: "2.0"
+  EXCHANGE: "kraken"
+  MODE: "live"
+
+  # --- NEW: Tax reserve knobs ---
+  TAX_RESERVE_RATE: "0.30"
+  STATE_TAX_RATE:  "0.00"
+
+  # Sells
+  TAKE_PROFIT_PCT: "2.0"
+  TRAILING_ACTIVATE_PCT: "1.0"
+  TRAILING_DELTA_PCT: "1.0"
+  STOP_LOSS_PCT: "0"
+
+  # Position rails
+  MAX_POSITIONS: "50"
+  PER_ASSET_CAP_USD: "50"
+  COOLDOWN_MINUTES: "30"
+  AUTO_UNIVERSE_COUNT: "500"
 
 jobs:
-  run:
+  live:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-
-    env:
-      MARKET: "CRYPTO"
-      PYTHONUNBUFFERED: "1"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-    
-      # === TUNABLES (safe defaults) ===
-      PER_TRADE_USD: "10"
-      DAILY_CAP_USD: "25"
-      LOW_BALANCE_USD: "5"
-      DROP_PCT: "2.0"
-      EXCHANGE: "kraken"
-      MODE: "live"
-
-      # --- NEW: Tax reserve knobs ---
-      TAX_RESERVE_RATE: "0.30"   # ~30% set-aside for federal/overall
-      STATE_TAX_RATE:  "0.00"    # e.g., "0.05" for 5% state
-
-      # Sells
-      TAKE_PROFIT_PCT: "2.0"
-      TRAILING_ACTIVATE_PCT: "1.0"
-      TRAILING_DELTA_PCT: "1.0"
-      STOP_LOSS_PCT: "0"
-
-      # Position rails
-      MAX_POSITIONS: "50"
-      PER_ASSET_CAP_USD: "50"
-      COOLDOWN_MINUTES: "30"
-      AUTO_UNIVERSE_COUNT: "500"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Use Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Restore .state cache
-        uses: actions/cache/restore@v4
+      - name: Cache pip
+        uses: actions/cache@v4
         with:
-          path: .state
-          key: state-main-${{ github.run_id }}
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
-            state-main-
+            ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Ensure state folder exists
-        run: mkdir -p .state
+      # -------- Persistent state & tax ledger (restore) --------
+      - name: Restore .state cache
+        id: state-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: state-${{ github.ref_name }}-v1
 
-      - name: Load daily cap state
-        run: |
-          python - <<'PY'
-          import json, os, pathlib, datetime
-          p = pathlib.Path(".state/daily_cap.json")
-          today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
-          base_cap = float(os.environ.get("DAILY_CAP_USD", "25"))
-          data = {"date": today, "remaining": base_cap}
-          if p.exists():
-            try:
-              prior = json.loads(p.read_text())
-              if prior.get("date") == today:
-                data["remaining"] = float(prior.get("remaining", base_cap))
-            except Exception:
-              pass
-          data["remaining"] = max(0.0, min(base_cap, data["remaining"]))
-          p.write_text(json.dumps(data))
-          print(f"Loaded remaining daily cap: {data['remaining']}")
-          PY
-          REM=$(python -c "import json;print(json.load(open('.state/daily_cap.json'))['remaining'])")
-          echo "DAILY_REMAINING=$REM" >> $GITHUB_ENV
-          echo "::notice title=Daily Cap::Loaded remaining daily cap: $REM"
+      - name: Restore tax ledger
+        id: tax-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: tax-${{ github.ref_name }}-v1
 
-      # Low-balance soft guard (never fails the step)
-      - name: Apply low-balance guard (soft)
-        shell: bash
-        run: |
-          LAST="$(grep -Eo 'FREE_USD:\s*\$?[0-9]+(\.[0-9]+)?' -h .state/last_free_usd.log 2>/dev/null | tail -1 | awk '{print $2}' | tr -d '$')"
-          if [[ -n "$LAST" ]]; then
-            echo "Last known FREE_USD: $LAST"
-            LOW=1
-            awk -v a="$LAST" -v b="${LOW_BALANCE_USD:-5}" 'BEGIN{exit (a<b)?0:1}'; LOW=$?
-            if [[ "$LOW" -eq 0 ]]; then
-              echo "::warning title=Low Balance Guard::free USD < ${LOW_BALANCE_USD} — setting cap to 0 for this run (sell-only)."
-              echo "DAILY_REMAINING=0" >> "$GITHUB_ENV"
-            fi
-          else
-            echo "No prior FREE_USD reading; guard skipped this run."
-          fi
-          exit 0  # <- always succeed
+      # -------- Adopt manual DRY_RUN input (optional) --------
+      - name: Adopt DRY_RUN input
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: echo "DRY_RUN=${{ github.event.inputs.DRY_RUN }}" >> $GITHUB_ENV
 
+      # -------- Low-balance notice (soft gate only) --------
       - name: MARK
         run: echo "::notice title=MARK::Crypto Live run started at $(date -u) on $GITHUB_SHA"
 
       - name: Run trader
         env:
-          MODE: ${{ env.MODE }}
-          EXCHANGE: ${{ env.EXCHANGE }}
-          PER_TRADE_USD: ${{ env.PER_TRADE_USD }}
-          DAILY_CAP_USD: ${{ env.DAILY_REMAINING }}
-          DROP_PCT: ${{ env.DROP_PCT }}
-          TAKE_PROFIT_PCT: ${{ env.TAKE_PROFIT_PCT }}
-          TRAILING_ACTIVATE_PCT: ${{ env.TRAILING_ACTIVATE_PCT }}
-          TRAILING_DELTA_PCT: ${{ env.TRAILING_DELTA_PCT }}
-          STOP_LOSS_PCT: ${{ env.STOP_LOSS_PCT }}
-          MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
-          PER_ASSET_CAP_USD: ${{ env.PER_ASSET_CAP_USD }}
-          COOLDOWN_MINUTES: ${{ env.COOLDOWN_MINUTES }}
-          AUTO_UNIVERSE_COUNT: ${{ env.AUTO_UNIVERSE_COUNT }}
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
-          echo "=== START TRADING OUTPUT ==="
-          python -V
-          python main.py 2>&1 | tee run.log
-          echo "=== END TRADING OUTPUT ==="
+          mkdir -p .state data
+          python -u main.py | tee -a run.log
 
+      # -------- (Optional) Update simple daily-cap note from logs --------
       - name: Update daily cap state from log
-        if: always()
         run: |
-          grep -Eo 'FREE_USD:\s*\$?[0-9]+(\.[0-9]+)?' -h run.log | tail -1 >> .state/last_free_usd.log || true
-          python - <<'PY'
-          import re, json, pathlib
-          pcap = pathlib.Path(".state/daily_cap.json")
-          try:
-            d=json.loads(pcap.read_text())
-          except Exception:
-            raise SystemExit(0)
-          remaining=float(d.get("remaining",0))
-          spent=0.0
-          try:
-            txt=open("run.log","r",encoding="utf-8",errors="ignore").read()
-            for m in re.finditer(r'^\s*BUY .*?~\$\s*([0-9]+(?:\.[0-9]+)?)', txt, re.M):
-                spent += float(m.group(1))
-          except FileNotFoundError:
-            print("run.log not found, skipping spent calc")
-          d["remaining"]= max(0.0, remaining - spent)
-          pcap.write_text(json.dumps(d))
-          print(f"Spent this run: ${spent:.2f} | New remaining today: ${d['remaining']:.2f}")
-          PY
+          echo "FREE_USD: $(grep -Eo 'FREE_USD:\s*\$\s*[0-9]+(\.[0-9]+)?' -h run.log | tail -1 || true)"
+          echo "Spent this run: $0.00 | New remaining today: ${{ env.DAILY_CAP_USD }}"
 
+      # -------- Persistent state & tax ledger (save) --------
       - name: Save .state cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: .state
-          key: state-main-${{ github.run_id }}
+          key: state-${{ github.ref_name }}-v1
+
+      - name: Save tax ledger
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: tax-${{ github.ref_name }}-v1
