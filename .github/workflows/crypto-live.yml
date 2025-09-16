@@ -1,115 +1,63 @@
 name: Crypto Live (Every 20 min — LIVE)
 
 on:
-  schedule:
-    - cron: "*/20 * * * *"   # run every 20 minutes
   workflow_dispatch:
-    inputs:
-      DRY_RUN:
-        description: "Dry run (no real orders): true/false"
-        required: true
-        default: "false"
-      PER_TRADE_USD:
-        description: "Per-trade USD notional"
-        required: true
-        default: "15"
-      DAILY_CAP_USD:
-        description: "Daily USD cap for this workflow run"
-        required: true
-        default: "60"
-      FORCE_SELL:
-        description: "One-time force sell list (DOGE,ADA or DOGE/USD,ADA/USD)"
-        required: false
-        default: ""
-      AUTO_UNIVERSE_SIZE:
-        description: "How many USD pairs to consider"
-        required: true
-        default: "500"
-      MIN_NOTIONAL_USD:
-        description: "Minimum notional to avoid dust rejections"
-        required: true
-        default: "0.50"
-      TAKE_PROFIT_PCT:
-        description: "Take-profit percent (e.g. 2.0)"
-        required: true
-        default: "2.0"
-      TRAIL_PCT:
-        description: "Trailing stop drawdown percent from peak (e.g. 1.0)"
-        required: true
-        default: "1.0"
-      MIN_PROFIT_TO_TRAIL:
-        description: "Only arm trailing after at least this profit %"
-        required: true
-        default: "0.5"
-      STOP_LOSS_PCT:
-        description: "Optional stop loss percent (blank disables)"
-        required: false
-        default: ""
+  schedule:
+    # Every 20 minutes
+    - cron: "*/20 * * * *"
 
-# ensure only one run at a time (a new run cancels any in-progress one)
+# Prevent overlapping runs of THIS workflow on the same branch.
+# If you trigger a new run while one is in progress, the old one will be cancelled
+# (you'll see "The operation was canceled" in the logs).
+# Using workflow+ref ensures other workflows don't cancel this one.
 concurrency:
-  group: crypto-live-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false   
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  trade:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Restore .state cache
-        uses: actions/cache/restore@v4
-        with:
-          path: .state
-          key: state-${{ github.ref_name }}
-          restore-keys: |
-            state-
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      - name: Restore .state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: state-main-${{ github.run_id }}
+          restore-keys: |
+            state-main-
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install ccxt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Ensure state folder exists
         run: mkdir -p .state
 
+      - name: MARK
+        run: echo "::notice title=MARK::Crypto Live run started at $(date -u) on $GITHUB_SHA"
+
       - name: Run trader
         env:
-          # Kraken secrets (Settings → Secrets and variables → Actions)
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-
-          # Exchange + toggles
-          EXCHANGE: "kraken"
-          DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'false' }}
-
-          # Budgets
-          PER_TRADE_USD: ${{ github.event.inputs.PER_TRADE_USD || '15' }}
-          DAILY_CAP_USD: ${{ github.event.inputs.DAILY_CAP_USD || '60' }}
-
-          # Universe & thresholds
-          AUTO_UNIVERSE_SIZE: ${{ github.event.inputs.AUTO_UNIVERSE_SIZE || '500' }}
-          MIN_NOTIONAL_USD: ${{ github.event.inputs.MIN_NOTIONAL_USD || '0.50' }}
-
-          # Sell rules
-          TAKE_PROFIT_PCT: ${{ github.event.inputs.TAKE_PROFIT_PCT || '2.0' }}
-          TRAIL_PCT: ${{ github.event.inputs.TRAIL_PCT || '1.0' }}
-          MIN_PROFIT_TO_TRAIL: ${{ github.event.inputs.MIN_PROFIT_TO_TRAIL || '0.5' }}
-          STOP_LOSS_PCT: ${{ github.event.inputs.STOP_LOSS_PCT || '' }}
-
-          # One-time force sell
-          FORCE_SELL: ${{ github.event.inputs.FORCE_SELL || '' }}
+          MODE: live                # your app reads this if wired
+          EXCHANGE: kraken          # if your app uses it
+          PER_TRADE_USD: "10"       # tune as needed
+          DAILY_CAP_USD: "25"       # tune as needed
+          DROP_PCT: "2.0"           # or your preferred gate
         run: |
           echo "=== START TRADING OUTPUT ==="
-          python -u main.py
+          python -V
+          python main.py
           echo "=== END TRADING OUTPUT ==="
 
       - name: Save .state cache
@@ -117,4 +65,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .state
-          key: state-${{ github.ref_name }}-${{ github.run_id }}
+          key: state-main-${{ github.run_id }}
