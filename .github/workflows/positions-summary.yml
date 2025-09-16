@@ -1,0 +1,50 @@
+name: Positions Summary (On-demand)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  summary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore .state cache
+        id: state-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: state-${{ github.ref_name }}-v1
+
+      - name: Restore data cache (optional)
+        id: data-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: tax-${{ github.ref_name }}-v1
+
+      - name: Install deps
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run positions summary
+        env:
+          EXCHANGE: "kraken"
+          QUOTE: "USD"
+        run: |
+          python -u positions_summary.py
+
+      - name: Commit CSV summary
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/positions_summary.csv
+          git commit -m "Update positions summary" || echo "No changes to commit"
+          git push || true
