@@ -1,0 +1,169 @@
+name: Equities Live (Market Hours)
+
+on:
+  workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: "Dry run (no real orders)?"
+        required: true
+        default: "true"
+      PER_TRADE_USD:
+        description: "Budget per trade (USD)"
+        required: true
+        default: "10"
+      DAILY_CAP_USD:
+        description: "Max total buys per day (USD)"
+        required: true
+        default: "25"
+      MAX_POSITIONS:
+        description: "Max concurrent open positions"
+        required: true
+        default: "5"
+      UNIVERSE_MODE:
+        description: "AUTO or LIST"
+        required: true
+        default: "AUTO"
+      EQUITY_UNIVERSE:
+        description: "Comma list if UNIVERSE_MODE=LIST (e.g. AAPL,MSFT,NVDA,AMD,TSLA)"
+        required: false
+        default: ""
+      TAKE_PROFIT_PCT:
+        description: "Take-profit percent (e.g. 1.5 for 1.5%)"
+        required: true
+        default: "1.5"
+      TRAILING_PCT:
+        description: "Trailing-profit percent (e.g. 0.7)"
+        required: true
+        default: "0.7"
+      STOP_LOSS_PCT:
+        description: "Optional stop-loss percent (e.g. 3.0, blank to disable)"
+        required: false
+        default: "3.0"
+
+  # Runs every 15 minutes while regular session is open (13:30–20:00 UTC = 09:30–16:00 ET).
+  schedule:
+    - cron: "*/15 13-19 * * 1-5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: equities-live
+  cancel-in-progress: false
+
+env:
+  MARKET: "EQUITIES"
+  BROKER: "ROBINHOOD"      # Your code should already route Robinhood on MARKET=EQUITIES
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # Safe defaults for scheduled runs. You can override on manual dispatch.
+  DRY_RUN: "true"
+  PER_TRADE_USD: "10"
+  DAILY_CAP_USD: "25"
+  MAX_POSITIONS: "5"
+  UNIVERSE_MODE: "AUTO"
+  EQUITY_UNIVERSE: ""
+  TAKE_PROFIT_PCT: "1.5"
+  TRAILING_PCT: "0.7"
+  STOP_LOSS_PCT: "3.0"
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Adopt manual inputs (if any)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          echo "DRY_RUN=${{ github.event.inputs.DRY_RUN }}" >> $GITHUB_ENV
+          echo "PER_TRADE_USD=${{ github.event.inputs.PER_TRADE_USD }}" >> $GITHUB_ENV
+          echo "DAILY_CAP_USD=${{ github.event.inputs.DAILY_CAP_USD }}" >> $GITHUB_ENV
+          echo "MAX_POSITIONS=${{ github.event.inputs.MAX_POSITIONS }}" >> $GITHUB_ENV
+          echo "UNIVERSE_MODE=${{ github.event.inputs.UNIVERSE_MODE }}" >> $GITHUB_ENV
+          echo "EQUITY_UNIVERSE=${{ github.event.inputs.EQUITY_UNIVERSE }}" >> $GITHUB_ENV
+          echo "TAKE_PROFIT_PCT=${{ github.event.inputs.TAKE_PROFIT_PCT }}" >> $GITHUB_ENV
+          echo "TRAILING_PCT=${{ github.event.inputs.TRAILING_PCT }}" >> $GITHUB_ENV
+          echo "STOP_LOSS_PCT=${{ github.event.inputs.STOP_LOSS_PCT }}" >> $GITHUB_ENV
+
+      - name: Check US market hours (skip if closed)
+        id: hours
+        shell: bash
+        run: |
+          # Uses NY time; skips weekends/holidays and outside 09:30–16:00.
+          TZ="America/New_York"
+          dow=$(date +%u)                 # 1=Mon ... 7=Sun
+          hour=$(TZ=$TZ date +%H)
+          min=$(TZ=$TZ date +%M)
+          hm=$((10#$hour * 60 + 10#$min)) # minutes since midnight
+
+          # Basic weekday check
+          if [ "$dow" -ge 6 ]; then
+            echo "open=false" >> $GITHUB_OUTPUT
+            echo "Market closed: weekend."
+            exit 0
+          fi
+
+          # Simple holiday list (extend as needed)
+          Y=$(TZ=$TZ date +%Y)
+          mmdd=$(TZ=$TZ date +%m-%d)
+          case "$mmdd" in
+            "01-01"|"07-04"|"12-25") echo "open=false" >> $GITHUB_OUTPUT; echo "Market holiday."; exit 0 ;;
+          esac
+
+          # Regular session 09:30–16:00
+          open=$((9*60 + 30))
+          close=$((16*60))
+          if [ "$hm" -ge "$open" ] && [ "$hm" -lt "$close" ]; then
+            echo "open=true" >> $GITHUB_OUTPUT
+            echo "Market open: proceeding."
+          else
+            echo "open=false" >> $GITHUB_OUTPUT
+            echo "Market closed (outside regular hours)."
+          fi
+
+      - name: Mark (hours gate)
+        if: ${{ steps.hours.outputs.open == 'true' || github.event_name == 'workflow_dispatch' }}
+        run: echo "Proceeding (market open or manual run)."
+
+      - name: Low-balance / sanity check
+        if: ${{ steps.hours.outputs.open == 'true' || github.event_name == 'workflow_dispatch' }}
+        run: |
+          echo "MARKET=$MARKET / BROKER=$BROKER / DRY_RUN=$DRY_RUN"
+          echo "PER_TRADE_USD=$PER_TRADE_USD DAILY_CAP_USD=$DAILY_CAP_USD MAX_POSITIONS=$MAX_POSITIONS"
+          echo "UNIVERSE_MODE=$UNIVERSE_MODE EQUITY_UNIVERSE=$EQUITY_UNIVERSE"
+          echo "TAKE_PROFIT_PCT=$TAKE_PROFIT_PCT TRAILING_PCT=$TRAILING_PCT STOP_LOSS_PCT=$STOP_LOSS_PCT"
+          # Your app should print FREE_USD / buying power for equities on startup.
+
+      - name: Run trader
+        if: ${{ steps.hours.outputs.open == 'true' || github.event_name == 'workflow_dispatch' }}
+        env:
+          # Read your Robinhood creds from repo/env/organization secrets
+          ROBINHOOD_USERNAME: ${{ secrets.ROBINHOOD_USERNAME }}
+          ROBINHOOD_PASSWORD: ${{ secrets.ROBINHOOD_PASSWORD }}
+          ROBINHOOD_MFA: ${{ secrets.ROBINHOOD_MFA }} # if applicable
+        run: |
+          python -u main.py --market equities
+
+      - name: Done
+        run: echo "Equities Live cycle complete."
