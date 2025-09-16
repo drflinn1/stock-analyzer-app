@@ -2,9 +2,8 @@
 """
 Tax Ledger & Reserve helper
 - Append every SELL to data/tax_ledger.csv with realized P/L and tax reserve
-- Simple, file-based; safe defaults; no external deps
+- Simple, file-based; no external deps
 """
-
 import csv, os, datetime as dt
 from typing import Optional
 
@@ -65,27 +64,21 @@ class TaxLedger:
         run_id: Optional[str] = None,   # e.g., GitHub run id/sha
         trade_id: Optional[str] = None  # your internal id
     ) -> dict:
-        """
-        Call this AFTER a SELL fills and you know realized P/L on that closed lot.
-        Returns a dict with reserved_usd and profit_usd for on-screen logging.
-        """
+        """Call after a SELL fills and you know realized P/L on that closed lot."""
         ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
         year = ts[:4]
         profit_usd = round((proceeds_usd - fees_usd) - cost_basis_usd, 2)
-
-        # Reserve only on profits (never on losses)
         combined_rate = max(0.0, self.reserve_rate) + max(0.0, self.state_rate)
         reserved_usd = round(max(0.0, profit_usd) * combined_rate, 2)
 
         row = [
-            ts, year, market.lower(), symbol,
+            ts, year, (market or "").lower(), symbol,
             "SELL", f"{qty:.8f}", f"{avg_price_usd:.8f}",
             f"{proceeds_usd:.2f}", f"{cost_basis_usd:.2f}", f"{fees_usd:.2f}",
             f"{profit_usd:.2f}", f"{holding_period_days:.2f}" if holding_period_days is not None else "",
             _holding_term(holding_period_days), f"{self.reserve_rate:.4f}", f"{self.state_rate:.4f}", f"{reserved_usd:.2f}",
             run_id or "", trade_id or ""
         ]
-
         with open(self.ledger_path, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(row)
 
@@ -99,15 +92,12 @@ class TaxLedger:
         }
 
     def reserve_balance(self) -> float:
-        """Sum of all reserved_usd in the ledger (useful to compare with your savings bucket)."""
+        """Sum of all reserved_usd in the ledger."""
         total = 0.0
         if not os.path.exists(self.ledger_path):
             return 0.0
         with open(self.ledger_path, "r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for r in reader:
-                try:
-                    total += float(r.get("reserved_usd", "0") or 0)
-                except Exception:
-                    pass
+            for r in csv.DictReader(f):
+                try: total += float(r.get("reserved_usd", "0") or 0)
+                except: pass
         return round(total, 2)
