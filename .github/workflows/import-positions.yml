@@ -1,0 +1,37 @@
+name: Import Positions (One-time)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Restore .state cache (if any)
+        id: state-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: state-${{ github.ref_name }}-v1
+      - name: Install deps
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Import positions from Kraken
+        env:
+          EXCHANGE: "kraken"
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        run: |
+          python -u import_positions.py
+      - name: Save .state cache
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: state-${{ github.ref_name }}-v1
