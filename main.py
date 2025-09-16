@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import os, time, json, math, re, sys, random, datetime
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 # =========================
 # Config via environment
@@ -25,6 +25,8 @@ COOLDOWN_MIN    = int(os.getenv("COOLDOWN_MINUTES", "30"))       # after a SELL,
 
 AUTO_UNIV_COUNT = int(os.getenv("AUTO_UNIVERSE_COUNT", "500"))   # size of auto universe
 QUOTE           = os.getenv("QUOTE", "USD").upper()
+
+MARKET          = os.getenv("MARKET", "crypto").lower()          # used in tax logs ("crypto"/"equities")
 
 STATE_DIR       = ".state"
 POSITIONS_FILE  = os.path.join(STATE_DIR, "positions.json")      # our simple ledger of entries
@@ -51,7 +53,12 @@ def _normalize_lot(x: Any):
     """Return a valid lot dict or None."""
     if isinstance(x, dict) and "qty" in x and "cost" in x:
         try:
-            return {"qty": float(x["qty"]), "cost": float(x["cost"]), "entry": x.get("entry") or datetime.datetime.utcnow().isoformat(), **{k:v for k,v in x.items() if k.startswith("_")}}
+            return {
+                "qty": float(x["qty"]),
+                "cost": float(x["cost"]),
+                "entry": x.get("entry") or datetime.datetime.utcnow().isoformat(),
+                **{k: v for k, v in x.items() if k.startswith("_")}
+            }
         except Exception:
             return None
     return None
@@ -60,7 +67,6 @@ def normalize_positions():
     """Ensure positions = {sym: [ {qty,cost,entry,_high?}, ... ]}."""
     changed = False
     if not isinstance(positions, dict):
-        # hopelessly wrong, reset
         print("WARN: positions.json invalid type; resetting")
         positions.clear()
         _save_json(POSITIONS_FILE, positions)
@@ -70,11 +76,9 @@ def normalize_positions():
     for sym, lots in list(positions.items()):
         new_lots: List[dict] = []
 
-        # try to parse if it was stored as a JSON string
         if isinstance(lots, str):
             try:
-                parsed = json.loads(lots)
-                lots = parsed
+                lots = json.loads(lots)
                 changed = True
             except Exception:
                 print(f"WARN: positions[{sym}] is a string and not JSON; dropping")
@@ -82,7 +86,6 @@ def normalize_positions():
                 continue
 
         if isinstance(lots, dict):
-            # single-lot dict -> wrap
             lot = _normalize_lot(lots)
             if lot: new_lots = [lot]
             changed = True
@@ -216,6 +219,68 @@ def mark_sold(sym):
     _save_json(COOLDOWN_FILE, cooldown)
 
 # =========================
+# Tax Ledger (per-lot after SELL)
+# =========================
+try:
+    from tax_ledger import TaxLedger
+    _ledger = TaxLedger()  # reads TAX_RESERVE_RATE / STATE_TAX_RATE / TAX_LEDGER_PATH
+    print(f"[boot] TaxLedger ready → {_ledger.ledger_path}")
+except Exception as e:
+    _ledger = None
+    print(f"[warn] TaxLedger not available: {e}")
+
+def _maybe_tax_log_per_lot(sym: str, lots: List[dict], sell_px: float, order_id: Optional[str] = None):
+    """
+    Append one tax row per-lot sold, using blended proceeds at the same sell price.
+    Only runs when DRY_RUN is False and _ledger is available.
+    """
+    if DRY_RUN or _ledger is None:
+        # In DRY mode we avoid writing real tax rows; still show a preview
+        if DRY_RUN:
+            try:
+                profit_preview = sum(max(0.0, (sell_px - float(l["cost"])) * float(l["qty"])) for l in lots)
+                print(f"[tax][dry] preview (not recorded) potential profit ~${profit_preview:.2f}")
+            except Exception:
+                pass
+        return
+
+    reserved_total = 0.0
+    profit_total = 0.0
+    for l in lots:
+        try:
+            qty = float(l["qty"]); cost = float(l["cost"])
+            proceeds = qty * sell_px
+            cost_basis = qty * cost
+            opened_at = l.get("entry")
+            hp_days = None
+            if isinstance(opened_at, str):
+                try:
+                    opened_dt = datetime.datetime.fromisoformat(opened_at.replace("Z",""))
+                    hp_days = (datetime.datetime.utcnow() - opened_dt).days
+                except Exception:
+                    hp_days = None
+            res = _ledger.record_sell(
+                market=MARKET,
+                symbol=sym,
+                qty=qty,
+                avg_price_usd=sell_px,
+                proceeds_usd=proceeds,
+                cost_basis_usd=cost_basis,
+                fees_usd=0.0,
+                holding_period_days=hp_days,
+                run_id=os.getenv("GITHUB_RUN_ID"),
+                trade_id=order_id
+            )
+            profit_total += float(res.get("profit_usd", 0.0))
+            reserved_total += float(res.get("reserved_usd", 0.0))
+        except Exception as e:
+            print(f"[tax][error] lot-record failed for {sym}: {e}")
+
+    print(f"[tax] profit=${profit_total:.2f} reserved=${reserved_total:.2f} "
+          f"(rate={getattr(_ledger,'reserve_rate',0):.2f}+{getattr(_ledger,'state_rate',0):.2f}) "
+          f"→ {_ledger.ledger_path}")
+
+# =========================
 # Order helpers
 # =========================
 def place_buy(sym, usd_amt):
@@ -239,14 +304,24 @@ def place_sell(sym, qty, reason):
     px = market_price(sym)
     if px <= 0: return False, 0.0, "bad_price"
     usd = qty * px
+
+    # Snapshot lots BEFORE we clear them so tax logging has the data
+    lots_snapshot = [l for l in _lots(sym) if isinstance(l, dict) and "qty" in l and "cost" in l]
+
     if DRY_RUN:
         print(f"SELL {sym}: {reason} sold {qty:.6f} ~${usd:.2f}")
+        # tax: dry-run preview only (no CSV write)
+        _maybe_tax_log_per_lot(sym, lots_snapshot, px, order_id=None)
         clear_sym(sym)
         mark_sold(sym)
         return True, usd, "dry"
+
     try:
         order = exchange.create_market_sell_order(sym, qty)
-        print(f"SELL {sym}: {reason} sold {qty:.6f} ~${usd:.2f} (order id {order.get('id','?')})")
+        oid = order.get('id', '?')
+        print(f"SELL {sym}: {reason} sold {qty:.6f} ~${usd:.2f} (order id {oid})")
+        # tax: write one row per lot actually sold
+        _maybe_tax_log_per_lot(sym, lots_snapshot, px, order_id=str(oid))
         clear_sym(sym)
         mark_sold(sym)
         return True, usd, "ok"
@@ -278,7 +353,7 @@ def evaluate_sells():
         # Take-profit
         if TAKE_PROFIT_PCT > 0 and chg_pct >= TAKE_PROFIT_PCT:
             ok, usd, _ = place_sell(sym, qty, f"TAKE_PROFIT {TAKE_PROFIT_PCT:.2f}%")
-            realized += usd
+            realized += usd if ok else 0.0
             continue
 
         # Trailing: watermark per-symbol
@@ -294,13 +369,13 @@ def evaluate_sells():
             pullback = (hi - px) / hi * 100.0 if hi > 0 else 0.0
             if pullback >= TRAIL_DELTA:
                 ok, usd, _ = place_sell(sym, qty, f"TRAIL_STOP {TRAIL_DELTA:.2f}% from peak")
-                realized += usd
+                realized += usd if ok else 0.0
                 continue
 
         # Stop-loss
         if STOP_LOSS_PCT > 0 and chg_pct <= -abs(STOP_LOSS_PCT):
             ok, usd, _ = place_sell(sym, qty, f"STOP_LOSS {STOP_LOSS_PCT:.2f}%")
-            realized += usd
+            realized += usd if ok else 0.0
             continue
 
     if realized > 0:
