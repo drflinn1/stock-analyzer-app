@@ -15,6 +15,10 @@ jobs:
     timeout-minutes: 120
 
     env:
+      MARKET: "CRYPTO"
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    
       # === TUNABLES (safe defaults) ===
       PER_TRADE_USD: "10"
       DAILY_CAP_USD: "25"
@@ -22,6 +26,10 @@ jobs:
       DROP_PCT: "2.0"
       EXCHANGE: "kraken"
       MODE: "live"
+
+      # --- NEW: Tax reserve knobs ---
+      TAX_RESERVE_RATE: "0.30"   # ~30% set-aside for federal/overall
+      STATE_TAX_RATE:  "0.00"    # e.g., "0.05" for 5% state
 
       # Sells
       TAKE_PROFIT_PCT: "2.0"
