@@ -15,13 +15,24 @@ jobs:
     timeout-minutes: 120
 
     env:
-      # TUNABLES
+      # === TUNABLES (safe defaults) ===
       PER_TRADE_USD: "10"
-      DAILY_CAP_USD: "25"     # baseline cap; remaining is persisted across runs
-      LOW_BALANCE_USD: "5"    # if free USD < this, pause buys for this run
+      DAILY_CAP_USD: "25"        # baseline cap; remaining is persisted across runs
+      LOW_BALANCE_USD: "5"       # if free USD < this, pause buys for this run
       DROP_PCT: "2.0"
       EXCHANGE: "kraken"
       MODE: "live"
+      # Optional sell knobs (your main.py already supports these)
+      TAKE_PROFIT_PCT: "2.0"
+      TRAILING_ACTIVATE_PCT: "1.0"
+      TRAILING_DELTA_PCT: "1.0"
+      STOP_LOSS_PCT: "0"
+
+      # Optional position rails (supported in updated main.py)
+      MAX_POSITIONS: "50"
+      PER_ASSET_CAP_USD: "50"
+      COOLDOWN_MINUTES: "30"
+      AUTO_UNIVERSE_COUNT: "500"
 
     steps:
       - name: Checkout
@@ -68,20 +79,18 @@ jobs:
           p.write_text(json.dumps(data))
           print(f"Loaded remaining daily cap: {data['remaining']}")
           PY
-          # expose to later steps
           REM=$(python -c "import json;print(json.load(open('.state/daily_cap.json'))['remaining'])")
           echo "DAILY_REMAINING=$REM" >> $GITHUB_ENV
           echo "::notice title=Daily Cap::Loaded remaining daily cap: $REM"
 
-      # Low-balance soft guard WITHOUT heredocs (YAML-safe)
+      # Low-balance soft guard (non-fatal on first run / missing file)
       - name: Apply low-balance guard (soft)
         shell: bash
+        continue-on-error: true
         run: |
-          # Read the last known FREE_USD from prior runs (if captured)
           LAST="$(grep -Eo 'FREE_USD:\s*\$?[0-9]+(\.[0-9]+)?' -h .state/last_free_usd.log 2>/dev/null | tail -1 | awk '{print $2}' | tr -d '$')"
           if [[ -n "$LAST" ]]; then
             echo "Last known FREE_USD: $LAST"
-            # float compare in awk: exit 0 if LAST < LOW, else 1
             if awk -v a="$LAST" -v b="${LOW_BALANCE_USD:-5}" 'BEGIN{exit (a<b)?0:1}'; then
               echo "::warning title=Low Balance Guard::free USD < ${LOW_BALANCE_USD} — setting cap to 0 for this run (sell-only)."
               echo "DAILY_REMAINING=0" >> "$GITHUB_ENV"
@@ -100,19 +109,26 @@ jobs:
           PER_TRADE_USD: ${{ env.PER_TRADE_USD }}
           DAILY_CAP_USD: ${{ env.DAILY_REMAINING }}   # use persisted remaining
           DROP_PCT: ${{ env.DROP_PCT }}
+          TAKE_PROFIT_PCT: ${{ env.TAKE_PROFIT_PCT }}
+          TRAILING_ACTIVATE_PCT: ${{ env.TRAILING_ACTIVATE_PCT }}
+          TRAILING_DELTA_PCT: ${{ env.TRAILING_DELTA_PCT }}
+          STOP_LOSS_PCT: ${{ env.STOP_LOSS_PCT }}
+          MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
+          PER_ASSET_CAP_USD: ${{ env.PER_ASSET_CAP_USD }}
+          COOLDOWN_MINUTES: ${{ env.COOLDOWN_MINUTES }}
+          AUTO_UNIVERSE_COUNT: ${{ env.AUTO_UNIVERSE_COUNT }}
         run: |
           echo "=== START TRADING OUTPUT ==="
           python -V
-          # Run and tee output for parsing
           python main.py 2>&1 | tee run.log
           echo "=== END TRADING OUTPUT ==="
 
+      # Persist FREE_USD + decrement daily cap from buys (non-fatal if run.log missing)
       - name: Update daily cap state from log
         if: always()
+        continue-on-error: true
         run: |
-          # Persist the last FREE_USD seen this run (if your app prints it)
           grep -Eo 'FREE_USD:\s*\$?[0-9]+(\.[0-9]+)?' -h run.log | tail -1 >> .state/last_free_usd.log || true
-          # Decrement today's remaining cap by total dollars bought this run
           python - <<'PY'
           import re, json, pathlib
           pcap = pathlib.Path(".state/daily_cap.json")
@@ -122,10 +138,12 @@ jobs:
             raise SystemExit(0)
           remaining=float(d.get("remaining",0))
           spent=0.0
-          with open("run.log","r",encoding="utf-8",errors="ignore") as f:
-            txt=f.read()
-          for m in re.finditer(r'^\s*BUY .*?~\$\s*([0-9]+(?:\.[0-9]+)?)', txt, re.M):
-            spent += float(m.group(1))
+          try:
+            txt=open("run.log","r",encoding="utf-8",errors="ignore").read()
+            for m in re.finditer(r'^\s*BUY .*?~\$\s*([0-9]+(?:\.[0-9]+)?)', txt, re.M):
+                spent += float(m.group(1))
+          except FileNotFoundError:
+            print("run.log not found, skipping spent calc")
           d["remaining"]= max(0.0, remaining - spent)
           pcap.write_text(json.dumps(d))
           print(f"Spent this run: ${spent:.2f} | New remaining today: ${d['remaining']:.2f}")
