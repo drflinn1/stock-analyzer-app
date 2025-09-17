@@ -68,6 +68,65 @@ def _save_json(path, obj):
 positions: Dict[str, Any] = _load_json(POSITIONS_FILE, {})
 cooldown: Dict[str, str]  = _load_json(COOLDOWN_FILE, {})
 
+# ---------- Apply temporary Sell Tester overrides ----------
+def apply_temp_overrides():
+    """Map UI params from the Sell Tester workflow into runtime overrides.
+
+    Supported envs (all optional):
+      TEMP_TP_PCT                        -> TAKE_PROFIT_PCT
+      TEMP_TRAILING_ACTIVATE_PCT         -> TRAIL_ACTIVATE
+      TEMP_TRAILING_DELTA_PCT            -> TRAIL_DELTA
+      TEMP_STOP_LOSS_PCT                 -> STOP_LOSS_PCT
+      TEMP_ATR_STOP_MULT                 -> ATR_STOP_MULT
+      SELL_DEBUG                         -> SELL_DEBUG (1/0)
+    """
+    global TAKE_PROFIT_PCT, TRAIL_ACTIVATE, TRAIL_DELTA, STOP_LOSS_PCT
+    global ATR_STOP_MULT, SELL_DEBUG
+
+    applied = {}
+
+    def _maybe_float(name):
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return None
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    m = _maybe_float("TEMP_TP_PCT")
+    if m is not None:
+        TAKE_PROFIT_PCT = m; applied["TAKE_PROFIT_PCT"] = m
+
+    m = _maybe_float("TEMP_TRAILING_ACTIVATE_PCT")
+    if m is not None:
+        TRAIL_ACTIVATE = m; applied["TRAIL_ACTIVATE"] = m
+
+    m = _maybe_float("TEMP_TRAILING_DELTA_PCT")
+    if m is not None:
+        TRAIL_DELTA = m; applied["TRAIL_DELTA"] = m
+
+    m = _maybe_float("TEMP_STOP_LOSS_PCT")
+    if m is not None:
+        STOP_LOSS_PCT = m; applied["STOP_LOSS_PCT"] = m
+
+    m = _maybe_float("TEMP_ATR_STOP_MULT")
+    if m is not None:
+        ATR_STOP_MULT = m; applied["ATR_STOP_MULT"] = m
+
+    sd = os.getenv("SELL_DEBUG")
+    if sd is not None:
+        try:
+            SELL_DEBUG = int(sd)
+            applied["SELL_DEBUG"] = SELL_DEBUG
+        except Exception:
+            pass
+
+    if applied:
+        # One concise line so you can see overrides at the top of the run.
+        print("[sellcfg] applied temp overrides → " +
+              ", ".join(f"{k}={v}" for k, v in applied.items()))
+
 # ---------- Auto-heal ----------
 def _normalize_lot(x: Any):
     if isinstance(x, dict) and "qty" in x and "cost" in x:
@@ -453,10 +512,11 @@ def evaluate_sells():
         qty = sum(float(l["qty"]) for l in valid)
         if qty <= 0:
             continue
-        avg_cost = sum(float(l["qty"])*float(l["cost"]) for l in valid)/qty
         px = market_price(sym)
         if px <= 0:
             continue
+
+        avg_cost = sum(float(l["qty"])*float(l["cost"]) for l in valid)/qty
         chg_pct = (px - avg_cost) / avg_cost * 100.0
 
         hi_key = "_high"
@@ -467,6 +527,12 @@ def evaluate_sells():
             hi = px
         pullback = (hi - px) / hi * 100.0 if hi > 0 else 0.0
 
+        # --- Runtime market constraints for audit ---
+        wallet_free = free_base_qty(sym)
+        min_qty = min_trade_qty(sym, px)
+        min_notional = (min_qty * px) if min_qty > 0 else 0.0
+        notional = qty * px
+
         atrp = 0.0
         if ATR_EXITS:
             try:
@@ -474,16 +540,21 @@ def evaluate_sells():
             except Exception:
                 atrp = 0.0
 
+        # SELL DEBUG: compact but rich audit
         if SELL_DEBUG:
-            x_info = (f"ATR%={atrp:.3f} TP>={ATR_TP_MULT:.2f}*ATR "
-                      f"ACT>={ATR_ACT_MULT:.2f}*ATR DELTA>={ATR_TRAIL_MULT:.2f}*ATR "
-                      f"STOP>={ATR_STOP_MULT:.2f}*ATR")
-            if not ATR_EXITS:
-                x_info = (f"TP={TAKE_PROFIT_PCT:.2f}% ACT={TRAIL_ACTIVATE:.2f}% "
-                          f"DELTA={TRAIL_DELTA:.2f}% SL={STOP_LOSS_PCT:.2f}%")
-            print(f"[sellchk] {sym} qty={qty:.6f} avg_cost={avg_cost:.8f} px={px:.8f} "
-                  f"chg={chg_pct:.2f}% hi={hi:.8f} pullback={pullback:.2f}%  {x_info}")
+            if ATR_EXITS and atrp > 0:
+                x_info = (f"ATR%={atrp:.3f}  TP>={ATR_TP_MULT:.2f}*ATR  "
+                          f"ACT>={ATR_ACT_MULT:.2f}*ATR  DELTA>={ATR_TRAIL_MULT:.2f}*ATR  "
+                          f"STOP>={ATR_STOP_MULT:.2f}*ATR")
+            else:
+                x_info = (f"TP={TAKE_PROFIT_PCT:.2f}%  ACT={TRAIL_ACTIVATE:.2f}%  "
+                          f"DELTA={TRAIL_DELTA:.2f}%  SL={STOP_LOSS_PCT:.2f}%")
+            print(f"[AUDIT] {sym} qty={qty:.8f} notional=${notional:.2f} "
+                  f"min_sell~${min_notional:.2f} wallet_base={wallet_free:.8f} "
+                  f"avg_cost={avg_cost:.8f} px={px:.8f} chg={chg_pct:.2f}% "
+                  f"hi={hi:.8f} pullback={pullback:.2f}%  {x_info}")
 
+        # --- Decisions ---
         if ATR_EXITS and atrp > 0:
             tp_thresh    = ATR_TP_MULT    * atrp
             act_thresh   = ATR_ACT_MULT   * atrp
@@ -581,6 +652,7 @@ def run_cycle():
     print("=== START TRADING OUTPUT ===")
     print(f"Python {sys.version.split()[0]}")
 
+    apply_temp_overrides()  # <- pick up Sell Tester inputs if present
     evaluate_sells()
 
     uni = autopick_universe(AUTO_UNIV_COUNT)
