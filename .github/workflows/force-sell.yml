@@ -19,24 +19,38 @@ on:
 jobs:
   force_sell:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 30
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install ccxt; fi
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install ccxt
+          fi
 
+      # IMPORTANT: provide exchange + secrets so main.py can see your wallet
       - name: Apply env (force sell)
         run: |
           echo "MODE=live" >> $GITHUB_ENV
           echo "DRY_RUN=${{ inputs.dry_run }}" >> $GITHUB_ENV
           echo "SELL_DEBUG=${{ inputs.sell_debug }}" >> $GITHUB_ENV
           echo "FORCE_SELL=1" >> $GITHUB_ENV
+          echo "EXCHANGE=kraken" >> $GITHUB_ENV
+          echo "MARKET=crypto" >> $GITHUB_ENV
+          echo "QUOTE=USD" >> $GITHUB_ENV
+          echo "KRAKEN_API_KEY=${{ secrets.KRAKEN_API_KEY }}" >> $GITHUB_ENV
+          echo "KRAKEN_API_SECRET=${{ secrets.KRAKEN_API_SECRET }}" >> $GITHUB_ENV
 
       - name: Run trader (force sells only)
         run: |
