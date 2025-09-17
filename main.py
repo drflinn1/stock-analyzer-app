@@ -29,7 +29,7 @@ ATR_ACT_MULT    = float(os.getenv("ATR_ACT_MULT", "0.8"))        # start trailin
 ATR_STOP_MULT   = float(os.getenv("ATR_STOP_MULT", "1.2"))       # stop losers when drawdown >= STOP_MULT * ATR
 
 # Entry filter (reduce random buys)
-ENTRY_GUARD       = int(os.getenv("ENTRY_GUARD", "1"))           # 1 = on
+ENTRY_GUARD       = int(os.getenv("ENTRY_GUARD", "1"))
 ENTRY_EMA_SHORT   = int(os.getenv("ENTRY_EMA_SHORT", "9"))
 ENTRY_EMA_LONG    = int(os.getenv("ENTRY_EMA_LONG", "21"))
 ENTRY_RSI_PERIOD  = int(os.getenv("ENTRY_RSI_PERIOD", "14"))
@@ -70,16 +70,7 @@ cooldown: Dict[str, str]  = _load_json(COOLDOWN_FILE, {})
 
 # ---------- Apply temporary Sell Tester overrides ----------
 def apply_temp_overrides():
-    """Map UI params from the Sell Tester workflow into runtime overrides.
-
-    Supported envs (all optional):
-      TEMP_TP_PCT                        -> TAKE_PROFIT_PCT
-      TEMP_TRAILING_ACTIVATE_PCT         -> TRAIL_ACTIVATE
-      TEMP_TRAILING_DELTA_PCT            -> TRAIL_DELTA
-      TEMP_STOP_LOSS_PCT                 -> STOP_LOSS_PCT
-      TEMP_ATR_STOP_MULT                 -> ATR_STOP_MULT
-      SELL_DEBUG                         -> SELL_DEBUG (1/0)
-    """
+    """Map UI params from the Sell Tester workflow into runtime overrides."""
     global TAKE_PROFIT_PCT, TRAIL_ACTIVATE, TRAIL_DELTA, STOP_LOSS_PCT
     global ATR_STOP_MULT, SELL_DEBUG
 
@@ -95,37 +86,25 @@ def apply_temp_overrides():
             return None
 
     m = _maybe_float("TEMP_TP_PCT")
-    if m is not None:
-        TAKE_PROFIT_PCT = m; applied["TAKE_PROFIT_PCT"] = m
-
+    if m is not None: TAKE_PROFIT_PCT = m; applied["TAKE_PROFIT_PCT"] = m
     m = _maybe_float("TEMP_TRAILING_ACTIVATE_PCT")
-    if m is not None:
-        TRAIL_ACTIVATE = m; applied["TRAIL_ACTIVATE"] = m
-
+    if m is not None: TRAIL_ACTIVATE = m; applied["TRAIL_ACTIVATE"] = m
     m = _maybe_float("TEMP_TRAILING_DELTA_PCT")
-    if m is not None:
-        TRAIL_DELTA = m; applied["TRAIL_DELTA"] = m
-
+    if m is not None: TRAIL_DELTA = m; applied["TRAIL_DELTA"] = m
     m = _maybe_float("TEMP_STOP_LOSS_PCT")
-    if m is not None:
-        STOP_LOSS_PCT = m; applied["STOP_LOSS_PCT"] = m
-
+    if m is not None: STOP_LOSS_PCT = m; applied["STOP_LOSS_PCT"] = m
     m = _maybe_float("TEMP_ATR_STOP_MULT")
-    if m is not None:
-        ATR_STOP_MULT = m; applied["ATR_STOP_MULT"] = m
+    if m is not None: ATR_STOP_MULT = m; applied["ATR_STOP_MULT"] = m
 
     sd = os.getenv("SELL_DEBUG")
     if sd is not None:
         try:
-            SELL_DEBUG = int(sd)
-            applied["SELL_DEBUG"] = SELL_DEBUG
+            SELL_DEBUG = int(sd); applied["SELL_DEBUG"] = SELL_DEBUG
         except Exception:
             pass
 
     if applied:
-        # One concise line so you can see overrides at the top of the run.
-        print("[sellcfg] applied temp overrides → " +
-              ", ".join(f"{k}={v}" for k, v in applied.items()))
+        print("[sellcfg] applied temp overrides → " + ", ".join(f"{k}={v}" for k,v in applied.items()))
 
 # ---------- Auto-heal ----------
 def _normalize_lot(x: Any):
@@ -499,6 +478,49 @@ def place_sell(sym, qty, reason):
         return False, 0.0, "err"
 
 # =========================
+# Wallet hydration (import live holdings for audit/sell)
+# =========================
+def hydrate_positions_from_wallet() -> int:
+    """Import wallet totals as synthetic lots for any symbols not already tracked."""
+    if not exchange:
+        return 0
+    try:
+        bal = exchange.fetch_balance()  # includes total
+        totals = bal.get("total") or {}
+    except Exception:
+        return 0
+
+    added = 0
+    for base, amt in (totals.items() if isinstance(totals, dict) else []):
+        try:
+            qty = float(amt or 0.0)
+        except Exception:
+            qty = 0.0
+        if qty <= 0:
+            continue
+        sym = f"{base}/{QUOTE}"
+        # only symbols tradable on this quote and not already tracked
+        try:
+            if sym not in exchange.markets:
+                continue
+        except Exception:
+            continue
+        if _lots(sym):
+            continue
+        px = market_price(sym) or 0.0
+        positions[sym] = [{
+            "qty": qty,
+            "cost": px,  # unknown true basis; set to px so chg_pct starts ~0
+            "entry": datetime.datetime.utcnow().isoformat(),
+            "_synthetic": True
+        }]
+        added += 1
+    if added:
+        _save_json(POSITIONS_FILE, positions)
+        print(f"[audit] hydrated {added} symbols from wallet for evaluation")
+    return added
+
+# =========================
 # Sell engine (ATR or %)
 # =========================
 def evaluate_sells():
@@ -517,7 +539,7 @@ def evaluate_sells():
             continue
 
         avg_cost = sum(float(l["qty"])*float(l["cost"]) for l in valid)/qty
-        chg_pct = (px - avg_cost) / avg_cost * 100.0
+        chg_pct = (px - avg_cost) / avg_cost * 100.0 if avg_cost > 0 else 0.0
 
         hi_key = "_high"
         hi = max([float(l.get(hi_key, avg_cost)) for l in valid] + [avg_cost])
@@ -540,7 +562,8 @@ def evaluate_sells():
             except Exception:
                 atrp = 0.0
 
-        # SELL DEBUG: compact but rich audit
+        origin = "wallet" if all(l.get("_synthetic") for l in valid) else "positions"
+
         if SELL_DEBUG:
             if ATR_EXITS and atrp > 0:
                 x_info = (f"ATR%={atrp:.3f}  TP>={ATR_TP_MULT:.2f}*ATR  "
@@ -549,7 +572,7 @@ def evaluate_sells():
             else:
                 x_info = (f"TP={TAKE_PROFIT_PCT:.2f}%  ACT={TRAIL_ACTIVATE:.2f}%  "
                           f"DELTA={TRAIL_DELTA:.2f}%  SL={STOP_LOSS_PCT:.2f}%")
-            print(f"[AUDIT] {sym} qty={qty:.8f} notional=${notional:.2f} "
+            print(f"[AUDIT] {sym} src={origin} qty={qty:.8f} notional=${notional:.2f} "
                   f"min_sell~${min_notional:.2f} wallet_base={wallet_free:.8f} "
                   f"avg_cost={avg_cost:.8f} px={px:.8f} chg={chg_pct:.2f}% "
                   f"hi={hi:.8f} pullback={pullback:.2f}%  {x_info}")
@@ -652,7 +675,8 @@ def run_cycle():
     print("=== START TRADING OUTPUT ===")
     print(f"Python {sys.version.split()[0]}")
 
-    apply_temp_overrides()  # <- pick up Sell Tester inputs if present
+    apply_temp_overrides()
+    hydrate_positions_from_wallet()  # <- import wallet holdings so sells can see them
     evaluate_sells()
 
     uni = autopick_universe(AUTO_UNIV_COUNT)
