@@ -21,6 +21,21 @@ env:
   MODE: "live"
   TAX_RESERVE_RATE: "0.30"
   STATE_TAX_RATE:  "0.00"
+  
+  ATR_EXITS: "1"
+  ATR_PERIOD: "14"
+  ATR_TP_MULT: "1.5"
+  ATR_TRAIL_MULT: "1.0"
+  ATR_ACT_MULT: "0.8"
+
+  ENTRY_GUARD: "1"
+  ENTRY_EMA_SHORT: "9"
+  ENTRY_EMA_LONG: "21"
+  ENTRY_RSI_PERIOD: "14"
+  ENTRY_RSI_MIN: "50"
+  ENTRY_RSI_MAX: "75"
+
+  TIMEFRAME: "5m"
 
 jobs:
   test:
