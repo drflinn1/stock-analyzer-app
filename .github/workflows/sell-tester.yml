@@ -19,6 +19,7 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   EXCHANGE: "kraken"
   MODE: "live"
+  ATR_STOP_MULT: "1.2"
 
   TAX_RESERVE_RATE: "0.30"
   STATE_TAX_RATE:  "0.00"
