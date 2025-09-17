@@ -31,7 +31,13 @@ env:
   ATR_TP_MULT: "1.5"
   ATR_TRAIL_MULT: "1.0"
   ATR_ACT_MULT: "0.8"
-  ATR_STOP_MULT: "1.2"    # default; can be overridden per run below
+  ATR_STOP_MULT: "1.2"    # default; overridden per run below
+
+  # === Percent fallback (if ATR_EXITS=0) ===
+  TAKE_PROFIT_PCT: "2.0"
+  TRAILING_ACTIVATE_PCT: "1.0"
+  TRAILING_DELTA_PCT: "1.0"
+  STOP_LOSS_PCT: "0"
 
   # === Entry guard (EMA/RSI) ===
   ENTRY_GUARD: "1"
@@ -52,7 +58,6 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
 
-      # Restore cached .state + data so we actually test live positions
       - name: Restore .state and data caches
         id: restore
         uses: actions/cache/restore@v4
@@ -73,7 +78,6 @@ jobs:
 
       - name: Apply temporary sell thresholds + debug (SELLS ONLY)
         run: |
-          # Sell thresholds/debug
           echo "DRY_RUN=${{ github.event.inputs.DRY_RUN }}" >> $GITHUB_ENV
           echo "TAKE_PROFIT_PCT=${{ github.event.inputs.TAKE_PROFIT_PCT }}" >> $GITHUB_ENV
           echo "TRAILING_ACTIVATE_PCT=${{ github.event.inputs.TRAILING_ACTIVATE_PCT }}" >> $GITHUB_ENV
@@ -81,10 +85,10 @@ jobs:
           echo "STOP_LOSS_PCT=${{ github.event.inputs.STOP_LOSS_PCT }}" >> $GITHUB_ENV
           echo "SELL_DEBUG=${{ github.event.inputs.SELL_DEBUG }}" >> $GITHUB_ENV
 
-          # Temporary ATR stop override for this run
+          # Tighten ATR stop for this test run
           echo "ATR_STOP_MULT=${{ github.event.inputs.TEMP_ATR_STOP_MULT }}" >> $GITHUB_ENV
 
-          # Force sells-only: set daily buy budget to zero
+          # Sells-only: zero the daily buy budget
           echo "DAILY_CAP_USD=0" >> $GITHUB_ENV
 
       - name: Run trader (sell test only)
