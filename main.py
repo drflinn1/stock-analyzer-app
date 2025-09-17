@@ -26,7 +26,7 @@ ATR_PERIOD      = int(os.getenv("ATR_PERIOD", "14"))
 ATR_TP_MULT     = float(os.getenv("ATR_TP_MULT", "1.5"))         # take-profit when move >= TP_MULT * ATR
 ATR_TRAIL_MULT  = float(os.getenv("ATR_TRAIL_MULT", "1.0"))      # trailing pullback >= TRAIL_MULT * ATR
 ATR_ACT_MULT    = float(os.getenv("ATR_ACT_MULT", "0.8"))        # start trailing after move >= ACT_MULT * ATR
-ATR_STOP_MULT   = float(os.getenv("ATR_STOP_MULT", "1.2"))       # **NEW** stop losers when drawdown >= STOP_MULT * ATR
+ATR_STOP_MULT   = float(os.getenv("ATR_STOP_MULT", "1.2"))       # stop losers when drawdown >= STOP_MULT * ATR
 
 # Entry filter (reduce random buys)
 ENTRY_GUARD       = int(os.getenv("ENTRY_GUARD", "1"))           # 1 = on
@@ -327,12 +327,68 @@ def _maybe_tax_log_per_lot(sym: str, lots: List[dict], sell_px: float, order_id:
           f"→ {_ledger.ledger_path}")
 
 # =========================
+# Market sizing helpers (wallet/min size/precision)
+# =========================
+def base_asset(sym: str) -> str:
+    return sym.split("/")[0]
+
+def free_base_qty(sym: str) -> float:
+    if not exchange: return 0.0
+    try:
+        bal = exchange.fetch_free_balance()
+        return float(bal.get(base_asset(sym), 0.0))
+    except Exception:
+        return 0.0
+
+def market_limits(sym: str) -> dict:
+    try:
+        return exchange.market(sym).get("limits", {}) or {}
+    except Exception:
+        return {}
+
+def market_precision(sym: str) -> dict:
+    try:
+        return exchange.market(sym).get("precision", {}) or {}
+    except Exception:
+        return {}
+
+def min_trade_qty(sym: str, px: float) -> float:
+    lim = market_limits(sym)
+    min_amt  = float((lim.get("amount") or {}).get("min") or 0.0)
+    min_cost = float((lim.get("cost")   or {}).get("min") or 0.0)
+    if px > 0 and min_cost > 0:
+        min_amt = max(min_amt, min_cost / px)
+    return float(min_amt or 0.0)
+
+def round_qty(sym: str, qty: float) -> float:
+    try:
+        prec = market_precision(sym).get("amount")
+        if isinstance(prec, int):
+            return float(f"{qty:.{prec}f}")
+    except Exception:
+        pass
+    return qty
+
+# =========================
 # Order helpers
 # =========================
 def place_buy(sym, usd_amt):
     px = market_price(sym)
-    if px <= 0: return False, 0.0, "bad_price"
+    if px <= 0: 
+        print(f"[buyerr] {sym}: bad price")
+        return False, 0.0, "bad_price"
+
     qty = usd_amt / px
+    min_qty = min_trade_qty(sym, px)
+    if min_qty > 0 and qty < min_qty:
+        print(f"[buyskip] {sym}: qty {qty:.8f} < min {min_qty:.8f} (usd ${usd_amt:.2f})")
+        return False, 0.0, "below_min"
+
+    qty = round_qty(sym, qty)
+    if qty <= 0:
+        print(f"[buyskip] {sym}: rounded qty is 0")
+        return False, 0.0, "rounded_zero"
+
     if DRY_RUN:
         print(f"BUY {sym}: DRY ~${usd_amt:.2f} @ ~{px:.8f} qty~{qty:.8f}")
         add_lot(sym, qty, px)
@@ -348,18 +404,34 @@ def place_buy(sym, usd_amt):
 
 def place_sell(sym, qty, reason):
     px = market_price(sym)
-    if px <= 0: return False, 0.0, "bad_price"
+    if px <= 0:
+        return False, 0.0, "bad_price"
+
+    wallet_free = free_base_qty(sym)
+    req_qty = float(qty)
+    qty = min(req_qty, wallet_free)
+    min_qty = min_trade_qty(sym, px)
+    qty = round_qty(sym, qty)
+
+    if qty <= 0 or (min_qty > 0 and qty < min_qty):
+        print(f"[sellskip] {sym}: request {req_qty:.8f}, wallet {wallet_free:.8f}, min {min_qty:.8f} → skip")
+        if wallet_free <= 0:
+            clear_sym(sym); mark_sold(sym)
+        return False, 0.0, "min_or_wallet"
+
     usd = qty * px
     lots_snapshot = [l for l in _lots(sym) if isinstance(l, dict) and "qty" in l and "cost" in l]
+
     if DRY_RUN:
-        print(f"SELL {sym}: {reason} sold {qty:.6f} ~${usd:.2f}")
+        print(f"SELL {sym}: {reason} (DRY) qty={qty:.6f} ~${usd:.2f}")
         _maybe_tax_log_per_lot(sym, lots_snapshot, px, order_id=None)
         clear_sym(sym); mark_sold(sym)
         return True, usd, "dry"
+
     try:
         order = exchange.create_market_sell_order(sym, qty)
         oid = order.get('id', '?')
-        print(f"SELL {sym}: {reason} sold {qty:.6f} ~${usd:.2f} (order id {oid})")
+        print(f"SELL {sym}: {reason} qty={qty:.6f} ~${usd:.2f} (order id {oid})")
         _maybe_tax_log_per_lot(sym, lots_snapshot, px, order_id=str(oid))
         clear_sym(sym); mark_sold(sym)
         return True, usd, "ok"
@@ -395,7 +467,6 @@ def evaluate_sells():
             hi = px
         pullback = (hi - px) / hi * 100.0 if hi > 0 else 0.0
 
-        # ATR thresholds in % space
         atrp = 0.0
         if ATR_EXITS:
             try:
@@ -413,28 +484,24 @@ def evaluate_sells():
             print(f"[sellchk] {sym} qty={qty:.6f} avg_cost={avg_cost:.8f} px={px:.8f} "
                   f"chg={chg_pct:.2f}% hi={hi:.8f} pullback={pullback:.2f}%  {x_info}")
 
-        # --- Exit rules ---
         if ATR_EXITS and atrp > 0:
             tp_thresh    = ATR_TP_MULT    * atrp
             act_thresh   = ATR_ACT_MULT   * atrp
             trail_thresh = ATR_TRAIL_MULT * atrp
             stop_thresh  = ATR_STOP_MULT  * atrp
 
-            # Take-profit
             if chg_pct >= tp_thresh:
                 ok, usd, _ = place_sell(sym, qty, f"ATR_TP {ATR_TP_MULT:.2f}*ATR (~{tp_thresh:.2f}%)")
                 realized += usd if ok else 0.0
                 if SELL_DEBUG: print(f"[sellchk] -> ATR_TP fired for {sym}")
                 continue
 
-            # Trailing stop after activation
             if chg_pct >= act_thresh and pullback >= trail_thresh:
                 ok, usd, _ = place_sell(sym, qty, f"ATR_TRAIL {ATR_TRAIL_MULT:.2f}*ATR (~{trail_thresh:.2f}%)")
                 realized += usd if ok else 0.0
                 if SELL_DEBUG: print(f"[sellchk] -> ATR_TRAIL fired for {sym}")
                 continue
 
-            # **ATR-based stop for losers**
             if chg_pct <= -stop_thresh:
                 ok, usd, _ = place_sell(sym, qty, f"ATR_STOP {ATR_STOP_MULT:.2f}*ATR (~{stop_thresh:.2f}%)")
                 realized += usd if ok else 0.0
@@ -442,7 +509,6 @@ def evaluate_sells():
                 continue
 
         else:
-            # Percent-based fallback
             if TAKE_PROFIT_PCT > 0 and chg_pct >= TAKE_PROFIT_PCT:
                 ok, usd, _ = place_sell(sym, qty, f"TAKE_PROFIT {TAKE_PROFIT_PCT:.2f}%")
                 realized += usd if ok else 0.0
