@@ -3,37 +3,15 @@ name: Sell Tester (On-demand, safe)
 on:
   workflow_dispatch:
     inputs:
-      DRY_RUN:
-        description: "Dry run (no real orders)?"
-        required: true
-        default: "true"
-      TAKE_PROFIT_PCT:
-        description: "Temp TP % (e.g., 0.8)"
-        required: true
-        default: "0.8"
-      TRAILING_ACTIVATE_PCT:
-        description: "Temp trailing activation % (e.g., 0.5)"
-        required: true
-        default: "0.5"
-      TRAILING_DELTA_PCT:
-        description: "Temp trailing pullback % (e.g., 0.3)"
-        required: true
-        default: "0.3"
-      STOP_LOSS_PCT:
-        description: "Temp stop-loss % (0 = disabled)"
-        required: true
-        default: "0"
-      SELL_DEBUG:
-        description: "Verbose sell checks? 1=yes, 0=no"
-        required: true
-        default: "1"
+      DRY_RUN:                  { description: "Dry run (no real orders)?", required: true, default: "false" }
+      TAKE_PROFIT_PCT:          { description: "Temp TP % (e.g., 0.5)",     required: true, default: "0.5" }
+      TRAILING_ACTIVATE_PCT:    { description: "Temp trailing activation % (e.g., 0.4)", required: true, default: "0.4" }
+      TRAILING_DELTA_PCT:       { description: "Temp trailing pullback % (e.g., 0.2)",   required: true, default: "0.2" }
+      STOP_LOSS_PCT:            { description: "Temp stop-loss % (0 = disabled)",        required: true, default: "0" }
+      SELL_DEBUG:               { description: "Verbose sell checks? 1=yes, 0=no",       required: true, default: "1" }
 
-permissions:
-  contents: read
-
-concurrency:
-  group: sell-tester
-  cancel-in-progress: false
+permissions: { contents: read }
+concurrency: { group: sell-tester, cancel-in-progress: false }
 
 env:
   MARKET: "CRYPTO"
@@ -41,8 +19,6 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   EXCHANGE: "kraken"
   MODE: "live"
-
-  # Tax reserve knobs (so tax logs fire on real sells)
   TAX_RESERVE_RATE: "0.30"
   STATE_TAX_RATE:  "0.00"
 
@@ -53,16 +29,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Restore .state and data caches
+        id: restore
         uses: actions/cache/restore@v4
         with:
           path: |
             .state
             data
           key: state-${{ github.ref_name }}-v1
+
+      - name: Show restored state
+        run: |
+          echo "cache-hit=${{ steps.restore.outputs['cache-hit'] }}"
+          ls -la . || true
+          ls -la .state || true
+          test -f .state/positions.json && { echo "[OK] positions.json present"; head -c 400 .state/positions.json; echo; } || echo "[MISS] positions.json MISSING"
 
       - name: Install deps
         run: |
@@ -85,7 +68,7 @@ jobs:
           mkdir -p .state data
           python -u main.py | tee -a sell_test.log
 
-      - name: Save caches back
+      - name: Save caches back (best-effort)
         if: always()
         uses: actions/cache/save@v4
         with:
