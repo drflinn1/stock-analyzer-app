@@ -39,7 +39,6 @@ jobs:
             pip install ccxt
           fi
 
-      # IMPORTANT: provide exchange + secrets so main.py can see your wallet
       - name: Apply env (force sell)
         run: |
           echo "MODE=live" >> $GITHUB_ENV
