@@ -40,8 +40,9 @@ env:
   ATR_TP_MULT: "1.5"
   ATR_TRAIL_MULT: "1.0"
   ATR_ACT_MULT: "0.8"
+  ATR_STOP_MULT: "1.2"   # <-- new
 
-  # === Percent fallback (still supported if ATR_EXITS=0) ===
+  # === Percent fallback (works if ATR_EXITS=0) ===
   TAKE_PROFIT_PCT: "2.0"
   TRAILING_ACTIVATE_PCT: "1.0"
   TRAILING_DELTA_PCT: "1.0"
