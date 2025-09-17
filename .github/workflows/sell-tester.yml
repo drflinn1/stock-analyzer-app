@@ -9,6 +9,7 @@ on:
       TRAILING_DELTA_PCT:    { description: "Temp trailing pullback % (e.g., 0.2)", required: true, default: "0.2" }
       STOP_LOSS_PCT:         { description: "Temp stop-loss % (0 = disabled)", required: true, default: "0" }
       SELL_DEBUG:            { description: "Verbose sell checks? 1=yes, 0=no", required: true, default: "1" }
+      TEMP_ATR_STOP_MULT:    { description: "Override ATR stop mult for this run (e.g., 1.0)", required: true, default: "1.0" }
 
 permissions: { contents: read }
 concurrency: { group: sell-tester, cancel-in-progress: false }
@@ -19,33 +20,39 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   EXCHANGE: "kraken"
   MODE: "live"
-  ATR_STOP_MULT: "1.2"
 
+  # === Tax ===
   TAX_RESERVE_RATE: "0.30"
   STATE_TAX_RATE:  "0.00"
 
-  # keep these for later (safe to leave on)
+  # === Adaptive exits (ATR) ===
   ATR_EXITS: "1"
   ATR_PERIOD: "14"
   ATR_TP_MULT: "1.5"
   ATR_TRAIL_MULT: "1.0"
   ATR_ACT_MULT: "0.8"
+  ATR_STOP_MULT: "1.2"    # default; can be overridden per run below
+
+  # === Entry guard (EMA/RSI) ===
   ENTRY_GUARD: "1"
   ENTRY_EMA_SHORT: "9"
   ENTRY_EMA_LONG: "21"
   ENTRY_RSI_PERIOD: "14"
   ENTRY_RSI_MIN: "50"
   ENTRY_RSI_MAX: "75"
+
   TIMEFRAME: "5m"
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
 
+      # Restore cached .state + data so we actually test live positions
       - name: Restore .state and data caches
         id: restore
         uses: actions/cache/restore@v4
@@ -64,8 +71,9 @@ jobs:
       - name: Install deps
         run: if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Apply temporary sell thresholds + debug
+      - name: Apply temporary sell thresholds + debug (SELLS ONLY)
         run: |
+          # Sell thresholds/debug
           echo "DRY_RUN=${{ github.event.inputs.DRY_RUN }}" >> $GITHUB_ENV
           echo "TAKE_PROFIT_PCT=${{ github.event.inputs.TAKE_PROFIT_PCT }}" >> $GITHUB_ENV
           echo "TRAILING_ACTIVATE_PCT=${{ github.event.inputs.TRAILING_ACTIVATE_PCT }}" >> $GITHUB_ENV
@@ -73,13 +81,19 @@ jobs:
           echo "STOP_LOSS_PCT=${{ github.event.inputs.STOP_LOSS_PCT }}" >> $GITHUB_ENV
           echo "SELL_DEBUG=${{ github.event.inputs.SELL_DEBUG }}" >> $GITHUB_ENV
 
+          # Temporary ATR stop override for this run
+          echo "ATR_STOP_MULT=${{ github.event.inputs.TEMP_ATR_STOP_MULT }}" >> $GITHUB_ENV
+
+          # Force sells-only: set daily buy budget to zero
+          echo "DAILY_CAP_USD=0" >> $GITHUB_ENV
+
       - name: Run trader (sell test only)
         env:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           mkdir -p .state data
-          python -u main.py
+          python -u main.py | tee -a sell_test.log
 
       - name: Save caches back (best-effort)
         if: always()
