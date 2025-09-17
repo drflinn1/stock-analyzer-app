@@ -1,145 +1,78 @@
 name: Crypto Live (Every 15 min)
 
 on:
-  workflow_dispatch:
-    inputs:
-      DRY_RUN:
-        description: "Dry run (no real orders)?"
-        required: true
-        default: "true"
   schedule:
     - cron: "*/15 * * * *"
-
-permissions:
-  contents: read
+  workflow_dispatch: {}
 
 concurrency:
   group: crypto-live
   cancel-in-progress: false
 
-env:
-  MARKET: "CRYPTO"
-  PYTHONUNBUFFERED: "1"
-  PIP_DISABLE_PIP_VERSION_CHECK: "1"
-
-  # Tunables
-  PER_TRADE_USD: "10"
-  DAILY_CAP_USD: "25"
-  LOW_BALANCE_USD: "5"
-  DROP_PCT: "2.0"
-  EXCHANGE: "kraken"
-  MODE: "live"
-
-  # === Tax ===
-  TAX_RESERVE_RATE: "0.30"
-  STATE_TAX_RATE: "0.00"
-
-  # === Adaptive exits (ATR) ===
-  ATR_EXITS: "1"
-  ATR_PERIOD: "14"
-  ATR_TP_MULT: "1.5"
-  ATR_TRAIL_MULT: "1.0"
-  ATR_ACT_MULT: "0.8"
-  ATR_STOP_MULT: "1.2"   # <-- new
-
-  # === Percent fallback (works if ATR_EXITS=0) ===
-  TAKE_PROFIT_PCT: "2.0"
-  TRAILING_ACTIVATE_PCT: "1.0"
-  TRAILING_DELTA_PCT: "1.0"
-  STOP_LOSS_PCT: "0"
-
-  # === Entry guard (EMA/RSI) ===
-  ENTRY_GUARD: "1"
-  ENTRY_EMA_SHORT: "9"
-  ENTRY_EMA_LONG: "21"
-  ENTRY_RSI_PERIOD: "14"
-  ENTRY_RSI_MIN: "50"
-  ENTRY_RSI_MAX: "75"
-
-  # Indicators timeframe
-  TIMEFRAME: "5m"
-
-  # Position rails
-  MAX_POSITIONS: "50"
-  PER_ASSET_CAP_USD: "50"
-  COOLDOWN_MINUTES: "30"
-  AUTO_UNIVERSE_COUNT: "500"
-
 jobs:
   live:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Use Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
       - name: Install deps
         run: |
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install ccxt; fi
 
-      # -------- Persistent state & tax ledger (restore) --------
-      - name: Restore .state cache
-        id: state-restore
+      - name: Restore state/ledger cache
         uses: actions/cache/restore@v4
         with:
-          path: .state
-          key: state-${{ github.ref_name }}-v1
+          path: |
+            .state
+            data/tax_ledger.csv
+          key: state-main-v1
 
-      - name: Restore tax ledger
-        id: tax-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: data
-          key: tax-${{ github.ref_name }}-v1
-
-      # -------- Adopt manual DRY_RUN input (optional) --------
-      - name: Adopt DRY_RUN input
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: echo "DRY_RUN=${{ github.event.inputs.DRY_RUN }}" >> $GITHUB_ENV
-
-      # -------- Low-balance notice (soft gate only) --------
-      - name: MARK
-        run: echo "::notice title=MARK::Crypto Live run started at $(date -u) on $GITHUB_SHA"
+      - name: Env (live trading)
+        run: |
+          echo "MODE=live" >> $GITHUB_ENV
+          echo "DRY_RUN=false" >> $GITHUB_ENV
+          echo "EXCHANGE=kraken" >> $GITHUB_ENV
+          echo "MARKET=crypto" >> $GITHUB_ENV
+          echo "QUOTE=USD" >> $GITHUB_ENV
+          echo "SELL_DEBUG=0" >> $GITHUB_ENV
+          echo "FORCE_SELL=0" >> $GITHUB_ENV   # <— important: OFF in live
+          # buy controls
+          echo "PER_TRADE_USD=10" >> $GITHUB_ENV
+          echo "DAILY_CAP_USD=25" >> $GITHUB_ENV
+          echo "AUTO_UNIVERSE_COUNT=500" >> $GITHUB_ENV
+          # ATR exits on (normal mode)
+          echo "ATR_EXITS=1" >> $GITHUB_ENV
+          echo "ATR_PERIOD=14" >> $GITHUB_ENV
+          echo "ATR_TP_MULT=1.5" >> $GITHUB_ENV
+          echo "ATR_ACT_MULT=0.8" >> $GITHUB_ENV
+          echo "ATR_TRAIL_MULT=1.0" >> $GITHUB_ENV
+          echo "ATR_STOP_MULT=1.2" >> $GITHUB_ENV
+          # % exits fallback (unused while ATR_EXITS=1; keep as defaults)
+          echo "TAKE_PROFIT_PCT=0.5" >> $GITHUB_ENV
+          echo "TRAILING_ACTIVATE_PCT=0.4" >> $GITHUB_ENV
+          echo "TRAILING_DELTA_PCT=0.2" >> $GITHUB_ENV
+          echo "STOP_LOSS_PCT=0" >> $GITHUB_ENV
+          # Secrets
+          echo "KRAKEN_API_KEY=${{ secrets.KRAKEN_API_KEY }}" >> $GITHUB_ENV
+          echo "KRAKEN_API_SECRET=${{ secrets.KRAKEN_API_SECRET }}" >> $GITHUB_ENV
 
       - name: Run trader
-        env:
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           mkdir -p .state data
-          python -u main.py | tee -a run.log
+          python -u main.py
 
-      # -------- (Optional) Update simple daily-cap note from logs --------
-      - name: Update daily cap state from log
-        run: |
-          echo "FREE_USD: $(grep -Eo 'FREE_USD:\s*\$\s*[0-9]+(\.[0-9]+)?' -h run.log | tail -1 || true)"
-          echo "Spent this run: $0.00 | New remaining today: ${{ env.DAILY_CAP_USD }}"
-
-      # -------- Persistent state & tax ledger (save) --------
-      - name: Save .state cache
+      - name: Save caches back (best-effort)
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: .state
-          key: state-${{ github.ref_name }}-v1
-
-      - name: Save tax ledger
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: data
-          key: tax-${{ github.ref_name }}-v1
+          path: |
+            .state
+            data/tax_ledger.csv
+          key: state-main-v1
