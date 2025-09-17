@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import os, time, json, math, re, sys, random, datetime
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # =========================
 # Config via environment
@@ -14,10 +14,29 @@ PER_TRADE_USD   = float(os.getenv("PER_TRADE_USD", "10"))
 DAILY_CAP_USD   = float(os.getenv("DAILY_CAP_USD", "25"))
 DROP_PCT        = float(os.getenv("DROP_PCT", "2.0"))
 
+# Percent-based exits (fallback / legacy)
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "2.0"))
 TRAIL_ACTIVATE  = float(os.getenv("TRAILING_ACTIVATE_PCT", "1.0"))
 TRAIL_DELTA     = float(os.getenv("TRAILING_DELTA_PCT", "1.0"))
 STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", "0"))
+
+# ATR exits (adaptive) — enable with ATR_EXITS=1
+ATR_EXITS       = int(os.getenv("ATR_EXITS", "1"))
+ATR_PERIOD      = int(os.getenv("ATR_PERIOD", "14"))
+ATR_TP_MULT     = float(os.getenv("ATR_TP_MULT", "1.5"))
+ATR_TRAIL_MULT  = float(os.getenv("ATR_TRAIL_MULT", "1.0"))
+ATR_ACT_MULT    = float(os.getenv("ATR_ACT_MULT", "0.8"))  # trigger trailing only after move >= 0.8*ATR
+
+# Entry filter (reduce random buys)
+ENTRY_GUARD       = int(os.getenv("ENTRY_GUARD", "1"))         # 1 = on
+ENTRY_EMA_SHORT   = int(os.getenv("ENTRY_EMA_SHORT", "9"))
+ENTRY_EMA_LONG    = int(os.getenv("ENTRY_EMA_LONG", "21"))
+ENTRY_RSI_PERIOD  = int(os.getenv("ENTRY_RSI_PERIOD", "14"))
+ENTRY_RSI_MIN     = float(os.getenv("ENTRY_RSI_MIN", "50"))
+ENTRY_RSI_MAX     = float(os.getenv("ENTRY_RSI_MAX", "75"))
+
+# Candle timeframe for indicators (ccxt style: 1m, 5m, 15m, 1h, ...)
+TIMEFRAME       = os.getenv("TIMEFRAME", "5m")
 
 MAX_POSITIONS   = int(os.getenv("MAX_POSITIONS", "50"))
 PER_ASSET_CAP   = float(os.getenv("PER_ASSET_CAP_USD", "50"))
@@ -25,7 +44,6 @@ COOLDOWN_MIN    = int(os.getenv("COOLDOWN_MINUTES", "30"))
 
 AUTO_UNIV_COUNT = int(os.getenv("AUTO_UNIVERSE_COUNT", "500"))
 QUOTE           = os.getenv("QUOTE", "USD").upper()
-
 MARKET          = os.getenv("MARKET", "crypto").lower()
 SELL_DEBUG      = int(os.getenv("SELL_DEBUG", "0"))
 
@@ -143,22 +161,94 @@ def list_tradeable_pairs():
     ))
 
 # =========================
-# Universe
+# Indicator helpers (EMA, RSI, ATR)
 # =========================
-def autopick_universe(limit=AUTO_UNIV_COUNT):
-    symbols = list_tradeable_pairs()
-    def score(sym):
-        try:
-            t = exchange.fetch_ticker(sym)
-            return float(t.get("baseVolume") or 0.0)
-        except Exception:
-            return 0.0
-    ranked = sorted(symbols, key=score, reverse=True)
-    if len(ranked) < limit:
-        ranked += [s for s in symbols if s not in ranked]
-    pick = ranked[:limit]
-    print(f"auto_universe: picked {len(pick)} of {len(symbols)} candidates")
-    return pick
+def ema(values: List[float], period: int) -> List[float]:
+    if period <= 1 or len(values) == 0:
+        return values[:]
+    k = 2.0 / (period + 1.0)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+def rsi(values: List[float], period: int) -> List[float]:
+    if len(values) < period + 1:
+        return [50.0] * len(values)
+    gains, losses = [], []
+    for i in range(1, len(values)):
+        d = values[i] - values[i-1]
+        gains.append(max(0.0, d))
+        losses.append(max(0.0, -d))
+    # Wilder smoothing
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    out = [50.0]*(period)  # pad
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain*(period-1) + gains[i]) / period
+        avg_loss = (avg_loss*(period-1) + losses[i]) / period
+        rs = (avg_gain / avg_loss) if avg_loss > 1e-12 else 999999.0
+        out.append(100.0 - (100.0 / (1.0 + rs)))
+    return out + [50.0]*(len(values)-len(out))
+
+def atr(high: List[float], low: List[float], close: List[float], period: int) -> List[float]:
+    if len(close) < period + 2:
+        return [0.0] * len(close)
+    tr_list = []
+    prev_close = close[0]
+    for i in range(1, len(close)):
+        tr = max(high[i]-low[i], abs(high[i]-prev_close), abs(low[i]-prev_close))
+        tr_list.append(tr)
+        prev_close = close[i]
+    # Wilder ATR
+    atrs = []
+    if len(tr_list) < period:
+        return [0.0]*len(close)
+    first = sum(tr_list[:period]) / period
+    atrs.append(first)
+    for i in range(period, len(tr_list)):
+        atrs.append((atrs[-1]*(period-1) + tr_list[i]) / period)
+    # pad to match len(close)
+    padded = [0.0]*(len(close)-len(atrs)-1) + atrs
+    padded.append(atrs[-1] if atrs else 0.0)
+    return padded
+
+_ohlcv_cache: Dict[Tuple[str,str,int], Tuple[List[float],List[float],List[float]]] = {}
+
+def fetch_candles(sym: str, timeframe: str, limit: int=200) -> Tuple[List[float],List[float],List[float]]:
+    """
+    Return (highs, lows, closes)
+    """
+    key = (sym, timeframe, limit)
+    if key in _ohlcv_cache:
+        return _ohlcv_cache[key]
+    if not exchange or not getattr(exchange, "has", {}).get("fetchOHLCV", False):
+        return [], [], []
+    try:
+        raw = exchange.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
+        highs = [float(x[2]) for x in raw]
+        lows  = [float(x[3]) for x in raw]
+        closes= [float(x[4]) for x in raw]
+        _ohlcv_cache[key] = (highs, lows, closes)
+        return highs, lows, closes
+    except Exception:
+        return [], [], []
+
+def indicators(sym: str) -> Dict[str, float]:
+    """
+    Compute and return the latest EMA short/long, RSI, ATR% (ATR expressed as percent of close)
+    """
+    highs, lows, closes = fetch_candles(sym, TIMEFRAME, limit=200)
+    if not closes:
+        return {"ema_s":0.0, "ema_l":0.0, "rsi":50.0, "atr_pct":0.0}
+
+    ema_s = ema(closes, ENTRY_EMA_SHORT)[-1]
+    ema_l = ema(closes, ENTRY_EMA_LONG)[-1]
+    r = rsi(closes, ENTRY_RSI_PERIOD)[-1]
+    a = atr(highs, lows, closes, ATR_PERIOD)[-1]
+    last_close = closes[-1]
+    atr_pct = (a/last_close*100.0) if last_close>0 else 0.0
+    return {"ema_s":ema_s, "ema_l":ema_l, "rsi":r, "atr_pct":atr_pct}
 
 # =========================
 # Ledger helpers
@@ -287,7 +377,7 @@ def place_sell(sym, qty, reason):
         return False, 0.0, "err"
 
 # =========================
-# Sell engine (TP / Trailing / SL)
+# Sell engine (ATR or %)
 # =========================
 def evaluate_sells():
     realized = 0.0
@@ -314,32 +404,58 @@ def evaluate_sells():
             hi = px
         pullback = (hi - px) / hi * 100.0 if hi > 0 else 0.0
 
+        # --- ATR thresholds in % space ---
+        atrp = 0.0
+        if ATR_EXITS:
+            try:
+                atrp = indicators(sym)["atr_pct"]
+            except Exception:
+                atrp = 0.0
+
         if SELL_DEBUG:
+            x_info = f"ATR_EXITS={ATR_EXITS} atr%={atrp:.3f} TP={TAKE_PROFIT_PCT:.2f}% TRAIL_ACT={TRAIL_ACTIVATE:.2f}% DELTA={TRAIL_DELTA:.2f}%"
+            if ATR_EXITS:
+                x_info = f"ATR%={atrp:.3f} TP>={ATR_TP_MULT:.2f}*ATR  ACT>={ATR_ACT_MULT:.2f}*ATR  DELTA>={ATR_TRAIL_MULT:.2f}*ATR"
             print(f"[sellchk] {sym} qty={qty:.6f} avg_cost={avg_cost:.8f} px={px:.8f} "
-                  f"chg={chg_pct:.2f}% hi={hi:.8f} pullback={pullback:.2f}% "
-                  f"TP>={TAKE_PROFIT_PCT:.2f}% TRAIL_ACT>={TRAIL_ACTIVATE:.2f}% "
-                  f"DELTA>={TRAIL_DELTA:.2f}% SL<={-abs(STOP_LOSS_PCT):.2f}%")
+                  f"chg={chg_pct:.2f}% hi={hi:.8f} pullback={pullback:.2f}%  {x_info}")
 
-        # Take-profit
-        if TAKE_PROFIT_PCT > 0 and chg_pct >= TAKE_PROFIT_PCT:
-            ok, usd, _ = place_sell(sym, qty, f"TAKE_PROFIT {TAKE_PROFIT_PCT:.2f}%")
-            realized += usd if ok else 0.0
-            if SELL_DEBUG: print(f"[sellchk] -> TAKE_PROFIT fired for {sym}")
-            continue
+        # --- Exit rules ---
+        if ATR_EXITS and atrp > 0:
+            tp_thresh      = ATR_TP_MULT    * atrp
+            act_thresh     = ATR_ACT_MULT   * atrp
+            trail_thresh   = ATR_TRAIL_MULT * atrp
 
-        # Trailing
-        if TRAIL_ACTIVATE > 0 and chg_pct >= TRAIL_ACTIVATE and pullback >= TRAIL_DELTA:
-            ok, usd, _ = place_sell(sym, qty, f"TRAIL_STOP {TRAIL_DELTA:.2f}% from peak")
-            realized += usd if ok else 0.0
-            if SELL_DEBUG: print(f"[sellchk] -> TRAIL_STOP fired for {sym}")
-            continue
+            if chg_pct >= tp_thresh:
+                ok, usd, _ = place_sell(sym, qty, f"ATR_TP {ATR_TP_MULT:.2f}*ATR (~{tp_thresh:.2f}%)")
+                realized += usd if ok else 0.0
+                if SELL_DEBUG: print(f"[sellchk] -> ATR_TP fired for {sym}")
+                continue
 
-        # Stop-loss
-        if STOP_LOSS_PCT > 0 and chg_pct <= -abs(STOP_LOSS_PCT):
-            ok, usd, _ = place_sell(sym, qty, f"STOP_LOSS {STOP_LOSS_PCT:.2f}%")
-            realized += usd if ok else 0.0
-            if SELL_DEBUG: print(f"[sellchk] -> STOP_LOSS fired for {sym}")
-            continue
+            if chg_pct >= act_thresh and pullback >= trail_thresh:
+                ok, usd, _ = place_sell(sym, qty, f"ATR_TRAIL {ATR_TRAIL_MULT:.2f}*ATR (~{trail_thresh:.2f}%)")
+                realized += usd if ok else 0.0
+                if SELL_DEBUG: print(f"[sellchk] -> ATR_TRAIL fired for {sym}")
+                continue
+
+        else:
+            # Percent-based fallback
+            if TAKE_PROFIT_PCT > 0 and chg_pct >= TAKE_PROFIT_PCT:
+                ok, usd, _ = place_sell(sym, qty, f"TAKE_PROFIT {TAKE_PROFIT_PCT:.2f}%")
+                realized += usd if ok else 0.0
+                if SELL_DEBUG: print(f"[sellchk] -> TAKE_PROFIT fired for {sym}")
+                continue
+
+            if TRAIL_ACTIVATE > 0 and chg_pct >= TRAIL_ACTIVATE and pullback >= TRAIL_DELTA:
+                ok, usd, _ = place_sell(sym, qty, f"TRAIL_STOP {TRAIL_DELTA:.2f}% from peak")
+                realized += usd if ok else 0.0
+                if SELL_DEBUG: print(f"[sellchk] -> TRAIL_STOP fired for {sym}")
+                continue
+
+            if STOP_LOSS_PCT > 0 and chg_pct <= -abs(STOP_LOSS_PCT):
+                ok, usd, _ = place_sell(sym, qty, f"STOP_LOSS {STOP_LOSS_PCT:.2f}%")
+                realized += usd if ok else 0.0
+                if SELL_DEBUG: print(f"[sellchk] -> STOP_LOSS fired for {sym}")
+                continue
 
     if realized > 0:
         print(f"REALIZED: freed ~${realized:.2f} from sells")
@@ -348,14 +464,49 @@ def evaluate_sells():
 # =========================
 # Buy engine (with guards)
 # =========================
+def entry_ok(sym: str, price: float) -> Tuple[bool, str]:
+    if not ENTRY_GUARD:
+        return True, "guard_off"
+    try:
+        ind = indicators(sym)
+        ema_ok = ind["ema_s"] > ind["ema_l"]
+        r = ind["rsi"]
+        r_ok = (ENTRY_RSI_MIN <= r <= ENTRY_RSI_MAX)
+        return (ema_ok and r_ok, f"ema_ok={ema_ok} rsi={r:.1f}")
+    except Exception as e:
+        return False, f"ind_err:{e}"
+
 def can_buy(sym, price, free_usd):
     if cooldown_active(sym): return False, "cooldown"
     if total_positions_count() >= MAX_POSITIONS: return False, "max_positions"
     exposure = position_usd_exposure(sym, price)
     if exposure + PER_TRADE_USD > PER_ASSET_CAP: return False, "per_asset_cap"
     if DAILY_CAP_USD <= 0: return False, "daily_cap_zero"
+    ok, why = entry_ok(sym, price)
+    if not ok: return False, f"entry:{why}"
     return True, "ok"
 
+# =========================
+# Auto-universe
+# =========================
+def autopick_universe(limit=AUTO_UNIV_COUNT):
+    symbols = list_tradeable_pairs()
+    def score(sym):
+        try:
+            t = exchange.fetch_ticker(sym)
+            return float(t.get("baseVolume") or 0.0)
+        except Exception:
+            return 0.0
+    ranked = sorted(symbols, key=score, reverse=True)
+    if len(ranked) < limit:
+        ranked += [s for s in symbols if s not in ranked]
+    pick = ranked[:limit]
+    print(f"auto_universe: picked {len(pick)} of {len(symbols)} candidates")
+    return pick
+
+# =========================
+# Main cycle
+# =========================
 def run_cycle():
     print("=== START TRADING OUTPUT ===")
     print(f"Python {sys.version.split()[0]}")
@@ -376,8 +527,10 @@ def run_cycle():
             price = market_price(sym)
         except Exception:
             continue
-        ok, _ = can_buy(sym, price, free_usd)
-        if not ok: continue
+        ok, why = can_buy(sym, price, free_usd)
+        if not ok:
+            if SELL_DEBUG: print(f"[buychk] skip {sym} → {why}")
+            continue
         success, qty, _ = place_buy(sym, PER_TRADE_USD)
         if success:
             buys_this_run += PER_TRADE_USD
