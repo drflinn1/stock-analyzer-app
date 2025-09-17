@@ -24,27 +24,45 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Restore state/data caches
+
+      # ---- RESTORE STATE LOUDLY ----
+      - name: Restore .state cache
+        id: state_restore
         uses: actions/cache/restore@v4
         with:
-          path: |
-            .state
-            data
+          path: .state
           key: state-${{ github.ref_name }}-v1
+      - name: Show state contents
+        run: |
+          echo "cache-hit=${{ steps.state_restore.outputs.cache-hit }}"
+          ls -la . || true
+          ls -la .state || true
+          test -f .state/positions.json && head -c 400 .state/positions.json || echo "positions.json MISSING"
+
+      - name: Restore data cache (tax)
+        id: data_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: tax-${{ github.ref_name }}-v1
+
       - name: Install deps
         run: |
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
       - name: Apply probe thresholds
         run: |
           echo "TAKE_PROFIT_PCT=${{ github.event.inputs.TAKE_PROFIT_PCT }}" >> $GITHUB_ENV
           echo "TRAILING_ACTIVATE_PCT=${{ github.event.inputs.TRAILING_ACTIVATE_PCT }}" >> $GITHUB_ENV
           echo "TRAILING_DELTA_PCT=${{ github.event.inputs.TRAILING_DELTA_PCT }}" >> $GITHUB_ENV
+
       - name: Run probe (no orders)
         env:
-            EXCHANGE: "kraken"
-            QUOTE: "USD"
+          EXCHANGE: "kraken"
+          QUOTE: "USD"
         run: |
           python -u probe_sells.py
