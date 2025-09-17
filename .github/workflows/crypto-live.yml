@@ -22,7 +22,7 @@ env:
   PYTHONUNBUFFERED: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
-  # === TUNABLES (safe defaults) ===
+  # Tunables
   PER_TRADE_USD: "10"
   DAILY_CAP_USD: "25"
   LOW_BALANCE_USD: "5"
@@ -30,15 +30,33 @@ env:
   EXCHANGE: "kraken"
   MODE: "live"
 
-  # --- NEW: Tax reserve knobs ---
+  # === Tax ===
   TAX_RESERVE_RATE: "0.30"
-  STATE_TAX_RATE:  "0.00"
+  STATE_TAX_RATE: "0.00"
 
-  # Sells
+  # === Adaptive exits (ATR) ===
+  ATR_EXITS: "1"
+  ATR_PERIOD: "14"
+  ATR_TP_MULT: "1.5"
+  ATR_TRAIL_MULT: "1.0"
+  ATR_ACT_MULT: "0.8"
+
+  # === Percent fallback (still supported if ATR_EXITS=0) ===
   TAKE_PROFIT_PCT: "2.0"
   TRAILING_ACTIVATE_PCT: "1.0"
   TRAILING_DELTA_PCT: "1.0"
   STOP_LOSS_PCT: "0"
+
+  # === Entry guard (EMA/RSI) ===
+  ENTRY_GUARD: "1"
+  ENTRY_EMA_SHORT: "9"
+  ENTRY_EMA_LONG: "21"
+  ENTRY_RSI_PERIOD: "14"
+  ENTRY_RSI_MIN: "50"
+  ENTRY_RSI_MAX: "75"
+
+  # Indicators timeframe
+  TIMEFRAME: "5m"
 
   # Position rails
   MAX_POSITIONS: "50"
