@@ -48,6 +48,9 @@ QUOTE           = os.getenv("QUOTE", "USD").upper()
 MARKET          = os.getenv("MARKET", "crypto").lower()
 SELL_DEBUG      = int(os.getenv("SELL_DEBUG", "0"))
 
+# NEW: Force-sell switch
+FORCE_SELL      = int(os.getenv("FORCE_SELL", "0"))              # 1 = sell all eligible holdings this run
+
 STATE_DIR       = ".state"
 POSITIONS_FILE  = os.path.join(STATE_DIR, "positions.json")
 COOLDOWN_FILE   = os.path.join(STATE_DIR, "cooldown.json")
@@ -499,7 +502,6 @@ def hydrate_positions_from_wallet() -> int:
         if qty <= 0:
             continue
         sym = f"{base}/{QUOTE}"
-        # only symbols tradable on this quote and not already tracked
         try:
             if sym not in exchange.markets:
                 continue
@@ -523,7 +525,7 @@ def hydrate_positions_from_wallet() -> int:
 # =========================
 # Sell engine (ATR or %)
 # =========================
-def evaluate_sells():
+def evaluate_sells(force: bool = False):
     realized = 0.0
     for sym, lots in list(positions.items()):
         if not isinstance(lots, list) or not lots:
@@ -577,7 +579,14 @@ def evaluate_sells():
                   f"avg_cost={avg_cost:.8f} px={px:.8f} chg={chg_pct:.2f}% "
                   f"hi={hi:.8f} pullback={pullback:.2f}%  {x_info}")
 
-        # --- Decisions ---
+        # ---------- FORCE SELL branch ----------
+        if force:
+            ok, usd, _ = place_sell(sym, qty, "FORCE_SELL")
+            realized += usd if ok else 0.0
+            if SELL_DEBUG: print(f"[sellchk] -> FORCE_SELL attempted for {sym}")
+            continue
+
+        # --- Normal Decisions ---
         if ATR_EXITS and atrp > 0:
             tp_thresh    = ATR_TP_MULT    * atrp
             act_thresh   = ATR_ACT_MULT   * atrp
@@ -676,8 +685,14 @@ def run_cycle():
     print(f"Python {sys.version.split()[0]}")
 
     apply_temp_overrides()
-    hydrate_positions_from_wallet()  # <- import wallet holdings so sells can see them
-    evaluate_sells()
+    hydrate_positions_from_wallet()  # import wallet holdings so sells can see them
+
+    # Use FORCE_SELL when requested
+    if FORCE_SELL:
+        if SELL_DEBUG: print("[force] FORCE_SELL=1 → selling all eligible holdings this run")
+        evaluate_sells(force=True)
+    else:
+        evaluate_sells(force=False)
 
     uni = autopick_universe(AUTO_UNIV_COUNT)
 
