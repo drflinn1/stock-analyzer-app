@@ -20,15 +20,16 @@ TRAIL_ACTIVATE  = float(os.getenv("TRAILING_ACTIVATE_PCT", "1.0"))
 TRAIL_DELTA     = float(os.getenv("TRAILING_DELTA_PCT", "1.0"))
 STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", "0"))
 
-# ATR exits (adaptive) — enable with ATR_EXITS=1
-ATR_EXITS       = int(os.getenv("ATR_EXITS", "1"))
+# --- Adaptive exits (ATR) ---
+ATR_EXITS       = int(os.getenv("ATR_EXITS", "1"))               # 1 = use ATR exits; 0 = use % exits
 ATR_PERIOD      = int(os.getenv("ATR_PERIOD", "14"))
-ATR_TP_MULT     = float(os.getenv("ATR_TP_MULT", "1.5"))
-ATR_TRAIL_MULT  = float(os.getenv("ATR_TRAIL_MULT", "1.0"))
-ATR_ACT_MULT    = float(os.getenv("ATR_ACT_MULT", "0.8"))  # trigger trailing only after move >= 0.8*ATR
+ATR_TP_MULT     = float(os.getenv("ATR_TP_MULT", "1.5"))         # take-profit when move >= TP_MULT * ATR
+ATR_TRAIL_MULT  = float(os.getenv("ATR_TRAIL_MULT", "1.0"))      # trailing pullback >= TRAIL_MULT * ATR
+ATR_ACT_MULT    = float(os.getenv("ATR_ACT_MULT", "0.8"))        # start trailing after move >= ACT_MULT * ATR
+ATR_STOP_MULT   = float(os.getenv("ATR_STOP_MULT", "1.2"))       # **NEW** stop losers when drawdown >= STOP_MULT * ATR
 
 # Entry filter (reduce random buys)
-ENTRY_GUARD       = int(os.getenv("ENTRY_GUARD", "1"))         # 1 = on
+ENTRY_GUARD       = int(os.getenv("ENTRY_GUARD", "1"))           # 1 = on
 ENTRY_EMA_SHORT   = int(os.getenv("ENTRY_EMA_SHORT", "9"))
 ENTRY_EMA_LONG    = int(os.getenv("ENTRY_EMA_LONG", "21"))
 ENTRY_RSI_PERIOD  = int(os.getenv("ENTRY_RSI_PERIOD", "14"))
@@ -98,7 +99,7 @@ def normalize_positions():
                 print(f"WARN: positions[{sym}] non-JSON string; dropping")
                 to_delete.append(sym); continue
         if isinstance(lots, dict):
-            lot = _normalize_lot(lots); 
+            lot = _normalize_lot(lots)
             if lot: new_lots = [lot]; changed = True
         elif isinstance(lots, list):
             for l in lots:
@@ -180,10 +181,9 @@ def rsi(values: List[float], period: int) -> List[float]:
         d = values[i] - values[i-1]
         gains.append(max(0.0, d))
         losses.append(max(0.0, -d))
-    # Wilder smoothing
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
-    out = [50.0]*(period)  # pad
+    out = [50.0]*(period)
     for i in range(period, len(gains)):
         avg_gain = (avg_gain*(period-1) + gains[i]) / period
         avg_loss = (avg_loss*(period-1) + losses[i]) / period
@@ -200,7 +200,6 @@ def atr(high: List[float], low: List[float], close: List[float], period: int) ->
         tr = max(high[i]-low[i], abs(high[i]-prev_close), abs(low[i]-prev_close))
         tr_list.append(tr)
         prev_close = close[i]
-    # Wilder ATR
     atrs = []
     if len(tr_list) < period:
         return [0.0]*len(close)
@@ -208,7 +207,6 @@ def atr(high: List[float], low: List[float], close: List[float], period: int) ->
     atrs.append(first)
     for i in range(period, len(tr_list)):
         atrs.append((atrs[-1]*(period-1) + tr_list[i]) / period)
-    # pad to match len(close)
     padded = [0.0]*(len(close)-len(atrs)-1) + atrs
     padded.append(atrs[-1] if atrs else 0.0)
     return padded
@@ -216,9 +214,6 @@ def atr(high: List[float], low: List[float], close: List[float], period: int) ->
 _ohlcv_cache: Dict[Tuple[str,str,int], Tuple[List[float],List[float],List[float]]] = {}
 
 def fetch_candles(sym: str, timeframe: str, limit: int=200) -> Tuple[List[float],List[float],List[float]]:
-    """
-    Return (highs, lows, closes)
-    """
     key = (sym, timeframe, limit)
     if key in _ohlcv_cache:
         return _ohlcv_cache[key]
@@ -235,13 +230,9 @@ def fetch_candles(sym: str, timeframe: str, limit: int=200) -> Tuple[List[float]
         return [], [], []
 
 def indicators(sym: str) -> Dict[str, float]:
-    """
-    Compute and return the latest EMA short/long, RSI, ATR% (ATR expressed as percent of close)
-    """
     highs, lows, closes = fetch_candles(sym, TIMEFRAME, limit=200)
     if not closes:
         return {"ema_s":0.0, "ema_l":0.0, "rsi":50.0, "atr_pct":0.0}
-
     ema_s = ema(closes, ENTRY_EMA_SHORT)[-1]
     ema_l = ema(closes, ENTRY_EMA_LONG)[-1]
     r = rsi(closes, ENTRY_RSI_PERIOD)[-1]
@@ -382,17 +373,17 @@ def place_sell(sym, qty, reason):
 def evaluate_sells():
     realized = 0.0
     for sym, lots in list(positions.items()):
-        if not isinstance(lots, list) or not lots: 
+        if not isinstance(lots, list) or not lots:
             continue
         valid = [l for l in lots if isinstance(l, dict) and "qty" in l and "cost" in l]
-        if not valid: 
+        if not valid:
             continue
         qty = sum(float(l["qty"]) for l in valid)
-        if qty <= 0: 
+        if qty <= 0:
             continue
         avg_cost = sum(float(l["qty"])*float(l["cost"]) for l in valid)/qty
         px = market_price(sym)
-        if px <= 0: 
+        if px <= 0:
             continue
         chg_pct = (px - avg_cost) / avg_cost * 100.0
 
@@ -404,7 +395,7 @@ def evaluate_sells():
             hi = px
         pullback = (hi - px) / hi * 100.0 if hi > 0 else 0.0
 
-        # --- ATR thresholds in % space ---
+        # ATR thresholds in % space
         atrp = 0.0
         if ATR_EXITS:
             try:
@@ -413,28 +404,41 @@ def evaluate_sells():
                 atrp = 0.0
 
         if SELL_DEBUG:
-            x_info = f"ATR_EXITS={ATR_EXITS} atr%={atrp:.3f} TP={TAKE_PROFIT_PCT:.2f}% TRAIL_ACT={TRAIL_ACTIVATE:.2f}% DELTA={TRAIL_DELTA:.2f}%"
-            if ATR_EXITS:
-                x_info = f"ATR%={atrp:.3f} TP>={ATR_TP_MULT:.2f}*ATR  ACT>={ATR_ACT_MULT:.2f}*ATR  DELTA>={ATR_TRAIL_MULT:.2f}*ATR"
+            x_info = (f"ATR%={atrp:.3f} TP>={ATR_TP_MULT:.2f}*ATR "
+                      f"ACT>={ATR_ACT_MULT:.2f}*ATR DELTA>={ATR_TRAIL_MULT:.2f}*ATR "
+                      f"STOP>={ATR_STOP_MULT:.2f}*ATR")
+            if not ATR_EXITS:
+                x_info = (f"TP={TAKE_PROFIT_PCT:.2f}% ACT={TRAIL_ACTIVATE:.2f}% "
+                          f"DELTA={TRAIL_DELTA:.2f}% SL={STOP_LOSS_PCT:.2f}%")
             print(f"[sellchk] {sym} qty={qty:.6f} avg_cost={avg_cost:.8f} px={px:.8f} "
                   f"chg={chg_pct:.2f}% hi={hi:.8f} pullback={pullback:.2f}%  {x_info}")
 
         # --- Exit rules ---
         if ATR_EXITS and atrp > 0:
-            tp_thresh      = ATR_TP_MULT    * atrp
-            act_thresh     = ATR_ACT_MULT   * atrp
-            trail_thresh   = ATR_TRAIL_MULT * atrp
+            tp_thresh    = ATR_TP_MULT    * atrp
+            act_thresh   = ATR_ACT_MULT   * atrp
+            trail_thresh = ATR_TRAIL_MULT * atrp
+            stop_thresh  = ATR_STOP_MULT  * atrp
 
+            # Take-profit
             if chg_pct >= tp_thresh:
                 ok, usd, _ = place_sell(sym, qty, f"ATR_TP {ATR_TP_MULT:.2f}*ATR (~{tp_thresh:.2f}%)")
                 realized += usd if ok else 0.0
                 if SELL_DEBUG: print(f"[sellchk] -> ATR_TP fired for {sym}")
                 continue
 
+            # Trailing stop after activation
             if chg_pct >= act_thresh and pullback >= trail_thresh:
                 ok, usd, _ = place_sell(sym, qty, f"ATR_TRAIL {ATR_TRAIL_MULT:.2f}*ATR (~{trail_thresh:.2f}%)")
                 realized += usd if ok else 0.0
                 if SELL_DEBUG: print(f"[sellchk] -> ATR_TRAIL fired for {sym}")
+                continue
+
+            # **ATR-based stop for losers**
+            if chg_pct <= -stop_thresh:
+                ok, usd, _ = place_sell(sym, qty, f"ATR_STOP {ATR_STOP_MULT:.2f}*ATR (~{stop_thresh:.2f}%)")
+                realized += usd if ok else 0.0
+                if SELL_DEBUG: print(f"[sellchk] -> ATR_STOP fired for {sym}")
                 continue
 
         else:
