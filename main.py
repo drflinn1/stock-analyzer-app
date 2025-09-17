@@ -29,7 +29,7 @@ ATR_ACT_MULT    = float(os.getenv("ATR_ACT_MULT", "0.8"))        # start trailin
 ATR_STOP_MULT   = float(os.getenv("ATR_STOP_MULT", "1.2"))       # stop losers when drawdown >= STOP_MULT * ATR
 
 # Entry filter (reduce random buys)
-ENTRY_GUARD       = int(os.getenv("ENTRY_GUARD", "1"))
+ENTRY_GUARD       = int(os.getenv("ENTRY_GUARD", "1"))           # 1 = on
 ENTRY_EMA_SHORT   = int(os.getenv("ENTRY_EMA_SHORT", "9"))
 ENTRY_EMA_LONG    = int(os.getenv("ENTRY_EMA_LONG", "21"))
 ENTRY_RSI_PERIOD  = int(os.getenv("ENTRY_RSI_PERIOD", "14"))
@@ -48,12 +48,30 @@ QUOTE           = os.getenv("QUOTE", "USD").upper()
 MARKET          = os.getenv("MARKET", "crypto").lower()
 SELL_DEBUG      = int(os.getenv("SELL_DEBUG", "0"))
 
-# NEW: Force-sell switch
+# NEW: Force-sell switch (one-time workflow)
 FORCE_SELL      = int(os.getenv("FORCE_SELL", "0"))              # 1 = sell all eligible holdings this run
+
+# ===== New risk/ops upgrades =====
+# fees/slippage safety (basis points: 1bp = 0.01%)
+FEE_BPS         = float(os.getenv("FEE_BPS", "20"))     # 0.20%
+SLIPPAGE_BPS    = float(os.getenv("SLIPPAGE_BPS", "10"))# 0.10%
+SAFETY_BPS      = float(os.getenv("SAFETY_BPS", "5"))   # 0.05%
+
+# auto-compounding daily budget (bps of equity)
+EQUITY_SPEND_BPS      = float(os.getenv("EQUITY_SPEND_BPS", "0"))   # 0=off
+MIN_DAILY_USD         = float(os.getenv("MIN_DAILY_USD", "0"))
+MAX_DAILY_USD         = float(os.getenv("MAX_DAILY_USD", "1e9"))
+
+# drawdown circuit breaker
+MAX_DRAWDOWN_PCT      = float(os.getenv("MAX_DRAWDOWN_PCT", "0"))   # 0=off
+PAUSE_MINUTES_ON_TRIP = int(os.getenv("PAUSE_MINUTES_ON_TRIP", "480"))
 
 STATE_DIR       = ".state"
 POSITIONS_FILE  = os.path.join(STATE_DIR, "positions.json")
 COOLDOWN_FILE   = os.path.join(STATE_DIR, "cooldown.json")
+
+# equity tracking state
+EQUITY_FILE     = os.path.join(STATE_DIR, "equity.json")
 
 os.makedirs(STATE_DIR, exist_ok=True)
 
@@ -70,10 +88,16 @@ def _save_json(path, obj):
 
 positions: Dict[str, Any] = _load_json(POSITIONS_FILE, {})
 cooldown: Dict[str, str]  = _load_json(COOLDOWN_FILE, {})
+equity_state: Dict[str, Any] = _load_json(EQUITY_FILE, {"max": 0.0, "last": 0.0, "paused_until": None})
 
 # ---------- Apply temporary Sell Tester overrides ----------
 def apply_temp_overrides():
-    """Map UI params from the Sell Tester workflow into runtime overrides."""
+    """Map UI params from the Sell Tester workflow into runtime overrides.
+
+    Supported envs (all optional):
+      TEMP_TP_PCT, TEMP_TRAILING_ACTIVATE_PCT, TEMP_TRAILING_DELTA_PCT,
+      TEMP_STOP_LOSS_PCT, TEMP_ATR_STOP_MULT, SELL_DEBUG
+    """
     global TAKE_PROFIT_PCT, TRAIL_ACTIVATE, TRAIL_DELTA, STOP_LOSS_PCT
     global ATR_STOP_MULT, SELL_DEBUG
 
@@ -523,6 +547,67 @@ def hydrate_positions_from_wallet() -> int:
     return added
 
 # =========================
+# Equity + budget helpers (new)
+# =========================
+def portfolio_equity() -> float:
+    if not exchange: return 0.0
+    try:
+        bal = exchange.fetch_balance()
+        totals = bal.get("total") or {}
+    except Exception:
+        return 0.0
+    eq = 0.0
+    for asset, amt in (totals.items() if isinstance(totals, dict) else []):
+        a = float(amt or 0.0)
+        if a <= 0:
+            continue
+        if asset == QUOTE:
+            eq += a
+        else:
+            sym = f"{asset}/{QUOTE}"
+            try:
+                if sym in exchange.markets:
+                    eq += a * market_price(sym)
+            except Exception:
+                pass
+    return eq
+
+def update_equity_stats():
+    eq = portfolio_equity()
+    m = max(float(equity_state.get("max", 0.0)), eq)
+    equity_state["last"] = eq
+    equity_state["max"] = m
+    _save_json(EQUITY_FILE, equity_state)
+    dd = 100.0 * (m - eq) / m if m > 0 else 0.0
+    return eq, dd
+
+def compute_daily_cap(base_cap: float) -> float:
+    # honor active pause
+    pu = equity_state.get("paused_until")
+    if pu:
+        try:
+            if datetime.datetime.utcnow() < datetime.datetime.fromisoformat(pu):
+                print(f"[circuit] buys paused until {pu}")
+                return 0.0
+        except Exception:
+            equity_state["paused_until"] = None
+
+    eq, dd = update_equity_stats()
+    if MAX_DRAWDOWN_PCT > 0 and dd >= MAX_DRAWDOWN_PCT:
+        equity_state["paused_until"] = (datetime.datetime.utcnow()
+            + datetime.timedelta(minutes=PAUSE_MINUTES_ON_TRIP)).isoformat()
+        _save_json(EQUITY_FILE, equity_state)
+        print(f"[circuit] drawdown {dd:.2f}% ≥ {MAX_DRAWDOWN_PCT:.2f}% → buys paused {PAUSE_MINUTES_ON_TRIP}m")
+        return 0.0
+
+    if EQUITY_SPEND_BPS > 0:
+        cap = eq * (EQUITY_SPEND_BPS / 10000.0)
+        cap = max(MIN_DAILY_USD, min(MAX_DAILY_USD, cap))
+        return cap
+
+    return base_cap
+
+# =========================
 # Sell engine (ATR or %)
 # =========================
 def evaluate_sells(force: bool = False):
@@ -579,6 +664,9 @@ def evaluate_sells(force: bool = False):
                   f"avg_cost={avg_cost:.8f} px={px:.8f} chg={chg_pct:.2f}% "
                   f"hi={hi:.8f} pullback={pullback:.2f}%  {x_info}")
 
+        # --- minimum profit buffer to clear fees/slippage ---
+        fee_buffer_pct = (FEE_BPS + SLIPPAGE_BPS + SAFETY_BPS) / 100.0  # e.g., 35 bps = 0.35%
+
         # ---------- FORCE SELL branch ----------
         if force:
             ok, usd, _ = place_sell(sym, qty, "FORCE_SELL")
@@ -593,8 +681,11 @@ def evaluate_sells(force: bool = False):
             trail_thresh = ATR_TRAIL_MULT * atrp
             stop_thresh  = ATR_STOP_MULT  * atrp
 
-            if chg_pct >= tp_thresh:
-                ok, usd, _ = place_sell(sym, qty, f"ATR_TP {ATR_TP_MULT:.2f}*ATR (~{tp_thresh:.2f}%)")
+            # require at least fee buffer to TP
+            effective_tp = max(tp_thresh, fee_buffer_pct)
+
+            if chg_pct >= effective_tp:
+                ok, usd, _ = place_sell(sym, qty, f"ATR_TP eff~{effective_tp:.2f}%")
                 realized += usd if ok else 0.0
                 if SELL_DEBUG: print(f"[sellchk] -> ATR_TP fired for {sym}")
                 continue
@@ -612,8 +703,11 @@ def evaluate_sells(force: bool = False):
                 continue
 
         else:
-            if TAKE_PROFIT_PCT > 0 and chg_pct >= TAKE_PROFIT_PCT:
-                ok, usd, _ = place_sell(sym, qty, f"TAKE_PROFIT {TAKE_PROFIT_PCT:.2f}%")
+            # Percent-mode TP must clear fee buffer
+            effective_pct = max(TAKE_PROFIT_PCT, fee_buffer_pct)
+
+            if TAKE_PROFIT_PCT > 0 and chg_pct >= effective_pct:
+                ok, usd, _ = place_sell(sym, qty, f"TAKE_PROFIT eff~{effective_pct:.2f}%")
                 realized += usd if ok else 0.0
                 if SELL_DEBUG: print(f"[sellchk] -> TAKE_PROFIT fired for {sym}")
                 continue
@@ -687,7 +781,7 @@ def run_cycle():
     apply_temp_overrides()
     hydrate_positions_from_wallet()  # import wallet holdings so sells can see them
 
-    # Use FORCE_SELL when requested
+    # Use FORCE_SELL when requested (one-time workflow)
     if FORCE_SELL:
         if SELL_DEBUG: print("[force] FORCE_SELL=1 → selling all eligible holdings this run")
         evaluate_sells(force=True)
@@ -699,7 +793,8 @@ def run_cycle():
     free_usd = get_free_usd()
     print(f"FREE_USD: ${free_usd:.2f}")
 
-    budget = min(DAILY_CAP_USD, free_usd)
+    # auto-compounding + drawdown-aware daily cap
+    budget = min(compute_daily_cap(DAILY_CAP_USD), free_usd)
     buys_this_run = 0.0
 
     for sym in uni:
