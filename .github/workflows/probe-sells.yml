@@ -1,0 +1,50 @@
+name: Probe Sells (On-demand)
+
+on:
+  workflow_dispatch:
+    inputs:
+      TAKE_PROFIT_PCT:
+        description: "TP % for probe (no orders)"
+        required: true
+        default: "0.8"
+      TRAILING_ACTIVATE_PCT:
+        description: "Trailing activation %"
+        required: true
+        default: "0.5"
+      TRAILING_DELTA_PCT:
+        description: "Trailing pullback %"
+        required: true
+        default: "0.3"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Restore state/data caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .state
+            data
+          key: state-${{ github.ref_name }}-v1
+      - name: Install deps
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Apply probe thresholds
+        run: |
+          echo "TAKE_PROFIT_PCT=${{ github.event.inputs.TAKE_PROFIT_PCT }}" >> $GITHUB_ENV
+          echo "TRAILING_ACTIVATE_PCT=${{ github.event.inputs.TRAILING_ACTIVATE_PCT }}" >> $GITHUB_ENV
+          echo "TRAILING_DELTA_PCT=${{ github.event.inputs.TRAILING_DELTA_PCT }}" >> $GITHUB_ENV
+      - name: Run probe (no orders)
+        env:
+            EXCHANGE: "kraken"
+            QUOTE: "USD"
+        run: |
+          python -u probe_sells.py
