@@ -3,12 +3,12 @@ name: Sell Tester (On-demand, safe)
 on:
   workflow_dispatch:
     inputs:
-      DRY_RUN:                  { description: "Dry run (no real orders)?", required: true, default: "false" }
-      TAKE_PROFIT_PCT:          { description: "Temp TP % (e.g., 0.5)",     required: true, default: "0.5" }
-      TRAILING_ACTIVATE_PCT:    { description: "Temp trailing activation % (e.g., 0.4)", required: true, default: "0.4" }
-      TRAILING_DELTA_PCT:       { description: "Temp trailing pullback % (e.g., 0.2)",   required: true, default: "0.2" }
-      STOP_LOSS_PCT:            { description: "Temp stop-loss % (0 = disabled)",        required: true, default: "0" }
-      SELL_DEBUG:               { description: "Verbose sell checks? 1=yes, 0=no",       required: true, default: "1" }
+      DRY_RUN:               { description: "Dry run (no real orders)?", required: true, default: "false" }
+      TAKE_PROFIT_PCT:       { description: "Temp TP % (e.g., 0.5)", required: true, default: "0.5" }
+      TRAILING_ACTIVATE_PCT: { description: "Temp trailing activation % (e.g., 0.4)", required: true, default: "0.4" }
+      TRAILING_DELTA_PCT:    { description: "Temp trailing pullback % (e.g., 0.2)", required: true, default: "0.2" }
+      STOP_LOSS_PCT:         { description: "Temp stop-loss % (0 = disabled)", required: true, default: "0" }
+      SELL_DEBUG:            { description: "Verbose sell checks? 1=yes, 0=no", required: true, default: "1" }
 
 permissions: { contents: read }
 concurrency: { group: sell-tester, cancel-in-progress: false }
@@ -19,28 +19,27 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   EXCHANGE: "kraken"
   MODE: "live"
+
   TAX_RESERVE_RATE: "0.30"
   STATE_TAX_RATE:  "0.00"
-  
+
+  # keep these for later (safe to leave on)
   ATR_EXITS: "1"
   ATR_PERIOD: "14"
   ATR_TP_MULT: "1.5"
   ATR_TRAIL_MULT: "1.0"
   ATR_ACT_MULT: "0.8"
-
   ENTRY_GUARD: "1"
   ENTRY_EMA_SHORT: "9"
   ENTRY_EMA_LONG: "21"
   ENTRY_RSI_PERIOD: "14"
   ENTRY_RSI_MIN: "50"
   ENTRY_RSI_MAX: "75"
-
   TIMEFRAME: "5m"
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -58,13 +57,11 @@ jobs:
       - name: Show restored state
         run: |
           echo "cache-hit=${{ steps.restore.outputs['cache-hit'] }}"
-          ls -la . || true
           ls -la .state || true
-          test -f .state/positions.json && { echo "[OK] positions.json present"; head -c 400 .state/positions.json; echo; } || echo "[MISS] positions.json MISSING"
+          test -f .state/positions.json && echo "[OK] positions.json present" || echo "[MISS] positions.json MISSING"
 
       - name: Install deps
-        run: |
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        run: if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Apply temporary sell thresholds + debug
         run: |
@@ -81,7 +78,7 @@ jobs:
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           mkdir -p .state data
-          python -u main.py | tee -a sell_test.log
+          python -u main.py
 
       - name: Save caches back (best-effort)
         if: always()
