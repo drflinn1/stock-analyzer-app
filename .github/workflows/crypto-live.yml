@@ -37,7 +37,7 @@ jobs:
       - name: Env (live trading)
         run: |
           echo "MODE=live" >> $GITHUB_ENV
-          echo "DRY_RUN=true" >> $GITHUB_ENV
+          echo "DRY_RUN=false" >> $GITHUB_ENV
           echo "EXCHANGE=kraken" >> $GITHUB_ENV
           echo "MARKET=crypto" >> $GITHUB_ENV
           echo "QUOTE=USD" >> $GITHUB_ENV
@@ -46,11 +46,11 @@ jobs:
 
           # ----- Buying controls -----
           echo "PER_TRADE_USD=10" >> $GITHUB_ENV
-          echo "DAILY_CAP_USD=25" >> $GITHUB_ENV         # base cap (used if EQUITY_SPEND_BPS=0)
+          echo "DAILY_CAP_USD=25" >> $GITHUB_ENV         # base cap if EQUITY_SPEND_BPS=0
           echo "AUTO_UNIVERSE_COUNT=500" >> $GITHUB_ENV
 
           # Auto-compounding budget & drawdown circuit breaker
-          echo "EQUITY_SPEND_BPS=0" >> $GITHUB_ENV       # spend 0.05% of equity/day; 0=off
+          echo "EQUITY_SPEND_BPS=5" >> $GITHUB_ENV       # spend 0.05% of equity/day; 0=off
           echo "MIN_DAILY_USD=10" >> $GITHUB_ENV
           echo "MAX_DAILY_USD=50" >> $GITHUB_ENV
           echo "MAX_DRAWDOWN_PCT=15" >> $GITHUB_ENV      # pause buys if DD >= 15%
