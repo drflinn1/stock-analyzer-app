@@ -24,7 +24,11 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install ccxt; fi
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install ccxt
+          fi
 
       - name: Restore state/ledger cache
         uses: actions/cache/restore@v4
@@ -42,21 +46,21 @@ jobs:
           echo "MARKET=crypto" >> $GITHUB_ENV
           echo "QUOTE=USD" >> $GITHUB_ENV
           echo "SELL_DEBUG=0" >> $GITHUB_ENV
-          echo "FORCE_SELL=0" >> $GITHUB_ENV   # keep OFF in live
+          echo "FORCE_SELL=0" >> $GITHUB_ENV    # keep OFF in live
 
           # ----- Buying controls -----
           echo "PER_TRADE_USD=10" >> $GITHUB_ENV
-          echo "DAILY_CAP_USD=25" >> $GITHUB_ENV         # base cap if EQUITY_SPEND_BPS=0
+          echo "DAILY_CAP_USD=25" >> $GITHUB_ENV         # used if EQUITY_SPEND_BPS=0
           echo "AUTO_UNIVERSE_COUNT=500" >> $GITHUB_ENV
 
-          # Auto-compounding budget & drawdown circuit breaker
+          # ----- Auto-compounding budget & drawdown circuit breaker -----
           echo "EQUITY_SPEND_BPS=5" >> $GITHUB_ENV       # spend 0.05% of equity/day; 0=off
           echo "MIN_DAILY_USD=10" >> $GITHUB_ENV
           echo "MAX_DAILY_USD=50" >> $GITHUB_ENV
           echo "MAX_DRAWDOWN_PCT=15" >> $GITHUB_ENV      # pause buys if DD >= 15%
           echo "PAUSE_MINUTES_ON_TRIP=480" >> $GITHUB_ENV
 
-          # Fees/slippage buffer for TP
+          # ----- Fees/slippage buffer for smarter TP -----
           echo "FEE_BPS=20" >> $GITHUB_ENV               # 0.20%
           echo "SLIPPAGE_BPS=10" >> $GITHUB_ENV          # 0.10%
           echo "SAFETY_BPS=5" >> $GITHUB_ENV             # 0.05%
@@ -75,7 +79,7 @@ jobs:
           echo "TRAILING_DELTA_PCT=0.2" >> $GITHUB_ENV
           echo "STOP_LOSS_PCT=0" >> $GITHUB_ENV
 
-          # API keys
+          # ----- API keys -----
           echo "KRAKEN_API_KEY=${{ secrets.KRAKEN_API_KEY }}" >> $GITHUB_ENV
           echo "KRAKEN_API_SECRET=${{ secrets.KRAKEN_API_SECRET }}" >> $GITHUB_ENV
 
