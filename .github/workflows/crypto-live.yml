@@ -37,7 +37,7 @@ jobs:
       - name: Env (live trading)
         run: |
           echo "MODE=live" >> $GITHUB_ENV
-          echo "DRY_RUN=false" >> $GITHUB_ENV
+          echo "DRY_RUN=true" >> $GITHUB_ENV
           echo "EXCHANGE=kraken" >> $GITHUB_ENV
           echo "MARKET=crypto" >> $GITHUB_ENV
           echo "QUOTE=USD" >> $GITHUB_ENV
