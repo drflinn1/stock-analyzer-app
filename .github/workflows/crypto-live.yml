@@ -50,7 +50,7 @@ jobs:
           echo "AUTO_UNIVERSE_COUNT=500" >> $GITHUB_ENV
 
           # Auto-compounding budget & drawdown circuit breaker
-          echo "EQUITY_SPEND_BPS=5" >> $GITHUB_ENV       # spend 0.05% of equity/day; 0=off
+          echo "EQUITY_SPEND_BPS=0" >> $GITHUB_ENV       # spend 0.05% of equity/day; 0=off
           echo "MIN_DAILY_USD=10" >> $GITHUB_ENV
           echo "MAX_DAILY_USD=50" >> $GITHUB_ENV
           echo "MAX_DRAWDOWN_PCT=15" >> $GITHUB_ENV      # pause buys if DD >= 15%
