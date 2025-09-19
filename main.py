@@ -1,4 +1,4 @@
-import os, sys, math, time, json, csv, pathlib, traceback, datetime as dt
+import os, sys, math, time, json, csv, pathlib, datetime as dt
 from typing import Dict, List, Tuple
 import ccxt
 import pandas as pd
@@ -13,10 +13,10 @@ def utcnow():         return dt.datetime.utcnow()
 
 DATA_DIR = pathlib.Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
 EQUITY_CSV = DATA_DIR / "equity_history.csv"
-TAX_LEDGER = DATA_DIR / "tax_ledger.csv"      # simple fills log
-POS_META    = DATA_DIR / "pos_meta.json"      # track entry, adds, last_add_price, add_count
+TAX_LEDGER = DATA_DIR / "tax_ledger.csv"
+POS_META    = DATA_DIR / "pos_meta.json"
 
-# ---------- Read env ----------
+# ---------- Env ----------
 MODE = env_str("MODE","live")
 DRY  = env_str("DRY_RUN","true").lower()=="true"
 EXCHANGE = env_str("EXCHANGE","kraken")
@@ -28,7 +28,7 @@ MAX_CONCURRENT_POS = env_i("MAX_CONCURRENT_POS",5)
 MIN_LIQ_USD_24H = env_f("MIN_LIQ_USD_24H",1_000_000)
 MOMENTUM_LOOKBACK_H = env_i("MOMENTUM_LOOKBACK_H",24)
 MIN_PRICE_USD = env_f("MIN_PRICE_USD",0.01)
-MIN_NOTIONAL_USD = env_f("MIN_NOTIONAL_USD",5)
+MIN_NOTIONAL_USD = env_f("MIN_NOTIONAL_USD",5)   # our own floor; exchange floor may be higher
 
 TF_FAST = env_str("TF_FAST","15m")
 TF_SLOW = env_str("TF_SLOW","1h")
@@ -68,8 +68,7 @@ DD_COOLDOWN_RUNS = env_i("DRAWDOWN_COOLDOWN_RUNS",8)
 WRITE_EQUITY_CSV = env_str("WRITE_EQUITY_CSV","true").lower()=="true"
 PRINT_EQUITY_ONE_LINER = env_str("PRINT_EQUITY_ONE_LINER","true").lower()=="true"
 
-# The guard job looks for these exact tokens in source:
-# TAKE_PROFIT / STOP_LOSS (keep these strings in code and logs)
+# Guard tokens for your Sell Logic Guard job
 TAKE_PROFIT_TOKEN = "TAKE_PROFIT"
 STOP_LOSS_TOKEN   = "STOP_LOSS"
 
@@ -86,6 +85,15 @@ def make_exchange():
     return ex
 
 ex = make_exchange()
+MARKETS = ex.load_markets()  # cache limits
+
+def market_limits(symbol):
+    m = MARKETS.get(symbol)
+    if not m:
+        ex.load_markets(True); m = ex.markets.get(symbol)
+    amt_min = float(((m or {}).get("limits") or {}).get("amount",{}).get("min") or 0)
+    cost_min = float(((m or {}).get("limits") or {}).get("cost",{}).get("min") or 0)
+    return max(amt_min, 0.0), max(cost_min, 0.0)
 
 # ---------- IO ----------
 def load_pos_meta():
@@ -125,10 +133,8 @@ def to_df(ohlcv):
     return df
 
 def indicators(df: pd.DataFrame):
-    # EMA/RSI/ATR (ta-lightweight)
     df["ema_s"] = df["c"].ewm(span=EMA_SHORT, adjust=False).mean()
     df["ema_l"] = df["c"].ewm(span=EMA_LONG, adjust=False).mean()
-    # RSI
     delta = df["c"].diff()
     up = np.where(delta>0, delta, 0.0)
     down = np.where(delta<0, -delta, 0.0)
@@ -136,7 +142,6 @@ def indicators(df: pd.DataFrame):
     roll_down = pd.Series(down).rolling(RSI_LEN).mean()
     rs = roll_up / (roll_down + 1e-12)
     df["rsi"] = 100 - (100/(1+rs))
-    # ATR
     tr = pd.concat([
         (df["h"]-df["l"]).abs(),
         (df["h"]-df["c"].shift(1)).abs(),
@@ -147,26 +152,22 @@ def indicators(df: pd.DataFrame):
 
 # ---------- Universe & ranking ----------
 def list_markets_usd():
-    markets = ex.load_markets()
     syms = []
-    for s, m in markets.items():
+    for s, m in MARKETS.items():
         if m.get("spot") and (m.get("quote") in ["USD","USDT"]) and (m.get("active") or True):
             syms.append(s)
     return syms
 
 def score_symbol(sym)->Tuple[float,dict]:
-    # 24h momentum + liquidity score
     try:
         ticker = ex.fetch_ticker(sym)
         last = float(ticker["last"] or 0)
-        base_vol = float(ticker.get("baseVolume") or 0)
         quote_vol = float(ticker.get("quoteVolume") or 0)
         if last < MIN_PRICE_USD: return -1e9, {}
-        liq = quote_vol
-        if liq < MIN_LIQ_USD_24H: return -1e9, {}
+        if quote_vol < MIN_LIQ_USD_24H: return -1e9, {}
         change = float(ticker.get("percentage") or 0.0)
-        score = (change) + 0.000001*liq  # momentum primary, liq as tiebreak
-        return score, {"last":last,"liq":liq,"pct":change}
+        score = change + 0.000001*quote_vol
+        return score, {"last":last,"liq":quote_vol,"pct":change}
     except Exception:
         return -1e9, {}
 
@@ -174,8 +175,7 @@ def rank_universe(cands: List[str])->List[str]:
     scored = []
     for s in cands:
         sc, meta = score_symbol(s)
-        if meta:
-            scored.append((sc, s))
+        if meta: scored.append((sc, s))
     scored.sort(reverse=True)
     return [s for _,s in scored[:UNIVERSE_TOP_N]]
 
@@ -193,18 +193,14 @@ def portfolio_and_equity():
             continue
         q = float(qty or 0)
         if q <= 0: continue
-        sym1 = f"{asset}/{BASE}"
-        sym2 = f"{asset}/USDT"
-        price = None
-        for sym in (sym1, sym2):
+        for sym in (f"{asset}/{BASE}", f"{asset}/USDT"):
             try:
                 price = float(ex.fetch_ticker(sym)["last"])
                 positions[sym] = q
+                equity += q * price
                 break
             except Exception:
                 continue
-        if price:
-            equity += q * price
     return positions, usd_free, equity
 
 def portfolio_exposure(positions: Dict[str,float])->float:
@@ -216,65 +212,57 @@ def portfolio_exposure(positions: Dict[str,float])->float:
             exp += qty * px
         except Exception:
             pass
-    if equity <= 0: return 0.0
-    return 100.0 * exp / equity
+    return 0.0 if equity<=0 else 100.0 * exp / equity
 
 # ---------- Orders ----------
 def place_order(side, symbol, qty):
     if qty <= 0: return None
     if DRY: return {"id":"DRY", "side":side, "symbol":symbol, "qty":qty}
     try:
-        if side=="buy":
-            od = ex.create_market_buy_order(symbol, qty)
-        else:
-            od = ex.create_market_sell_order(symbol, qty)
-        return od
+        return ex.create_market_buy_order(symbol, qty) if side=="buy" else ex.create_market_sell_order(symbol, qty)
     except Exception as e:
         print(f"[order] fail {side} {symbol} {qty}: {e}")
         return None
 
-# ---------- Sizing / risk ----------
+# ---------- Risk / sizing ----------
 def size_by_atr(symbol, price, atr, equity, step_mult=1.0):
     if atr<=0 or price<=0: return 0.0, 0.0
     risk_dollars = equity * (RISK_PER_TRADE_PCT/100.0) * step_mult
     unit_risk = ATR_MULT_SL * atr
     if unit_risk<=0: return 0.0, 0.0
-    qty = risk_dollars / unit_risk
+    qty = (risk_dollars / unit_risk)
     notional = qty * price
     notional = min(notional, PER_TRADE_USD_CAP)
     qty = notional / price
     return max(qty, 0.0), notional
 
+def tradeable(symbol, qty, price):
+    amt_min, exch_cost_min = market_limits(symbol)
+    notional = qty * price
+    min_cost = max(MIN_NOTIONAL_USD, exch_cost_min)
+    ok = (qty >= max(amt_min, 0.0)) and (notional >= min_cost)
+    return ok, amt_min, min_cost, notional
+
 # ---------- Position meta ----------
 pos_meta = load_pos_meta()
-
 def get_meta(sym):
     return pos_meta.get(sym, {"entry_ts":None,"entry_px":None,"add_count":0,"last_add_px":None})
-
 def set_meta(sym, **kwargs):
-    m = get_meta(sym)
-    m.update(kwargs)
-    pos_meta[sym]=m
-    save_pos_meta(pos_meta)
+    m = get_meta(sym); m.update(kwargs); pos_meta[sym]=m; save_pos_meta(pos_meta)
 
-# ---------- Stale logic ----------
+# ---------- Stale / pyramid ----------
 def is_stale(sym, df_fast: pd.DataFrame, meta)->bool:
     if meta.get("entry_ts"):
         age_h = (utcnow() - dt.datetime.fromtimestamp(meta["entry_ts"])).total_seconds()/3600.0
-        if age_h >= STALE_MAX_HOURS:
-            return True
+        if age_h >= STALE_MAX_HOURS: return True
     rsi_tail = df_fast["rsi"].tail(STALE_RSI_MAX_BARS)
-    if len(rsi_tail)==STALE_RSI_MAX_BARS and (rsi_tail < RSI_SELL).all():
-        return True
-    c = df_fast["c"].iloc[-1]
+    if len(rsi_tail)==STALE_RSI_MAX_BARS and (rsi_tail < RSI_SELL).all(): return True
     entry_px = meta.get("entry_px")
     if entry_px:
-        pnl_pct = 100.0*(c/entry_px - 1.0)
-        if pnl_pct <= STALE_MIN_GAIN_PCT:
-            return True
+        pnl_pct = 100.0*(df_fast["c"].iloc[-1]/entry_px - 1.0)
+        if pnl_pct <= STALE_MIN_GAIN_PCT: return True
     return False
 
-# ---------- Pyramiding trigger ----------
 def pyramid_should_add(sym, df_fast: pd.DataFrame, meta)->bool:
     if not PYRAMID_ENABLED: return False
     if meta.get("add_count",0) >= PYRAMID_MAX_ADDS: return False
@@ -284,13 +272,12 @@ def pyramid_should_add(sym, df_fast: pd.DataFrame, meta)->bool:
     gain_pct = 100.0*(c/entry_px - 1.0)
     return gain_pct >= PYRAMID_ADD_AT_GAIN_PCT
 
-# ---------- Strategy ----------
+# ---------- Drawdown breaker ----------
 def allow_new_entries_by_dd():
     if not EQUITY_CSV.exists(): return True
     df = pd.read_csv(EQUITY_CSV)
     if df.empty: return True
-    e = float(df["equity"].iloc[-1])
-    hwm = float(df["equity"].max())
+    e = float(df["equity"].iloc[-1]); hwm = float(df["equity"].max())
     dd = 0.0 if hwm<=0 else 100.0*(1.0 - e/hwm)
     return dd < DD_TRIP
 
@@ -299,57 +286,62 @@ def equity_one_liner(now_e):
     if EQUITY_CSV.exists():
         try:
             df = pd.read_csv(EQUITY_CSV)
-            if not df.empty:
-                hwm = max(now_e, df["equity"].max())
-        except Exception:
-            pass
+            if not df.empty: hwm = max(now_e, df["equity"].max())
+        except Exception: pass
     dd = 0.0 if hwm<=0 else 100.0*(1.0 - now_e/hwm)
     return hwm, dd
 
+# ---------- Main run ----------
 def run():
     print("=== START TRADING OUTPUT ===")
     print(f"Python {sys.version.split()[0]}")
     positions, usd_free, equity = portfolio_and_equity()
     print(f"[audit] hydrated {len(positions)} symbols from wallet for evaluation")
 
-    # ---- SELL PASS: stale exits + ATR bands (TAKE_PROFIT / STOP_LOSS) ----
+    # SELL PASS (stale + ATR TAKE_PROFIT / STOP_LOSS with trailing)
     for sym, qty in list(positions.items()):
         try:
             df_f = indicators(to_df(fetch_ohlcv(sym, TF_FAST, limit=ATR_LEN*4+60))).dropna()
             c = df_f["c"].iloc[-1]; atr = df_f["atr"].iloc[-1]
             m = get_meta(sym)
 
-            # Stale exits
             if is_stale(sym, df_f, m):
-                od = place_order("sell", sym, qty)
-                if od:
-                    print(f"SELL STALE_EXIT {sym}: qty={qty:.8f} ~${qty*c:.2f}")
-                    append_tax({"ts":now_ts(),"side":"sell","symbol":sym,"qty":qty,"price":c,"notional":qty*c,"order_id":od.get('id')})
-                    set_meta(sym, add_count=0, entry_ts=None, entry_px=None, last_add_px=None)
+                ok, amt_min, min_cost, notional = tradeable(sym, qty, c)
+                if not ok:
+                    print(f"[sellskip] {sym}: qty={qty:.8g} ${notional:.2f} < min (amount>={amt_min} cost>={min_cost}) -> hold as dust")
+                else:
+                    od = place_order("sell", sym, qty)
+                    if od:
+                        print(f"SELL STALE_EXIT {sym}: qty={qty:.8f} ~${qty*c:.2f}")
+                        append_tax({"ts":now_ts(),"side":"sell","symbol":sym,"qty":qty,"price":c,"notional":qty*c,"order_id":od.get('id')})
+                        set_meta(sym, add_count=0, entry_ts=None, entry_px=None, last_add_px=None)
                 continue
 
-            # ATR-based TAKE_PROFIT / STOP_LOSS (with trailing)
             entry_px = m.get("entry_px")
             if entry_px and atr>0:
                 tp = entry_px + ATR_MULT_TP*atr
                 sl = entry_px - ATR_MULT_SL*atr
                 if c >= entry_px + TRAIL_ACTIVATE_AT_TP_FRAC*ATR_MULT_TP*atr:
                     trail = c - ATR_MULT_TS*atr
-                    sl = max(sl, trail)  # tighten via trailing stop
+                    sl = max(sl, trail)
                 if c >= tp or c <= sl:
-                    tag = TAKE_PROFIT_TOKEN if c >= tp else STOP_LOSS_TOKEN
-                    od = place_order("sell", sym, qty)
-                    if od:
-                        print(f"SELL {tag} {sym}: px={c:.6f} qty={qty:.8f} ~${qty*c:.2f}")
-                        append_tax({"ts":now_ts(),"side":"sell","symbol":sym,"qty":qty,"price":c,"notional":qty*c,"order_id":od.get('id')})
-                        set_meta(sym, add_count=0, entry_ts=None, entry_px=None, last_add_px=None)
+                    ok, amt_min, min_cost, notional = tradeable(sym, qty, c)
+                    if not ok:
+                        print(f"[sellskip] {sym}: qty={qty:.8g} ${notional:.2f} < min (amount>={amt_min} cost>={min_cost}) -> hold as dust")
+                    else:
+                        tag = TAKE_PROFIT_TOKEN if c >= tp else STOP_LOSS_TOKEN
+                        od = place_order("sell", sym, qty)
+                        if od:
+                            print(f"SELL {tag} {sym}: px={c:.6f} qty={qty:.8f} ~${qty*c:.2f}")
+                            append_tax({"ts":now_ts(),"side":"sell","symbol":sym,"qty":qty,"price":c,"notional":qty*c,"order_id":od.get('id')})
+                            set_meta(sym, add_count=0, entry_ts=None, entry_px=None, last_add_px=None)
         except Exception as e:
             print(f"[sellpass] {sym} error: {e}")
 
     # refresh balances after sells
     positions, usd_free, equity = portfolio_and_equity()
 
-    # ---- PYRAMID: add to winners with guards ----
+    # PYRAMID adds
     if PYRAMID_ENABLED:
         for sym, qty in list(positions.items()):
             try:
@@ -358,14 +350,13 @@ def run():
                 m = get_meta(sym)
                 if pyramid_should_add(sym, df_f, m):
                     exposure_pct = portfolio_exposure(positions)
-                    if exposure_pct >= PORTFOLIO_MAX_EXPOSURE_PCT:
-                        continue
+                    if exposure_pct >= PORTFOLIO_MAX_EXPOSURE_PCT: continue
                     qty_add, notional = size_by_atr(sym, c, atr, equity, step_mult=PYRAMID_STEP_ATR)
-                    if notional < MIN_NOTIONAL_USD or (usd_free - notional) < MIN_FREE_CASH_USD:
-                        continue
+                    ok, amt_min, min_cost, _ = tradeable(sym, qty_add, c)
+                    if not ok or notional < MIN_NOTIONAL_USD or (usd_free - notional) < MIN_FREE_CASH_USD: continue
                     od = place_order("buy", sym, qty_add)
                     if od:
-                        print(f"PYRAMID + {sym}: +{qty_add:.8f} ~${notional:.2f} (gain>= {PYRAMID_ADD_AT_GAIN_PCT}%)")
+                        print(f"PYRAMID + {sym}: +{qty_add:.8f} ~${notional:.2f}")
                         append_tax({"ts":now_ts(),"side":"buy","symbol":sym,"qty":qty_add,"price":c,"notional":qty_add*c,"order_id":od.get('id')})
                         set_meta(sym, add_count=m.get("add_count",0)+1, last_add_px=c)
                         usd_free -= notional
@@ -373,7 +364,7 @@ def run():
             except Exception as e:
                 print(f"[pyramid] {sym} error: {e}")
 
-    # ---- ENTRY PASS: new positions if DD allows ----
+    # ENTRY PASS
     if allow_new_entries_by_dd():
         cands = list_markets_usd() if AUTO_UNIVERSE else list(positions.keys())
         short_list = rank_universe(cands)
@@ -393,8 +384,8 @@ def run():
                 exposure_pct = portfolio_exposure(positions)
                 if exposure_pct >= PORTFOLIO_MAX_EXPOSURE_PCT: break
                 qty, notional = size_by_atr(sym, c, atr, equity, step_mult=1.0)
-                if notional < MIN_NOTIONAL_USD: continue
-                if (usd_free - notional) < MIN_FREE_CASH_USD: continue
+                ok, amt_min, min_cost, _ = tradeable(sym, qty, c)
+                if not ok or notional < MIN_NOTIONAL_USD or (usd_free - notional) < MIN_FREE_CASH_USD: continue
                 od = place_order("buy", sym, qty)
                 if od:
                     append_tax({"ts":now_ts(),"side":"buy","symbol":sym,"qty":qty,"price":c,"notional":qty*c,"order_id":od.get('id')})
@@ -408,7 +399,7 @@ def run():
     else:
         print(f"[risk] drawdown breaker active; skipping new entries")
 
-    # ---- Final equity print ----
+    # Final equity
     _, usd_free, equity = portfolio_and_equity()
     ts = now_ts()
     if WRITE_EQUITY_CSV: append_equity_csv(ts, equity)
@@ -419,8 +410,7 @@ def run():
             if EQUITY_CSV.exists():
                 df = pd.read_csv(EQUITY_CSV)
                 if len(df)>=2: delta = float(df["equity"].iloc[-1]) - float(df["equity"].iloc[-2])
-        except Exception:
-            pass
+        except Exception: pass
         pct = 0.0 if equity<=0 else 100.0* (delta / max(equity-delta, 1e-9))
         print(f"[equity] now=${equity:.2f} Δrun=${delta:+.2f} ({pct:+.2f}%) HWM=${hwm:.2f} DD={dd:.2f}%")
     print("=== END TRADING OUTPUT ===")
