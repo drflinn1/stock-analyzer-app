@@ -65,9 +65,9 @@ jobs:
 
       # ===== Dust Sweeper (SELLS ONLY) =====
       DUST_SWEEP_ENABLED: "true"
-      DUST_SWEEP_USD_TRIGGER: "1"   # was 15 — sweep even for ~$1 of dust
-      DUST_MAX_NOTIONAL_USD: "20"   # was 12 — classify more tiny bags as dust
-      DUST_SKIP_ASSETS: "USD,USDT,USDC" # never touch these
+      DUST_SWEEP_USD_TRIGGER: "1"     # sweep as soon as total dust >= $1
+      DUST_MAX_NOTIONAL_USD: "20"     # treat positions <= $20 as dust
+      DUST_SKIP_ASSETS: "USD,USDT,USDC"
 
       # ===== Budget rails =====
       DAILY_CAP_USD: "300"
