@@ -1,9 +1,9 @@
 # SELL-ONLY Dust Sweeper for Kraken via ccxt
-# - Sells tiny balances ("dust") when they are individually sellable
-# - Respects exchange min amount and min notional per market
+# - Tries BOTH USD and USDT quotes; picks the one with the LOWER min requirements
+# - Sells tiny balances ("dust") only when that market meets amount/cost mins
 # - Never buys. Safe to run every schedule (pre & post)
 import os, time, pathlib
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import ccxt
 
 def env_str(k, d=""): return os.environ.get(k, d)
@@ -14,13 +14,13 @@ DATA_DIR = pathlib.Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG = print
 
 # ---- env ----
-DRY = env_b("DRY_RUN", "false")          # default false in live
+DRY = env_b("DRY_RUN", "false")
 EXCHANGE = env_str("EXCHANGE","kraken")
 BASE = env_str("BASE_CCY","USD")
 
 DUST_ENABLED = env_b("DUST_SWEEP_ENABLED","true")
-DUST_TRIGGER = env_f("DUST_SWEEP_USD_TRIGGER", 15.0)  # only sweep if sum(dust) >= trigger
-DUST_MAX_USD = env_f("DUST_MAX_NOTIONAL_USD", 12.0)   # classify positions <= this as "dust"
+DUST_TRIGGER = env_f("DUST_SWEEP_USD_TRIGGER", 1.0)    # <— lowered default
+DUST_MAX_USD = env_f("DUST_MAX_NOTIONAL_USD", 20.0)     # <— broaden default
 DUST_SKIP = {s.strip().upper() for s in env_str("DUST_SKIP_ASSETS","USD,USDT,USDC").split(",") if s.strip()}
 
 if not DUST_ENABLED:
@@ -38,29 +38,37 @@ def make_exchange():
 ex = make_exchange()
 MARKETS = ex.load_markets()
 
-def best_symbol_for_asset(asset: str) -> str | None:
-    for q in (BASE, "USDT"):
-        s = f"{asset}/{q}"
-        if s in MARKETS:
-            return s
-    return None
-
 def market_limits(symbol: str) -> Tuple[float,float]:
     m = MARKETS.get(symbol, {})
     amt_min = float(((m.get("limits") or {}).get("amount") or {}).get("min") or 0)
     cost_min = float(((m.get("limits") or {}).get("cost") or {}).get("min") or 0)
     return max(0.0, amt_min), max(0.0, cost_min)
 
+def best_pair_with_lowest_min(asset: str) -> Optional[str]:
+    candidates = []
+    for q in (BASE, "USDT"):
+        s = f"{asset}/{q}"
+        if s in MARKETS:
+            amt_min, cost_min = market_limits(s)
+            candidates.append((cost_min, amt_min, s))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[1]))  # prefer lowest cost_min, then amt_min
+    return candidates[0][2]
+
 def fetch_positions() -> Dict[str,dict]:
     bal = ex.fetch_balance()
     total = bal.get("total",{})
     positions = {}
     for asset, qty in total.items():
-        if asset.upper() in DUST_SKIP or asset.upper()==BASE.upper(): continue
+        if asset.upper() in DUST_SKIP or asset.upper()==BASE.upper(): 
+            continue
         q = float(qty or 0.0)
-        if q <= 0: continue
-        sym = best_symbol_for_asset(asset)
-        if not sym: continue
+        if q <= 0: 
+            continue
+        sym = best_pair_with_lowest_min(asset)
+        if not sym: 
+            continue
         try:
             px = float(ex.fetch_ticker(sym)["last"])
         except Exception:
@@ -105,7 +113,7 @@ def main():
             sold += 1
         else:
             skipped += 1
-        time.sleep(0.2)  # be nice to API
+        time.sleep(0.2)
 
     LOG(f"[dust] done: sold={sold} skipped={skipped}")
 
