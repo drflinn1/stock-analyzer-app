@@ -47,6 +47,7 @@ jobs:
           echo "QUOTE=USD" >> $GITHUB_ENV
           echo "SELL_DEBUG=0" >> $GITHUB_ENV
           echo "FORCE_SELL=0" >> $GITHUB_ENV    # keep OFF in live
+          echo "DUST_MIN_USD=1" >> $GITHUB_ENV
 
           # ----- Buying controls -----
           echo "PER_TRADE_USD=10" >> $GITHUB_ENV
