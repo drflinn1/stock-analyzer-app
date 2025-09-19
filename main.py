@@ -13,10 +13,13 @@ def utcnow():         return dt.datetime.utcnow()
 
 DATA_DIR = pathlib.Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
 EQUITY_CSV = DATA_DIR / "equity_history.csv"
-TAX_LEDGER = DATA_DIR / "tax_ledger.csv"
-POS_META    = DATA_DIR / "pos_meta.json"
+TAX_LEDGER = DATA_DIR / "tax_ledger.csv"      # fills log
+POS_META    = DATA_DIR / "pos_meta.json"      # track entry, adds, last_add_price, add_count
 
-# ---------- Env ----------
+# ---------- TAX ledger fields ----------
+TAX_FIELDS = ["ts","event","side","symbol","qty","price","notional","fee","fee_ccy","order_id","note"]
+
+# ---------- Read env ----------
 MODE = env_str("MODE","live")
 DRY  = env_str("DRY_RUN","true").lower()=="true"
 EXCHANGE = env_str("EXCHANGE","kraken")
@@ -28,28 +31,28 @@ MAX_CONCURRENT_POS = env_i("MAX_CONCURRENT_POS",5)
 MIN_LIQ_USD_24H = env_f("MIN_LIQ_USD_24H",1_000_000)
 MOMENTUM_LOOKBACK_H = env_i("MOMENTUM_LOOKBACK_H",24)
 MIN_PRICE_USD = env_f("MIN_PRICE_USD",0.01)
-MIN_NOTIONAL_USD = env_f("MIN_NOTIONAL_USD",5)   # our own floor; exchange floor may be higher
+MIN_NOTIONAL_USD = env_f("MIN_NOTIONAL_USD",5)
 
 TF_FAST = env_str("TF_FAST","15m")
 TF_SLOW = env_str("TF_SLOW","1h")
 EMA_SHORT = env_i("EMA_SHORT",20)
 EMA_LONG  = env_i("EMA_LONG",50)
 RSI_LEN   = env_i("RSI_LEN",14)
-RSI_BUY   = env_f("RSI_BUY",55)
+RSI_BUY   = env_f("RSI_BUY",60)  # defensive now
 RSI_SELL  = env_f("RSI_SELL",45)
 
 ATR_LEN   = env_i("ATR_LEN",14)
 RISK_PER_TRADE_PCT = env_f("RISK_PER_TRADE_PCT",1.6)
 PER_TRADE_USD_CAP  = env_f("PER_TRADE_USD_CAP",75)
 MAX_TRADES_PER_RUN = env_i("MAX_TRADES_PER_RUN",6)
-PORTFOLIO_MAX_EXPOSURE_PCT = env_f("PORTFOLIO_MAX_EXPOSURE_PCT",90)
+PORTFOLIO_MAX_EXPOSURE_PCT = env_f("PORTFOLIO_MAX_EXPOSURE_PCT",75)
 
 ATR_MULT_TP = env_f("ATR_MULTIPLIER_TP",1.0)
 ATR_MULT_TS = env_f("ATR_MULTIPLIER_TS",1.4)
-ATR_MULT_SL = env_f("ATR_MULTIPLIER_SL",2.0)
+ATR_MULT_SL = env_f("ATR_MULTIPLIER_SL",1.8)
 TRAIL_ACTIVATE_AT_TP_FRAC = env_f("TRAIL_ACTIVATE_AT_TP_FRAC",0.5)
 
-STALE_MAX_HOURS     = env_i("STALE_MAX_HOURS",48)
+STALE_MAX_HOURS     = env_i("STALE_MAX_HOURS",24)
 STALE_RSI_MAX_BARS  = env_i("STALE_RSI_MAX_BARS",6)
 STALE_MIN_GAIN_PCT  = env_f("STALE_MIN_GAIN_PCT",-3)
 
@@ -68,7 +71,7 @@ DD_COOLDOWN_RUNS = env_i("DRAWDOWN_COOLDOWN_RUNS",8)
 WRITE_EQUITY_CSV = env_str("WRITE_EQUITY_CSV","true").lower()=="true"
 PRINT_EQUITY_ONE_LINER = env_str("PRINT_EQUITY_ONE_LINER","true").lower()=="true"
 
-# Guard tokens for your Sell Logic Guard job
+# Guard tokens required by your guard job:
 TAKE_PROFIT_TOKEN = "TAKE_PROFIT"
 STOP_LOSS_TOKEN   = "STOP_LOSS"
 
@@ -85,17 +88,35 @@ def make_exchange():
     return ex
 
 ex = make_exchange()
-MARKETS = ex.load_markets()  # cache limits
-
-def market_limits(symbol):
-    m = MARKETS.get(symbol)
-    if not m:
-        ex.load_markets(True); m = ex.markets.get(symbol)
-    amt_min = float(((m or {}).get("limits") or {}).get("amount",{}).get("min") or 0)
-    cost_min = float(((m or {}).get("limits") or {}).get("cost",{}).get("min") or 0)
-    return max(amt_min, 0.0), max(cost_min, 0.0)
+MARKETS = ex.load_markets()
 
 # ---------- IO ----------
+def append_equity_csv(ts:int, equity:float):
+    write_header = not EQUITY_CSV.exists()
+    with EQUITY_CSV.open("a", newline="") as f:
+        w = csv.writer(f)
+        if write_header: w.writerow(["ts","equity"])
+        w.writerow([ts, f"{equity:.2f}"])
+
+def append_tax(row: Dict):
+    write_header = not TAX_LEDGER.exists()
+    with TAX_LEDGER.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=TAX_FIELDS)
+        if write_header: w.writeheader()
+        w.writerow(row)
+
+def _fee_from_order(od):
+    fee = 0.0; fee_ccy = None
+    f = (od or {}).get("fee")
+    if f:
+        fee = float(f.get("cost") or 0)
+        fee_ccy = f.get("currency")
+    fl = (od or {}).get("fees") or []
+    if fl and fee == 0 and isinstance(fl, list):
+        fee = float(fl[0].get("cost") or 0)
+        fee_ccy = fl[0].get("currency")
+    return fee, fee_ccy
+
 def load_pos_meta():
     if POS_META.exists():
         return json.loads(POS_META.read_text())
@@ -103,20 +124,6 @@ def load_pos_meta():
 
 def save_pos_meta(meta):
     POS_META.write_text(json.dumps(meta, indent=2, sort_keys=True))
-
-def append_tax(row: Dict):
-    write_header = not TAX_LEDGER.exists()
-    with TAX_LEDGER.open("a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["ts","side","symbol","qty","price","notional","order_id"])
-        if write_header: w.writeheader()
-        w.writerow(row)
-
-def append_equity_csv(ts:int, equity:float):
-    write_header = not EQUITY_CSV.exists()
-    with EQUITY_CSV.open("a", newline="") as f:
-        w = csv.writer(f)
-        if write_header: w.writerow(["ts","equity"])
-        w.writerow([ts, f"{equity:.2f}"])
 
 # ---------- Market data ----------
 def fetch_ohlcv(symbol, timeframe, limit=200):
@@ -236,6 +243,15 @@ def size_by_atr(symbol, price, atr, equity, step_mult=1.0):
     qty = notional / price
     return max(qty, 0.0), notional
 
+# ---------- Exchange min guards ----------
+def market_limits(symbol):
+    m = MARKETS.get(symbol)
+    if not m:
+        ex.load_markets(True); m = ex.markets.get(symbol)
+    amt_min = float(((m or {}).get("limits") or {}).get("amount",{}).get("min") or 0)
+    cost_min = float(((m or {}).get("limits") or {}).get("cost",{}).get("min") or 0)
+    return max(amt_min, 0.0), max(cost_min, 0.0)
+
 def tradeable(symbol, qty, price):
     amt_min, exch_cost_min = market_limits(symbol)
     notional = qty * price
@@ -312,8 +328,13 @@ def run():
                 else:
                     od = place_order("sell", sym, qty)
                     if od:
+                        fee, fee_ccy = _fee_from_order(od)
                         print(f"SELL STALE_EXIT {sym}: qty={qty:.8f} ~${qty*c:.2f}")
-                        append_tax({"ts":now_ts(),"side":"sell","symbol":sym,"qty":qty,"price":c,"notional":qty*c,"order_id":od.get('id')})
+                        append_tax({
+                            "ts": now_ts(),"event":"TRADE","side":"sell","symbol":sym,
+                            "qty":qty,"price":c,"notional":qty*c,"fee":fee,"fee_ccy":fee_ccy or BASE,
+                            "order_id": od.get('id'),"note":"STALE_EXIT"
+                        })
                         set_meta(sym, add_count=0, entry_ts=None, entry_px=None, last_add_px=None)
                 continue
 
@@ -332,8 +353,13 @@ def run():
                         tag = TAKE_PROFIT_TOKEN if c >= tp else STOP_LOSS_TOKEN
                         od = place_order("sell", sym, qty)
                         if od:
+                            fee, fee_ccy = _fee_from_order(od)
                             print(f"SELL {tag} {sym}: px={c:.6f} qty={qty:.8f} ~${qty*c:.2f}")
-                            append_tax({"ts":now_ts(),"side":"sell","symbol":sym,"qty":qty,"price":c,"notional":qty*c,"order_id":od.get('id')})
+                            append_tax({
+                                "ts": now_ts(),"event":"TRADE","side":"sell","symbol":sym,
+                                "qty":qty,"price":c,"notional":qty*c,"fee":fee,"fee_ccy":fee_ccy or BASE,
+                                "order_id": od.get('id'),"note": tag
+                            })
                             set_meta(sym, add_count=0, entry_ts=None, entry_px=None, last_add_px=None)
         except Exception as e:
             print(f"[sellpass] {sym} error: {e}")
@@ -356,8 +382,13 @@ def run():
                     if not ok or notional < MIN_NOTIONAL_USD or (usd_free - notional) < MIN_FREE_CASH_USD: continue
                     od = place_order("buy", sym, qty_add)
                     if od:
+                        fee, fee_ccy = _fee_from_order(od)
                         print(f"PYRAMID + {sym}: +{qty_add:.8f} ~${notional:.2f}")
-                        append_tax({"ts":now_ts(),"side":"buy","symbol":sym,"qty":qty_add,"price":c,"notional":qty_add*c,"order_id":od.get('id')})
+                        append_tax({
+                            "ts": now_ts(),"event":"TRADE","side":"buy","symbol":sym,
+                            "qty":qty_add,"price":c,"notional":qty_add*c,"fee":fee,"fee_ccy":fee_ccy or BASE,
+                            "order_id": od.get('id'),"note":"PYRAMID"
+                        })
                         set_meta(sym, add_count=m.get("add_count",0)+1, last_add_px=c)
                         usd_free -= notional
                         positions[sym] = qty + qty_add
@@ -388,7 +419,12 @@ def run():
                 if not ok or notional < MIN_NOTIONAL_USD or (usd_free - notional) < MIN_FREE_CASH_USD: continue
                 od = place_order("buy", sym, qty)
                 if od:
-                    append_tax({"ts":now_ts(),"side":"buy","symbol":sym,"qty":qty,"price":c,"notional":qty*c,"order_id":od.get('id')})
+                    fee, fee_ccy = _fee_from_order(od)
+                    append_tax({
+                        "ts": now_ts(),"event":"TRADE","side":"buy","symbol":sym,
+                        "qty":qty,"price":c,"notional":qty*c,"fee":fee,"fee_ccy":fee_ccy or BASE,
+                        "order_id": od.get('id'),"note":"ENTRY"
+                    })
                     set_meta(sym, entry_ts=now_ts(), entry_px=c, last_add_px=c, add_count=0)
                     positions[sym] = positions.get(sym,0.0) + qty
                     usd_free -= notional
@@ -411,7 +447,9 @@ def run():
                 df = pd.read_csv(EQUITY_CSV)
                 if len(df)>=2: delta = float(df["equity"].iloc[-1]) - float(df["equity"].iloc[-2])
         except Exception: pass
-        pct = 0.0 if equity<=0 else 100.0* (delta / max(equity-delta, 1e-9))
+    # defensive to avoid div by zero
+        base = max(equity - delta, 1e-9)
+        pct = 100.0 * (delta / base)
         print(f"[equity] now=${equity:.2f} Δrun=${delta:+.2f} ({pct:+.2f}%) HWM=${hwm:.2f} DD={dd:.2f}%")
     print("=== END TRADING OUTPUT ===")
 
