@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-import os, time, json, math, re, sys, random, datetime
-from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+import os, sys, json, datetime
+from typing import Any, Dict, List, Tuple
 
 # =========================
 # Config via environment
@@ -12,9 +11,8 @@ DRY_RUN         = MODE != "live" or os.getenv("DRY_RUN", "false").lower() == "tr
 
 PER_TRADE_USD   = float(os.getenv("PER_TRADE_USD", "10"))
 DAILY_CAP_USD   = float(os.getenv("DAILY_CAP_USD", "25"))
-DROP_PCT        = float(os.getenv("DROP_PCT", "2.0"))
 
-# Percent-based exits (fallback / legacy)
+# Percent-based exits (fallback)
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "2.0"))
 TRAIL_ACTIVATE  = float(os.getenv("TRAILING_ACTIVATE_PCT", "1.0"))
 TRAIL_DELTA     = float(os.getenv("TRAILING_DELTA_PCT", "1.0"))
@@ -23,20 +21,19 @@ STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", "0"))
 # --- Adaptive exits (ATR) ---
 ATR_EXITS       = int(os.getenv("ATR_EXITS", "1"))               # 1 = use ATR exits; 0 = use % exits
 ATR_PERIOD      = int(os.getenv("ATR_PERIOD", "14"))
-ATR_TP_MULT     = float(os.getenv("ATR_TP_MULT", "1.5"))         # take-profit when move >= TP_MULT * ATR
-ATR_TRAIL_MULT  = float(os.getenv("ATR_TRAIL_MULT", "1.0"))      # trailing pullback >= TRAIL_MULT * ATR
-ATR_ACT_MULT    = float(os.getenv("ATR_ACT_MULT", "0.8"))        # start trailing after move >= ACT_MULT * ATR
-ATR_STOP_MULT   = float(os.getenv("ATR_STOP_MULT", "1.2"))       # stop losers when drawdown >= STOP_MULT * ATR
+ATR_TP_MULT     = float(os.getenv("ATR_TP_MULT", "1.5"))
+ATR_TRAIL_MULT  = float(os.getenv("ATR_TRAIL_MULT", "1.0"))
+ATR_ACT_MULT    = float(os.getenv("ATR_ACT_MULT", "0.8"))
+ATR_STOP_MULT   = float(os.getenv("ATR_STOP_MULT", "1.2"))
 
-# Entry filter (reduce random buys)
-ENTRY_GUARD       = int(os.getenv("ENTRY_GUARD", "1"))           # 1 = on
+# Entry guard
+ENTRY_GUARD       = int(os.getenv("ENTRY_GUARD", "1"))
 ENTRY_EMA_SHORT   = int(os.getenv("ENTRY_EMA_SHORT", "9"))
 ENTRY_EMA_LONG    = int(os.getenv("ENTRY_EMA_LONG", "21"))
 ENTRY_RSI_PERIOD  = int(os.getenv("ENTRY_RSI_PERIOD", "14"))
 ENTRY_RSI_MIN     = float(os.getenv("ENTRY_RSI_MIN", "50"))
 ENTRY_RSI_MAX     = float(os.getenv("ENTRY_RSI_MAX", "75"))
 
-# Candle timeframe for indicators (ccxt style: 1m, 5m, 15m, 1h, ...)
 TIMEFRAME       = os.getenv("TIMEFRAME", "5m")
 
 MAX_POSITIONS   = int(os.getenv("MAX_POSITIONS", "50"))
@@ -48,32 +45,35 @@ QUOTE           = os.getenv("QUOTE", "USD").upper()
 MARKET          = os.getenv("MARKET", "crypto").lower()
 SELL_DEBUG      = int(os.getenv("SELL_DEBUG", "0"))
 
-# NEW: Force-sell switch (one-time workflow)
+# Force-sell for the one-time workflow
 FORCE_SELL      = int(os.getenv("FORCE_SELL", "0"))              # 1 = sell all eligible holdings this run
 
-# ===== New risk/ops upgrades =====
-# fees/slippage safety (basis points: 1bp = 0.01%)
-FEE_BPS         = float(os.getenv("FEE_BPS", "20"))     # 0.20%
-SLIPPAGE_BPS    = float(os.getenv("SLIPPAGE_BPS", "10"))# 0.10%
-SAFETY_BPS      = float(os.getenv("SAFETY_BPS", "5"))   # 0.05%
+# fees/slippage (basis points)
+FEE_BPS         = float(os.getenv("FEE_BPS", "20"))
+SLIPPAGE_BPS    = float(os.getenv("SLIPPAGE_BPS", "10"))
+SAFETY_BPS      = float(os.getenv("SAFETY_BPS", "5"))
 
-# auto-compounding daily budget (bps of equity)
-EQUITY_SPEND_BPS      = float(os.getenv("EQUITY_SPEND_BPS", "0"))   # 0=off
-MIN_DAILY_USD         = float(os.getenv("MIN_DAILY_USD", "0"))
-MAX_DAILY_USD         = float(os.getenv("MAX_DAILY_USD", "1e9"))
+# auto-compounding budget (bps of equity)
+EQUITY_SPEND_BPS      = float(os.getenv("EQUITY_SPEND_BPS", "5"))   # 0=off
+MIN_DAILY_USD         = float(os.getenv("MIN_DAILY_USD", "10"))
+MAX_DAILY_USD         = float(os.getenv("MAX_DAILY_USD", "50"))
 
 # drawdown circuit breaker
-MAX_DRAWDOWN_PCT      = float(os.getenv("MAX_DRAWDOWN_PCT", "0"))   # 0=off
+MAX_DRAWDOWN_PCT      = float(os.getenv("MAX_DRAWDOWN_PCT", "15"))
 PAUSE_MINUTES_ON_TRIP = int(os.getenv("PAUSE_MINUTES_ON_TRIP", "480"))
 
+# dust control (skip importing unsellable crumbs)
+DUST_MIN_USD   = float(os.getenv("DUST_MIN_USD", "1.0"))
+
 STATE_DIR       = ".state"
+DATA_DIR        = "data"
 POSITIONS_FILE  = os.path.join(STATE_DIR, "positions.json")
 COOLDOWN_FILE   = os.path.join(STATE_DIR, "cooldown.json")
-
-# equity tracking state
-EQUITY_FILE     = os.path.join(STATE_DIR, "equity.json")
+EQUITY_FILE     = os.path.join(STATE_DIR, "equity.json")         # {last, max, paused_until}
+EQUITY_CSV      = os.path.join(DATA_DIR,  "equity_history.csv")  # timestamp, equity_usd
 
 os.makedirs(STATE_DIR, exist_ok=True)
+os.makedirs(DATA_DIR,  exist_ok=True)
 
 def _load_json(path, default):
     try:
@@ -89,49 +89,6 @@ def _save_json(path, obj):
 positions: Dict[str, Any] = _load_json(POSITIONS_FILE, {})
 cooldown: Dict[str, str]  = _load_json(COOLDOWN_FILE, {})
 equity_state: Dict[str, Any] = _load_json(EQUITY_FILE, {"max": 0.0, "last": 0.0, "paused_until": None})
-
-# ---------- Apply temporary Sell Tester overrides ----------
-def apply_temp_overrides():
-    """Map UI params from the Sell Tester workflow into runtime overrides.
-
-    Supported envs (all optional):
-      TEMP_TP_PCT, TEMP_TRAILING_ACTIVATE_PCT, TEMP_TRAILING_DELTA_PCT,
-      TEMP_STOP_LOSS_PCT, TEMP_ATR_STOP_MULT, SELL_DEBUG
-    """
-    global TAKE_PROFIT_PCT, TRAIL_ACTIVATE, TRAIL_DELTA, STOP_LOSS_PCT
-    global ATR_STOP_MULT, SELL_DEBUG
-
-    applied = {}
-
-    def _maybe_float(name):
-        v = os.getenv(name)
-        if v is None or str(v).strip() == "":
-            return None
-        try:
-            return float(v)
-        except Exception:
-            return None
-
-    m = _maybe_float("TEMP_TP_PCT")
-    if m is not None: TAKE_PROFIT_PCT = m; applied["TAKE_PROFIT_PCT"] = m
-    m = _maybe_float("TEMP_TRAILING_ACTIVATE_PCT")
-    if m is not None: TRAIL_ACTIVATE = m; applied["TRAIL_ACTIVATE"] = m
-    m = _maybe_float("TEMP_TRAILING_DELTA_PCT")
-    if m is not None: TRAIL_DELTA = m; applied["TRAIL_DELTA"] = m
-    m = _maybe_float("TEMP_STOP_LOSS_PCT")
-    if m is not None: STOP_LOSS_PCT = m; applied["STOP_LOSS_PCT"] = m
-    m = _maybe_float("TEMP_ATR_STOP_MULT")
-    if m is not None: ATR_STOP_MULT = m; applied["ATR_STOP_MULT"] = m
-
-    sd = os.getenv("SELL_DEBUG")
-    if sd is not None:
-        try:
-            SELL_DEBUG = int(sd); applied["SELL_DEBUG"] = SELL_DEBUG
-        except Exception:
-            pass
-
-    if applied:
-        print("[sellcfg] applied temp overrides → " + ", ".join(f"{k}={v}" for k,v in applied.items()))
 
 # ---------- Auto-heal ----------
 def _normalize_lot(x: Any):
@@ -150,19 +107,10 @@ def _normalize_lot(x: Any):
 def normalize_positions():
     changed = False
     if not isinstance(positions, dict):
-        print("WARN: positions.json invalid; resetting")
-        positions.clear()
-        _save_json(POSITIONS_FILE, positions)
-        return
+        positions.clear(); _save_json(POSITIONS_FILE, positions); return
     to_delete = []
     for sym, lots in list(positions.items()):
         new_lots: List[dict] = []
-        if isinstance(lots, str):
-            try:
-                lots = json.loads(lots); changed = True
-            except Exception:
-                print(f"WARN: positions[{sym}] non-JSON string; dropping")
-                to_delete.append(sym); continue
         if isinstance(lots, dict):
             lot = _normalize_lot(lots)
             if lot: new_lots = [lot]; changed = True
@@ -172,15 +120,11 @@ def normalize_positions():
                 if lot: new_lots.append(lot)
                 else: changed = True
         else:
-            print(f"WARN: positions[{sym}] unexpected type {type(lots)}; dropping")
-            to_delete.append(sym); continue
+            to_delete.append(sym)
         if new_lots: positions[sym] = new_lots
         else: to_delete.append(sym)
-    for sym in to_delete: positions.pop(sym, None)
-    if changed or to_delete:
-        print("NOTE: normalized positions.json")
-        _save_json(POSITIONS_FILE, positions)
-
+    for sym in set(to_delete): positions.pop(sym, None)
+    if changed or to_delete: _save_json(POSITIONS_FILE, positions)
 normalize_positions()
 
 # =========================
@@ -266,8 +210,7 @@ def atr(high: List[float], low: List[float], close: List[float], period: int) ->
         tr_list.append(tr)
         prev_close = close[i]
     atrs = []
-    if len(tr_list) < period:
-        return [0.0]*len(close)
+    if len(tr_list) < period: return [0.0]*len(close)
     first = sum(tr_list[:period]) / period
     atrs.append(first)
     for i in range(period, len(tr_list)):
@@ -280,8 +223,7 @@ _ohlcv_cache: Dict[Tuple[str,str,int], Tuple[List[float],List[float],List[float]
 
 def fetch_candles(sym: str, timeframe: str, limit: int=200) -> Tuple[List[float],List[float],List[float]]:
     key = (sym, timeframe, limit)
-    if key in _ohlcv_cache:
-        return _ohlcv_cache[key]
+    if key in _ohlcv_cache: return _ohlcv_cache[key]
     if not exchange or not getattr(exchange, "has", {}).get("fetchOHLCV", False):
         return [], [], []
     try:
@@ -354,14 +296,8 @@ except Exception as e:
     _ledger = None
     print(f"[warn] TaxLedger not available: {e}")
 
-def _maybe_tax_log_per_lot(sym: str, lots: List[dict], sell_px: float, order_id: Optional[str] = None):
+def _maybe_tax_log_per_lot(sym: str, lots: List[dict], sell_px: float, order_id: str | None):
     if DRY_RUN or _ledger is None:
-        if DRY_RUN and SELL_DEBUG:
-            try:
-                profit_preview = sum(max(0.0, (sell_px - float(l["cost"])) * float(l["qty"])) for l in lots)
-                print(f"[tax][dry] preview (not recorded) potential profit ~${profit_preview:.2f}")
-            except Exception:
-                pass
         return
     reserved_total = 0.0
     profit_total = 0.0
@@ -387,12 +323,10 @@ def _maybe_tax_log_per_lot(sym: str, lots: List[dict], sell_px: float, order_id:
             reserved_total += float(res.get("reserved_usd", 0.0))
         except Exception as e:
             print(f"[tax][error] lot-record failed for {sym}: {e}")
-    print(f"[tax] profit=${profit_total:.2f} reserved=${reserved_total:.2f} "
-          f"(rate={getattr(_ledger,'reserve_rate',0):.2f}+{getattr(_ledger,'state_rate',0):.2f}) "
-          f"→ {_ledger.ledger_path}")
+    print(f"[tax] profit=${profit_total:.2f} reserved=${reserved_total:.2f} → data/tax_ledger.csv")
 
 # =========================
-# Market sizing helpers (wallet/min size/precision)
+# Market sizing helpers
 # =========================
 def base_asset(sym: str) -> str:
     return sym.split("/")[0]
@@ -435,13 +369,12 @@ def round_qty(sym: str, qty: float) -> float:
     return qty
 
 # =========================
-# Order helpers
+# Orders
 # =========================
 def place_buy(sym, usd_amt):
     px = market_price(sym)
     if px <= 0: 
-        print(f"[buyerr] {sym}: bad price")
-        return False, 0.0, "bad_price"
+        print(f"[buyerr] {sym}: bad price"); return False, 0.0, "bad_price"
 
     qty = usd_amt / px
     min_qty = min_trade_qty(sym, px)
@@ -489,8 +422,6 @@ def place_sell(sym, qty, reason):
 
     if DRY_RUN:
         print(f"SELL {sym}: {reason} (DRY) qty={qty:.6f} ~${usd:.2f}")
-        _maybe_tax_log_per_lot(sym, lots_snapshot, px, order_id=None)
-        clear_sym(sym); mark_sold(sym)
         return True, usd, "dry"
 
     try:
@@ -505,14 +436,15 @@ def place_sell(sym, qty, reason):
         return False, 0.0, "err"
 
 # =========================
-# Wallet hydration (import live holdings for audit/sell)
+# Hydration (skip dust)
 # =========================
 def hydrate_positions_from_wallet() -> int:
-    """Import wallet totals as synthetic lots for any symbols not already tracked."""
+    """Import wallet totals as synthetic lots for any symbols not already tracked,
+    but skip dust below the exchange min-notional or DUST_MIN_USD."""
     if not exchange:
         return 0
     try:
-        bal = exchange.fetch_balance()  # includes total
+        bal = exchange.fetch_balance()
         totals = bal.get("total") or {}
     except Exception:
         return 0
@@ -525,29 +457,48 @@ def hydrate_positions_from_wallet() -> int:
             qty = 0.0
         if qty <= 0:
             continue
+
         sym = f"{base}/{QUOTE}"
         try:
             if sym not in exchange.markets:
                 continue
         except Exception:
             continue
+
+        px = market_price(sym) or 0.0
+        if px <= 0:
+            continue
+
+        # exchange min-notional
+        try:
+            min_qty = min_trade_qty(sym, px)
+            min_notional = (min_qty * px) if min_qty > 0 else 0.0
+        except Exception:
+            min_notional = 0.0
+
+        notional = qty * px
+        if notional < max(DUST_MIN_USD, min_notional):
+            # skip crumbs that can’t be sold anyway
+            continue
+
         if _lots(sym):
             continue
-        px = market_price(sym) or 0.0
+
         positions[sym] = [{
             "qty": qty,
-            "cost": px,  # unknown true basis; set to px so chg_pct starts ~0
+            "cost": px,  # baseline at hydration time
             "entry": datetime.datetime.utcnow().isoformat(),
             "_synthetic": True
         }]
         added += 1
+
     if added:
         _save_json(POSITIONS_FILE, positions)
         print(f"[audit] hydrated {added} symbols from wallet for evaluation")
     return added
 
 # =========================
-# Equity + budget helpers (new)
+# Equity + budget + summary
 # =========================
 def portfolio_equity() -> float:
     if not exchange: return 0.0
@@ -559,8 +510,7 @@ def portfolio_equity() -> float:
     eq = 0.0
     for asset, amt in (totals.items() if isinstance(totals, dict) else []):
         a = float(amt or 0.0)
-        if a <= 0:
-            continue
+        if a <= 0: continue
         if asset == QUOTE:
             eq += a
         else:
@@ -575,11 +525,19 @@ def portfolio_equity() -> float:
 def update_equity_stats():
     eq = portfolio_equity()
     m = max(float(equity_state.get("max", 0.0)), eq)
+    last = float(equity_state.get("last", 0.0))
     equity_state["last"] = eq
     equity_state["max"] = m
     _save_json(EQUITY_FILE, equity_state)
     dd = 100.0 * (m - eq) / m if m > 0 else 0.0
-    return eq, dd
+    # append to CSV
+    try:
+        with open(EQUITY_CSV, "a", encoding="utf-8") as f:
+            ts = datetime.datetime.utcnow().isoformat()
+            f.write(f"{ts},{eq:.6f}\n")
+    except Exception:
+        pass
+    return eq, last, dd, m
 
 def compute_daily_cap(base_cap: float) -> float:
     # honor active pause
@@ -592,7 +550,7 @@ def compute_daily_cap(base_cap: float) -> float:
         except Exception:
             equity_state["paused_until"] = None
 
-    eq, dd = update_equity_stats()
+    eq, _, dd, _ = update_equity_stats()
     if MAX_DRAWDOWN_PCT > 0 and dd >= MAX_DRAWDOWN_PCT:
         equity_state["paused_until"] = (datetime.datetime.utcnow()
             + datetime.timedelta(minutes=PAUSE_MINUTES_ON_TRIP)).isoformat()
@@ -606,6 +564,13 @@ def compute_daily_cap(base_cap: float) -> float:
         return cap
 
     return base_cap
+
+def print_equity_summary():
+    eq, last, dd, hi = update_equity_stats()
+    delta = eq - last
+    pct = (delta/last*100.0) if last > 0 else 0.0
+    print(f"[equity] now=${eq:.2f}  Δrun=${delta:.2f} ({pct:+.2f}%)  HWM=${hi:.2f}  DD={dd:.2f}%")
+    print(f"[equity] history → {EQUITY_CSV}")
 
 # =========================
 # Sell engine (ATR or %)
@@ -636,7 +601,6 @@ def evaluate_sells(force: bool = False):
             hi = px
         pullback = (hi - px) / hi * 100.0 if hi > 0 else 0.0
 
-        # --- Runtime market constraints for audit ---
         wallet_free = free_base_qty(sym)
         min_qty = min_trade_qty(sym, px)
         min_notional = (min_qty * px) if min_qty > 0 else 0.0
@@ -649,79 +613,60 @@ def evaluate_sells(force: bool = False):
             except Exception:
                 atrp = 0.0
 
-        origin = "wallet" if all(l.get("_synthetic") for l in valid) else "positions"
-
         if SELL_DEBUG:
             if ATR_EXITS and atrp > 0:
-                x_info = (f"ATR%={atrp:.3f}  TP>={ATR_TP_MULT:.2f}*ATR  "
-                          f"ACT>={ATR_ACT_MULT:.2f}*ATR  DELTA>={ATR_TRAIL_MULT:.2f}*ATR  "
-                          f"STOP>={ATR_STOP_MULT:.2f}*ATR")
+                x_info = (f"ATR%={atrp:.3f} TP>={ATR_TP_MULT:.2f}*ATR ACT>={ATR_ACT_MULT:.2f}*ATR "
+                          f"DELTA>={ATR_TRAIL_MULT:.2f}*ATR STOP>={ATR_STOP_MULT:.2f}*ATR")
             else:
-                x_info = (f"TP={TAKE_PROFIT_PCT:.2f}%  ACT={TRAIL_ACTIVATE:.2f}%  "
-                          f"DELTA={TRAIL_DELTA:.2f}%  SL={STOP_LOSS_PCT:.2f}%")
+                x_info = (f"TP={TAKE_PROFIT_PCT:.2f}% ACT={TRAIL_ACTIVATE:.2f}% "
+                          f"DELTA={TRAIL_DELTA:.2f}% SL={STOP_LOSS_PCT:.2f}%")
+            origin = "wallet" if all(l.get("_synthetic") for l in valid) else "positions"
             print(f"[AUDIT] {sym} src={origin} qty={qty:.8f} notional=${notional:.2f} "
-                  f"min_sell~${min_notional:.2f} wallet_base={wallet_free:.8f} "
-                  f"avg_cost={avg_cost:.8f} px={px:.8f} chg={chg_pct:.2f}% "
-                  f"hi={hi:.8f} pullback={pullback:.2f}%  {x_info}")
+                  f"min_sell~${min_notional:.2f} avg_cost={avg_cost:.8f} px={px:.8f} "
+                  f"chg={chg_pct:.2f}% hi={hi:.8f} pullback={pullback:.2f}%  {x_info}")
 
-        # --- minimum profit buffer to clear fees/slippage ---
-        fee_buffer_pct = (FEE_BPS + SLIPPAGE_BPS + SAFETY_BPS) / 100.0  # e.g., 35 bps = 0.35%
+        fee_buffer_pct = (FEE_BPS + SLIPPAGE_BPS + SAFETY_BPS) / 100.0
 
-        # ---------- FORCE SELL branch ----------
         if force:
             ok, usd, _ = place_sell(sym, qty, "FORCE_SELL")
             realized += usd if ok else 0.0
-            if SELL_DEBUG: print(f"[sellchk] -> FORCE_SELL attempted for {sym}")
             continue
 
-        # --- Normal Decisions ---
         if ATR_EXITS and atrp > 0:
             tp_thresh    = ATR_TP_MULT    * atrp
             act_thresh   = ATR_ACT_MULT   * atrp
             trail_thresh = ATR_TRAIL_MULT * atrp
             stop_thresh  = ATR_STOP_MULT  * atrp
-
-            # require at least fee buffer to TP
             effective_tp = max(tp_thresh, fee_buffer_pct)
 
             if chg_pct >= effective_tp:
                 ok, usd, _ = place_sell(sym, qty, f"ATR_TP eff~{effective_tp:.2f}%")
                 realized += usd if ok else 0.0
-                if SELL_DEBUG: print(f"[sellchk] -> ATR_TP fired for {sym}")
                 continue
 
             if chg_pct >= act_thresh and pullback >= trail_thresh:
                 ok, usd, _ = place_sell(sym, qty, f"ATR_TRAIL {ATR_TRAIL_MULT:.2f}*ATR (~{trail_thresh:.2f}%)")
                 realized += usd if ok else 0.0
-                if SELL_DEBUG: print(f"[sellchk] -> ATR_TRAIL fired for {sym}")
                 continue
 
             if chg_pct <= -stop_thresh:
                 ok, usd, _ = place_sell(sym, qty, f"ATR_STOP {ATR_STOP_MULT:.2f}*ATR (~{stop_thresh:.2f}%)")
                 realized += usd if ok else 0.0
-                if SELL_DEBUG: print(f"[sellchk] -> ATR_STOP fired for {sym}")
                 continue
 
         else:
-            # Percent-mode TP must clear fee buffer
             effective_pct = max(TAKE_PROFIT_PCT, fee_buffer_pct)
-
             if TAKE_PROFIT_PCT > 0 and chg_pct >= effective_pct:
                 ok, usd, _ = place_sell(sym, qty, f"TAKE_PROFIT eff~{effective_pct:.2f}%")
                 realized += usd if ok else 0.0
-                if SELL_DEBUG: print(f"[sellchk] -> TAKE_PROFIT fired for {sym}")
                 continue
-
             if TRAIL_ACTIVATE > 0 and chg_pct >= TRAIL_ACTIVATE and pullback >= TRAIL_DELTA:
                 ok, usd, _ = place_sell(sym, qty, f"TRAIL_STOP {TRAIL_DELTA:.2f}% from peak")
                 realized += usd if ok else 0.0
-                if SELL_DEBUG: print(f"[sellchk] -> TRAIL_STOP fired for {sym}")
                 continue
-
             if STOP_LOSS_PCT > 0 and chg_pct <= -abs(STOP_LOSS_PCT):
                 ok, usd, _ = place_sell(sym, qty, f"STOP_LOSS {STOP_LOSS_PCT:.2f}%")
                 realized += usd if ok else 0.0
-                if SELL_DEBUG: print(f"[sellchk] -> STOP_LOSS fired for {sym}")
                 continue
 
     if realized > 0:
@@ -729,7 +674,7 @@ def evaluate_sells(force: bool = False):
     return realized
 
 # =========================
-# Buy engine (with guards)
+# Buy engine
 # =========================
 def entry_ok(sym: str, price: float) -> Tuple[bool, str]:
     if not ENTRY_GUARD:
@@ -754,7 +699,7 @@ def can_buy(sym, price, free_usd):
     return True, "ok"
 
 # =========================
-# Auto-universe
+# Universe
 # =========================
 def autopick_universe(limit=AUTO_UNIV_COUNT):
     symbols = list_tradeable_pairs()
@@ -772,18 +717,15 @@ def autopick_universe(limit=AUTO_UNIV_COUNT):
     return pick
 
 # =========================
-# Main cycle
+# Main
 # =========================
 def run_cycle():
     print("=== START TRADING OUTPUT ===")
     print(f"Python {sys.version.split()[0]}")
 
-    apply_temp_overrides()
-    hydrate_positions_from_wallet()  # import wallet holdings so sells can see them
+    hydrate_positions_from_wallet()
 
-    # Use FORCE_SELL when requested (one-time workflow)
     if FORCE_SELL:
-        if SELL_DEBUG: print("[force] FORCE_SELL=1 → selling all eligible holdings this run")
         evaluate_sells(force=True)
     else:
         evaluate_sells(force=False)
@@ -793,7 +735,6 @@ def run_cycle():
     free_usd = get_free_usd()
     print(f"FREE_USD: ${free_usd:.2f}")
 
-    # auto-compounding + drawdown-aware daily cap
     budget = min(compute_daily_cap(DAILY_CAP_USD), free_usd)
     buys_this_run = 0.0
 
@@ -813,6 +754,7 @@ def run_cycle():
             budget -= PER_TRADE_USD
 
     print(f"Budget left after buys: ${budget:.2f}")
+    print_equity_summary()
     print("=== END TRADING OUTPUT ===")
     return buys_this_run
 
