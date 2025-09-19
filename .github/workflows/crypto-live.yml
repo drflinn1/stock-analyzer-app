@@ -36,6 +36,7 @@ jobs:
           path: |
             .state
             data/tax_ledger.csv
+            data/equity_history.csv
           key: state-main-v1
 
       - name: Env (live trading)
@@ -46,27 +47,29 @@ jobs:
           echo "MARKET=crypto" >> $GITHUB_ENV
           echo "QUOTE=USD" >> $GITHUB_ENV
           echo "SELL_DEBUG=0" >> $GITHUB_ENV
-          echo "FORCE_SELL=0" >> $GITHUB_ENV    # keep OFF in live
-          echo "DUST_MIN_USD=1" >> $GITHUB_ENV
+          echo "FORCE_SELL=0" >> $GITHUB_ENV
 
           # ----- Buying controls -----
           echo "PER_TRADE_USD=10" >> $GITHUB_ENV
-          echo "DAILY_CAP_USD=25" >> $GITHUB_ENV         # used if EQUITY_SPEND_BPS=0
+          echo "DAILY_CAP_USD=25" >> $GITHUB_ENV
           echo "AUTO_UNIVERSE_COUNT=500" >> $GITHUB_ENV
 
-          # ----- Auto-compounding budget & drawdown circuit breaker -----
-          echo "EQUITY_SPEND_BPS=5" >> $GITHUB_ENV       # spend 0.05% of equity/day; 0=off
+          # ----- Auto-compounding & circuit breaker -----
+          echo "EQUITY_SPEND_BPS=5" >> $GITHUB_ENV
           echo "MIN_DAILY_USD=10" >> $GITHUB_ENV
           echo "MAX_DAILY_USD=50" >> $GITHUB_ENV
-          echo "MAX_DRAWDOWN_PCT=15" >> $GITHUB_ENV      # pause buys if DD >= 15%
+          echo "MAX_DRAWDOWN_PCT=15" >> $GITHUB_ENV
           echo "PAUSE_MINUTES_ON_TRIP=480" >> $GITHUB_ENV
 
-          # ----- Fees/slippage buffer for smarter TP -----
-          echo "FEE_BPS=20" >> $GITHUB_ENV               # 0.20%
-          echo "SLIPPAGE_BPS=10" >> $GITHUB_ENV          # 0.10%
-          echo "SAFETY_BPS=5" >> $GITHUB_ENV             # 0.05%
+          # ----- Fees buffer -----
+          echo "FEE_BPS=20" >> $GITHUB_ENV
+          echo "SLIPPAGE_BPS=10" >> $GITHUB_ENV
+          echo "SAFETY_BPS=5" >> $GITHUB_ENV
 
-          # ----- ATR exits (primary) -----
+          # ----- Dust (don’t import crumbs) -----
+          echo "DUST_MIN_USD=1" >> $GITHUB_ENV
+
+          # ----- ATR exits -----
           echo "ATR_EXITS=1" >> $GITHUB_ENV
           echo "ATR_PERIOD=14" >> $GITHUB_ENV
           echo "ATR_TP_MULT=1.5" >> $GITHUB_ENV
@@ -74,7 +77,7 @@ jobs:
           echo "ATR_TRAIL_MULT=1.0" >> $GITHUB_ENV
           echo "ATR_STOP_MULT=1.2" >> $GITHUB_ENV
 
-          # ----- % exits fallback (unused while ATR_EXITS=1) -----
+          # ----- % exits fallback -----
           echo "TAKE_PROFIT_PCT=0.5" >> $GITHUB_ENV
           echo "TRAILING_ACTIVATE_PCT=0.4" >> $GITHUB_ENV
           echo "TRAILING_DELTA_PCT=0.2" >> $GITHUB_ENV
@@ -96,4 +99,14 @@ jobs:
           path: |
             .state
             data/tax_ledger.csv
+            data/equity_history.csv
           key: state-main-v1
+
+      - name: Upload reports (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trading-reports
+          path: |
+            data/tax_ledger.csv
+            data/equity_history.csv
