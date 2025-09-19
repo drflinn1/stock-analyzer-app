@@ -1,8 +1,7 @@
 # SELL-ONLY Dust Sweeper for Kraken via ccxt
-# - Tries BOTH USD and USDT quotes; picks the one with the LOWER min requirements
-# - Sells tiny balances ("dust") only when that market meets amount/cost mins
-# - Never buys. Safe to run every schedule (pre & post)
-import os, time, pathlib
+# - Tries USD or USDT quote (lower min wins)
+# - Writes DUST_SELL rows into data/tax_ledger.csv (so exports include them)
+import os, time, pathlib, csv
 from typing import Dict, Tuple, Optional
 import ccxt
 
@@ -11,6 +10,8 @@ def env_f(k, d=0.0):  return float(os.environ.get(k, d))
 def env_b(k, d="false"): return os.environ.get(k, d).lower() == "true"
 
 DATA_DIR = pathlib.Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
+LEDGER = DATA_DIR / "tax_ledger.csv"
+TAX_FIELDS = ["ts","event","side","symbol","qty","price","notional","fee","fee_ccy","order_id","note"]
 LOG = print
 
 # ---- env ----
@@ -19,8 +20,8 @@ EXCHANGE = env_str("EXCHANGE","kraken")
 BASE = env_str("BASE_CCY","USD")
 
 DUST_ENABLED = env_b("DUST_SWEEP_ENABLED","true")
-DUST_TRIGGER = env_f("DUST_SWEEP_USD_TRIGGER", 1.0)    # <— lowered default
-DUST_MAX_USD = env_f("DUST_MAX_NOTIONAL_USD", 20.0)     # <— broaden default
+DUST_TRIGGER = env_f("DUST_SWEEP_USD_TRIGGER", 1.0)
+DUST_MAX_USD = env_f("DUST_MAX_NOTIONAL_USD", 20.0)
 DUST_SKIP = {s.strip().upper() for s in env_str("DUST_SKIP_ASSETS","USD,USDT,USDC").split(",") if s.strip()}
 
 if not DUST_ENABLED:
@@ -34,7 +35,6 @@ def make_exchange():
             "enableRateLimit": True,
         })
     raise RuntimeError("Only Kraken wired.")
-
 ex = make_exchange()
 MARKETS = ex.load_markets()
 
@@ -53,8 +53,25 @@ def best_pair_with_lowest_min(asset: str) -> Optional[str]:
             candidates.append((cost_min, amt_min, s))
     if not candidates:
         return None
-    candidates.sort(key=lambda x: (x[0], x[1]))  # prefer lowest cost_min, then amt_min
+    candidates.sort(key=lambda x: (x[0], x[1]))
     return candidates[0][2]
+
+def append_tax(row: Dict):
+    write_header = not LEDGER.exists()
+    with LEDGER.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=TAX_FIELDS)
+        if write_header: w.writeheader()
+        w.writerow(row)
+
+def _fee_from_order(od):
+    fee = 0.0; fee_ccy = None
+    f = (od or {}).get("fee")
+    if f:
+        fee = float(f.get("cost") or 0); fee_ccy = f.get("currency")
+    fl = (od or {}).get("fees") or []
+    if fl and fee == 0 and isinstance(fl, list):
+        fee = float(fl[0].get("cost") or 0); fee_ccy = fl[0].get("currency")
+    return fee, fee_ccy
 
 def fetch_positions() -> Dict[str,dict]:
     bal = ex.fetch_balance()
@@ -78,7 +95,7 @@ def fetch_positions() -> Dict[str,dict]:
 
 def create_sell(symbol, qty):
     if DRY:
-        return {"id":"DRY", "symbol":symbol, "side":"sell", "qty":qty}
+        return {"id":"DRY", "symbol":symbol, "side":"sell", "qty":qty, "average": None, "cost": None, "filled": qty}
     try:
         return ex.create_market_sell_order(symbol, qty)
     except Exception as e:
@@ -91,7 +108,6 @@ def main():
     if not positions:
         LOG("[dust] no positions found"); return
 
-    # classify dust
     dust = {sym:info for sym,info in positions.items() if info["usd"] <= DUST_MAX_USD}
     total_dust = sum(info["usd"] for info in dust.values())
     LOG(f"[dust] candidates={len(dust)} total_dust=${total_dust:.2f} (trigger=${DUST_TRIGGER:.2f})")
@@ -109,6 +125,21 @@ def main():
             skipped += 1; continue
         od = create_sell(sym, qty)
         if od:
+            avg = od.get("average") or ( (od.get("cost") or 0.0) / (od.get("filled") or qty or 1.0) ) or px
+            fee, fee_ccy = _fee_from_order(od)
+            append_tax({
+                "ts": int(time.time()),
+                "event": "DUST_SELL",
+                "side": "sell",
+                "symbol": sym,
+                "qty": qty,
+                "price": float(avg),
+                "notional": float(avg) * qty,
+                "fee": float(fee),
+                "fee_ccy": fee_ccy or BASE,
+                "order_id": od.get("id"),
+                "note": "DUST"
+            })
             LOG(f"[dustsell] {sym} qty={qty:.8g} ~${usd:.2f} (min_cost={min_cost}) id={od.get('id')}")
             sold += 1
         else:
