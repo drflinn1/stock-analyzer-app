@@ -1,9 +1,8 @@
 # SELL-ONLY Dust Sweeper for Kraken via ccxt
 # - Sells tiny balances ("dust") when they are individually sellable
 # - Respects exchange min amount and min notional per market
-# - Never buys. Safe to run every schedule before main.py
-
-import os, time, json, pathlib, datetime as dt
+# - Never buys. Safe to run every schedule (pre & post)
+import os, time, pathlib
 from typing import Dict, Tuple
 import ccxt
 
@@ -25,8 +24,7 @@ DUST_MAX_USD = env_f("DUST_MAX_NOTIONAL_USD", 12.0)   # classify positions <= th
 DUST_SKIP = {s.strip().upper() for s in env_str("DUST_SKIP_ASSETS","USD,USDT,USDC").split(",") if s.strip()}
 
 if not DUST_ENABLED:
-    LOG("[dust] disabled; skipping")
-    raise SystemExit(0)
+    LOG("[dust] disabled; skipping"); raise SystemExit(0)
 
 def make_exchange():
     if EXCHANGE.lower()=="kraken":
@@ -41,7 +39,6 @@ ex = make_exchange()
 MARKETS = ex.load_markets()
 
 def best_symbol_for_asset(asset: str) -> str | None:
-    # Prefer BASE (USD), fallback USDT
     for q in (BASE, "USDT"):
         s = f"{asset}/{q}"
         if s in MARKETS:
@@ -54,11 +51,10 @@ def market_limits(symbol: str) -> Tuple[float,float]:
     cost_min = float(((m.get("limits") or {}).get("cost") or {}).get("min") or 0)
     return max(0.0, amt_min), max(0.0, cost_min)
 
-def fetch_equity_snapshot():
+def fetch_positions() -> Dict[str,dict]:
     bal = ex.fetch_balance()
     total = bal.get("total",{})
     positions = {}
-    usd_equity = float(total.get(BASE,0) or 0)
     for asset, qty in total.items():
         if asset.upper() in DUST_SKIP or asset.upper()==BASE.upper(): continue
         q = float(qty or 0.0)
@@ -69,10 +65,8 @@ def fetch_equity_snapshot():
             px = float(ex.fetch_ticker(sym)["last"])
         except Exception:
             continue
-        notional = q * px
-        positions[sym] = {"asset":asset,"qty":q,"price":px,"usd":notional}
-        usd_equity += notional
-    return positions, usd_equity
+        positions[sym] = {"asset":asset,"qty":q,"price":px,"usd":q*px}
+    return positions
 
 def create_sell(symbol, qty):
     if DRY:
@@ -85,7 +79,7 @@ def create_sell(symbol, qty):
 
 def main():
     LOG("[dust] starting sweep (SELLS ONLY)")
-    positions, _ = fetch_equity_snapshot()
+    positions = fetch_positions()
     if not positions:
         LOG("[dust] no positions found"); return
 
@@ -97,7 +91,6 @@ def main():
     if total_dust < DUST_TRIGGER:
         LOG("[dust] under trigger; skip entire sweep"); return
 
-    # attempt to sell each dust position if above exchange min
     sold = 0; skipped = 0
     for sym, info in sorted(dust.items(), key=lambda kv: kv[1]["usd"], reverse=True):
         amt_min, cost_min = market_limits(sym)
@@ -105,8 +98,7 @@ def main():
         min_cost = max(cost_min, 0.0)
         if qty < max(amt_min, 0.0) or usd < min_cost:
             LOG(f"[dustskip] {sym} qty={qty:.8g} ${usd:.2f} < min (amount>={amt_min} cost>={min_cost})")
-            skipped += 1
-            continue
+            skipped += 1; continue
         od = create_sell(sym, qty)
         if od:
             LOG(f"[dustsell] {sym} qty={qty:.8g} ~${usd:.2f} (min_cost={min_cost}) id={od.get('id')}")
