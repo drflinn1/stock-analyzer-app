@@ -1,14 +1,13 @@
-name: Crypto Live (Every 15 min — AGGRESSIVE)
+name: Crypto Live (Every 15 min — CONCENTRATED + PYRAMID)
 
 on:
   workflow_dispatch:
   schedule:
-    # Every 15 minutes
     - cron: "*/15 * * * *"
 
 concurrency:
-  group: crypto-live-aggressive
-  cancel-in-progress: true   # <— changed to prevent overlapping runs
+  group: crypto-live-concentrated
+  cancel-in-progress: true
 
 jobs:
   trade:
@@ -16,21 +15,22 @@ jobs:
     timeout-minutes: 25
 
     env:
-      # ===== Core run mode =====
+      # ===== Core =====
       MODE: "live"
-      DRY_RUN: "false"                  # real orders
+      DRY_RUN: "false"
       EXCHANGE: "kraken"
       BASE_CCY: "USD"
 
-      # ===== Universe (auto + ranking) =====
+      # ===== Universe & Ranking (concentrated) =====
       AUTO_UNIVERSE: "true"
-      UNIVERSE_TOP_N: "20"
-      MIN_LIQ_USD_24H: "200000"
+      UNIVERSE_TOP_N: "6"            # score all, shortlist top 6
+      MAX_CONCURRENT_POS: "5"        # but only hold up to 5
+      MIN_LIQ_USD_24H: "1000000"     # >= $1M 24h volume
       MOMENTUM_LOOKBACK_H: "24"
       MIN_PRICE_USD: "0.01"
       MIN_NOTIONAL_USD: "5"
 
-      # ===== Multi-timeframe confirmation =====
+      # ===== Multi-timeframe trend filter =====
       TF_FAST: "15m"
       TF_SLOW: "1h"
       EMA_SHORT: "20"
@@ -39,27 +39,37 @@ jobs:
       RSI_BUY: "55"
       RSI_SELL: "45"
 
-      # ===== Volatility-scaled position sizing =====
+      # ===== Volatility-scaled sizing (spicier) =====
       ATR_LEN: "14"
-      RISK_PER_TRADE_PCT: "1.0"
-      PER_TRADE_USD_CAP: "40"
-      MAX_TRADES_PER_RUN: "10"
-      MAX_CONCURRENT_POS: "16"
-      PORTFOLIO_MAX_EXPOSURE_PCT: "80"
+      RISK_PER_TRADE_PCT: "1.6"
+      PER_TRADE_USD_CAP: "75"
+      MAX_TRADES_PER_RUN: "6"
+      PORTFOLIO_MAX_EXPOSURE_PCT: "90"
 
-      # ===== Exits: ATR TP + trailing + SL =====
-      ATR_MULTIPLIER_TP: "1.2"
-      ATR_MULTIPLIER_TS: "1.6"
-      ATR_MULTIPLIER_SL: "2.4"
-      TRAIL_ACTIVATE_AT_TP_FRAC: "0.6"
+      # ===== Exits (faster recycle) =====
+      ATR_MULTIPLIER_TP: "1.0"
+      ATR_MULTIPLIER_TS: "1.4"
+      ATR_MULTIPLIER_SL: "2.0"
+      TRAIL_ACTIVATE_AT_TP_FRAC: "0.5"
+
+      # ===== Stale position logic =====
+      STALE_MAX_HOURS: "48"          # hard time stop: >48h -> exit
+      STALE_RSI_MAX_BARS: "6"        # OR RSI<45 for 6 consecutive fast bars -> exit
+      STALE_MIN_GAIN_PCT: "-3"       # also dump if drawdown worse than -3% and no momentum
+
+      # ===== Pyramiding winners =====
+      PYRAMID_ENABLED: "true"
+      PYRAMID_MAX_ADDS: "2"          # add up to 2 times
+      PYRAMID_ADD_AT_GAIN_PCT: "2.0" # each add triggers at +2% from last add/entry
+      PYRAMID_STEP_ATR: "0.75"       # size each add so ATR risk ~ 0.75x base risk
 
       # ===== Budget rails =====
-      DAILY_CAP_USD: "200"
-      MIN_FREE_CASH_USD: "25"
+      DAILY_CAP_USD: "300"
+      MIN_FREE_CASH_USD: "15"
       SLIPPAGE_PCT: "0.10"
 
-      # ===== Drawdown circuit breaker =====
-      DRAWDOWN_PCT_TRIP: "12"
+      # ===== Circuit breaker =====
+      DRAWDOWN_PCT_TRIP: "15"
       DRAWDOWN_COOLDOWN_RUNS: "8"
 
       # ===== Telemetry =====
@@ -67,7 +77,7 @@ jobs:
       WRITE_EQUITY_CSV: "true"
       PRINT_EQUITY_ONE_LINER: "true"
 
-      # ===== Exchange creds =====
+      # ===== Secrets =====
       KRAKEN_API_KEY: "${{ secrets.KRAKEN_API_KEY }}"
       KRAKEN_API_SECRET: "${{ secrets.KRAKEN_API_SECRET }}"
 
@@ -87,48 +97,7 @@ jobs:
 
       - name: Run trader
         id: run_trader
-        env:
-          DRY_RUN: ${{ env.DRY_RUN }}
-          EXCHANGE: ${{ env.EXCHANGE }}
-          BASE_CCY: ${{ env.BASE_CCY }}
-
-          AUTO_UNIVERSE: ${{ env.AUTO_UNIVERSE }}
-          UNIVERSE_TOP_N: ${{ env.UNIVERSE_TOP_N }}
-          MIN_LIQ_USD_24H: ${{ env.MIN_LIQ_USD_24H }}
-          MOMENTUM_LOOKBACK_H: ${{ env.MOMENTUM_LOOKBACK_H }}
-          MIN_PRICE_USD: ${{ env.MIN_PRICE_USD }}
-          MIN_NOTIONAL_USD: ${{ env.MIN_NOTIONAL_USD }}
-
-          TF_FAST: ${{ env.TF_FAST }}
-          TF_SLOW: ${{ env.TF_SLOW }}
-          EMA_SHORT: ${{ env.EMA_SHORT }}
-          EMA_LONG: ${{ env.EMA_LONG }}
-          RSI_LEN: ${{ env.RSI_LEN }}
-          RSI_BUY: ${{ env.RSI_BUY }}
-          RSI_SELL: ${{ env.RSI_SELL }}
-
-          ATR_LEN: ${{ env.ATR_LEN }}
-          RISK_PER_TRADE_PCT: ${{ env.RISK_PER_TRADE_PCT }}
-          PER_TRADE_USD_CAP: ${{ env.PER_TRADE_USD_CAP }}
-          MAX_TRADES_PER_RUN: ${{ env.MAX_TRADES_PER_RUN }}
-          MAX_CONCURRENT_POS: ${{ env.MAX_CONCURRENT_POS }}
-          PORTFOLIO_MAX_EXPOSURE_PCT: ${{ env.PORTFOLIO_MAX_EXPOSURE_PCT }}
-
-          ATR_MULTIPLIER_TP: ${{ env.ATR_MULTIPLIER_TP }}
-          ATR_MULTIPLIER_TS: ${{ env.ATR_MULTIPLIER_TS }}
-          ATR_MULTIPLIER_SL: ${{ env.ATR_MULTIPLIER_SL }}
-          TRAIL_ACTIVATE_AT_TP_FRAC: ${{ env.TRAIL_ACTIVATE_AT_TP_FRAC }}
-
-          DAILY_CAP_USD: ${{ env.DAILY_CAP_USD }}
-          MIN_FREE_CASH_USD: ${{ env.MIN_FREE_CASH_USD }}
-          SLIPPAGE_PCT: ${{ env.SLIPPAGE_PCT }}
-
-          DRAWDOWN_PCT_TRIP: ${{ env.DRAWDOWN_PCT_TRIP }}
-          DRAWDOWN_COOLDOWN_RUNS: ${{ env.DRAWDOWN_COOLDOWN_RUNS }}
-
-          LOG_LEVEL: ${{ env.LOG_LEVEL }}
-          WRITE_EQUITY_CSV: ${{ env.WRITE_EQUITY_CSV }}
-          PRINT_EQUITY_ONE_LINER: ${{ env.PRINT_EQUITY_ONE_LINER }}
+        env: ${{ env }}
         run: |
           python -u main.py
 
