@@ -1,4 +1,4 @@
-name: Crypto Live (Every 15 min — CONCENTRATED + PYRAMID)
+name: Crypto Live (Every 15 min — CONCENTRATED + PYRAMID + SWEEP)
 
 on:
   workflow_dispatch:
@@ -53,15 +53,22 @@ jobs:
       TRAIL_ACTIVATE_AT_TP_FRAC: "0.5"
 
       # ===== Stale position logic =====
-      STALE_MAX_HOURS: "48"          # hard time stop: >48h -> exit
-      STALE_RSI_MAX_BARS: "6"        # OR RSI<45 for 6 consecutive fast bars -> exit
-      STALE_MIN_GAIN_PCT: "-3"       # also dump if drawdown worse than -3% and no momentum
+      STALE_MAX_HOURS: "48"
+      STALE_RSI_MAX_BARS: "6"
+      STALE_MIN_GAIN_PCT: "-3"
 
       # ===== Pyramiding winners =====
       PYRAMID_ENABLED: "true"
-      PYRAMID_MAX_ADDS: "2"          # add up to 2 times
-      PYRAMID_ADD_AT_GAIN_PCT: "2.0" # each add triggers at +2% from last add/entry
-      PYRAMID_STEP_ATR: "0.75"       # size each add so ATR risk ~ 0.75x base risk
+      PYRAMID_MAX_ADDS: "2"
+      PYRAMID_ADD_AT_GAIN_PCT: "2.0"
+      PYRAMID_STEP_ATR: "0.75"
+
+      # ===== Dust Sweeper (SELLS ONLY) =====
+      DUST_SWEEP_ENABLED: "true"
+      DUST_SWEEP_USD_TRIGGER: "15"     # run sweep only if total 'dust' >= $15
+      DUST_MAX_NOTIONAL_USD: "12"      # a position <= this is considered dust
+      DUST_SKIP_ASSETS: "USD,USDT,USDC" # never touch these
+      # (sweeper also checks exchange min amount / min notional per market)
 
       # ===== Budget rails =====
       DAILY_CAP_USD: "300"
@@ -95,9 +102,11 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install ccxt pandas numpy ta; fi
 
+      - name: Dust Sweep (pre-run, sells only)
+        run: |
+          python -u tools/dust_sweeper.py
+
       - name: Run trader
-        id: run_trader
-        env: ${{ env }}
         run: |
           python -u main.py
 
