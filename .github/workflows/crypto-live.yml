@@ -1,4 +1,4 @@
-name: Crypto Live (Every 15 min - CONCENTRATED + PYRAMID + SWEEP)
+name: Crypto Live (Every 15 min - CONCENTRATED + PYRAMID + SWEEP + TAX)
 
 on:
   workflow_dispatch:
@@ -36,24 +36,24 @@ jobs:
       EMA_SHORT: "20"
       EMA_LONG: "50"
       RSI_LEN: "14"
-      RSI_BUY: "55"
+      RSI_BUY: "60"                  # tighter entry while market is weak (REMEMBER to revert to 55)
       RSI_SELL: "45"
 
-      # ===== Volatility-scaled sizing (spicier) =====
+      # ===== Volatility-scaled sizing =====
       ATR_LEN: "14"
       RISK_PER_TRADE_PCT: "1.6"
       PER_TRADE_USD_CAP: "75"
       MAX_TRADES_PER_RUN: "6"
-      PORTFOLIO_MAX_EXPOSURE_PCT: "90"
+      PORTFOLIO_MAX_EXPOSURE_PCT: "75"      # cap while choppy (REMEMBER to revert to 90)
 
       # ===== Exits (faster recycle) =====
       ATR_MULTIPLIER_TP: "1.0"
       ATR_MULTIPLIER_TS: "1.4"
-      ATR_MULTIPLIER_SL: "2.0"
+      ATR_MULTIPLIER_SL: "1.8"              # slightly tighter stop (REMEMBER to revert to 2.0)
       TRAIL_ACTIVATE_AT_TP_FRAC: "0.5"
 
       # ===== Stale position logic =====
-      STALE_MAX_HOURS: "48"
+      STALE_MAX_HOURS: "24"                 # recycle capital faster (REMEMBER to revert to 48)
       STALE_RSI_MAX_BARS: "6"
       STALE_MIN_GAIN_PCT: "-3"
 
@@ -65,8 +65,8 @@ jobs:
 
       # ===== Dust Sweeper (SELLS ONLY) =====
       DUST_SWEEP_ENABLED: "true"
-      DUST_SWEEP_USD_TRIGGER: "1"     # sweep as soon as total dust >= $1
-      DUST_MAX_NOTIONAL_USD: "20"     # treat positions <= $20 as dust
+      DUST_SWEEP_USD_TRIGGER: "1"      # sweep as soon as total dust >= $1
+      DUST_MAX_NOTIONAL_USD: "20"      # treat positions <= $20 as dust
       DUST_SKIP_ASSETS: "USD,USDT,USDC"
 
       # ===== Budget rails =====
@@ -134,10 +134,24 @@ jobs:
             echo "[dust] tools/dust_sweeper.py missing - skipping post-run sweep"
           fi
 
-      - name: Upload equity history (artifact)
+      - name: Tax export (FIFO 8949)
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          if [[ -f tools/tax_export.py ]]; then
+            python -u tools/tax_export.py
+          else
+            echo "[tax] tools/tax_export.py missing - skipping tax export"
+          fi
+
+      - name: Upload artifacts (equity + tax)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: equity_history
-          path: data/equity_history.csv
+          name: run_artifacts
+          path: |
+            data/equity_history.csv
+            data/tax_8949.csv
+            data/tax_summary.json
           if-no-files-found: ignore
