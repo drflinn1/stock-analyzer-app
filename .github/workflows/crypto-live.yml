@@ -8,7 +8,7 @@ on:
 
 concurrency:
   group: crypto-live-aggressive
-  cancel-in-progress: false
+  cancel-in-progress: true   # <— changed to prevent overlapping runs
 
 jobs:
   trade:
@@ -23,56 +23,51 @@ jobs:
       BASE_CCY: "USD"
 
       # ===== Universe (auto + ranking) =====
-      AUTO_UNIVERSE: "true"             # scan exchange for USD/USDT spot pairs
-      UNIVERSE_TOP_N: "20"              # take strongest top-N after ranking
-      MIN_LIQ_USD_24H: "200000"         # drop illiquid tickers
-      MOMENTUM_LOOKBACK_H: "24"         # recent momentum window (hours)
-      MIN_PRICE_USD: "0.01"             # skip dust
-      MIN_NOTIONAL_USD: "5"             # exchange min order size guard
+      AUTO_UNIVERSE: "true"
+      UNIVERSE_TOP_N: "20"
+      MIN_LIQ_USD_24H: "200000"
+      MOMENTUM_LOOKBACK_H: "24"
+      MIN_PRICE_USD: "0.01"
+      MIN_NOTIONAL_USD: "5"
 
-      # ===== Multi-timeframe confirmation (pro-style) =====
-      # Trade only when 15m trend agrees with 1h trend (filters chop, keeps strong moves)
+      # ===== Multi-timeframe confirmation =====
       TF_FAST: "15m"
       TF_SLOW: "1h"
       EMA_SHORT: "20"
       EMA_LONG: "50"
       RSI_LEN: "14"
-      RSI_BUY: "55"                     # aggressive: require mild strength to buy
+      RSI_BUY: "55"
       RSI_SELL: "45"
 
-      # ===== Volatility-scaled position sizing (ATR-based) =====
+      # ===== Volatility-scaled position sizing =====
       ATR_LEN: "14"
-      # Target risk per trade as % of equity. Position size computed as:
-      # size_notional = min(PER_TRADE_USD_CAP, risk_pct * equity / ATR_units_of_risk)
-      RISK_PER_TRADE_PCT: "1.0"         # 1% of equity risk per trade (aggressive)
-      PER_TRADE_USD_CAP: "40"           # ceiling per trade (still caps outliers)
-      MAX_TRADES_PER_RUN: "10"          # aggressive fan-out per scan
-      MAX_CONCURRENT_POS: "16"          # allow many small, diversified positions
-      PORTFOLIO_MAX_EXPOSURE_PCT: "80"  # cap total notional exposure vs equity
+      RISK_PER_TRADE_PCT: "1.0"
+      PER_TRADE_USD_CAP: "40"
+      MAX_TRADES_PER_RUN: "10"
+      MAX_CONCURRENT_POS: "16"
+      PORTFOLIO_MAX_EXPOSURE_PCT: "80"
 
-      # ===== Exits: ATR take-profit + trailing stop + fail-safe stop =====
-      # Tighter multipliers -> faster profit taking and higher churn (snowball bias)
-      ATR_MULTIPLIER_TP: "1.2"          # realize quicker gains to recycle capital
-      ATR_MULTIPLIER_TS: "1.6"          # trail winners reasonably close
-      ATR_MULTIPLIER_SL: "2.4"          # fail-safe hard stop (still protects downside)
-      TRAIL_ACTIVATE_AT_TP_FRAC: "0.6"  # start trailing after 60% of TP is reached
+      # ===== Exits: ATR TP + trailing + SL =====
+      ATR_MULTIPLIER_TP: "1.2"
+      ATR_MULTIPLIER_TS: "1.6"
+      ATR_MULTIPLIER_SL: "2.4"
+      TRAIL_ACTIVATE_AT_TP_FRAC: "0.6"
 
-      # ===== Budgeting / “don’t go broke” rails =====
-      DAILY_CAP_USD: "200"              # allow more trading throughput per day
-      MIN_FREE_CASH_USD: "25"           # don’t place new orders if under this
-      SLIPPAGE_PCT: "0.10"              # 10 bps slippage budget per order
+      # ===== Budget rails =====
+      DAILY_CAP_USD: "200"
+      MIN_FREE_CASH_USD: "25"
+      SLIPPAGE_PCT: "0.10"
 
       # ===== Drawdown circuit breaker =====
-      # If equity falls X% from its all-time-high, pause new entries for N runs
-      DRAWDOWN_PCT_TRIP: "12"           # aggressive risk; still has a fuse
+      DRAWDOWN_PCT_TRIP: "12"
       DRAWDOWN_COOLDOWN_RUNS: "8"
 
-      # ===== Logging / telemetry =====
+      # ===== Telemetry =====
       LOG_LEVEL: "INFO"
-      WRITE_EQUITY_CSV: "true"          # appends data/equity_history.csv
-      PRINT_EQUITY_ONE_LINER: "true"    # "[equity] now=$... Δrun=... HWM=... DD=..."
+      WRITE_EQUITY_CSV: "true"
+      PRINT_EQUITY_ONE_LINER: "true"
 
-      # ===== Exchange credentials (from repo or org secrets) =====
+      # ===== Exchange creds =====
       KRAKEN_API_KEY: "${{ secrets.KRAKEN_API_KEY }}"
       KRAKEN_API_SECRET: "${{ secrets.KRAKEN_API_SECRET }}"
 
@@ -93,7 +88,6 @@ jobs:
       - name: Run trader
         id: run_trader
         env:
-          # pass-through in case your code expects these names exactly
           DRY_RUN: ${{ env.DRY_RUN }}
           EXCHANGE: ${{ env.EXCHANGE }}
           BASE_CCY: ${{ env.BASE_CCY }}
