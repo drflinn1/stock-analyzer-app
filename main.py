@@ -38,7 +38,7 @@ TF_SLOW = env_str("TF_SLOW","1h")
 EMA_SHORT = env_i("EMA_SHORT",20)
 EMA_LONG  = env_i("EMA_LONG",50)
 RSI_LEN   = env_i("RSI_LEN",14)
-RSI_BUY   = env_f("RSI_BUY",60)  # defensive for now
+RSI_BUY   = env_f("RSI_BUY",60)
 RSI_SELL  = env_f("RSI_SELL",45)
 
 ATR_LEN   = env_i("ATR_LEN",14)
@@ -74,7 +74,7 @@ DD_COOLDOWN_RUNS = env_i("DRAWDOWN_COOLDOWN_RUNS",8)
 WRITE_EQUITY_CSV = env_str("WRITE_EQUITY_CSV","true").lower()=="true"
 PRINT_EQUITY_ONE_LINER = env_str("PRINT_EQUITY_ONE_LINER","true").lower()=="true"
 
-# Guard tokens required by your guard job:
+# Guard tokens required by guard job:
 TAKE_PROFIT_TOKEN = "TAKE_PROFIT"
 STOP_LOSS_TOKEN   = "STOP_LOSS"
 
@@ -314,6 +314,9 @@ def equity_one_liner(now_e):
 def run():
     print("=== START TRADING OUTPUT ===")
     print(f"Python {sys.version.split()[0]}")
+    # NEW: echo the configured fee buffer so it’s visible every run
+    print(f"[cfg] fee_buy_buffer={FEE_BUY_BUFFER_PCT:.2f}%")
+
     positions, usd_free, equity = portfolio_and_equity()
     print(f"[audit] hydrated {len(positions)} symbols from wallet for evaluation")
 
@@ -382,8 +385,7 @@ def run():
                     if exposure_pct >= PORTFOLIO_MAX_EXPOSURE_PCT: continue
                     qty_add, notional = size_by_atr(sym, c, atr, equity, step_mult=PYRAMID_STEP_ATR)
                     ok, amt_min, min_cost, _ = tradeable(sym, qty_add, c)
-                    # ---- FEES BUFFER APPLIED HERE ----
-                    cash_needed = notional * (1.0 + FEE_BUY_BUFFER_PCT/100.0)
+                    cash_needed = notional * (1.0 + FEE_BUY_BUFFER_PCT/100.0)   # buffer here
                     if (not ok) or (notional < MIN_NOTIONAL_USD) or ((usd_free - cash_needed) < MIN_FREE_CASH_USD):
                         continue
                     od = place_order("buy", sym, qty_add)
@@ -422,8 +424,7 @@ def run():
                 if exposure_pct >= PORTFOLIO_MAX_EXPOSURE_PCT: break
                 qty, notional = size_by_atr(sym, c, atr, equity, step_mult=1.0)
                 ok, amt_min, min_cost, _ = tradeable(sym, qty, c)
-                # ---- FEES BUFFER APPLIED HERE ----
-                cash_needed = notional * (1.0 + FEE_BUY_BUFFER_PCT/100.0)
+                cash_needed = notional * (1.0 + FEE_BUY_BUFFER_PCT/100.0)     # buffer here
                 if (not ok) or (notional < MIN_NOTIONAL_USD) or ((usd_free - cash_needed) < MIN_FREE_CASH_USD):
                     continue
                 od = place_order("buy", sym, qty)
