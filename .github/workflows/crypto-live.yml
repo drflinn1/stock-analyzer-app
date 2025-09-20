@@ -5,7 +5,7 @@ on:
   schedule:
     - cron: "*/15 * * * *"
 
-# Manual runs cancel older work; scheduled runs will queue (won't cancel your manual)
+# Manual runs win; scheduled runs queue behind them
 concurrency:
   group: crypto-live-concentrated
   cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
@@ -26,7 +26,7 @@ jobs:
       AUTO_UNIVERSE: "true"
       UNIVERSE_TOP_N: "10"          # was 6 – more candidates
       MAX_CONCURRENT_POS: "6"       # was 5 – slightly wider book
-      MIN_LIQ_USD_24H: "750000"     # was 1,000,000 – still decent liquidity
+      MIN_LIQ_USD_24H: "750000"     # was 1,000,000
       MOMENTUM_LOOKBACK_H: "24"
       MIN_PRICE_USD: "0.01"
       MIN_NOTIONAL_USD: "5"
@@ -43,8 +43,10 @@ jobs:
       # ===== Volatility-scaled sizing =====
       ATR_LEN: "14"
       RISK_PER_TRADE_PCT: "1.6"
-      PER_TRADE_USD_CAP: "75"       # optional bump to 85 if you want bigger swings
-      MAX_TRADES_PER_RUN: "8"       # was 6 – allow more fills per cycle
+      PER_TR
+
+      ADE_USD_CAP: "75"       # bump to 85 later if you want bigger swings
+      MAX_TRADES_PER_RUN: "8"       # was 6
       PORTFOLIO_MAX_EXPOSURE_PCT: "75"
 
       # ===== Exits =====
@@ -53,18 +55,18 @@ jobs:
       ATR_MULTIPLIER_SL: "1.8"
       TRAIL_ACTIVATE_AT_TP_FRAC: "0.5"
 
-      # ===== Stale position logic =====
+      # ===== Stale logic =====
       STALE_MAX_HOURS: "24"
       STALE_RSI_MAX_BARS: "6"
       STALE_MIN_GAIN_PCT: "-3"
 
-      # ===== Pyramiding winners =====
+      # ===== Pyramiding =====
       PYRAMID_ENABLED: "true"
       PYRAMID_MAX_ADDS: "2"
       PYRAMID_ADD_AT_GAIN_PCT: "2.0"
       PYRAMID_STEP_ATR: "0.75"
 
-      # ===== Dust Sweeper (SELLS ONLY) =====
+      # ===== Dust sweeper (SELLS ONLY) =====
       DUST_SWEEP_ENABLED: "true"
       DUST_SWEEP_USD_TRIGGER: "1"
       DUST_MAX_NOTIONAL_USD: "20"
@@ -75,8 +77,8 @@ jobs:
       MIN_FREE_CASH_USD: "15"
       SLIPPAGE_PCT: "0.10"
 
-      # ===== Buy fee buffer (live) =====
-      FEE_BUY_BUFFER_PCT: "0.5"     # require +0.5% headroom for buys
+      # ===== Buy fee buffer =====
+      FEE_BUY_BUFFER_PCT: "0.5"
 
       # ===== Circuit breaker =====
       DRAWDOWN_PCT_TRIP: "15"
@@ -86,6 +88,7 @@ jobs:
       LOG_LEVEL: "INFO"
       WRITE_EQUITY_CSV: "true"
       PRINT_EQUITY_ONE_LINER: "true"
+      DEBUG_SKIPS: "true"            # <— NEW: prints why entries/pyramids were skipped
 
       # ===== Secrets =====
       KRAKEN_API_KEY: "${{ secrets.KRAKEN_API_KEY }}"
