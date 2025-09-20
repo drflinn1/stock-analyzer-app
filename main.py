@@ -13,8 +13,8 @@ def utcnow():         return dt.datetime.utcnow()
 
 DATA_DIR = pathlib.Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
 EQUITY_CSV = DATA_DIR / "equity_history.csv"
-TAX_LEDGER = DATA_DIR / "tax_ledger.csv"      # fills log
-POS_META    = DATA_DIR / "pos_meta.json"      # track entry, adds, last_add_price, add_count
+TAX_LEDGER = DATA_DIR / "tax_ledger.csv"
+POS_META    = DATA_DIR / "pos_meta.json"
 
 # ---------- TAX ledger fields ----------
 TAX_FIELDS = ["ts","event","side","symbol","qty","price","notional","fee","fee_ccy","order_id","note"]
@@ -38,7 +38,7 @@ TF_SLOW = env_str("TF_SLOW","1h")
 EMA_SHORT = env_i("EMA_SHORT",20)
 EMA_LONG  = env_i("EMA_LONG",50)
 RSI_LEN   = env_i("RSI_LEN",14)
-RSI_BUY   = env_f("RSI_BUY",60)  # defensive now
+RSI_BUY   = env_f("RSI_BUY",60)  # defensive for now
 RSI_SELL  = env_f("RSI_SELL",45)
 
 ATR_LEN   = env_i("ATR_LEN",14)
@@ -64,6 +64,9 @@ PYRAMID_STEP_ATR        = env_f("PYRAMID_STEP_ATR",0.75)
 DAILY_CAP_USD = env_f("DAILY_CAP_USD",300)
 MIN_FREE_CASH_USD = env_f("MIN_FREE_CASH_USD",15)
 SLIPPAGE_PCT = env_f("SLIPPAGE_PCT",0.10)
+
+# --- NEW: buy-fee safety buffer (Option A)
+FEE_BUY_BUFFER_PCT = env_f("FEE_BUY_BUFFER_PCT", 0.5)
 
 DD_TRIP = env_f("DRAWDOWN_PCT_TRIP",15)
 DD_COOLDOWN_RUNS = env_i("DRAWDOWN_COOLDOWN_RUNS",8)
@@ -314,7 +317,7 @@ def run():
     positions, usd_free, equity = portfolio_and_equity()
     print(f"[audit] hydrated {len(positions)} symbols from wallet for evaluation")
 
-    # SELL PASS (stale + ATR TAKE_PROFIT / STOP_LOSS with trailing)
+    # SELL PASS
     for sym, qty in list(positions.items()):
         try:
             df_f = indicators(to_df(fetch_ohlcv(sym, TF_FAST, limit=ATR_LEN*4+60))).dropna()
@@ -364,7 +367,7 @@ def run():
         except Exception as e:
             print(f"[sellpass] {sym} error: {e}")
 
-    # refresh balances after sells
+    # refresh after sells
     positions, usd_free, equity = portfolio_and_equity()
 
     # PYRAMID adds
@@ -379,18 +382,21 @@ def run():
                     if exposure_pct >= PORTFOLIO_MAX_EXPOSURE_PCT: continue
                     qty_add, notional = size_by_atr(sym, c, atr, equity, step_mult=PYRAMID_STEP_ATR)
                     ok, amt_min, min_cost, _ = tradeable(sym, qty_add, c)
-                    if not ok or notional < MIN_NOTIONAL_USD or (usd_free - notional) < MIN_FREE_CASH_USD: continue
+                    # ---- FEES BUFFER APPLIED HERE ----
+                    cash_needed = notional * (1.0 + FEE_BUY_BUFFER_PCT/100.0)
+                    if (not ok) or (notional < MIN_NOTIONAL_USD) or ((usd_free - cash_needed) < MIN_FREE_CASH_USD):
+                        continue
                     od = place_order("buy", sym, qty_add)
                     if od:
                         fee, fee_ccy = _fee_from_order(od)
-                        print(f"PYRAMID + {sym}: +{qty_add:.8f} ~${notional:.2f}")
+                        print(f"PYRAMID + {sym}: +{qty_add:.8f} ~${notional:.2f} (cash_needed=${cash_needed:.2f})")
                         append_tax({
                             "ts": now_ts(),"event":"TRADE","side":"buy","symbol":sym,
                             "qty":qty_add,"price":c,"notional":qty_add*c,"fee":fee,"fee_ccy":fee_ccy or BASE,
                             "order_id": od.get('id'),"note":"PYRAMID"
                         })
                         set_meta(sym, add_count=m.get("add_count",0)+1, last_add_px=c)
-                        usd_free -= notional
+                        usd_free -= cash_needed
                         positions[sym] = qty + qty_add
             except Exception as e:
                 print(f"[pyramid] {sym} error: {e}")
@@ -416,7 +422,10 @@ def run():
                 if exposure_pct >= PORTFOLIO_MAX_EXPOSURE_PCT: break
                 qty, notional = size_by_atr(sym, c, atr, equity, step_mult=1.0)
                 ok, amt_min, min_cost, _ = tradeable(sym, qty, c)
-                if not ok or notional < MIN_NOTIONAL_USD or (usd_free - notional) < MIN_FREE_CASH_USD: continue
+                # ---- FEES BUFFER APPLIED HERE ----
+                cash_needed = notional * (1.0 + FEE_BUY_BUFFER_PCT/100.0)
+                if (not ok) or (notional < MIN_NOTIONAL_USD) or ((usd_free - cash_needed) < MIN_FREE_CASH_USD):
+                    continue
                 od = place_order("buy", sym, qty)
                 if od:
                     fee, fee_ccy = _fee_from_order(od)
@@ -427,9 +436,9 @@ def run():
                     })
                     set_meta(sym, entry_ts=now_ts(), entry_px=c, last_add_px=c, add_count=0)
                     positions[sym] = positions.get(sym,0.0) + qty
-                    usd_free -= notional
+                    usd_free -= cash_needed
                     entries_done += 1
-                    print(f"BUY {sym}: ~${notional:.2f} (qty={qty:.8f})")
+                    print(f"BUY {sym}: ~${notional:.2f} (qty={qty:.8f}, cash_needed=${cash_needed:.2f})")
             except Exception as e:
                 print(f"[entry] {sym} error: {e}")
     else:
@@ -447,7 +456,6 @@ def run():
                 df = pd.read_csv(EQUITY_CSV)
                 if len(df)>=2: delta = float(df["equity"].iloc[-1]) - float(df["equity"].iloc[-2])
         except Exception: pass
-    # defensive to avoid div by zero
         base = max(equity - delta, 1e-9)
         pct = 100.0 * (delta / base)
         print(f"[equity] now=${equity:.2f} Δrun=${delta:+.2f} ({pct:+.2f}%) HWM=${hwm:.2f} DD={dd:.2f}%")
