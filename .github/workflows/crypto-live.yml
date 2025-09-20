@@ -5,9 +5,10 @@ on:
   schedule:
     - cron: "*/15 * * * *"
 
+# Manual runs cancel older work; scheduled runs will queue (won't cancel your manual)
 concurrency:
   group: crypto-live-concentrated
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 jobs:
   trade:
@@ -21,11 +22,11 @@ jobs:
       EXCHANGE: "kraken"
       BASE_CCY: "USD"
 
-      # ===== Universe & Ranking (concentrated) =====
+      # ===== Universe & Ranking (Aggro-Lite) =====
       AUTO_UNIVERSE: "true"
-      UNIVERSE_TOP_N: "10"
-      MAX_CONCURRENT_POS: "6"
-      MIN_LIQ_USD_24H: "750000"
+      UNIVERSE_TOP_N: "10"          # was 6 – more candidates
+      MAX_CONCURRENT_POS: "6"       # was 5 – slightly wider book
+      MIN_LIQ_USD_24H: "750000"     # was 1,000,000 – still decent liquidity
       MOMENTUM_LOOKBACK_H: "24"
       MIN_PRICE_USD: "0.01"
       MIN_NOTIONAL_USD: "5"
@@ -36,14 +37,14 @@ jobs:
       EMA_SHORT: "20"
       EMA_LONG: "50"
       RSI_LEN: "14"
-      RSI_BUY: "58"                  # defensive; we’ll flip back later
+      RSI_BUY: "58"                 # was 60 – easier to trigger entries
       RSI_SELL: "45"
 
       # ===== Volatility-scaled sizing =====
       ATR_LEN: "14"
       RISK_PER_TRADE_PCT: "1.6"
-      PER_TRADE_USD_CAP: "85"
-      MAX_TRADES_PER_RUN: "8"
+      PER_TRADE_USD_CAP: "75"       # optional bump to 85 if you want bigger swings
+      MAX_TRADES_PER_RUN: "8"       # was 6 – allow more fills per cycle
       PORTFOLIO_MAX_EXPOSURE_PCT: "75"
 
       # ===== Exits =====
@@ -74,8 +75,8 @@ jobs:
       MIN_FREE_CASH_USD: "15"
       SLIPPAGE_PCT: "0.10"
 
-      # ===== Buy fee buffer (Option A) =====
-      FEE_BUY_BUFFER_PCT: "0.5"      # require +0.5% headroom for buys
+      # ===== Buy fee buffer (live) =====
+      FEE_BUY_BUFFER_PCT: "0.5"     # require +0.5% headroom for buys
 
       # ===== Circuit breaker =====
       DRAWDOWN_PCT_TRIP: "15"
