@@ -25,7 +25,7 @@ def main():
         r = csv.DictReader(f)
         for row in r:
             side = (row.get("side") or "").lower()
-            if side not in {"buy","sell"}: 
+            if side not in {"buy","sell"}:
                 continue
             ts = int(float(row["ts"]))
             sym = row["symbol"]
