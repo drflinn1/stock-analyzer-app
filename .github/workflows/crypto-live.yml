@@ -36,7 +36,7 @@ jobs:
       EMA_SHORT: "20"
       EMA_LONG: "50"
       RSI_LEN: "14"
-      RSI_BUY: "60"                  # remember to flip back to 55 when momentum returns
+      RSI_BUY: "60"                  # defensive; we’ll flip back later
       RSI_SELL: "45"
 
       # ===== Volatility-scaled sizing =====
@@ -44,16 +44,16 @@ jobs:
       RISK_PER_TRADE_PCT: "1.6"
       PER_TRADE_USD_CAP: "75"
       MAX_TRADES_PER_RUN: "6"
-      PORTFOLIO_MAX_EXPOSURE_PCT: "75"  # remember to flip back to 90
+      PORTFOLIO_MAX_EXPOSURE_PCT: "75"
 
       # ===== Exits =====
       ATR_MULTIPLIER_TP: "1.0"
       ATR_MULTIPLIER_TS: "1.4"
-      ATR_MULTIPLIER_SL: "1.8"          # remember to flip back to 2.0
+      ATR_MULTIPLIER_SL: "1.8"
       TRAIL_ACTIVATE_AT_TP_FRAC: "0.5"
 
       # ===== Stale position logic =====
-      STALE_MAX_HOURS: "24"             # remember to flip back to 48
+      STALE_MAX_HOURS: "24"
       STALE_RSI_MAX_BARS: "6"
       STALE_MIN_GAIN_PCT: "-3"
 
@@ -75,7 +75,7 @@ jobs:
       SLIPPAGE_PCT: "0.10"
 
       # ===== Buy fee buffer (Option A) =====
-      FEE_BUY_BUFFER_PCT: "0.5"         # <-- new: require +0.5% cash headroom for buys
+      FEE_BUY_BUFFER_PCT: "0.5"      # require +0.5% headroom for buys
 
       # ===== Circuit breaker =====
       DRAWDOWN_PCT_TRIP: "15"
