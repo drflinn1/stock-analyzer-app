@@ -23,9 +23,9 @@ jobs:
 
       # ===== Universe & Ranking (concentrated) =====
       AUTO_UNIVERSE: "true"
-      UNIVERSE_TOP_N: "6"
-      MAX_CONCURRENT_POS: "5"
-      MIN_LIQ_USD_24H: "1000000"
+      UNIVERSE_TOP_N: "10"
+      MAX_CONCURRENT_POS: "6"
+      MIN_LIQ_USD_24H: "750000"
       MOMENTUM_LOOKBACK_H: "24"
       MIN_PRICE_USD: "0.01"
       MIN_NOTIONAL_USD: "5"
@@ -36,14 +36,14 @@ jobs:
       EMA_SHORT: "20"
       EMA_LONG: "50"
       RSI_LEN: "14"
-      RSI_BUY: "60"                  # defensive; we’ll flip back later
+      RSI_BUY: "58"                  # defensive; we’ll flip back later
       RSI_SELL: "45"
 
       # ===== Volatility-scaled sizing =====
       ATR_LEN: "14"
       RISK_PER_TRADE_PCT: "1.6"
-      PER_TRADE_USD_CAP: "75"
-      MAX_TRADES_PER_RUN: "6"
+      PER_TRADE_USD_CAP: "85"
+      MAX_TRADES_PER_RUN: "8"
       PORTFOLIO_MAX_EXPOSURE_PCT: "75"
 
       # ===== Exits =====
