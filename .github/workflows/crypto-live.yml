@@ -43,9 +43,7 @@ jobs:
       # ===== Volatility-scaled sizing =====
       ATR_LEN: "14"
       RISK_PER_TRADE_PCT: "1.6"
-      PER_TR
-
-      ADE_USD_CAP: "75"       # bump to 85 later if you want bigger swings
+      PER_TRADE_USD_CAP: "75"       # <— FIXED key (was split); bump to 85 later if desired
       MAX_TRADES_PER_RUN: "8"       # was 6
       PORTFOLIO_MAX_EXPOSURE_PCT: "75"
 
@@ -88,7 +86,7 @@ jobs:
       LOG_LEVEL: "INFO"
       WRITE_EQUITY_CSV: "true"
       PRINT_EQUITY_ONE_LINER: "true"
-      DEBUG_SKIPS: "true"            # <— NEW: prints why entries/pyramids were skipped
+      DEBUG_SKIPS: "true"            # prints reasons when entries/pyramids are skipped
 
       # ===== Secrets =====
       KRAKEN_API_KEY: "${{ secrets.KRAKEN_API_KEY }}"
