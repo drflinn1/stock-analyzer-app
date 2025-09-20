@@ -14,7 +14,6 @@ LEDGER = DATA_DIR / "tax_ledger.csv"
 TAX_FIELDS = ["ts","event","side","symbol","qty","price","notional","fee","fee_ccy","order_id","note"]
 LOG = print
 
-# ---- env ----
 DRY = env_b("DRY_RUN", "false")
 EXCHANGE = env_str("EXCHANGE","kraken")
 BASE = env_str("BASE_CCY","USD")
