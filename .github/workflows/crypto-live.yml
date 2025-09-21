@@ -1,4 +1,4 @@
-name: Crypto Live (Every 15 min - CONCENTRATED + PYRAMID + SWEEP + TAX)
+name: Crypto Live — CONCENTRATED Momentum (15m, Pyramid + Sweep + Tax)
 
 on:
   workflow_dispatch:
@@ -22,11 +22,11 @@ jobs:
       EXCHANGE: "kraken"
       BASE_CCY: "USD"
 
-      # ===== Universe & Ranking (Aggro-Lite) =====
+      # ===== Universe & Ranking (Concentrated) =====
       AUTO_UNIVERSE: "true"
-      UNIVERSE_TOP_N: "10"          # was 6 – more candidates
-      MAX_CONCURRENT_POS: "6"       # was 5 – slightly wider book
-      MIN_LIQ_USD_24H: "750000"     # was 1,000,000
+      UNIVERSE_TOP_N: "12"          # broaden candidates
+      MAX_CONCURRENT_POS: "3"       # concentrate the book
+      MIN_LIQ_USD_24H: "500000"     # still safe liquidity
       MOMENTUM_LOOKBACK_H: "24"
       MIN_PRICE_USD: "0.01"
       MIN_NOTIONAL_USD: "5"
@@ -37,20 +37,20 @@ jobs:
       EMA_SHORT: "20"
       EMA_LONG: "50"
       RSI_LEN: "14"
-      RSI_BUY: "58"                 # was 60 – easier to trigger entries
+      RSI_BUY: "57"                 # slightly looser to get entries
       RSI_SELL: "45"
 
       # ===== Volatility-scaled sizing =====
       ATR_LEN: "14"
       RISK_PER_TRADE_PCT: "1.6"
-      PER_TRADE_USD_CAP: "75"       # <— FIXED key (was split); bump to 85 later if desired
-      MAX_TRADES_PER_RUN: "8"       # was 6
-      PORTFOLIO_MAX_EXPOSURE_PCT: "75"
+      PER_TRADE_USD_CAP: "85"       # larger tickets
+      MAX_TRADES_PER_RUN: "10"
+      PORTFOLIO_MAX_EXPOSURE_PCT: "85"   # bigger snowball ceiling
 
       # ===== Exits =====
       ATR_MULTIPLIER_TP: "1.0"
       ATR_MULTIPLIER_TS: "1.4"
-      ATR_MULTIPLIER_SL: "1.8"
+      ATR_MULTIPLIER_SL: "1.6"      # quicker to free capital
       TRAIL_ACTIVATE_AT_TP_FRAC: "0.5"
 
       # ===== Stale logic =====
@@ -60,8 +60,8 @@ jobs:
 
       # ===== Pyramiding =====
       PYRAMID_ENABLED: "true"
-      PYRAMID_MAX_ADDS: "2"
-      PYRAMID_ADD_AT_GAIN_PCT: "2.0"
+      PYRAMID_MAX_ADDS: "3"               # more adds
+      PYRAMID_ADD_AT_GAIN_PCT: "1.8"      # add sooner
       PYRAMID_STEP_ATR: "0.75"
 
       # ===== Dust sweeper (SELLS ONLY) =====
@@ -76,7 +76,7 @@ jobs:
       SLIPPAGE_PCT: "0.10"
 
       # ===== Buy fee buffer =====
-      FEE_BUY_BUFFER_PCT: "0.5"
+      FEE_BUY_BUFFER_PCT: "0.5"     # require +0.5% headroom for buys
 
       # ===== Circuit breaker =====
       DRAWDOWN_PCT_TRIP: "15"
@@ -86,7 +86,7 @@ jobs:
       LOG_LEVEL: "INFO"
       WRITE_EQUITY_CSV: "true"
       PRINT_EQUITY_ONE_LINER: "true"
-      DEBUG_SKIPS: "true"            # prints reasons when entries/pyramids are skipped
+      DEBUG_SKIPS: "true"            # harmless if not implemented in code
 
       # ===== Secrets =====
       KRAKEN_API_KEY: "${{ secrets.KRAKEN_API_KEY }}"
