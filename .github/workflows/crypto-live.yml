@@ -22,6 +22,10 @@ jobs:
       EXCHANGE: "kraken"
       BASE_CCY: "USD"
 
+      # ===== Safe-sell hardening (used by tools/run_with_safe_sell.py) =====
+      SELL_SAFETY_EPS_PCT: "0.25"                  # sell up to 0.25% less than free balance
+      CANCEL_OPEN_ORDERS_BEFORE_SELL: "true"       # free any lingering reserves
+
       # ===== Universe & Ranking (Concentrated) =====
       AUTO_UNIVERSE: "true"
       UNIVERSE_TOP_N: "12"          # broaden candidates
@@ -37,7 +41,7 @@ jobs:
       EMA_SHORT: "20"
       EMA_LONG: "50"
       RSI_LEN: "14"
-      RSI_BUY: "57"                 # slightly looser to get entries
+      RSI_BUY: "57"
       RSI_SELL: "45"
 
       # ===== Volatility-scaled sizing =====
@@ -60,8 +64,8 @@ jobs:
 
       # ===== Pyramiding =====
       PYRAMID_ENABLED: "true"
-      PYRAMID_MAX_ADDS: "3"               # more adds
-      PYRAMID_ADD_AT_GAIN_PCT: "1.8"      # add sooner
+      PYRAMID_MAX_ADDS: "3"
+      PYRAMID_ADD_AT_GAIN_PCT: "1.8"
       PYRAMID_STEP_ATR: "0.75"
 
       # ===== Dust sweeper (SELLS ONLY) =====
@@ -76,7 +80,7 @@ jobs:
       SLIPPAGE_PCT: "0.10"
 
       # ===== Buy fee buffer =====
-      FEE_BUY_BUFFER_PCT: "0.5"     # require +0.5% headroom for buys
+      FEE_BUY_BUFFER_PCT: "0.5"
 
       # ===== Circuit breaker =====
       DRAWDOWN_PCT_TRIP: "15"
@@ -86,7 +90,7 @@ jobs:
       LOG_LEVEL: "INFO"
       WRITE_EQUITY_CSV: "true"
       PRINT_EQUITY_ONE_LINER: "true"
-      DEBUG_SKIPS: "true"            # harmless if not implemented in code
+      DEBUG_SKIPS: "true"
 
       # ===== Secrets =====
       KRAKEN_API_KEY: "${{ secrets.KRAKEN_API_KEY }}"
@@ -122,11 +126,11 @@ jobs:
             echo "[dust] tools/dust_sweeper.py missing - skipping pre-run sweep"
           fi
 
-      - name: Run trader
+      - name: Run trader (with safe-sell patch)
         shell: bash
         run: |
           set -e
-          python -u main.py
+          python -u tools/run_with_safe_sell.py
 
       - name: Dust Sweep (post-run, sells only)
         if: always()
