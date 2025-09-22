@@ -1,6 +1,7 @@
 import os
 import logging
 import random
+import importlib
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -18,16 +19,36 @@ TRAIL_ACTIVATE = 0.02  # start trailing after +2%
 TRAIL_DISTANCE = 0.01  # trail 1% below peak
 STOP_LOSS = 0.02       # hard stop at -2%
 
+def _import_class(possible_modules: list[str], class_name: str):
+    """
+    Try importing class_name from each module path in order.
+    Returns the class if found, otherwise raises the last ImportError.
+    """
+    last_err = None
+    for mod in possible_modules:
+        try:
+            module = importlib.import_module(mod)
+            return getattr(module, class_name)
+        except Exception as e:
+            last_err = e
+    raise last_err if last_err else ImportError(f"Could not import {class_name} from {possible_modules}")
+
 def get_broker():
     """
-    Lazy-import so EQUITIES runs even if crypto broker file isn't present,
-    and vice versa.
+    Lazy-import so EQUITIES runs even if crypto broker file isn't present, and vice versa.
+    Prefers package path 'trader.*' but falls back to root-level files if present.
     """
     if MARKET == "crypto":
-        from broker_crypto_ccxt import CryptoBroker
+        CryptoBroker = _import_class(
+            ["trader.broker_crypto_ccxt", "broker_crypto_ccxt"],
+            "CryptoBroker",
+        )
         return CryptoBroker()
     else:
-        from broker_robinhood import RobinhoodBroker
+        RobinhoodBroker = _import_class(
+            ["trader.broker_robinhood", "broker_robinhood"],
+            "RobinhoodBroker",
+        )
         return RobinhoodBroker()
 
 def pick_universe(market: str):
