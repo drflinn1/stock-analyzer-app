@@ -7,7 +7,14 @@
 from __future__ import annotations
 import os, sys
 from typing import List
-from trader.broker_alpaca import AlpacaEquitiesBroker
+
+# Try normal package import first; fall back to adding repo root to sys.path
+try:
+    from trader.broker_alpaca import AlpacaEquitiesBroker
+except ModuleNotFoundError:
+    import pathlib
+    sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
+    from trader.broker_alpaca import AlpacaEquitiesBroker
 
 def env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name, str(default)).strip().lower()
