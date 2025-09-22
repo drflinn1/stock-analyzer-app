@@ -1,38 +1,65 @@
-name: Equities Live (9:35 & 3:50 ET — SAFE)
 
-on:
-  workflow_dispatch:
-  schedule:
-    # 9:35 AM ET (13:35 UTC)
-    - cron: '35 13 * * 1-5'
-    # 3:50 PM ET (19:50 UTC)
-    - cron: '50 19 * * 1-5'
 
-jobs:
-  trade:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
+env:
+IN_DRY: ${{ github.event.inputs.DRY_RUN }}
+run: |
+# If manual run provided an input, honor it; otherwise default to true for scheduled runs
+if [ -z "${IN_DRY}" ]; then echo "DRY_RUN=true" >> $GITHUB_ENV; else echo "DRY_RUN=${IN_DRY}" >> $GITHUB_ENV; fi
+echo "BROKER=alpaca" >> $GITHUB_ENV
+echo "ASSET_CLASS=equities" >> $GITHUB_ENV
+echo "PER_TRADE_USD=${{ github.event.inputs.PER_TRADE_USD || '25' }}" >> $GITHUB_ENV
+echo "DAILY_CAP_USD=${{ github.event.inputs.DAILY_CAP_USD || '50' }}" >> $GITHUB_ENV
+echo "AUTO_UNIVERSE=1" >> $GITHUB_ENV
+echo "UNIVERSE=${{ github.event.inputs.UNIVERSE || 'SPY,AAPL,MSFT,TSLA,NVDA,AMD' }}" >> $GITHUB_ENV
+echo "MIN_NOTIONAL_USD=1.00" >> $GITHUB_ENV
+# PAPER endpoints by default
+echo "ALPACA_BASE_URL=https://paper-api.alpaca.markets" >> $GITHUB_ENV
+echo "ALPACA_DATA_URL=https://data.alpaca.markets" >> $GITHUB_ENV
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+- name: Inject secrets (Alpaca)
+env:
+ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+run: |
+if [ -z "$ALPACA_API_KEY" ] || [ -z "$ALPACA_API_SECRET" ]; then
+echo "Missing ALPACA secrets; running in DRY_RUN must be true." && exit 1
+fi
+echo "ALPACA_API_KEY=$ALPACA_API_KEY" >> $GITHUB_ENV
+echo "ALPACA_API_SECRET=$ALPACA_API_SECRET" >> $GITHUB_ENV
 
-      - name: Run equities trader
-        env:
-          ROBINHOOD_USERNAME: ${{ secrets.ROBINHOOD_USERNAME }}
-          ROBINHOOD_PASSWORD: ${{ secrets.ROBINHOOD_PASSWORD }}
-          ROBINHOOD_MFA: ${{ secrets.ROBINHOOD_MFA }}
-          STATE_DIR: .state
-          MARKET: equities
-          DRY_RUN: "true"   # flip to "false" when ready
-          PER_TRADE_USD: "10"
-          DAILY_CAP_USD: "20"
-        run: |
-          python main.py
+
+- name: Sanity check broker ping (paper)
+run: |
+python - << 'PY'
+import os
+from trader.broker_alpaca import AlpacaEquitiesBroker
+dry = os.getenv('DRY_RUN','true').lower()=='true'
+b = AlpacaEquitiesBroker(dry_run=dry)
+print('DRY_RUN =', dry)
+print('Ping =', b.ping())
+print('Cash =', b.get_cash())
+print('AAPL px =', b.get_latest_price('AAPL'))
+PY
+
+
+- name: Run trader
+# If your main entry is different, update the command below.
+env:
+PYTHONUNBUFFERED: "1"
+run: |
+set -e
+echo "=== ENV ==="; env | sort
+echo "=== START MAIN ==="
+if [ -f "main.py" ]; then
+python main.py --asset equities --broker alpaca || python main.py
+elif [ -f "trader/main.py" ]; then
+python trader/main.py --asset equities --broker alpaca || python trader/main.py
+else
+echo "No main.py found. Please update the run step to your entry point."; exit 2
+fi
+
+
+- name: Mark success
+if: ${{ success() }}
+run: echo "Equities (Alpaca — PAPER) run completed."
