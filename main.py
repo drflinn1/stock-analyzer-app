@@ -1,13 +1,25 @@
 import os
+import sys
 import logging
 import random
 import importlib
+from pathlib import Path
+
+# ----- Path shim so 'trader/*' is always importable -----
+ROOT = Path(__file__).resolve().parent
+TRADER_DIR = ROOT / "trader"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+if TRADER_DIR.exists() and str(TRADER_DIR) not in sys.path:
+    sys.path.insert(0, str(TRADER_DIR))
+# --------------------------------------------------------
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 # Env
-MARKET = os.getenv("MARKET", "crypto")  # "crypto" or "equities"
+MARKET = os.getenv("MARKET", "crypto")            # "crypto" or "equities"
+EQUITIES_BROKER = os.getenv("EQUITIES_BROKER", "robinhood")  # "alpaca" or "robinhood"
 STATE_DIR = os.getenv("STATE_DIR", ".state")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 PER_TRADE_USD = float(os.getenv("PER_TRADE_USD", "10"))
@@ -19,43 +31,33 @@ TRAIL_ACTIVATE = 0.02  # start trailing after +2%
 TRAIL_DISTANCE = 0.01  # trail 1% below peak
 STOP_LOSS = 0.02       # hard stop at -2%
 
-def _import_class(possible_modules: list[str], class_name: str):
-    """
-    Try importing class_name from each module path in order.
-    Returns the class if found, otherwise raises the last ImportError.
-    """
-    last_err = None
-    for mod in possible_modules:
+def _import_class(paths, name):
+    last = None
+    for p in paths:
         try:
-            module = importlib.import_module(mod)
-            return getattr(module, class_name)
+            return getattr(importlib.import_module(p), name)
         except Exception as e:
-            last_err = e
-    raise last_err if last_err else ImportError(f"Could not import {class_name} from {possible_modules}")
+            last = e
+    raise last or ImportError(f"Could not import {name} from {paths}")
 
 def get_broker():
     """
-    Lazy-import so EQUITIES runs even if crypto broker file isn't present, and vice versa.
-    Prefers package path 'trader.*' but falls back to root-level files if present.
+    Lazy-import broker so each mode only loads what it needs.
+    Prefers package path 'trader.*' but falls back to root-level file names.
     """
     if MARKET == "crypto":
-        CryptoBroker = _import_class(
-            ["trader.broker_crypto_ccxt", "broker_crypto_ccxt"],
-            "CryptoBroker",
-        )
+        CryptoBroker = _import_class(["trader.broker_crypto_ccxt", "broker_crypto_ccxt"], "CryptoBroker")
         return CryptoBroker()
     else:
-        RobinhoodBroker = _import_class(
-            ["trader.broker_robinhood", "broker_robinhood"],
-            "RobinhoodBroker",
-        )
+        if EQUITIES_BROKER.lower() == "alpaca":
+            AlpacaBroker = _import_class(["trader.broker_alpaca", "broker_alpaca"], "AlpacaBroker")
+            return AlpacaBroker()
+        RobinhoodBroker = _import_class(["trader.broker_robinhood", "broker_robinhood"], "RobinhoodBroker")
         return RobinhoodBroker()
 
 def pick_universe(market: str):
     if market == "crypto":
-        # Starter crypto universe
         return ["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD"]
-    # Starter equities universe
     return ["AAPL", "MSFT", "GOOGL", "AMZN"]
 
 def should_sell(entry_price: float, current_price: float, peak_price: float | None = None) -> bool:
@@ -82,7 +84,10 @@ def should_sell(entry_price: float, current_price: float, peak_price: float | No
     return False
 
 def run_trader():
-    logging.info(f"Starting trader in {MARKET.upper()} mode. Dry run={DRY_RUN}")
+    logging.info(
+        f"Starting trader in {MARKET.upper()} mode. Dry run={DRY_RUN}. "
+        f"Broker={'ccxt' if MARKET=='crypto' else EQUITIES_BROKER}"
+    )
 
     broker = get_broker()
 
@@ -116,16 +121,14 @@ def run_trader():
         logging.warning("Buy failed.")
 
     # --- SELL CHECK (demo path so guard sees SELL/TP/TRAIL/SL) ---
-    # In the real bot this would iterate open positions with true prices.
     entry = 100.0
     current = 103.0
     peak = 104.0
     if should_sell(entry, current, peak):
-        qty = 0.1  # demo quantity
+        qty = 0.1
         try:
             broker.sell(symbol, qty)
         finally:
-            # Uppercase token so Sell Logic Guard's \bSELL\b passes
             logging.info(f"SELL executed: {symbol} qty={qty}")
 
 if __name__ == "__main__":
