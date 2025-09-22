@@ -1,5 +1,5 @@
 # FILE: .github/workflows/equities-live.yml
-# Equities Live (Alpaca) — PAPER first
+# Equities Live (Alpaca) — PAPER first (forced equities smoke)
 
 name: Equities Live (Alpaca — PAPER)
 
@@ -42,7 +42,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # include ccxt because broker_crypto_ccxt.py is imported by your code
+          # include ccxt just in case other modules import it
           pip install requests pandas ccxt yfinance
 
       - name: Export env (safe defaults)
@@ -52,9 +52,7 @@ jobs:
           IN_DC: ${{ github.event.inputs.DAILY_CAP_USD }}
           IN_UNI: ${{ github.event.inputs.UNIVERSE }}
         run: |
-          # DRY_RUN default to true when not provided (e.g., scheduled runs)
           if [ -z "$IN_DRY" ]; then echo "DRY_RUN=true" >> $GITHUB_ENV; else echo "DRY_RUN=$IN_DRY" >> $GITHUB_ENV; fi
-          # Inputs with fallbacks
           if [ -z "$IN_PT" ]; then echo "PER_TRADE_USD=25" >> $GITHUB_ENV; else echo "PER_TRADE_USD=$IN_PT" >> $GITHUB_ENV; fi
           if [ -z "$IN_DC" ]; then echo "DAILY_CAP_USD=50" >> $GITHUB_ENV; else echo "DAILY_CAP_USD=$IN_DC" >> $GITHUB_ENV; fi
           if [ -z "$IN_UNI" ]; then echo "UNIVERSE=SPY,AAPL,MSFT,TSLA,NVDA,AMD" >> $GITHUB_ENV; else echo "UNIVERSE=$IN_UNI" >> $GITHUB_ENV; fi
@@ -62,7 +60,6 @@ jobs:
           echo "ASSET_CLASS=equities" >> $GITHUB_ENV
           echo "AUTO_UNIVERSE=1" >> $GITHUB_ENV
           echo "MIN_NOTIONAL_USD=1.00" >> $GITHUB_ENV
-          # PAPER endpoints by default
           echo "ALPACA_BASE_URL=https://paper-api.alpaca.markets" >> $GITHUB_ENV
           echo "ALPACA_DATA_URL=https://data.alpaca.markets" >> $GITHUB_ENV
 
@@ -90,20 +87,14 @@ jobs:
           print('AAPL px =', b.get_latest_price('AAPL'))
           PY
 
-      - name: Run trader
+      - name: Run equities smoke (force)
         env:
           PYTHONUNBUFFERED: '1'
         run: |
           set -e
           echo "=== ENV ==="; env | sort
-          echo "=== START MAIN ==="
-          if [ -f "main.py" ]; then
-            python main.py --asset equities --broker alpaca || python main.py
-          elif [ -f "trader/main.py" ]; then
-            python trader/main.py --asset equities --broker alpaca || python trader/main.py
-          else
-            echo "No main.py found. Please update the run step to your entry point."; exit 2
-          fi
+          echo "=== RUN EQUITIES SMOKE ==="
+          python trader/equities_smoke.py
 
       - name: Mark success
         if: ${{ success() }}
