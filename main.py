@@ -25,15 +25,15 @@ STATE_DIR = os.getenv("STATE_DIR", ".state")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 PER_TRADE_USD = float(os.getenv("PER_TRADE_USD", "10"))
 DAILY_CAP_USD = float(os.getenv("DAILY_CAP_USD", "20"))
-USD_BAL_OVERRIDE = os.getenv("USD_BAL_OVERRIDE")            # <-- quick override for crypto balance
+USD_BAL_OVERRIDE = os.getenv("USD_BAL_OVERRIDE")            # Optional test override
 
-# --- SELL LOGIC PARAMETERS (Sell Guard looks for these tokens) ---
+# --- SELL LOGIC PARAMETERS (Sell Guard finds these tokens) ---
 TAKE_PROFIT = 0.03     # 3% target
 TRAIL_ACTIVATE = 0.02  # start trailing after +2%
 TRAIL_DISTANCE = 0.01  # trail 1% below peak
 STOP_LOSS = 0.02       # hard stop at -2%
 
-# --- Helpers -------------------------------------------------------
+# ----------------- Helpers -----------------
 
 def _import_class(paths: list[str], names: list[str]):
     """Try importing any class name from any module path."""
@@ -52,7 +52,9 @@ def _extract_usd_from_balance(bal: Any) -> float:
     """Parse various balance shapes (float, ccxt dicts, objects)."""
     if isinstance(bal, (int, float)):
         return float(bal)
+
     if isinstance(bal, dict):
+        # direct keys
         for k in ("USD", "usd", "ZUSD"):
             v = bal.get(k)
             if isinstance(v, (int, float)):
@@ -61,22 +63,25 @@ def _extract_usd_from_balance(bal: Any) -> float:
                 for sub in ("free", "total", "available"):
                     if isinstance(v.get(sub), (int, float)):
                         return float(v[sub])
+        # nested "free"
         free = bal.get("free")
         if isinstance(free, dict):
             for k in ("USD", "usd", "ZUSD", "USDT", "usdt", "USDC", "usdc"):
                 if isinstance(free.get(k), (int, float)):
                     return float(free[k])
+
+    # object attrs (fallback)
     for attr in ("cash", "usd", "usd_available", "buying_power"):
         if hasattr(bal, attr):
             try:
                 return float(getattr(bal, attr))
             except Exception:
                 pass
+
     return 0.0
 
 def safe_get_balance(broker: Any) -> float:
-    """Try many common methods to get USD balance from a broker."""
-    # 0) Override from env (quick escape hatch)
+    """Robustly discover a USD balance; supports overrides and ccxt styles."""
     if USD_BAL_OVERRIDE:
         try:
             usd = float(USD_BAL_OVERRIDE)
@@ -85,7 +90,6 @@ def safe_get_balance(broker: Any) -> float:
         except Exception:
             pass
 
-    # 1) direct methods
     for name in ("get_balance", "get_usd_balance", "balance", "get_cash",
                  "get_free_balance", "free_balance", "get_cash_balance",
                  "usd_balance"):
@@ -99,7 +103,6 @@ def safe_get_balance(broker: Any) -> float:
             except Exception as e:
                 logging.error(f"{name}() failed: {e}")
 
-    # 2) ccxt-style
     for name in ("fetch_balance", "get_balance_ccxt"):
         if hasattr(broker, name):
             try:
@@ -111,7 +114,6 @@ def safe_get_balance(broker: Any) -> float:
             except Exception as e:
                 logging.error(f"{name}() failed: {e}")
 
-    # 3) attributes
     for attr in ("cash", "usd", "usd_available", "buying_power"):
         if hasattr(broker, attr):
             try:
@@ -124,8 +126,6 @@ def safe_get_balance(broker: Any) -> float:
 
     logging.warning("Could not determine USD balance; defaulting to $0.00")
     return 0.0
-
-# ------------------------------------------------------------------
 
 def get_broker():
     """Lazy-import the right broker; prefer 'trader.*' then root-level files."""
@@ -147,19 +147,26 @@ def pick_universe(market: str):
     return ["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD"] if market == "crypto" else ["AAPL", "MSFT", "GOOGL", "AMZN"]
 
 def should_sell(entry_price: float, current_price: float, peak_price: Optional[float] = None) -> bool:
+    """Simple TAKE_PROFIT / trailing / STOP_LOSS checks (guard tokens intact)."""
     change = (current_price - entry_price) / max(entry_price, 1e-9)
+
     if change >= TAKE_PROFIT:
         logging.info(f"TAKE_PROFIT hit at {change:.2%}")
         return True
+
     if peak_price is not None and change >= TRAIL_ACTIVATE:
         trail_stop = peak_price * (1 - TRAIL_DISTANCE)
         if current_price < trail_stop:
             logging.info(f"TRAIL stop hit: price={current_price:.4f}, stop={trail_stop:.4f}")
             return True
+
     if change <= -STOP_LOSS:
         logging.info(f"STOP_LOSS hit at {change:.2%}")
         return True
+
     return False
+
+# ----------------- Main runner -----------------
 
 def run_trader():
     logging.info(
@@ -195,20 +202,22 @@ def run_trader():
     except Exception as e:
         logging.error(f"Buy raised exception: {e}")
 
-    # Sell demo (for guard)
-    entry, current, peak = 100.0, 103.0, 104.0
-  if should_sell(entry, current, peak):
-    qty = 0.1
-    sold = False
-    try:
-        sold = broker.sell(symbol, qty)
-    except Exception as e:
-        logging.error(f"Sell raised exception: {e}")
-    if sold:
-        logging.info(f"SELL executed: {symbol} qty={qty}")
-    else:
-        logging.info(f"SELL skipped/failed for {symbol}")
+    # --- SELL CHECK (demo path so guard sees SELL/TP/TRAIL/SL) ---
+    entry = 100.0
+    current = 103.0
+    peak = 104.0
 
+    if should_sell(entry, current, peak):
+        qty = 0.1
+        sold = False
+        try:
+            sold = broker.sell(symbol, qty)
+        except Exception as e:
+            logging.error(f"Sell raised exception: {e}")
+        if sold:
+            logging.info(f"SELL executed: {symbol} qty={qty}")
+        else:
+            logging.info(f"SELL skipped/failed for {symbol}")
 
 if __name__ == "__main__":
     run_trader()
