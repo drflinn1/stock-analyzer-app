@@ -27,7 +27,7 @@ jobs:
     env:
       # ===== Core =====
       MODE: "live"
-      DRY_RUN: "true"
+      DRY_RUN: "false"
       EXCHANGE: "kraken"
       BASE_CCY: "USD"
 
