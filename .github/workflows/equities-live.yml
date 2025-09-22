@@ -1,5 +1,5 @@
 # FILE: .github/workflows/equities-live.yml
-# Equities Live (Alpaca) — PAPER first (forced equities smoke)
+# Equities Live (Alpaca) — PAPER first (forced equities smoke; module mode)
 
 name: Equities Live (Alpaca — PAPER)
 
@@ -42,30 +42,41 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # include ccxt just in case other modules import it
+          # include ccxt because other modules in your repo import broker_crypto_ccxt
           pip install requests pandas ccxt yfinance
 
-      - name: Export env (safe defaults)
+      - name: Export env (safe defaults + paper/live endpoint)
         env:
           IN_DRY: ${{ github.event.inputs.DRY_RUN }}
-          IN_PT: ${{ github.event.inputs.PER_TRADE_USD }}
-          IN_DC: ${{ github.event.inputs.DAILY_CAP_USD }}
+          IN_PT:  ${{ github.event.inputs.PER_TRADE_USD }}
+          IN_DC:  ${{ github.event.inputs.DAILY_CAP_USD }}
           IN_UNI: ${{ github.event.inputs.UNIVERSE }}
         run: |
-          if [ -z "$IN_DRY" ]; then echo "DRY_RUN=true" >> $GITHUB_ENV; else echo "DRY_RUN=$IN_DRY" >> $GITHUB_ENV; fi
+          # Resolve effective DRY_RUN value (default true for schedules)
+          if [ -z "$IN_DRY" ]; then EFF_DRY=true; else EFF_DRY="$IN_DRY"; fi
+          echo "DRY_RUN=$EFF_DRY" >> $GITHUB_ENV
+
+          # Other inputs with fallbacks
           if [ -z "$IN_PT" ]; then echo "PER_TRADE_USD=25" >> $GITHUB_ENV; else echo "PER_TRADE_USD=$IN_PT" >> $GITHUB_ENV; fi
           if [ -z "$IN_DC" ]; then echo "DAILY_CAP_USD=50" >> $GITHUB_ENV; else echo "DAILY_CAP_USD=$IN_DC" >> $GITHUB_ENV; fi
           if [ -z "$IN_UNI" ]; then echo "UNIVERSE=SPY,AAPL,MSFT,TSLA,NVDA,AMD" >> $GITHUB_ENV; else echo "UNIVERSE=$IN_UNI" >> $GITHUB_ENV; fi
+
           echo "BROKER=alpaca" >> $GITHUB_ENV
           echo "ASSET_CLASS=equities" >> $GITHUB_ENV
           echo "AUTO_UNIVERSE=1" >> $GITHUB_ENV
           echo "MIN_NOTIONAL_USD=1.00" >> $GITHUB_ENV
-          echo "ALPACA_BASE_URL=https://paper-api.alpaca.markets" >> $GITHUB_ENV
+
+          # Base URLs: paper by default; switch when DRY_RUN=false
+          if [ "$EFF_DRY" = "false" ]; then
+            echo "ALPACA_BASE_URL=https://api.alpaca.markets" >> $GITHUB_ENV
+          else
+            echo "ALPACA_BASE_URL=https://paper-api.alpaca.markets" >> $GITHUB_ENV
+          fi
           echo "ALPACA_DATA_URL=https://data.alpaca.markets" >> $GITHUB_ENV
 
       - name: Inject secrets (Alpaca)
         env:
-          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_KEY:   ${{ secrets.ALPACA_API_KEY }}
           ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
         run: |
           if [ -z "$ALPACA_API_KEY" ] || [ -z "$ALPACA_API_SECRET" ]; then
@@ -74,7 +85,7 @@ jobs:
           echo "ALPACA_API_KEY=$ALPACA_API_KEY" >> $GITHUB_ENV
           echo "ALPACA_API_SECRET=$ALPACA_API_SECRET" >> $GITHUB_ENV
 
-      - name: Sanity check broker ping (paper)
+      - name: Sanity check broker ping
         run: |
           python - << 'PY'
           import os
@@ -87,14 +98,14 @@ jobs:
           print('AAPL px =', b.get_latest_price('AAPL'))
           PY
 
-      - name: Run equities smoke (force)
+      - name: Run equities smoke (module mode; avoids Kraken)
         env:
           PYTHONUNBUFFERED: '1'
         run: |
           set -e
           echo "=== ENV ==="; env | sort
           echo "=== RUN EQUITIES SMOKE ==="
-          python trader/equities_smoke.py
+          python -m trader.equities_smoke
 
       - name: Mark success
         if: ${{ success() }}
