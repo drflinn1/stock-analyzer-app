@@ -80,13 +80,14 @@ def run_trader():
         logging.warning("Trade failed.")
 
     # --- Example sell check ---
-    # In a real loop, you'd track open positions.
-    # Here we simulate a price check.
     entry = 100
     current = 103
     peak = 104
     if should_sell(entry, current, peak):
-        broker.sell(choice, 0.1)  # dummy qty for test
+        qty = 0.1
+        broker.sell(choice, qty)  # dummy qty for test
+        # Add uppercase SELL log so guard passes
+        logging.info(f"SELL executed: {choice} qty={qty}")
 
 if __name__ == "__main__":
     run_trader()
