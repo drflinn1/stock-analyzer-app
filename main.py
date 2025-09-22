@@ -202,12 +202,12 @@ def run_trader():
     except Exception as e:
         logging.error(f"Buy raised exception: {e}")
 
-    # --- SELL CHECK (demo path so guard sees SELL/TP/TRAIL/SL) ---
+    # --- SELL CHECK (demo path for guard; DISABLED in live) ---
     entry = 100.0
     current = 103.0
     peak = 104.0
 
-    if should_sell(entry, current, peak):
+    if DRY_RUN and should_sell(entry, current, peak):
         qty = 0.1
         sold = False
         try:
@@ -218,6 +218,8 @@ def run_trader():
             logging.info(f"SELL executed: {symbol} qty={qty}")
         else:
             logging.info(f"SELL skipped/failed for {symbol}")
+    else:
+        logging.info("Live mode: demo sell is disabled.")
 
 if __name__ == "__main__":
     run_trader()
