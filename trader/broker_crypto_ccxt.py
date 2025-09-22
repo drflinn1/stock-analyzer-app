@@ -1,9 +1,9 @@
-# trader/broker_crypto_ccxt.py
 # CCXT broker wrapper with Kraken-safe USD/ZUSD balance detection.
 
 from typing import Optional, Dict, Any, Tuple
 import math
 import os
+import logging
 import ccxt
 
 
@@ -52,7 +52,6 @@ class CCXTCryptoBroker:
                 "secret": api_secret,
                 "password": api_password,
                 "enableRateLimit": True,
-                # "timeout": 20000,
             }
         )
 
@@ -125,7 +124,9 @@ class CCXTCryptoBroker:
 
     # ---------- Trading helpers ---------- #
 
-    def place_market_notional(self, symbol: str, usd_amount: float, fee_buffer: float = 0.001) -> Dict[str, Any]:
+    def place_market_notional(
+        self, symbol: str, usd_amount: float, fee_buffer: float = 0.001
+    ) -> Dict[str, Any]:
         """
         Market buy sized by USD notional. Converts to base amount using live price.
         A small fee_buffer keeps cost <= usd_amount.
@@ -137,7 +138,9 @@ class CCXTCryptoBroker:
         base_amt = (usd_amount / price) * (1.0 - fee_buffer)
         base_amt = self._round_amount(symbol, base_amt)
         if base_amt <= 0:
-            raise ValueError(f"Computed amount too small for {symbol} with usd_amount={usd_amount}")
+            raise ValueError(
+                f"Computed amount too small for {symbol} with usd_amount={usd_amount}"
+            )
 
         if self.dry_run:
             return {
@@ -150,7 +153,9 @@ class CCXTCryptoBroker:
                 "status": "dry_run_only",
             }
 
-        return self.exchange.create_order(symbol, type="market", side="buy", amount=base_amt)
+        return self.exchange.create_order(
+            symbol, type="market", side="buy", amount=base_amt
+        )
 
     def market_sell_all(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Sell full available base position of `symbol` (e.g., BTC for BTC/USD)."""
@@ -171,9 +176,105 @@ class CCXTCryptoBroker:
                 "status": "dry_run_only",
             }
 
-        return self.exchange.create_order(symbol, type="market", side="sell", amount=free_base)
+        return self.exchange.create_order(
+            symbol, type="market", side="sell", amount=free_base
+        )
 
-    # ---------- Misc ---------- #
 
-    def get_position_size(self, symbol: str) -> float:
-        ba
+# ===== Standard interface adapter for main.py =====
+# Provides: get_balance(), buy(symbol, usd_amount), sell(symbol, qty)
+# Inherits your existing CCXTCryptoBroker and assumes `self.exchange` is a ccxt instance.
+
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+
+def _usd_from_ccxt_balance(bal: dict) -> float:
+    # direct USD
+    for k in ("USD", "ZUSD"):
+        v = bal.get(k)
+        if isinstance(v, dict):
+            for sub in ("free", "total", "available"):
+                if isinstance(v.get(sub), (int, float)):
+                    return float(v[sub])
+        if isinstance(v, (int, float)):
+            return float(v)
+    # stables (assume 1:1)
+    for k in ("USDT", "USDC"):
+        v = bal.get(k)
+        if isinstance(v, dict) and isinstance(v.get("free"), (int, float)):
+            return float(v["free"])
+    free = bal.get("free")
+    if isinstance(free, dict):
+        for k in ("USD", "ZUSD", "USDT", "USDC"):
+            if isinstance(free.get(k), (int, float)):
+                return float(free[k])
+    return 0.0
+
+class CryptoBroker(CCXTCryptoBroker):
+    """
+    Minimal shim so main.py can call a consistent API.
+    Your original CCXTCryptoBroker stays untouched above.
+    """
+    def _ex(self):
+        ex = getattr(self, "exchange", None)
+        if ex is None:
+            raise RuntimeError("CCXTCryptoBroker has no `exchange` (ccxt) set")
+        return ex
+
+    def get_balance(self) -> float:
+        try:
+            bal = self._ex().fetch_balance()
+            usd = _usd_from_ccxt_balance(bal)
+            logging.info(f"[ccxt] USD balance detected: ${usd:.2f}")
+            return float(usd)
+        except Exception as e:
+            logging.error(f"[ccxt] fetch_balance failed: {e}")
+            return 0.0
+
+    def _last_price(self, symbol: str) -> float:
+        ex = self._ex()
+        try:
+            t = ex.fetch_ticker(symbol)
+            if t and t.get("last"):
+                return float(t["last"])
+        except Exception:
+            pass
+        ob = ex.fetch_order_book(symbol)
+        if ob.get("bids"):
+            return float(ob["bids"][0][0])
+        if ob.get("asks"):
+            return float(ob["asks"][0][0])
+        raise RuntimeError(f"No price for {symbol}")
+
+    def buy(self, symbol: str, usd_amount: float) -> bool:
+        try:
+            price = self._last_price(symbol)
+            amount = float(usd_amount) / max(price, 1e-12)
+            ex = self._ex()
+            if hasattr(ex, "amount_to_precision"):
+                amount = float(ex.amount_to_precision(symbol, amount))
+            if DRY_RUN:
+                logging.info(f"[DRY RUN] ccxt BUY {symbol} amount={amount} (~${usd_amount:.2f}) @~{price}")
+                return True
+            ex.create_market_buy_order(symbol, amount)
+            logging.info(f"[LIVE] ccxt BUY {symbol} amount={amount}")
+            return True
+        except Exception as e:
+            logging.error(f"[ccxt] buy failed: {e}")
+            return False
+
+    def sell(self, symbol: str, qty: float) -> bool:
+        try:
+            ex = self._ex()
+            q = float(qty)
+            if hasattr(ex, "amount_to_precision"):
+                q = float(ex.amount_to_precision(symbol, q))
+            if DRY_RUN:
+                logging.info(f"[DRY RUN] ccxt SELL {symbol} qty={q}")
+                return True
+            ex.create_market_sell_order(symbol, q)
+            logging.info(f"[LIVE] ccxt SELL {symbol} qty={q}")
+            return True
+        except Exception as e:
+            logging.error(f"[ccxt] sell failed: {e}")
+            return False
+# ===== end adapter =====
