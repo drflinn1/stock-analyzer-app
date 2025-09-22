@@ -1,11 +1,5 @@
-# FILE: trader/broker_alpaca.py
-# (unchanged — see previous content)
-# ...
-
-# -------------------------------------------------------------
 # FILE: .github/workflows/equities-live.yml
-# Equities Live (Alpaca) — PAPER first (YAML fix #2)
-# -------------------------------------------------------------
+# Equities Live (Alpaca) — PAPER first
 
 name: Equities Live (Alpaca — PAPER)
 
@@ -51,16 +45,23 @@ jobs:
           pip install requests pandas
 
       - name: Export env (safe defaults)
+        env:
+          IN_DRY: ${{ github.event.inputs.DRY_RUN }}
+          IN_PT: ${{ github.event.inputs.PER_TRADE_USD }}
+          IN_DC: ${{ github.event.inputs.DAILY_CAP_USD }}
+          IN_UNI: ${{ github.event.inputs.UNIVERSE }}
         run: |
-          # DRY_RUN default to true when not provided
-          echo "DRY_RUN=${{ github.event.inputs.DRY_RUN || 'true' }}" >> $GITHUB_ENV
-          echo "PER_TRADE_USD=${{ github.event.inputs.PER_TRADE_USD || '25' }}" >> $GITHUB_ENV
-          echo "DAILY_CAP_USD=${{ github.event.inputs.DAILY_CAP_USD || '50' }}" >> $GITHUB_ENV
-          echo "UNIVERSE=${{ github.event.inputs.UNIVERSE || 'SPY,AAPL,MSFT,TSLA,NVDA,AMD' }}" >> $GITHUB_ENV
+          # DRY_RUN default to true when not provided (e.g., scheduled runs)
+          if [ -z "$IN_DRY" ]; then echo "DRY_RUN=true" >> $GITHUB_ENV; else echo "DRY_RUN=$IN_DRY" >> $GITHUB_ENV; fi
+          # Inputs with fallbacks
+          if [ -z "$IN_PT" ]; then echo "PER_TRADE_USD=25" >> $GITHUB_ENV; else echo "PER_TRADE_USD=$IN_PT" >> $GITHUB_ENV; fi
+          if [ -z "$IN_DC" ]; then echo "DAILY_CAP_USD=50" >> $GITHUB_ENV; else echo "DAILY_CAP_USD=$IN_DC" >> $GITHUB_ENV; fi
+          if [ -z "$IN_UNI" ]; then echo "UNIVERSE=SPY,AAPL,MSFT,TSLA,NVDA,AMD" >> $GITHUB_ENV; else echo "UNIVERSE=$IN_UNI" >> $GITHUB_ENV; fi
           echo "BROKER=alpaca" >> $GITHUB_ENV
           echo "ASSET_CLASS=equities" >> $GITHUB_ENV
           echo "AUTO_UNIVERSE=1" >> $GITHUB_ENV
           echo "MIN_NOTIONAL_USD=1.00" >> $GITHUB_ENV
+          # PAPER endpoints by default
           echo "ALPACA_BASE_URL=https://paper-api.alpaca.markets" >> $GITHUB_ENV
           echo "ALPACA_DATA_URL=https://data.alpaca.markets" >> $GITHUB_ENV
 
