@@ -42,7 +42,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas
+          # include ccxt because broker_crypto_ccxt.py is imported by your code
+          pip install requests pandas ccxt yfinance
 
       - name: Export env (safe defaults)
         env:
