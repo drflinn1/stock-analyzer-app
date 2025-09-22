@@ -34,7 +34,8 @@ jobs:
       # Safety: never sell more than this “epsilon” below free balance
       SELL_SAFETY_EPS_PCT: "0.25"
       CANCEL_OPEN_ORDERS_BEFORE_SELL: "true"
-
+      USD_BAL_OVERRIDE: "50"
+      
       # ===== Universe & Ranking (Concentrated) =====
       AUTO_UNIVERSE: "true"
       UNIVERSE_TOP_N: "12"              # broaden candidates
