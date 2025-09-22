@@ -197,14 +197,18 @@ def run_trader():
 
     # Sell demo (for guard)
     entry, current, peak = 100.0, 103.0, 104.0
-    if should_sell(entry, current, peak):
-        qty = 0.1
-        try:
-            broker.sell(symbol, qty)
-        except Exception as e:
-            logging.error(f"Sell raised exception: {e}")
-        finally:
-            logging.info(f"SELL executed: {symbol} qty={qty}")
+  if should_sell(entry, current, peak):
+    qty = 0.1
+    sold = False
+    try:
+        sold = broker.sell(symbol, qty)
+    except Exception as e:
+        logging.error(f"Sell raised exception: {e}")
+    if sold:
+        logging.info(f"SELL executed: {symbol} qty={qty}")
+    else:
+        logging.info(f"SELL skipped/failed for {symbol}")
+
 
 if __name__ == "__main__":
     run_trader()
