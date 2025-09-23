@@ -1,52 +1,46 @@
 """
-Equities Engine — uses Alpaca Market Data bars (1D) for indicators.
-- Fixes the missing 1D bar issue by switching from yfinance to Alpaca data.
-- Adds a clear log line showing how many bars were fetched per symbol.
-- Keeps your existing env-driven knobs:
+Equities Engine — Alpaca 1D Bars (IEX) + Bar Count Log
+
+What’s new
+- Uses Alpaca Market Data (1D) and FORCES feed="iex" to avoid SIP 403 errors on free tier.
+- Logs: "Bars fetched for SYMBOL: N (need ≥120)" so you can see data coverage fast.
+- Trades with MARKET orders when MARKET_ONLY=true.
+
+Env knobs (from workflow dispatch):
     DRY_RUN=false|true
     PER_TRADE_USD=3
     DAILY_CAP_USD=12
     UNIVERSE=AAPL,MSFT
     MARKET_ONLY=true
-- Places MARKET orders only when MARKET_ONLY=true (default true).
 
-ENV for Alpaca (data & trading):
+Alpaca credentials (repo → Settings → Secrets and variables → Actions):
     ALPACA_API_KEY
     ALPACA_SECRET_KEY
-    ALPACA_PAPER=true|false   # optional, defaults to true
-
-Notes:
-- If keys are missing, we still try to run, but trading will be disabled and we'll warn.
-- Indicator logic is intentionally simple/robust (EMA cross + RSI filter); adjust as needed.
+    ALPACA_PAPER=true|false   # optional, defaults true
 """
 from __future__ import annotations
 
 import os
 import sys
-import time
-import json
-import math
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional
+from typing import Optional
 
 import pandas as pd
 
+# ---------- Alpaca SDK ----------
 try:
-    # Alpaca SDK (data)
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
     from alpaca.trading.client import TradingClient
     from alpaca.trading.requests import MarketOrderRequest
     from alpaca.trading.enums import OrderSide, TimeInForce
-except Exception as e:  # pragma: no cover
-    # Defer import errors to runtime with a clearer message
-    raise RuntimeError(
-        "alpaca-py is required. Please 'pip install alpaca-py' in your workflow.") from e
+except Exception as e:
+    raise RuntimeError("alpaca-py is required. Run: pip install alpaca-py") from e
 
-# ------------------------------ logging -----------------------------------
+# ---------- logging ----------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -54,8 +48,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("equities_engine")
 
-# ------------------------------ config ------------------------------------
-
+# ---------- config ----------
 def getenv_bool(key: str, default: bool) -> bool:
     v = os.getenv(key)
     if v is None:
@@ -75,8 +68,7 @@ ALPACA_PAPER = getenv_bool("ALPACA_PAPER", True)
 # indicator lookback safety
 MIN_BARS = 120  # ensure enough bars for EMA/RSI
 
-# ------------------------------ indicators --------------------------------
-
+# ---------- indicators ----------
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
@@ -84,36 +76,41 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
-    roll_up = up.ewm(alpha=1/period, adjust=False).mean()
-    roll_down = down.ewm(alpha=1/period, adjust=False).mean()
+    roll_up = up.ewm(alpha=1 / period, adjust=False).mean()
+    roll_down = down.ewm(alpha=1 / period, adjust=False).mean()
     rs = roll_up / (roll_down.replace(0, 1e-9))
     return 100 - (100 / (1 + rs))
 
-# ------------------------------ data fetch --------------------------------
-
+# ---------- data fetch ----------
 def make_data_client() -> StockHistoricalDataClient:
+    # Alpaca data client requires both key and secret.
     if not (ALPACA_API_KEY and ALPACA_SECRET_KEY):
-        log.warning("ALPACA keys are missing; data client will still init, but trading will be disabled.")
-    return StockHistoricalDataClient(ALPACA_API_KEY or "", ALPACA_SECRET_KEY or "")
-
+        raise RuntimeError("Alpaca credentials missing. Set ALPACA_API_KEY and ALPACA_SECRET_KEY.")
+    return StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
 def fetch_daily_bars(client: StockHistoricalDataClient, symbol: str, days: int = 400) -> pd.DataFrame:
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
+    # Force the free IEX feed to avoid SIP 403 on free accounts.
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=TimeFrame.Day,
         start=start,
         end=end,
         adjustment="raw",
-        feed=None,  # let SDK choose (SIP if entitled, else free feed)
+        feed="iex",           # <<< key change
         limit=None,
     )
-    bars = client.get_stock_bars(req)
+    try:
+        bars = client.get_stock_bars(req)
+    except Exception as e:
+        log.error(f"Alpaca data error for {symbol}: {e}")
+        return pd.DataFrame()
+
     df = bars.df  # MultiIndex (symbol, timestamp)
     if df is None or df.empty:
         return pd.DataFrame()
-    # For single symbol, drop the first level
+
     if isinstance(df.index, pd.MultiIndex):
         df = df.xs(symbol, level=0, drop_level=True)
     df = df.reset_index().rename(columns={
@@ -128,8 +125,7 @@ def fetch_daily_bars(client: StockHistoricalDataClient, symbol: str, days: int =
     df.set_index("date", inplace=True)
     return df
 
-# ------------------------------ trading -----------------------------------
-
+# ---------- trading ----------
 @dataclass
 class Position:
     symbol: str
@@ -146,7 +142,7 @@ class Broker:
 
     def get_cash(self) -> float:
         if not self.enabled:
-            return float("inf")  # allow planning
+            return float("inf")  # allow planning in DRY_RUN
         acct = self.client.get_account()
         return float(acct.cash)
 
@@ -167,7 +163,6 @@ class Broker:
         if DRY_RUN or not self.enabled:
             log.info(f"DRY_RUN or trading disabled → SELL ALL {symbol} (simulated)")
             return None
-        # Use qty = 'all' via notional-less market sell requires position lookup
         pos = None
         try:
             for p in self.client.get_all_positions():
@@ -188,8 +183,7 @@ class Broker:
         order = self.client.submit_order(req)
         return order.id
 
-# ------------------------------ strategy ----------------------------------
-
+# ---------- strategy ----------
 def generate_signal(df: pd.DataFrame) -> str:
     """Return 'BUY', 'SELL', or 'HOLD' based on EMA cross + RSI filter.
     - BUY: EMA(12) crosses above EMA(26) and RSI > 50
@@ -202,7 +196,6 @@ def generate_signal(df: pd.DataFrame) -> str:
     ema26 = ema(close, 26)
     r = rsi(close, 14)
 
-    # Cross detection: look at last two points
     fast_now, fast_prev = float(ema12.iloc[-1]), float(ema12.iloc[-2])
     slow_now, slow_prev = float(ema26.iloc[-1]), float(ema26.iloc[-2])
     r_now = float(r.iloc[-1])
@@ -216,23 +209,28 @@ def generate_signal(df: pd.DataFrame) -> str:
         return "SELL"
     return "HOLD"
 
-# ------------------------------ engine ------------------------------------
-
+# ---------- engine ----------
 def main() -> int:
-    log.info("Starting Equities Engine (Alpaca bars)")
+    log.info("Starting Equities Engine (Alpaca bars; feed=iex)")
     log.info(f"Config → DRY_RUN={DRY_RUN} PER_TRADE_USD={PER_TRADE_USD} DAILY_CAP_USD={DAILY_CAP_USD} MARKET_ONLY={MARKET_ONLY}")
     log.info(f"Universe: {UNIVERSE}")
 
-    data_client = make_data_client()
+    try:
+        data_client = make_data_client()
+    except Exception as e:
+        log.error(f"Cannot start data client: {e}")
+        return 1
+
     broker = Broker()
 
     spend_left = DAILY_CAP_USD
     total_buys = 0
     total_sells = 0
+
     for symbol in UNIVERSE:
         try:
             df = fetch_daily_bars(data_client, symbol, days=420)
-            log.info(f"Bars fetched for {symbol}: {len(df)} (need ≥{MIN_BARS})")  # <= explicit bar count line
+            log.info(f"Bars fetched for {symbol}: {len(df)} (need ≥{MIN_BARS})")
             if df.empty or len(df) < MIN_BARS:
                 log.warning(f"Skipping {symbol}: insufficient bars for indicators")
                 continue
@@ -260,7 +258,6 @@ def main() -> int:
 
     log.info(f"Done. Buys placed: {total_buys}, Sells placed: {total_sells}, Daily spend remaining: ${spend_left:.2f}")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
