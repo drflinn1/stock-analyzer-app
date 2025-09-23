@@ -1,5 +1,5 @@
 # FILE: .github/workflows/equities-live.yml
-# Equities Live (Alpaca) — PAPER first (forced equities smoke; module mode)
+# Equities Live (Alpaca) — PAPER/LIVE with market-hours guard
 
 name: Equities Live (Alpaca — PAPER)
 
@@ -22,6 +22,10 @@ on:
         description: "Comma-separated tickers"
         required: false
         default: "SPY,AAPL,MSFT,TSLA,NVDA,AMD"
+      MARKET_ONLY:
+        description: "Skip trading steps when market is closed? true/false"
+        required: false
+        default: "true"
   schedule:
     - cron: '35 13 * * 1-5'   # 09:35 ET during EDT
     - cron: '50 19 * * 1-5'   # 15:50 ET during EDT
@@ -30,6 +34,7 @@ jobs:
   trade:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -42,51 +47,108 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # include ccxt because other modules in your repo import broker_crypto_ccxt
+          # ccxt is installed because some modules import broker_crypto_ccxt
           pip install requests pandas ccxt yfinance
 
       - name: Export env (safe defaults + paper/live endpoint)
         env:
-          IN_DRY: ${{ github.event.inputs.DRY_RUN }}
-          IN_PT:  ${{ github.event.inputs.PER_TRADE_USD }}
-          IN_DC:  ${{ github.event.inputs.DAILY_CAP_USD }}
-          IN_UNI: ${{ github.event.inputs.UNIVERSE }}
+          IN_DRY:        ${{ github.event.inputs.DRY_RUN }}
+          IN_PT:         ${{ github.event.inputs.PER_TRADE_USD }}
+          IN_DC:         ${{ github.event.inputs.DAILY_CAP_USD }}
+          IN_UNI:        ${{ github.event.inputs.UNIVERSE }}
+          IN_MARKETONLY: ${{ github.event.inputs.MARKET_ONLY }}
         run: |
-          # Resolve effective DRY_RUN value (default true for schedules)
+          # Resolve DRY_RUN (default true)
           if [ -z "$IN_DRY" ]; then EFF_DRY=true; else EFF_DRY="$IN_DRY"; fi
           echo "DRY_RUN=$EFF_DRY" >> $GITHUB_ENV
 
-          # Other inputs with fallbacks
+          # Inputs with fallbacks
           if [ -z "$IN_PT" ]; then echo "PER_TRADE_USD=25" >> $GITHUB_ENV; else echo "PER_TRADE_USD=$IN_PT" >> $GITHUB_ENV; fi
           if [ -z "$IN_DC" ]; then echo "DAILY_CAP_USD=50" >> $GITHUB_ENV; else echo "DAILY_CAP_USD=$IN_DC" >> $GITHUB_ENV; fi
           if [ -z "$IN_UNI" ]; then echo "UNIVERSE=SPY,AAPL,MSFT,TSLA,NVDA,AMD" >> $GITHUB_ENV; else echo "UNIVERSE=$IN_UNI" >> $GITHUB_ENV; fi
+
+          # Market-only toggle (default true)
+          if [ -z "$IN_MARKETONLY" ]; then IN_MARKETONLY=true; fi
+          echo "MARKET_ONLY=$IN_MARKETONLY" >> $GITHUB_ENV
 
           echo "BROKER=alpaca" >> $GITHUB_ENV
           echo "ASSET_CLASS=equities" >> $GITHUB_ENV
           echo "AUTO_UNIVERSE=1" >> $GITHUB_ENV
           echo "MIN_NOTIONAL_USD=1.00" >> $GITHUB_ENV
+          echo "ALPACA_DATA_URL=https://data.alpaca.markets" >> $GITHUB_ENV
 
-          # Base URLs: paper by default; switch when DRY_RUN=false
+          # Base URL: Paper (default) vs Live when DRY_RUN=false
           if [ "$EFF_DRY" = "false" ]; then
             echo "ALPACA_BASE_URL=https://api.alpaca.markets" >> $GITHUB_ENV
           else
             echo "ALPACA_BASE_URL=https://paper-api.alpaca.markets" >> $GITHUB_ENV
           fi
-          echo "ALPACA_DATA_URL=https://data.alpaca.markets" >> $GITHUB_ENV
 
-      - name: Inject secrets (Alpaca)
+      - name: Inject secrets (choose paper/live by DRY_RUN)
         env:
-          ALPACA_API_KEY:   ${{ secrets.ALPACA_API_KEY }}
-          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          # PAPER (existing)
+          PKEY: ${{ secrets.ALPACA_API_KEY }}
+          PSEC: ${{ secrets.ALPACA_API_SECRET }}
+          # LIVE (new)
+          LKEY: ${{ secrets.ALPACA_API_KEY_LIVE }}
+          LSEC: ${{ secrets.ALPACA_API_SECRET_LIVE }}
         run: |
-          if [ -z "$ALPACA_API_KEY" ] || [ -z "$ALPACA_API_SECRET" ]; then
-            echo "Missing ALPACA secrets; ensure repo secrets are set. For paper runs DRY_RUN must be true." && exit 1
+          if [ "$DRY_RUN" = "false" ]; then
+            if [ -z "$LKEY" ] || [ -z "$LSEC" ]; then
+              echo "DRY_RUN=false but LIVE keys are missing (ALPACA_API_KEY_LIVE/ALPACA_API_SECRET_LIVE)"; exit 1
+            fi
+            echo "ALPACA_API_KEY=$LKEY" >> $GITHUB_ENV
+            echo "ALPACA_API_SECRET=$LSEC" >> $GITHUB_ENV
+            echo "Using LIVE credentials."
+          else
+            if [ -z "$PKEY" ] || [ -z "$PSEC" ]; then
+              echo "PAPER keys missing (ALPACA_API_KEY/ALPACA_API_SECRET)"; exit 1
+            fi
+            echo "ALPACA_API_KEY=$PKEY" >> $GITHUB_ENV
+            echo "ALPACA_API_SECRET=$PSEC" >> $GITHUB_ENV
+            echo "Using PAPER credentials."
           fi
-          echo "ALPACA_API_KEY=$ALPACA_API_KEY" >> $GITHUB_ENV
-          echo "ALPACA_API_SECRET=$ALPACA_API_SECRET" >> $GITHUB_ENV
+
+      - name: Check market hours
+        id: market
+        env:
+          ALPACA_BASE_URL: ${{ env.ALPACA_BASE_URL }}
+          ALPACA_API_KEY:  ${{ env.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ env.ALPACA_API_SECRET }}
+          MARKET_ONLY:     ${{ env.MARKET_ONLY }}
+        run: |
+          python - << 'PY'
+          import os, requests, sys
+          base = os.getenv('ALPACA_BASE_URL','https://paper-api.alpaca.markets').rstrip('/')
+          hdrs = {
+            "APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY",""),
+            "APCA-API-SECRET-KEY": os.getenv("ALPACA_API_SECRET",""),
+          }
+          market_only = os.getenv("MARKET_ONLY","true").lower() == "true"
+          is_open = True  # default proceed
+          if market_only:
+            try:
+              r = requests.get(base + "/v2/clock", headers=hdrs, timeout=15)
+              r.raise_for_status()
+              is_open = bool(r.json().get("is_open"))
+            except Exception as e:
+              # If the clock call fails, be safe and do NOT trade
+              is_open = False
+          print("ALPACA_BASE_URL =", base)
+          print("MARKET_ONLY     =", market_only)
+          print("Market is_open  =", is_open)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write(f"is_open={'true' if is_open else 'false'}\n")
+          PY
+
+      - name: Market closed — skipping trading steps
+        if: steps.market.outputs.is_open != 'true'
+        run: echo "Market is closed; trading steps skipped by guard."
 
       - name: Sanity check broker ping
+        if: steps.market.outputs.is_open == 'true'
         run: |
+          echo "ALPACA_BASE_URL=$ALPACA_BASE_URL"
           python - << 'PY'
           import os
           from trader.broker_alpaca import AlpacaEquitiesBroker
@@ -99,6 +161,7 @@ jobs:
           PY
 
       - name: Run equities smoke (module mode; avoids Kraken)
+        if: steps.market.outputs.is_open == 'true'
         env:
           PYTHONUNBUFFERED: '1'
         run: |
