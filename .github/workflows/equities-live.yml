@@ -1,5 +1,5 @@
 # FILE: .github/workflows/equities-live.yml
-# Equities Live (Alpaca) — PAPER/LIVE with market-hours guard
+# Equities Live (Alpaca) — PAPER/LIVE with market-hours guard & equities engine
 
 name: Equities Live (Alpaca — PAPER)
 
@@ -26,6 +26,19 @@ on:
         description: "Skip trading steps when market is closed? true/false"
         required: false
         default: "true"
+      TP_PCT:
+        description: "Take-profit percent (e.g., 0.02 = 2%)"
+        required: false
+        default: "0.02"
+      ATR_MULT:
+        description: "ATR multiple for stop (e.g., 1.5)"
+        required: false
+        default: "1.5"
+      MAX_BUYS_PER_RUN:
+        description: "Max buys per run"
+        required: false
+        default: "3"
+
   schedule:
     - cron: '35 13 * * 1-5'   # 09:35 ET during EDT
     - cron: '50 19 * * 1-5'   # 15:50 ET during EDT
@@ -47,8 +60,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # ccxt is installed because some modules import broker_crypto_ccxt
-          pip install requests pandas ccxt yfinance
+          pip install requests pandas numpy yfinance ccxt
 
       - name: Export env (safe defaults + paper/live endpoint)
         env:
@@ -57,19 +69,22 @@ jobs:
           IN_DC:         ${{ github.event.inputs.DAILY_CAP_USD }}
           IN_UNI:        ${{ github.event.inputs.UNIVERSE }}
           IN_MARKETONLY: ${{ github.event.inputs.MARKET_ONLY }}
+          IN_TP:         ${{ github.event.inputs.TP_PCT }}
+          IN_ATR:        ${{ github.event.inputs.ATR_MULT }}
+          IN_MAXBUYS:    ${{ github.event.inputs.MAX_BUYS_PER_RUN }}
         run: |
-          # Resolve DRY_RUN (default true)
+          # DRY_RUN
           if [ -z "$IN_DRY" ]; then EFF_DRY=true; else EFF_DRY="$IN_DRY"; fi
           echo "DRY_RUN=$EFF_DRY" >> $GITHUB_ENV
 
-          # Inputs with fallbacks
-          if [ -z "$IN_PT" ]; then echo "PER_TRADE_USD=25" >> $GITHUB_ENV; else echo "PER_TRADE_USD=$IN_PT" >> $GITHUB_ENV; fi
-          if [ -z "$IN_DC" ]; then echo "DAILY_CAP_USD=50" >> $GITHUB_ENV; else echo "DAILY_CAP_USD=$IN_DC" >> $GITHUB_ENV; fi
-          if [ -z "$IN_UNI" ]; then echo "UNIVERSE=SPY,AAPL,MSFT,TSLA,NVDA,AMD" >> $GITHUB_ENV; else echo "UNIVERSE=$IN_UNI" >> $GITHUB_ENV; fi
-
-          # Market-only toggle (default true)
-          if [ -z "$IN_MARKETONLY" ]; then IN_MARKETONLY=true; fi
-          echo "MARKET_ONLY=$IN_MARKETONLY" >> $GITHUB_ENV
+          # Inputs with defaults
+          echo "PER_TRADE_USD=${IN_PT:-25}"        >> $GITHUB_ENV
+          echo "DAILY_CAP_USD=${IN_DC:-50}"        >> $GITHUB_ENV
+          echo "UNIVERSE=${IN_UNI:-SPY,AAPL,MSFT,TSLA,NVDA,AMD}" >> $GITHUB_ENV
+          echo "MARKET_ONLY=${IN_MARKETONLY:-true}" >> $GITHUB_ENV
+          echo "TP_PCT=${IN_TP:-0.02}"             >> $GITHUB_ENV
+          echo "ATR_MULT=${IN_ATR:-1.5}"           >> $GITHUB_ENV
+          echo "MAX_BUYS_PER_RUN=${IN_MAXBUYS:-3}" >> $GITHUB_ENV
 
           echo "BROKER=alpaca" >> $GITHUB_ENV
           echo "ASSET_CLASS=equities" >> $GITHUB_ENV
@@ -77,7 +92,7 @@ jobs:
           echo "MIN_NOTIONAL_USD=1.00" >> $GITHUB_ENV
           echo "ALPACA_DATA_URL=https://data.alpaca.markets" >> $GITHUB_ENV
 
-          # Base URL: Paper (default) vs Live when DRY_RUN=false
+          # Base URL per dry-run
           if [ "$EFF_DRY" = "false" ]; then
             echo "ALPACA_BASE_URL=https://api.alpaca.markets" >> $GITHUB_ENV
           else
@@ -112,27 +127,24 @@ jobs:
       - name: Check market hours
         id: market
         env:
-          ALPACA_BASE_URL: ${{ env.ALPACA_BASE_URL }}
-          ALPACA_API_KEY:  ${{ env.ALPACA_API_KEY }}
+          ALPACA_BASE_URL:   ${{ env.ALPACA_BASE_URL }}
+          ALPACA_API_KEY:    ${{ env.ALPACA_API_KEY }}
           ALPACA_API_SECRET: ${{ env.ALPACA_API_SECRET }}
-          MARKET_ONLY:     ${{ env.MARKET_ONLY }}
+          MARKET_ONLY:       ${{ env.MARKET_ONLY }}
         run: |
           python - << 'PY'
-          import os, requests, sys
+          import os, requests
           base = os.getenv('ALPACA_BASE_URL','https://paper-api.alpaca.markets').rstrip('/')
-          hdrs = {
-            "APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY",""),
-            "APCA-API-SECRET-KEY": os.getenv("ALPACA_API_SECRET",""),
-          }
+          hdrs = {"APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY",""),
+                  "APCA-API-SECRET-KEY": os.getenv("ALPACA_API_SECRET","")}
           market_only = os.getenv("MARKET_ONLY","true").lower() == "true"
-          is_open = True  # default proceed
+          is_open = True
           if market_only:
             try:
               r = requests.get(base + "/v2/clock", headers=hdrs, timeout=15)
               r.raise_for_status()
               is_open = bool(r.json().get("is_open"))
-            except Exception as e:
-              # If the clock call fails, be safe and do NOT trade
+            except Exception:
               is_open = False
           print("ALPACA_BASE_URL =", base)
           print("MARKET_ONLY     =", market_only)
@@ -143,7 +155,7 @@ jobs:
 
       - name: Market closed — skipping trading steps
         if: steps.market.outputs.is_open != 'true'
-        run: echo "Market is closed; trading steps skipped by guard."
+        run: echo "Market closed; trading steps skipped by guard."
 
       - name: Sanity check broker ping
         if: steps.market.outputs.is_open == 'true'
@@ -160,16 +172,16 @@ jobs:
           print('AAPL px =', b.get_latest_price('AAPL'))
           PY
 
-      - name: Run equities smoke (module mode; avoids Kraken)
+      - name: Run equities engine (module)
         if: steps.market.outputs.is_open == 'true'
         env:
           PYTHONUNBUFFERED: '1'
         run: |
           set -e
           echo "=== ENV ==="; env | sort
-          echo "=== RUN EQUITIES SMOKE ==="
-          python -m trader.equities_smoke
+          echo "=== RUN EQUITIES ENGINE ==="
+          python -m trader.equities_engine
 
       - name: Mark success
         if: ${{ success() }}
-        run: echo 'Equities (Alpaca — PAPER) run completed.'
+        run: echo 'Equities (Alpaca) run completed.'
