@@ -23,9 +23,8 @@ on:
         description: "true to use market orders"
         required: true
         default: "true"
-  # If you want a schedule, uncomment and tune (times are UTC)
   # schedule:
-  #   - cron: "40 14 * * 1-5"   # example: 07:40 PT, weekdays
+  #   - cron: "40 14 * * 1-5"  # example: 07:40 PT weekdays (UTC)
 
 jobs:
   run:
@@ -44,30 +43,18 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-            # Ensure Alpaca SDK is present even if requirements.txt forgot it:
-            pip install alpaca-py
-          else
-            pip install pandas numpy alpaca-py
-          fi
+          pip install -r requirements.txt
 
       - name: Run Equities Engine
         env:
-          # run-time knobs from the dispatch form
           DRY_RUN:        ${{ github.event.inputs.DRY_RUN }}
           PER_TRADE_USD:  ${{ github.event.inputs.PER_TRADE_USD }}
           DAILY_CAP_USD:  ${{ github.event.inputs.DAILY_CAP_USD }}
           UNIVERSE:       ${{ github.event.inputs.UNIVERSE }}
           MARKET_ONLY:    ${{ github.event.inputs.MARKET_ONLY }}
-
-          # Alpaca credentials (add in repo Settings → Secrets and variables → Actions)
           ALPACA_API_KEY:     ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY:  ${{ secrets.ALPACA_SECRET_KEY }}
-          ALPACA_PAPER:       "true"   # change to false if you flip live
-
-          # Logging
+          ALPACA_PAPER:       "true"
           LOG_LEVEL: "INFO"
         run: |
-          # Adjust path if you placed the engine elsewhere
           python trader/equities_engine.py
