@@ -70,4 +70,4 @@ jobs:
           LOG_LEVEL: "INFO"
         run: |
           # Adjust path if you placed the engine elsewhere
-          python equities_engine.py
+          python trader/equities_engine.py
