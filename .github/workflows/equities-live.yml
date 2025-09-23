@@ -1,5 +1,5 @@
 # FILE: .github/workflows/equities-live.yml
-# Equities Live (Alpaca) — PAPER/LIVE with market-hours guard & equities engine
+# PAPER/LIVE with market-hours guard + equities engine
 
 name: Equities Live (Alpaca — PAPER)
 
@@ -8,35 +8,27 @@ on:
     inputs:
       DRY_RUN:
         description: "Dry run (paper)? true/false"
-        required: false
         default: "true"
       PER_TRADE_USD:
         description: "USD per trade"
-        required: false
         default: "25"
       DAILY_CAP_USD:
         description: "Max USD spent per day"
-        required: false
         default: "50"
       UNIVERSE:
         description: "Comma-separated tickers"
-        required: false
         default: "SPY,AAPL,MSFT,TSLA,NVDA,AMD"
       MARKET_ONLY:
         description: "Skip trading steps when market is closed? true/false"
-        required: false
         default: "true"
       TP_PCT:
         description: "Take-profit percent (e.g., 0.02 = 2%)"
-        required: false
         default: "0.02"
       ATR_MULT:
         description: "ATR multiple for stop (e.g., 1.5)"
-        required: false
         default: "1.5"
       MAX_BUYS_PER_RUN:
         description: "Max buys per run"
-        required: false
         default: "3"
 
   schedule:
@@ -49,11 +41,9 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -62,7 +52,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pandas numpy yfinance ccxt
 
-      - name: Export env (safe defaults + paper/live endpoint)
+      - name: Export env (safe defaults + endpoints)
         env:
           IN_DRY:        ${{ github.event.inputs.DRY_RUN }}
           IN_PT:         ${{ github.event.inputs.PER_TRADE_USD }}
@@ -73,27 +63,20 @@ jobs:
           IN_ATR:        ${{ github.event.inputs.ATR_MULT }}
           IN_MAXBUYS:    ${{ github.event.inputs.MAX_BUYS_PER_RUN }}
         run: |
-          # DRY_RUN
-          if [ -z "$IN_DRY" ]; then EFF_DRY=true; else EFF_DRY="$IN_DRY"; fi
-          echo "DRY_RUN=$EFF_DRY" >> $GITHUB_ENV
-
-          # Inputs with defaults
-          echo "PER_TRADE_USD=${IN_PT:-25}"        >> $GITHUB_ENV
-          echo "DAILY_CAP_USD=${IN_DC:-50}"        >> $GITHUB_ENV
+          echo "DRY_RUN=${IN_DRY:-true}" >> $GITHUB_ENV
+          echo "PER_TRADE_USD=${IN_PT:-25}" >> $GITHUB_ENV
+          echo "DAILY_CAP_USD=${IN_DC:-50}" >> $GITHUB_ENV
           echo "UNIVERSE=${IN_UNI:-SPY,AAPL,MSFT,TSLA,NVDA,AMD}" >> $GITHUB_ENV
           echo "MARKET_ONLY=${IN_MARKETONLY:-true}" >> $GITHUB_ENV
-          echo "TP_PCT=${IN_TP:-0.02}"             >> $GITHUB_ENV
-          echo "ATR_MULT=${IN_ATR:-1.5}"           >> $GITHUB_ENV
+          echo "TP_PCT=${IN_TP:-0.02}" >> $GITHUB_ENV
+          echo "ATR_MULT=${IN_ATR:-1.5}" >> $GITHUB_ENV
           echo "MAX_BUYS_PER_RUN=${IN_MAXBUYS:-3}" >> $GITHUB_ENV
-
           echo "BROKER=alpaca" >> $GITHUB_ENV
           echo "ASSET_CLASS=equities" >> $GITHUB_ENV
           echo "AUTO_UNIVERSE=1" >> $GITHUB_ENV
           echo "MIN_NOTIONAL_USD=1.00" >> $GITHUB_ENV
           echo "ALPACA_DATA_URL=https://data.alpaca.markets" >> $GITHUB_ENV
-
-          # Base URL per dry-run
-          if [ "$EFF_DRY" = "false" ]; then
+          if [ "${IN_DRY:-true}" = "false" ]; then
             echo "ALPACA_BASE_URL=https://api.alpaca.markets" >> $GITHUB_ENV
           else
             echo "ALPACA_BASE_URL=https://paper-api.alpaca.markets" >> $GITHUB_ENV
@@ -101,24 +84,18 @@ jobs:
 
       - name: Inject secrets (choose paper/live by DRY_RUN)
         env:
-          # PAPER (existing)
           PKEY: ${{ secrets.ALPACA_API_KEY }}
           PSEC: ${{ secrets.ALPACA_API_SECRET }}
-          # LIVE (new)
           LKEY: ${{ secrets.ALPACA_API_KEY_LIVE }}
           LSEC: ${{ secrets.ALPACA_API_SECRET_LIVE }}
         run: |
           if [ "$DRY_RUN" = "false" ]; then
-            if [ -z "$LKEY" ] || [ -z "$LSEC" ]; then
-              echo "DRY_RUN=false but LIVE keys are missing (ALPACA_API_KEY_LIVE/ALPACA_API_SECRET_LIVE)"; exit 1
-            fi
+            if [ -z "$LKEY" ] || [ -z "$LSEC" ]; then echo "Missing LIVE keys"; exit 1; fi
             echo "ALPACA_API_KEY=$LKEY" >> $GITHUB_ENV
             echo "ALPACA_API_SECRET=$LSEC" >> $GITHUB_ENV
             echo "Using LIVE credentials."
           else
-            if [ -z "$PKEY" ] || [ -z "$PSEC" ]; then
-              echo "PAPER keys missing (ALPACA_API_KEY/ALPACA_API_SECRET)"; exit 1
-            fi
+            if [ -z "$PKEY" ] || [ -z "$PSEC" ]; then echo "Missing PAPER keys"; exit 1; fi
             echo "ALPACA_API_KEY=$PKEY" >> $GITHUB_ENV
             echo "ALPACA_API_SECRET=$PSEC" >> $GITHUB_ENV
             echo "Using PAPER credentials."
@@ -160,7 +137,6 @@ jobs:
       - name: Sanity check broker ping
         if: steps.market.outputs.is_open == 'true'
         run: |
-          echo "ALPACA_BASE_URL=$ALPACA_BASE_URL"
           python - << 'PY'
           import os
           from trader.broker_alpaca import AlpacaEquitiesBroker
