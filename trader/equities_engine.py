@@ -1,22 +1,23 @@
 """
-Equities Engine — Alpaca 1D Bars (IEX) + Bar Count Log
+Equities Engine — Alpaca 1D Bars (IEX) with yfinance fallback + Bar Count Log
 
-What’s new
-- Uses Alpaca Market Data (1D) and FORCES feed="iex" to avoid SIP 403 errors on free tier.
-- Logs: "Bars fetched for SYMBOL: N (need ≥120)" so you can see data coverage fast.
-- Trades with MARKET orders when MARKET_ONLY=true.
+Flow
+- Try Alpaca Market Data (feed="iex"). If it errors (e.g., 401) or returns 0 bars,
+  automatically fall back to yfinance daily bars so the run still proceeds.
+- Logs "Bars fetched for SYMBOL: N (need ≥120)" before signals.
+- MARKET orders when MARKET_ONLY=true.
 
-Env knobs (from workflow dispatch):
-    DRY_RUN=false|true
-    PER_TRADE_USD=3
-    DAILY_CAP_USD=12
-    UNIVERSE=AAPL,MSFT
-    MARKET_ONLY=true
+Env knobs (workflow dispatch):
+  DRY_RUN=true|false
+  PER_TRADE_USD=3
+  DAILY_CAP_USD=12
+  UNIVERSE=AAPL,MSFT
+  MARKET_ONLY=true
 
-Alpaca credentials (repo → Settings → Secrets and variables → Actions):
-    ALPACA_API_KEY
-    ALPACA_SECRET_KEY
-    ALPACA_PAPER=true|false   # optional, defaults true
+Secrets:
+  ALPACA_API_KEY
+  ALPACA_SECRET_KEY
+  ALPACA_PAPER=true|false (optional, defaults true)
 """
 from __future__ import annotations
 
@@ -28,6 +29,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
+
+# ---------- optional yfinance (fallback) ----------
+try:
+    import yfinance as yf
+    HAVE_YF = True
+except Exception:
+    HAVE_YF = False
 
 # ---------- Alpaca SDK ----------
 try:
@@ -66,63 +74,86 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 ALPACA_PAPER = getenv_bool("ALPACA_PAPER", True)
 
 # indicator lookback safety
-MIN_BARS = 120  # ensure enough bars for EMA/RSI
+MIN_BARS = 120  # EMA/RSI needs history
 
 # ---------- indicators ----------
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    roll_up = up.ewm(alpha=1 / period, adjust=False).mean()
-    roll_down = down.ewm(alpha=1 / period, adjust=False).mean()
-    rs = roll_up / (roll_down.replace(0, 1e-9))
+    d = series.diff()
+    up = d.clip(lower=0)
+    dn = -d.clip(upper=0)
+    roll_up = up.ewm(alpha=1/period, adjust=False).mean()
+    roll_dn = dn.ewm(alpha=1/period, adjust=False).mean()
+    rs = roll_up / (roll_dn.replace(0, 1e-9))
     return 100 - (100 / (1 + rs))
 
 # ---------- data fetch ----------
-def make_data_client() -> StockHistoricalDataClient:
-    # Alpaca data client requires both key and secret.
+def make_data_client() -> Optional[StockHistoricalDataClient]:
     if not (ALPACA_API_KEY and ALPACA_SECRET_KEY):
-        raise RuntimeError("Alpaca credentials missing. Set ALPACA_API_KEY and ALPACA_SECRET_KEY.")
-    return StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        log.warning("Alpaca creds missing → will use yfinance fallback for data.")
+        return None
+    try:
+        return StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    except Exception as e:
+        log.error(f"Failed to init Alpaca data client: {e} → will use yfinance fallback.")
+        return None
 
-def fetch_daily_bars(client: StockHistoricalDataClient, symbol: str, days: int = 400) -> pd.DataFrame:
+def fetch_daily_bars_alpaca(client: Optional[StockHistoricalDataClient], symbol: str, days: int) -> pd.DataFrame:
+    if client is None:
+        return pd.DataFrame()
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
-    # Force the free IEX feed to avoid SIP 403 on free accounts.
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=TimeFrame.Day,
         start=start,
         end=end,
         adjustment="raw",
-        feed="iex",           # <<< key change
+        feed="iex",  # force free-tier feed
         limit=None,
     )
     try:
         bars = client.get_stock_bars(req)
+        df = bars.df
+        if df is None or df.empty:
+            return pd.DataFrame()
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(symbol, level=0, drop_level=True)
+        df = df.reset_index().rename(columns={"timestamp": "date"})
+        df = df[["date", "open", "high", "low", "close", "volume"]]
+        df.sort_values("date", inplace=True)
+        df.set_index("date", inplace=True)
+        return df
     except Exception as e:
         log.error(f"Alpaca data error for {symbol}: {e}")
         return pd.DataFrame()
 
-    df = bars.df  # MultiIndex (symbol, timestamp)
-    if df is None or df.empty:
+def fetch_daily_bars_yf(symbol: str, days: int) -> pd.DataFrame:
+    if not HAVE_YF:
+        log.error("yfinance not installed and Alpaca data failed — no data available.")
+        return pd.DataFrame()
+    try:
+        # Use ~2 years to be safe if days large
+        period = "5y" if days >= 1200 else "2y" if days >= 500 else f"{max(days, 200)}d"
+        hist = yf.Ticker(symbol).history(period=period, interval="1d", auto_adjust=False)
+        if hist is None or hist.empty:
+            return pd.DataFrame()
+        df = hist.rename(
+            columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
+        )[["open", "high", "low", "close", "volume"]].copy()
+        df.index.name = "date"
+        return df
+    except Exception as e:
+        log.error(f"yfinance error for {symbol}: {e}")
         return pd.DataFrame()
 
-    if isinstance(df.index, pd.MultiIndex):
-        df = df.xs(symbol, level=0, drop_level=True)
-    df = df.reset_index().rename(columns={
-        "timestamp": "date",
-        "open": "open",
-        "high": "high",
-        "low": "low",
-        "close": "close",
-        "volume": "volume",
-    })
-    df.sort_values("date", inplace=True)
-    df.set_index("date", inplace=True)
+def fetch_daily_bars(client: Optional[StockHistoricalDataClient], symbol: str, days: int = 420) -> pd.DataFrame:
+    df = fetch_daily_bars_alpaca(client, symbol, days)
+    if df.empty:
+        log.warning(f"{symbol}: Alpaca returned 0 bars → trying yfinance fallback…")
+        df = fetch_daily_bars_yf(symbol, days)
     return df
 
 # ---------- trading ----------
@@ -136,15 +167,13 @@ class Broker:
         self.enabled = bool(ALPACA_API_KEY and ALPACA_SECRET_KEY)
         self.client = None
         if self.enabled:
-            self.client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER)
+            try:
+                self.client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER)
+            except Exception as e:
+                log.error(f"Trading client init failed: {e}")
+                self.enabled = False
         else:
             log.warning("Trading disabled: missing ALPACA_API_KEY/ALPACA_SECRET_KEY")
-
-    def get_cash(self) -> float:
-        if not self.enabled:
-            return float("inf")  # allow planning in DRY_RUN
-        acct = self.client.get_account()
-        return float(acct.cash)
 
     def market_buy_usd(self, symbol: str, usd: float) -> Optional[str]:
         if DRY_RUN or not self.enabled:
@@ -185,10 +214,6 @@ class Broker:
 
 # ---------- strategy ----------
 def generate_signal(df: pd.DataFrame) -> str:
-    """Return 'BUY', 'SELL', or 'HOLD' based on EMA cross + RSI filter.
-    - BUY: EMA(12) crosses above EMA(26) and RSI > 50
-    - SELL: EMA(12) crosses below EMA(26) and RSI < 50
-    """
     if df.empty or len(df) < MIN_BARS:
         return "HOLD"
     close = df["close"].astype(float)
@@ -211,16 +236,11 @@ def generate_signal(df: pd.DataFrame) -> str:
 
 # ---------- engine ----------
 def main() -> int:
-    log.info("Starting Equities Engine (Alpaca bars; feed=iex)")
+    log.info("Starting Equities Engine (Alpaca→yfinance data)")
     log.info(f"Config → DRY_RUN={DRY_RUN} PER_TRADE_USD={PER_TRADE_USD} DAILY_CAP_USD={DAILY_CAP_USD} MARKET_ONLY={MARKET_ONLY}")
     log.info(f"Universe: {UNIVERSE}")
 
-    try:
-        data_client = make_data_client()
-    except Exception as e:
-        log.error(f"Cannot start data client: {e}")
-        return 1
-
+    data_client = make_data_client()
     broker = Broker()
 
     spend_left = DAILY_CAP_USD
