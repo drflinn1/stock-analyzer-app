@@ -30,11 +30,19 @@ on:
       PICKS_PER_RUN:
         description: "how many symbols to buy max"
         required: true
-        default: "4"
+        default: "6"
       MIN_ADV_USD:
         description: "Min avg $ volume (20d) for eligibility (IEX feed)"
         required: true
-        default: "5000000"
+        default: "2000000"
+      AVOID_REBUY:
+        description: "true = don't buy if already holding"
+        required: true
+        default: "false"
+      MIN_BUYS:
+        description: "Minimum buys per run (0 disables fallback)"
+        required: true
+        default: "1"
 
 jobs:
   run:
@@ -69,8 +77,10 @@ jobs:
           AUTO_PICK:      ${{ github.event.inputs.AUTO_PICK }}
           PICKS_PER_RUN:  ${{ github.event.inputs.PICKS_PER_RUN }}
           MIN_ADV_USD:    ${{ github.event.inputs.MIN_ADV_USD }}
+          AVOID_REBUY:    ${{ github.event.inputs.AVOID_REBUY }}
+          MIN_BUYS:       ${{ github.event.inputs.MIN_BUYS }}
 
-          # Alpaca credentials (Paper mode)
+          # Alpaca (Paper)
           ALPACA_API_KEY:     ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY:  ${{ secrets.ALPACA_SECRET_KEY }}
           ALPACA_PAPER:       "true"
