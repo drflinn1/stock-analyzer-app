@@ -13,3 +13,5 @@ pyotp
 ta==0.11.0
 ccxt
 scipy>=1.10.0
+alpaca-py>=0.12
+
