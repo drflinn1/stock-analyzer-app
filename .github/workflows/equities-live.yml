@@ -1,4 +1,4 @@
-# .github/workflows/equities-live.yml  (only showing the parts to change)
+name: Equities Live — Alpaca 1D Bars (Auto-Pick)
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ on:
         required: true
         default: "12"
       UNIVERSE:
-        description: "Used only if AUTO_PICK=false"
+        description: "Used only if AUTO_PICK=false (comma list)"
         required: true
         default: "AAPL,MSFT"
       MARKET_ONLY:
@@ -24,7 +24,7 @@ on:
         required: true
         default: "true"
       AUTO_PICK:
-        description: "true=scan & auto-pick top names"
+        description: "true = scan & auto-pick top names"
         required: true
         default: "true"
       PICKS_PER_RUN:
@@ -32,7 +32,28 @@ on:
         required: true
         default: "4"
 
-# ...
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas numpy alpaca-py yfinance
+          fi
 
       - name: Run Equities Engine
         env:
@@ -44,9 +65,11 @@ on:
           AUTO_PICK:      ${{ github.event.inputs.AUTO_PICK }}
           PICKS_PER_RUN:  ${{ github.event.inputs.PICKS_PER_RUN }}
 
+          # Alpaca
           ALPACA_API_KEY:     ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY:  ${{ secrets.ALPACA_SECRET_KEY }}
           ALPACA_PAPER:       "true"
+
           LOG_LEVEL: "INFO"
         run: |
           python trader/equities_engine.py
