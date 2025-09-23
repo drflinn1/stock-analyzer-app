@@ -1,4 +1,4 @@
-name: Equities Live — Alpaca 1D Bars
+# .github/workflows/equities-live.yml  (only showing the parts to change)
 
 on:
   workflow_dispatch:
@@ -16,34 +16,23 @@ on:
         required: true
         default: "12"
       UNIVERSE:
-        description: "Comma-separated tickers"
+        description: "Used only if AUTO_PICK=false"
         required: true
         default: "AAPL,MSFT"
       MARKET_ONLY:
         description: "true to use market orders"
         required: true
         default: "true"
-  # schedule:
-  #   - cron: "40 14 * * 1-5"  # example: 07:40 PT weekdays (UTC)
+      AUTO_PICK:
+        description: "true=scan & auto-pick top names"
+        required: true
+        default: "true"
+      PICKS_PER_RUN:
+        description: "how many symbols to buy max"
+        required: true
+        default: "4"
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+# ...
 
       - name: Run Equities Engine
         env:
@@ -52,6 +41,9 @@ jobs:
           DAILY_CAP_USD:  ${{ github.event.inputs.DAILY_CAP_USD }}
           UNIVERSE:       ${{ github.event.inputs.UNIVERSE }}
           MARKET_ONLY:    ${{ github.event.inputs.MARKET_ONLY }}
+          AUTO_PICK:      ${{ github.event.inputs.AUTO_PICK }}
+          PICKS_PER_RUN:  ${{ github.event.inputs.PICKS_PER_RUN }}
+
           ALPACA_API_KEY:     ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY:  ${{ secrets.ALPACA_SECRET_KEY }}
           ALPACA_PAPER:       "true"
