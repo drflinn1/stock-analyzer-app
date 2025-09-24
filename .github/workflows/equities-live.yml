@@ -71,7 +71,7 @@ jobs:
     runs-on: ubuntu-latest
     concurrency:
       group: equities-live
-      cancel-in-progress: false
+      cancel-in-progress: true
 
     steps:
       - name: Checkout
