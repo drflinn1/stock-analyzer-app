@@ -2,7 +2,7 @@ name: Crypto Live (Every 4h — Auto-Pick)
 
 on:
   schedule:
-    - cron: "0 */4 * * *"   # every 4 hours
+    - cron: "0 */4 * * *"
   workflow_dispatch:
 
 jobs:
@@ -37,7 +37,10 @@ jobs:
           SL_PCT: "0.015"
           TREND_FILTER: "True"
           COOL: "60m"
+          # Pass secrets using BOTH name styles (engine-friendly)
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          KRAKEN_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           python trader/crypto_engine.py
