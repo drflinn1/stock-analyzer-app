@@ -2,7 +2,7 @@ name: Crypto Live (Every 4h — Auto-Pick)
 
 on:
   schedule:
-    - cron: "0 */4 * * *"
+    - cron: "0 */4 * * *"   # every 4 hours
   workflow_dispatch:
 
 jobs:
@@ -21,6 +21,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Optional: sanity check that key env names are present (no values shown)
       - name: Sanity check which API env names are present (no values shown)
         env:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
@@ -46,8 +47,8 @@ jobs:
           MIN_QUOTE_VOL_USD: "2000000"
           MIN_RAISE_USD: "10"
           AVOID_REBUY: "False"
-          TP_PCT: "0.025"
-          SL_PCT: "0.015"
+          TP_PCT: "0.035"   # <-- 3.5% take-profit
+          SL_PCT: "0.02"    # <-- 2.0% stop-loss
           TREND_FILTER: "True"
           COOL: "60m"
           # provide all common key names
