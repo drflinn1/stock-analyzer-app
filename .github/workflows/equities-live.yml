@@ -61,6 +61,14 @@ on:
         required: true
         default: "true"
 
+permissions:
+  contents: read
+
+# ← prevents overlapping duplicate runs
+concurrency:
+  group: equities-live
+  cancel-in-progress: true
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -86,18 +94,18 @@ jobs:
 
       - name: Run Equities Engine
         env:
-          DRY_RUN:            ${{ github.event.inputs.DRY_RUN }}
-          PER_TRADE_USD:      ${{ github.event.inputs.PER_TRADE_USD }}
-          DAILY_CAP_USD:      ${{ github.event.inputs.DAILY_CAP_USD }}
-          UNIVERSE:           ${{ github.event.inputs.UNIVERSE }}
-          MARKET_ONLY:        ${{ github.event.inputs.MARKET_ONLY }}
-          AUTO_PICK:          ${{ github.event.inputs.AUTO_PICK }}
-          PICKS_PER_RUN:      ${{ github.event.inputs.PICKS_PER_RUN }}
-          MIN_ADV_USD:        ${{ github.event.inputs.MIN_ADV_USD }}
-          AVOID_REBUY:        ${{ github.event.inputs.AVOID_REBUY }}
-          MIN_BUYS:           ${{ github.event.inputs.MIN_BUYS }}
-          STOP_LOSS_PCT:      ${{ github.event.inputs.STOP_LOSS_PCT }}
-          TAKE_PROFIT_PCT:    ${{ github.event.inputs.TAKE_PROFIT_PCT }}
+          DRY_RUN:             ${{ github.event.inputs.DRY_RUN }}
+          PER_TRADE_USD:       ${{ github.event.inputs.PER_TRADE_USD }}
+          DAILY_CAP_USD:       ${{ github.event.inputs.DAILY_CAP_USD }}
+          UNIVERSE:            ${{ github.event.inputs.UNIVERSE }}
+          MARKET_ONLY:         ${{ github.event.inputs.MARKET_ONLY }}
+          AUTO_PICK:           ${{ github.event.inputs.AUTO_PICK }}
+          PICKS_PER_RUN:       ${{ github.event.inputs.PICKS_PER_RUN }}
+          MIN_ADV_USD:         ${{ github.event.inputs.MIN_ADV_USD }}
+          AVOID_REBUY:         ${{ github.event.inputs.AVOID_REBUY }}
+          MIN_BUYS:            ${{ github.event.inputs.MIN_BUYS }}
+          STOP_LOSS_PCT:       ${{ github.event.inputs.STOP_LOSS_PCT }}
+          TAKE_PROFIT_PCT:     ${{ github.event.inputs.TAKE_PROFIT_PCT }}
           SELL_ON_TREND_BREAK: ${{ github.event.inputs.SELL_ON_TREND_BREAK }}
 
           # Alpaca (Paper)
