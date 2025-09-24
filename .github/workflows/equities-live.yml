@@ -2,8 +2,7 @@ name: Equities Live — Alpaca 1D Bars (Auto-Pick)
 run-name: >
   Equities Live — Auto-Pick
   (PICKS=${{ inputs.PICKS_PER_RUN }}, MIN_ADV=${{ inputs.MIN_ADV_USD }},
-   MIN_BUYS=${{ inputs.MIN_BUYS }}, SL=${{ inputs.STOP_LOSS_PCT }},
-   TP=${{ inputs.TAKE_PROFIT_PCT }})
+   SL=${{ inputs.STOP_LOSS_PCT }}, TP=${{ inputs.TAKE_PROFIT_PCT }})
 
 on:
   workflow_dispatch:
@@ -24,10 +23,6 @@ on:
         description: "Used only if AUTO_PICK=false (comma list)"
         required: true
         default: "AAPL,MSFT"
-      MARKET_ONLY:
-        description: "true to use market orders"
-        required: true
-        default: "true"
       AUTO_PICK:
         description: "true = scan & auto-pick top names"
         required: true
@@ -37,17 +32,13 @@ on:
         required: true
         default: "6"
       MIN_ADV_USD:
-        description: "Min avg $ volume (20d) for eligibility (IEX feed)"
+        description: "Min avg $ volume (20d) for eligibility (IEX)"
         required: true
         default: "2000000"
       AVOID_REBUY:
         description: "true = don't buy if already holding"
         required: true
         default: "true"
-      MIN_BUYS:
-        description: "Minimum buys per run (0 disables fallback)"
-        required: true
-        default: "0"
       STOP_LOSS_PCT:
         description: "Fractional stop-loss (e.g., 0.04 for 4%)"
         required: true
@@ -56,15 +47,10 @@ on:
         description: "Fractional take-profit (e.g., 0.08 for 8%)"
         required: true
         default: "0.08"
-      SELL_ON_TREND_BREAK:
-        description: "true = sell on EMA12<EMA26 & RSI<50"
-        required: true
-        default: "true"
 
 permissions:
   contents: read
 
-# ← prevents overlapping duplicate runs
 concurrency:
   group: equities-live
   cancel-in-progress: true
@@ -73,7 +59,6 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -98,15 +83,16 @@ jobs:
           PER_TRADE_USD:       ${{ github.event.inputs.PER_TRADE_USD }}
           DAILY_CAP_USD:       ${{ github.event.inputs.DAILY_CAP_USD }}
           UNIVERSE:            ${{ github.event.inputs.UNIVERSE }}
-          MARKET_ONLY:         ${{ github.event.inputs.MARKET_ONLY }}
           AUTO_PICK:           ${{ github.event.inputs.AUTO_PICK }}
           PICKS_PER_RUN:       ${{ github.event.inputs.PICKS_PER_RUN }}
           MIN_ADV_USD:         ${{ github.event.inputs.MIN_ADV_USD }}
           AVOID_REBUY:         ${{ github.event.inputs.AVOID_REBUY }}
-          MIN_BUYS:            ${{ github.event.inputs.MIN_BUYS }}
           STOP_LOSS_PCT:       ${{ github.event.inputs.STOP_LOSS_PCT }}
           TAKE_PROFIT_PCT:     ${{ github.event.inputs.TAKE_PROFIT_PCT }}
-          SELL_ON_TREND_BREAK: ${{ github.event.inputs.SELL_ON_TREND_BREAK }}
+
+          # Defaults moved out of inputs (can be hardcoded in code as needed)
+          MARKET_ONLY:         "true"
+          SELL_ON_TREND_BREAK: "true"
 
           # Alpaca (Paper)
           ALPACA_API_KEY:     ${{ secrets.ALPACA_API_KEY }}
