@@ -1,4 +1,9 @@
 name: Equities Live — Alpaca 1D Bars (Auto-Pick)
+run-name: >
+  Equities Live — Auto-Pick
+  (PICKS=${{ inputs.PICKS_PER_RUN }}, MIN_ADV=${{ inputs.MIN_ADV_USD }},
+   MIN_BUYS=${{ inputs.MIN_BUYS }}, SL=${{ inputs.STOP_LOSS_PCT }},
+   TP=${{ inputs.TAKE_PROFIT_PCT }})
 
 on:
   workflow_dispatch:
@@ -38,11 +43,23 @@ on:
       AVOID_REBUY:
         description: "true = don't buy if already holding"
         required: true
-        default: "false"
+        default: "true"
       MIN_BUYS:
         description: "Minimum buys per run (0 disables fallback)"
         required: true
-        default: "1"
+        default: "0"
+      STOP_LOSS_PCT:
+        description: "Fractional stop-loss (e.g., 0.04 for 4%)"
+        required: true
+        default: "0.04"
+      TAKE_PROFIT_PCT:
+        description: "Fractional take-profit (e.g., 0.08 for 8%)"
+        required: true
+        default: "0.08"
+      SELL_ON_TREND_BREAK:
+        description: "true = sell on EMA12<EMA26 & RSI<50"
+        required: true
+        default: "true"
 
 jobs:
   run:
@@ -69,16 +86,19 @@ jobs:
 
       - name: Run Equities Engine
         env:
-          DRY_RUN:        ${{ github.event.inputs.DRY_RUN }}
-          PER_TRADE_USD:  ${{ github.event.inputs.PER_TRADE_USD }}
-          DAILY_CAP_USD:  ${{ github.event.inputs.DAILY_CAP_USD }}
-          UNIVERSE:       ${{ github.event.inputs.UNIVERSE }}
-          MARKET_ONLY:    ${{ github.event.inputs.MARKET_ONLY }}
-          AUTO_PICK:      ${{ github.event.inputs.AUTO_PICK }}
-          PICKS_PER_RUN:  ${{ github.event.inputs.PICKS_PER_RUN }}
-          MIN_ADV_USD:    ${{ github.event.inputs.MIN_ADV_USD }}
-          AVOID_REBUY:    ${{ github.event.inputs.AVOID_REBUY }}
-          MIN_BUYS:       ${{ github.event.inputs.MIN_BUYS }}
+          DRY_RUN:            ${{ github.event.inputs.DRY_RUN }}
+          PER_TRADE_USD:      ${{ github.event.inputs.PER_TRADE_USD }}
+          DAILY_CAP_USD:      ${{ github.event.inputs.DAILY_CAP_USD }}
+          UNIVERSE:           ${{ github.event.inputs.UNIVERSE }}
+          MARKET_ONLY:        ${{ github.event.inputs.MARKET_ONLY }}
+          AUTO_PICK:          ${{ github.event.inputs.AUTO_PICK }}
+          PICKS_PER_RUN:      ${{ github.event.inputs.PICKS_PER_RUN }}
+          MIN_ADV_USD:        ${{ github.event.inputs.MIN_ADV_USD }}
+          AVOID_REBUY:        ${{ github.event.inputs.AVOID_REBUY }}
+          MIN_BUYS:           ${{ github.event.inputs.MIN_BUYS }}
+          STOP_LOSS_PCT:      ${{ github.event.inputs.STOP_LOSS_PCT }}
+          TAKE_PROFIT_PCT:    ${{ github.event.inputs.TAKE_PROFIT_PCT }}
+          SELL_ON_TREND_BREAK:${{ github.event.inputs.SELL_ON_TREND_BREAK }}
 
           # Alpaca (Paper)
           ALPACA_API_KEY:     ${{ secrets.ALPACA_API_KEY }}
