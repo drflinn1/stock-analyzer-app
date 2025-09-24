@@ -1,33 +1,14 @@
 # trader/main.py
-# Shim so workflows have a stable entrypoint.
-# It looks for a likely crypto engine and runs it as __main__.
+# Forwarder shim: if a workflow calls trader/main.py, run crypto_engine.py instead.
 
-import os, sys, runpy, glob
+import os, sys, runpy
 
 HERE = os.path.dirname(__file__)
+TARGET = os.path.join(HERE, "crypto_engine.py")
 
-CANDIDATES = [
-    "engine.py",
-    "crypto_engine.py",
-    "crypto_live.py",
-    "crypto_main.py",
-    "live.py",
-    "bot.py",
-]
+if not os.path.isfile(TARGET):
+    raise SystemExit("crypto_engine.py not found next to main.py — please add trader/crypto_engine.py")
 
-# 1) Try known names in order
-for name in CANDIDATES:
-    path = os.path.join(HERE, name)
-    if os.path.isfile(path):
-        sys.argv = [path]
-        runpy.run_path(path, run_name="__main__")
-        raise SystemExit(0)
-
-# 2) Fallback: any file that looks like crypto*
-for path in sorted(glob.glob(os.path.join(HERE, "crypto*.py"))):
-    if os.path.isfile(path):
-        sys.argv = [path]
-        runpy.run_path(path, run_name="__main__")
-        raise SystemExit(0)
-
-raise SystemExit("No crypto entrypoint found (looked for engine.py/crypto_*.py in trader/).")
+# Ensure __name__ == "__main__" behavior in the target
+sys.argv = [TARGET]
+runpy.run_path(TARGET, run_name="__main__")
