@@ -1,104 +1,125 @@
-name: Equities Live — Alpaca 1D Bars (Auto-Pick)
-run-name: >
-  Equities Live — Auto-Pick
-  (PICKS=${{ inputs.PICKS_PER_RUN }}, MIN_ADV=${{ inputs.MIN_ADV_USD }},
-   SL=${{ inputs.STOP_LOSS_PCT }}, TP=${{ inputs.TAKE_PROFIT_PCT }})
+name: Equities Live (Alpaca Paper — 15m)
 
 on:
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: "true or false"
-        required: true
+        description: "If true, log only — no orders"
+        required: false
         default: "false"
       PER_TRADE_USD:
-        description: "USD notional per buy"
-        required: true
-        default: "3"
+        description: "Notional dollars per new buy"
+        required: false
+        default: "1000"
       DAILY_CAP_USD:
-        description: "USD daily spend cap"
-        required: true
-        default: "12"
-      UNIVERSE:
-        description: "Used only if AUTO_PICK=false (comma list)"
-        required: true
-        default: "AAPL,MSFT"
-      AUTO_PICK:
-        description: "true = scan & auto-pick top names"
-        required: true
+        description: "Max total new buys per day"
+        required: false
+        default: "5000"
+      MAX_POSITIONS:
+        description: "Max concurrent long positions"
+        required: false
+        default: "10"
+      UNIVERSE_MODE:
+        description: "SP100 or USER_LIST (config/equities_universe.txt)"
+        required: false
+        default: "SP100"
+      UNIVERSE_SIZE:
+        description: "How many tickers to consider after ranking"
+        required: false
+        default: "20"
+      EMA_FAST:
+        description: "Fast EMA length"
+        required: false
+        default: "20"
+      EMA_SLOW:
+        description: "Slow EMA length"
+        required: false
+        default: "50"
+      RSI_MIN:
+        description: "Minimum RSI(14) to allow"
+        required: false
+        default: "50"
+      RSI_MAX:
+        description: "Maximum RSI(14) to allow"
+        required: false
+        default: "80"
+      MIN_AVG_DOLLAR_VOL:
+        description: "Min 20d avg dollar volume (price*volume)"
+        required: false
+        default: "20000000"  # $20M
+      TP_PCT:
+        description: "Take‑profit percent (e.g., 0.03 = 3%)"
+        required: false
+        default: "0.03"
+      SL_PCT:
+        description: "Stop‑loss percent (e.g., 0.02 = 2%)"
+        required: false
+        default: "0.02"
+      USE_BRACKETS:
+        description: "Use bracket orders with TP/SL"
+        required: false
         default: "true"
-      PICKS_PER_RUN:
-        description: "how many symbols to buy max"
-        required: true
-        default: "6"
-      MIN_ADV_USD:
-        description: "Min avg $ volume (20d) for eligibility (IEX)"
-        required: true
-        default: "2000000"
-      AVOID_REBUY:
-        description: "true = don't buy if already holding"
-        required: true
-        default: "true"
-      STOP_LOSS_PCT:
-        description: "Fractional stop-loss (e.g., 0.04 for 4%)"
-        required: true
-        default: "0.04"
-      TAKE_PROFIT_PCT:
-        description: "Fractional take-profit (e.g., 0.08 for 8%)"
-        required: true
-        default: "0.08"
+  schedule:
+    # Every 15 minutes during US market hours (13:00–20:59 UTC = 9:00–16:59 ET). Code also checks market clock.
+    - cron: "*/15 13-20 * * 1-5"
 
 permissions:
-  contents: read
-
-concurrency:
-  group: equities-live
-  cancel-in-progress: true
+  contents: write
 
 jobs:
-  run:
+  live:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    concurrency:
+      group: equities-live
+      cancel-in-progress: false
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install pandas numpy alpaca-py yfinance
-          fi
+          pip install alpaca-py yfinance pandas numpy ta pytz
 
       - name: Run Equities Engine
         env:
-          DRY_RUN:             ${{ github.event.inputs.DRY_RUN }}
-          PER_TRADE_USD:       ${{ github.event.inputs.PER_TRADE_USD }}
-          DAILY_CAP_USD:       ${{ github.event.inputs.DAILY_CAP_USD }}
-          UNIVERSE:            ${{ github.event.inputs.UNIVERSE }}
-          AUTO_PICK:           ${{ github.event.inputs.AUTO_PICK }}
-          PICKS_PER_RUN:       ${{ github.event.inputs.PICKS_PER_RUN }}
-          MIN_ADV_USD:         ${{ github.event.inputs.MIN_ADV_USD }}
-          AVOID_REBUY:         ${{ github.event.inputs.AVOID_REBUY }}
-          STOP_LOSS_PCT:       ${{ github.event.inputs.STOP_LOSS_PCT }}
-          TAKE_PROFIT_PCT:     ${{ github.event.inputs.TAKE_PROFIT_PCT }}
-
-          # Defaults moved out of inputs (can be hardcoded in code as needed)
-          MARKET_ONLY:         "true"
-          SELL_ON_TREND_BREAK: "true"
-
-          # Alpaca (Paper)
-          ALPACA_API_KEY:     ${{ secrets.ALPACA_API_KEY }}
-          ALPACA_SECRET_KEY:  ${{ secrets.ALPACA_SECRET_KEY }}
-          ALPACA_PAPER:       "true"
-
-          LOG_LEVEL: "INFO"
+          # Secrets
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          # Tunables (inputs)
+          DRY_RUN: ${{ inputs.DRY_RUN || 'false' }}
+          PER_TRADE_USD: ${{ inputs.PER_TRADE_USD || '1000' }}
+          DAILY_CAP_USD: ${{ inputs.DAILY_CAP_USD || '5000' }}
+          MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || '10' }}
+          UNIVERSE_MODE: ${{ inputs.UNIVERSE_MODE || 'SP100' }}
+          UNIVERSE_SIZE: ${{ inputs.UNIVERSE_SIZE || '20' }}
+          EMA_FAST: ${{ inputs.EMA_FAST || '20' }}
+          EMA_SLOW: ${{ inputs.EMA_SLOW || '50' }}
+          RSI_MIN: ${{ inputs.RSI_MIN || '50' }}
+          RSI_MAX: ${{ inputs.RSI_MAX || '80' }}
+          MIN_AVG_DOLLAR_VOL: ${{ inputs.MIN_AVG_DOLLAR_VOL || '20000000' }}
+          TP_PCT: ${{ inputs.TP_PCT || '0.03' }}
+          SL_PCT: ${{ inputs.SL_PCT || '0.02' }}
+          USE_BRACKETS: ${{ inputs.USE_BRACKETS || 'true' }}
         run: |
-          python trader/equities_engine.py
+          python -u trader/equities_engine.py
+
+      - name: Commit state changes (optional)
+        run: |
+          mkdir -p .state
+          git config user.email "actions@github.com"
+          git config user.name "github-actions"
+          if [ -n "$(git status --porcelain .state 2>/dev/null)" ]; then
+            git add .state
+            git commit -m "Equities state update [skip ci]"
+            git push
+          else
+            echo "No state changes to commit."
