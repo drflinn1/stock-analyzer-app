@@ -2,7 +2,7 @@ name: Crypto Live (Every 15 min — CONCENTRATED + PYRAMID + SWEEP + TAX)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       DRY_RUN:
@@ -43,6 +43,16 @@ jobs:
         env:
           DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'false' }}
           LOG_LEVEL: "INFO"
-          # add your existing exchange env here...
+          # (your existing exchange env vars here)
         run: |
-          python trader/main.py
+          set -e
+          if [ -f trader/main.py ]; then
+            echo "Running trader/main.py"
+            python trader/main.py
+          elif [ -f trader/engine.py ]; then
+            echo "Running trader/engine.py"
+            python trader/engine.py
+          else
+            echo "ERROR: No crypto entrypoint (expected trader/main.py or trader/engine.py)."
+            exit 1
+          fi
