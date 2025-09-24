@@ -1,8 +1,8 @@
-name: Crypto Live (Every 15 min — CONCENTRATED + PYRAMID + SWEEP + TAX)
+name: Crypto Live (Every 30 min — Auto-Pick + TP/SL)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/30 * * * *"   # every 30 minutes (UTC)
   workflow_dispatch:
     inputs:
       DRY_RUN:
@@ -40,22 +40,29 @@ jobs:
             pip install pandas numpy ccxt python-dateutil
           fi
 
-      - name: Run Crypto Trader
+      - name: Run Crypto Trader (Auto-Pick)
         env:
-          # controls
-          DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.DRY_RUN) || 'false' }}
-          PER_TRADE_USD: "3"
-          DAILY_CAP_USD: "12"
-          UNIVERSE: "BTC/USDT,ETH/USDT,SOL/USDT"
-          AVOID_REBUY: "true"
-          STOP_LOSS_PCT: "0.04"
-          TAKE_PROFIT_PCT: "0.08"
+          # controls (tweaks)
+          DRY_RUN:             ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.DRY_RUN) || 'false' }}
+          PER_TRADE_USD:       "10"      # ↑ from 3
+          DAILY_CAP_USD:       "20"      # keep small: 2 buys per run
+          AVOID_REBUY:         "true"
+          TAKE_PROFIT_PCT:     "0.025"   # 2.5% TP
+          STOP_LOSS_PCT:       "0.015"   # 1.5% SL
 
-          # exchange (Kraken by default)
-          EXCHANGE_ID: "kraken"
-          API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          API_PASSWORD: ${{ secrets.KRAKEN_API_PASSWORD }}
+          # auto-pick universe (USD quote on Kraken)
+          AUTO_PICK:           "true"
+          QUOTE_CCY:           "USD"
+          PICKS_PER_RUN:       "2"
+          MIN_QUOTE_VOL_USD:   "2000000"  # min 24h quote$ volume
+          TREND_FILTER:        "true"     # only buy if 1h EMA12>EMA26 & RSI>50
+          COOLDOWN_MINUTES:    "60"       # per-symbol cooldown after a buy
+
+          # exchange (Kraken)
+          EXCHANGE_ID:         "kraken"
+          API_KEY:             ${{ secrets.KRAKEN_API_KEY }}
+          API_SECRET:          ${{ secrets.KRAKEN_API_SECRET }}
+          API_PASSWORD:        ${{ secrets.KRAKEN_API_PASSWORD }}
 
           LOG_LEVEL: "INFO"
         run: |
