@@ -21,6 +21,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Sanity check which API env names are present (no values shown)
+        env:
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          KRAKEN_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        run: |
+          for v in KRAKEN_API_KEY KRAKEN_API_SECRET KRAKEN_KEY KRAKEN_SECRET API_KEY API_SECRET; do
+            if [ -z "${!v}" ]; then echo "$v=EMPTY"; else echo "$v=SET"; fi
+          done
+
       - name: Run Crypto Trader (Auto-Pick)
         env:
           DRY_RUN: "False"
@@ -37,10 +50,12 @@ jobs:
           SL_PCT: "0.015"
           TREND_FILTER: "True"
           COOL: "60m"
-          # Pass secrets using BOTH name styles (engine-friendly)
+          # provide all common key names
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
           KRAKEN_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           python trader/crypto_engine.py
