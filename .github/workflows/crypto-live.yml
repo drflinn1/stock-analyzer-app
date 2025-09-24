@@ -21,7 +21,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Optional: sanity check that key env names are present (no values shown)
+      # Optional sanity check (prints SET/EMPTY; never shows secret values)
       - name: Sanity check which API env names are present (no values shown)
         env:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
@@ -41,14 +41,14 @@ jobs:
           EXCHANGE: "kraken"
           QUOTE: "USD"
           AUTO_PICK: "True"
-          PICKS: "2"
+          PICKS: "3"                 # <-- bumped to 3
           PER_TRADE_USD: "25"
           DAILY_CAP_USD: "1000000"
           MIN_QUOTE_VOL_USD: "2000000"
           MIN_RAISE_USD: "10"
           AVOID_REBUY: "False"
-          TP_PCT: "0.035"   # <-- 3.5% take-profit
-          SL_PCT: "0.02"    # <-- 2.0% stop-loss
+          TP_PCT: "0.035"            # 3.5% take-profit
+          SL_PCT: "0.02"             # 2.0% stop-loss
           TREND_FILTER: "True"
           COOL: "60m"
           # provide all common key names
