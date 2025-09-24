@@ -35,18 +35,6 @@ on:
         description: "Slow EMA length"
         required: false
         default: "50"
-      RSI_MIN:
-        description: "Minimum RSI(14) to allow"
-        required: false
-        default: "50"
-      RSI_MAX:
-        description: "Maximum RSI(14) to allow"
-        required: false
-        default: "80"
-      MIN_AVG_DOLLAR_VOL:
-        description: "Min 20d avg dollar volume (price*volume)"
-        required: false
-        default: "20000000"  # $20M
       TP_PCT:
         description: "Take‑profit percent (e.g., 0.03 = 3%)"
         required: false
@@ -55,14 +43,10 @@ on:
         description: "Stop‑loss percent (e.g., 0.02 = 2%)"
         required: false
         default: "0.02"
-      USE_BRACKETS:
-        description: "Use bracket orders with TP/SL"
-        required: false
-        default: "true"
   # schedule:
-#   # Temporarily disabled during testing to avoid overlapping runs.
-#   # Every 15 minutes during US market hours (13:00–20:59 UTC = 9:00–16:59 ET).
-#   # - cron: "*/15 13-20 * * 1-5"
+  #   # Temporarily disabled during testing to avoid overlapping runs.
+  #   # Every 15 minutes during US market hours (13:00–20:59 UTC = 9:00–16:59 ET).
+  #   # - cron: "*/15 13-20 * * 1-5"
 
 permissions:
   contents: write
@@ -95,7 +79,8 @@ jobs:
           # Secrets
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
-          # Tunables (inputs)
+          
+          # Inputs (10 max for workflow_dispatch)
           DRY_RUN: ${{ inputs.DRY_RUN || 'false' }}
           PER_TRADE_USD: ${{ inputs.PER_TRADE_USD || '1000' }}
           DAILY_CAP_USD: ${{ inputs.DAILY_CAP_USD || '5000' }}
@@ -104,12 +89,14 @@ jobs:
           UNIVERSE_SIZE: ${{ inputs.UNIVERSE_SIZE || '20' }}
           EMA_FAST: ${{ inputs.EMA_FAST || '20' }}
           EMA_SLOW: ${{ inputs.EMA_SLOW || '50' }}
-          RSI_MIN: ${{ inputs.RSI_MIN || '50' }}
-          RSI_MAX: ${{ inputs.RSI_MAX || '80' }}
-          MIN_AVG_DOLLAR_VOL: ${{ inputs.MIN_AVG_DOLLAR_VOL || '20000000' }}
           TP_PCT: ${{ inputs.TP_PCT || '0.03' }}
           SL_PCT: ${{ inputs.SL_PCT || '0.02' }}
-          USE_BRACKETS: ${{ inputs.USE_BRACKETS || 'true' }}
+
+          # Advanced filters (not exposed as inputs to stay under 10-limit)
+          RSI_MIN: '50'
+          RSI_MAX: '80'
+          MIN_AVG_DOLLAR_VOL: '20000000'
+          USE_BRACKETS: 'true'
         run: |
           python -u trader/equities_engine.py
 
