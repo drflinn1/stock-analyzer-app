@@ -1,150 +1,48 @@
-name: "Crypto Live (Every 15 min — CONCENTRATED + PYRAMID + SWEEP + TAX)"
+name: Crypto Live (Every 15 min — CONCENTRATED + PYRAMID + SWEEP + TAX)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"          # every 15 minutes
-  workflow_dispatch:                # allow manual runs
-  push:                             # keep name visible and let us re-run on edits
-    paths:
-      - ".github/workflows/crypto-live.yml"
-      - "tools/**"
-      - "trader/**"
-      - "data/**"
+    - cron: "*/15 * * * *"   # every 15 minutes
+  workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: "true or false"
+        required: true
+        default: "false"
 
 permissions:
   contents: read
 
 concurrency:
-  group: crypto-live-concentrated
-  cancel-in-progress: true          # avoid overlapping runs
+  group: crypto-live
+  cancel-in-progress: true
 
 jobs:
-  trade:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-
-    # -------- Strategy + runtime config (edit freely) --------
-    env:
-      # ===== Core =====
-      MODE: "live"
-      DRY_RUN: "false"
-      EXCHANGE: "kraken"
-      BASE_CCY: "USD"
-
-      # Safety: never sell more than this “epsilon” below free balance
-      SELL_SAFETY_EPS_PCT: "0.25"
-      CANCEL_OPEN_ORDERS_BEFORE_SELL: "true"
-      USD_BAL_OVERRIDE: "50"
-      
-      # ===== Universe & Ranking (Concentrated) =====
-      AUTO_UNIVERSE: "true"
-      UNIVERSE_TOP_N: "12"              # broaden candidates
-      MAX_CONCURRENT_POS: "3"           # concentrate the book
-      MIN_LIQ_USD_24H: "500000"         # still safe liquidity
-      MOMENTUM_LOOKBACK_H: "24"
-      MIN_PRICE_USD: "0.01"
-      MIN_NOTIONAL_USD: "5"
-
-      # ===== Multi-timeframe trend filter =====
-      TF_FAST: "15m"
-      TF_SLOW: "1h"
-      EMA_SHORT: "20"
-      EMA_LONG: "50"
-      RSI_LEN: "14"
-      RSI_BUY: "58"                     # easier to trigger entries in chop
-      RSI_SELL: "45"
-
-      # ===== Volatility-scaled sizing =====
-      ATR_LEN: "14"
-      RISK_PER_TRADE_PCT: "1.6"
-
-      # ===== Caps / risk budget =====
-      ADE_USD_CAP: "75"                 # per trade cap
-      MAX_TRADES_PER_RUN: "8"
-      PORTFOLIO_MAX_EXPOSURE_PCT: "75"
-
-      # ===== Exits =====
-      ATR_MULTIPLIER_TP: "1.0"
-      ATR_MULTIPLIER_TS: "1.4"
-      ATR_MULTIPLIER_SL: "1.8"
-      TRAIL_ACTIVATE_AT_R_TO_R: "0.4"
-      REBUY_DROP_PCT: "6"
-
-      # ===== Pyramiding =====
-      PYRAMID_ENABLED: "true"
-      PYRAMID_STEP_UP_PCT: "4"
-      PYRAMID_MAX_LAYERS: "2"
-
-      # ===== Safe-sell wrapper settings =====
-      FEE_BUY_BUFFER_PCT: "0.50"        # must sell above fees
-      SAFE_SELL_EPS_PCT: "0.25"
-
-      # ===== Dust Sweeper =====
-      DUST_TRIGGER_USD: "1.00"          # sweep if total dust >= $1
-      DUST_SELLS_ONLY: "true"
-
-      # ===== Exchange secrets (from repo settings → Secrets and variables → Actions) =====
-      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-
+    timeout-minutes: 60
     steps:
-      - name: Set up job
-        run: echo "Starting Crypto Live — Concentrated + Pyramid + Sweep + Tax"
-
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
-        shell: bash
         run: |
-          set -e
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install ccxt pandas numpy python-dateutil requests tenacity ta
+            pip install pandas numpy ccxt python-dateutil
           fi
 
-      - name: Dust Sweep (pre-run, sells only)
-        shell: bash
+      - name: Run Crypto Trader
+        env:
+          DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'false' }}
+          LOG_LEVEL: "INFO"
+          # add your existing exchange env here...
         run: |
-          set -e
-          echo "[dust] starting sweep (SELLS ONLY)"
-          python -u tools/dust_sweeper.py || echo "[dust] sweeper completed (or skipped)"
-
-      - name: Run trader (with safe-sell patch)
-        shell: bash
-        run: |
-          set -e
-          # Wrapper: prevents sells below fees/epsilon and cancels stale open orders
-          python -u tools/run_with_safe_sell.py
-
-      - name: Dust Sweep (post-run, sells only)
-        if: always()
-        shell: bash
-        run: |
-          set -e
-          echo "[dust] starting sweep (SELLS ONLY)"
-          python -u tools/dust_sweeper.py || echo "[dust] sweeper completed (or skipped)"
-
-      - name: Tax export (FIFO 8949)
-        shell: bash
-        run: |
-          set -e
-          python -u tools/tax_export.py || echo "[tax] no ledger found"
-
-      - name: Upload artifacts (equity + tax)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: equity + tax
-          if-no-files-found: ignore
-          path: |
-            data/equity_history.csv
-            data/tax_8949.csv
-            data/tax_summary.json
+          python trader/main.py
