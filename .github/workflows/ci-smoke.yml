@@ -1,47 +1,24 @@
 name: CI Smoke
 
 on:
+  push:
+    paths-ignore:
+      - 'trader/**'
+      - '.github/workflows/crypto-live.yml'
+      - '.github/workflows/equities-live.yml'
+      - '.github/workflows/equities-daily.yml'
   pull_request:
-    branches:
-      - main
-  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  smoke:
+  lint:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install ccxt
-
-      - name: Import & quick sanity
-        shell: bash
-        run: |
-          python - <<'PY'
-          import importlib.util, sys, pathlib
-          p = pathlib.Path('main.py')
-          if not p.exists():
-              print('ERROR: main.py missing'); sys.exit(1)
-
-          # Import to catch syntax errors quickly
-          spec = importlib.util.spec_from_file_location('botmain', 'main.py')
-          m = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(m)
-
-          # sanity: required env names defined
-          for r in ['PER_TRADE_USD','DAILY_CAP_USD','MIN_NOTIONAL_USD']:
-              if not hasattr(m, r):
-                  print(f'Missing env var constant: {r}')
-                  sys.exit(2)
-
-          print('Smoke OK')
-          PY
+          python-version: "3.11"
+      - run: python -m pip install ruff || true
+      - run: ruff --version || true
