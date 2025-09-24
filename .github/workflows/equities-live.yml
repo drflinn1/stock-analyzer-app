@@ -71,7 +71,7 @@ jobs:
   live:
     runs-on: ubuntu-latest
     concurrency:
-      group: equities-live
+      group: ${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: true
 
     steps:
