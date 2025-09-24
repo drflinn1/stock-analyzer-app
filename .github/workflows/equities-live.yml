@@ -98,7 +98,7 @@ jobs:
           MIN_BUYS:           ${{ github.event.inputs.MIN_BUYS }}
           STOP_LOSS_PCT:      ${{ github.event.inputs.STOP_LOSS_PCT }}
           TAKE_PROFIT_PCT:    ${{ github.event.inputs.TAKE_PROFIT_PCT }}
-          SELL_ON_TREND_BREAK:${{ github.event.inputs.SELL_ON_TREND_BREAK }}
+          SELL_ON_TREND_BREAK: ${{ github.event.inputs.SELL_ON_TREND_BREAK }}
 
           # Alpaca (Paper)
           ALPACA_API_KEY:     ${{ secrets.ALPACA_API_KEY }}
