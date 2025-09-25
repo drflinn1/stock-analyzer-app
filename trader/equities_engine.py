@@ -59,8 +59,8 @@ SL_PCT = float(os.getenv("SL_PCT", "0.020"))
 UNIVERSE = [s.strip().upper() for s in os.getenv("UNIVERSE", "SPY,AAPL").split(",") if s.strip()]
 
 # LIVE trim knobs
-TRIM_LOSS_FLOOR = float(os.getenv("TRIM_LOSS_FLOOR", "-0.01"))     # only trim if <= -1.0%
-MAX_TRIMS_PER_RUN = int(os.getenv("MAX_TRIMS_PER_RUN", "2"))       # limit sells per run
+TRIM_LOSS_FLOOR = float(os.getenv("TRIM_LOSS_FLOOR", "-0.01"))   # only trim if <= -1.0%
+MAX_TRIMS_PER_RUN = int(os.getenv("MAX_TRIMS_PER_RUN", "2"))     # limit trims per run
 
 log.info(f"Alpaca key loaded (ending …{ALPACA_API_KEY[-4:]}); endpoint={'PAPER' if ALPACA_PAPER else 'LIVE'}.")
 
@@ -93,7 +93,7 @@ def api_err(label: str, e: Exception):
     log.error(f"{label}: status={status} body={body}")
 
 def yf_downtrend(sym: str) -> bool:
-    """Return True if last close < SMA20 (simple downtrend filter)."""
+    """True if last close < SMA20 (simple downtrend)."""
     try:
         df = yf.download(sym, period="30d", interval="1d", progress=False)
         if df is None or df.empty:
@@ -156,14 +156,12 @@ if not ALPACA_PAPER and len(open_positions) > MAX_POSITIONS:
                 trim_pool.append((plpc, sym, q))
 
     if trim_pool:
-        # Most negative first (worst losers)
-        trim_pool.sort(key=lambda t: t[0])  # more negative first
+        trim_pool.sort(key=lambda t: t[0])  # most negative first
         to_close = trim_pool[: min(excess, MAX_TRIMS_PER_RUN)]
         log.info(
             f"LIVE auto-trim: need {excess} -> closing up to {len(to_close)} "
             f"loser(s) in downtrend (floor {TRIM_LOSS_FLOOR:+.2%}) -> {[(s, q) for _, s, q in to_close]}"
         )
-
         for _, sym, q in to_close:
             if DRY_RUN:
                 log.info(f"DRY_RUN: would SELL {sym} x{q} (auto-trim).")
@@ -181,10 +179,7 @@ if not ALPACA_PAPER and len(open_positions) > MAX_POSITIONS:
             except APIError as e:
                 api_err(f"AUTO-TRIM SELL failed for {sym}", e)
     else:
-        log.info(
-            "LIVE auto-trim: over cap but no eligible losers below floor and in downtrend; "
-            "keeping winners/near-breakeven and skipping trim."
-        )
+        log.info("LIVE auto-trim: over cap but no eligible losers below floor and in downtrend; skipping trim.")
 
 # Recompute positions after possible trim (to set buy slots correctly)
 try:
