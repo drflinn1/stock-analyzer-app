@@ -1,0 +1,51 @@
+name: Equities Live — PAPER (every 15m, multi-buy)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * 1-5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: equities-live-paper
+  cancel-in-progress: true
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # --- Trading config (PAPER) ---
+      ALPACA_PAPER: "true"
+      DRY_RUN: "false"
+      PER_TRADE_USD: "2000"
+      MAX_POSITIONS: "20"
+      BUY_PER_RUN: "5"
+      TP_PCT: "0.035"
+      SL_PCT: "0.020"
+      UNIVERSE: "SPY,QQQ,VOO,AAPL,MSFT,NVDA,AMD,AVGO,META,GOOGL,AMZN,TSLA,SMCI,ORCL,INTC,CRM,COST,UNH,LIN,PEP,ADBE,TMUS,ASML,NFLX,TXN,AMAT,PLTR,MA,V,IBM,DE,BA,GE,ABBV,MRK,PFE,JNJ,WMT,MCD,NKE,XOM,CVX"
+      LOG_LEVEL: "INFO"
+
+      # --- Secrets ---
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install "alpaca-py>=0.42.1" pandas yfinance tenacity
+
+      - name: Run Equities Engine
+        env: { PYTHONUNBUFFERED: "1" }
+        run: python -u trader/equities_engine.py
