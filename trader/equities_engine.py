@@ -154,15 +154,16 @@ def alpaca_client(cfg) -> TradingClient:
     log.info("Alpaca key loaded (ending …%s); endpoint=%s.", end_key, "PAPER" if cfg["paper"] else "LIVE")
     return tc
 
-def get_cash_positions_equity(tc: TradingClient) -> Tuple[float, float, List[str], float, Dict[str, float], List[object]]:
+def get_cash_positions_equity(tc: TradingClient) -> Tuple[float, float, List[str], float, Dict[str, float], List[object], float]:
     acct = tc.get_account()
     cash = float(acct.cash)
     buying_power = float(getattr(acct, "buying_power", cash))
     equity = float(acct.equity)
+    last_equity = float(getattr(acct, "last_equity", equity))
     positions = tc.get_all_positions()
     held = [p.symbol for p in positions]
-    by_symbol_value = {p.symbol: float(p.market_value) for p in positions}
-    return cash, buying_power, held, equity, by_symbol_value, positions
+    by_symbol_value = {p.symbol: float(p.market_value) for p in positions]
+    return cash, buying_power, held, equity, by_symbol_value, positions, last_equity
 
 # ---------- Universe helpers ----------
 _CURATED_MEGACAPS: List[str] = [
@@ -397,7 +398,7 @@ def main():
     cfg = load_config()
     tc = alpaca_client(cfg)
 
-    cash, buying_power, held, equity, by_symbol_value, positions = get_cash_positions_equity(tc)
+    cash, buying_power, held, equity, by_symbol_value, positions, last_equity = get_cash_positions_equity(tc)
     log.info("Cash: $%.2f | BuyingPower: $%.2f | Equity: $%.2f | Open positions: %d -> %s", cash, buying_power, equity, len(held), held)
 
     # --- summary trackers ---
@@ -475,6 +476,41 @@ def main():
         except Exception as e:
             log.warning("order: %s failed: %s", pick.symbol, e)
             continue
+
+    # --- KPI block ---
+    invested = sum(by_symbol_value.values())
+    exposure_pct = (invested / equity * 100.0) if equity > 0 else 0.0
+    # Unrealized P&L across open positions
+    unrealized_total = 0.0
+    for p in positions:
+        try:
+            entry = float(p.avg_entry_price)
+            cur = float(p.current_price)
+            qty = float(p.qty)
+            unrealized_total += (cur - entry) * qty
+        except Exception:
+            pass
+    daily_pnl = equity - last_equity
+    # Count protective orders (TP/SL/TRAIL) currently open
+    tp_count = sl_count = trl_count = 0
+    for p in positions:
+        for o in open_orders_for_symbol(tc, p.symbol):
+            try:
+                if str(getattr(o, "side", "")).lower() != "sell":
+                    continue
+                typ = str(getattr(o, "type", "")).lower()
+                if typ == "limit" or getattr(o, "limit_price", None):
+                    tp_count += 1
+                elif typ in ("stop", "stop_loss") or getattr(o, "stop_price", None):
+                    sl_count += 1
+                elif typ == "trailing_stop" or getattr(o, "trail_percent", None) or getattr(o, "trail_price", None):
+                    trl_count += 1
+            except Exception:
+                continue
+    log.info(
+        "KPI | Equity=$%.2f | Cash=$%.2f | BuyingPower=$%.2f | Invested=$%.2f (%.2f%%) | UnrealizedPnL=$%.2f | DailyPnL=$%.2f | TP=%d SL=%d TRL=%d | Positions=%d",
+        equity, cash, buying_power, invested, exposure_pct, unrealized_total, daily_pnl, tp_count, sl_count, trl_count, len(positions)
+    )
 
     # --- Summary block ---
     def _fmt(lst: List[str]) -> str:
