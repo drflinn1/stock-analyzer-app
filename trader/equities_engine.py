@@ -1,10 +1,19 @@
 """
-Alpaca Equities Engine (Paper-ready, multi-buy)
+Alpaca Equities Engine (Paper or Live; multi-buy capable)
 - Safe to run every 15m via GitHub Actions
 - Skips instantly if market closed
 - Buys up to BUY_PER_RUN bracket orders (TP/SL) per run
 - Respects MAX_POSITIONS and cash guards
 - Retries transient API errors
+
+ENV:
+  ALPACA_API_KEY, ALPACA_API_SECRET
+  ALPACA_PAPER ("true"|"false") -> selects Paper or Live endpoint
+  DRY_RUN ("true"|"false")
+  PER_TRADE_USD, MAX_POSITIONS, BUY_PER_RUN
+  TP_PCT, SL_PCT
+  UNIVERSE (comma list)
+  LOG_LEVEL
 """
 from __future__ import annotations
 import os, sys, math, logging
@@ -12,6 +21,7 @@ from dataclasses import dataclass
 from typing import List
 import yfinance as yf
 from tenacity import retry, stop_after_attempt, wait_fixed
+
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -26,6 +36,14 @@ logging.basicConfig(
 log = logging.getLogger("equities")
 
 # ---------- config ----------
+ALPACA_API_KEY = (os.getenv("ALPACA_API_KEY") or "").strip()
+ALPACA_API_SECRET = (os.getenv("ALPACA_API_SECRET") or "").strip()
+ALPACA_PAPER = (os.getenv("ALPACA_PAPER", "true").lower() == "true")  # <- controls paper vs live
+
+if not (ALPACA_API_KEY and ALPACA_API_SECRET):
+    log.error("Missing Alpaca env vars: ALPACA_API_KEY, ALPACA_API_SECRET")
+    sys.exit(2)
+
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 PER_TRADE_USD = float(os.getenv("PER_TRADE_USD", "25"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
@@ -34,14 +52,13 @@ TP_PCT = float(os.getenv("TP_PCT", "0.035"))
 SL_PCT = float(os.getenv("SL_PCT", "0.020"))
 UNIVERSE = [s.strip().upper() for s in os.getenv("UNIVERSE", "SPY,AAPL").split(",") if s.strip()]
 
-ALPACA_API_KEY = (os.getenv("ALPACA_API_KEY") or "").strip()
-ALPACA_API_SECRET = (os.getenv("ALPACA_API_SECRET") or "").strip()
-if not (ALPACA_API_KEY and ALPACA_API_SECRET):
-    log.error("Missing Alpaca env vars: ALPACA_API_KEY, ALPACA_API_SECRET (check GitHub → Settings → Secrets).")
-    sys.exit(2)
+log.info(f"Alpaca key loaded (ending …{ALPACA_API_KEY[-4:]}); endpoint={'PAPER' if ALPACA_PAPER else 'LIVE'}.")
 
-log.info(f"Alpaca key loaded (ending …{ALPACA_API_KEY[-4:]}); using PAPER endpoint.")
-client = TradingClient(api_key=ALPACA_API_KEY, secret_key=ALPACA_API_SECRET, paper=True)
+client = TradingClient(
+    api_key=ALPACA_API_KEY,
+    secret_key=ALPACA_API_SECRET,
+    paper=ALPACA_PAPER,  # True = Paper, False = Live
+)
 
 # ---------- helpers ----------
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
@@ -126,7 +143,7 @@ if not candidates:
     log.info("No buy signals this run.")
     sys.exit(0)
 
-# Rank by cheaper first to maximize share count with fixed PER_TRADE_USD
+# Cheaper first to maximize share count with fixed PER_TRADE_USD
 candidates.sort(key=lambda p: p.price)
 
 to_buy = min(slots_left, BUY_PER_RUN, len(candidates))
