@@ -21,14 +21,11 @@ from dataclasses import dataclass
 from typing import List
 import pandas as pd
 import yfinance as yf
-from pytz import timezone
-from datetime import datetime
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.common.rest import URL
 
 # ---------- logging ----------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -58,7 +55,7 @@ client = TradingClient(
     api_key=ALPACA_API_KEY,
     secret_key=ALPACA_API_SECRET,
     paper=True,
-    base_url=URL(ALPACA_BASE_URL),
+    base_url=ALPACA_BASE_URL,  # pass as plain string (fixes ImportError)
 )
 
 # ---------- helpers ----------
