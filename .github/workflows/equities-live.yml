@@ -1,67 +1,45 @@
-name: Equities Live (Alpaca Paper — 15m)
+name: Equities Live (Paper, every 15m)
 
 on:
   workflow_dispatch:
-    inputs:
-      DRY_RUN:
-        description: "If true, log only — no orders"
-        required: false
-        default: "false"
-      PER_TRADE_USD:
-        description: "Notional dollars per new buy"
-        required: false
-        default: "1000"
-      DAILY_CAP_USD:
-        description: "Max total new buys per day"
-        required: false
-        default: "5000"
-      MAX_POSITIONS:
-        description: "Max concurrent long positions"
-        required: false
-        default: "10"
-      UNIVERSE_MODE:
-        description: "SP100 or USER_LIST (config/equities_universe.txt)"
-        required: false
-        default: "SP100"
-      UNIVERSE_SIZE:
-        description: "How many tickers to consider after ranking"
-        required: false
-        default: "20"
-      EMA_FAST:
-        description: "Fast EMA length"
-        required: false
-        default: "20"
-      EMA_SLOW:
-        description: "Slow EMA length"
-        required: false
-        default: "50"
-      TP_PCT:
-        description: "Take‑profit percent (e.g., 0.03 = 3%)"
-        required: false
-        default: "0.03"
-      SL_PCT:
-        description: "Stop‑loss percent (e.g., 0.02 = 2%)"
-        required: false
-        default: "0.02"
   schedule:
-  # Every 15 minutes during US market hours (13:00–20:59 UTC = 9:00–16:59 ET)
-  - cron: "*/15 13-20 * * 1-5"
+    # Run every 15 minutes on weekdays. The script itself checks the Alpaca clock
+    # and exits instantly if the market is closed or outside regular hours.
+    - cron: "*/15 * * * 1-5"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: equities-live
+  cancel-in-progress: true
 
 jobs:
-  live:
+  trade:
     runs-on: ubuntu-latest
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}
-      cancel-in-progress: true
+    timeout-minutes: 10
+
+    env:
+      # --- Trading config ---
+      DRY_RUN: "false"                 # keep false for live Paper trades
+      EXCHANGE: "alpaca"
+      PER_TRADE_USD: "25"             # dollars per new position
+      MAX_POSITIONS: "3"              # cap how many open positions we allow
+      TP_PCT: "0.035"                 # 3.5% take-profit (bracket order)
+      SL_PCT: "0.020"                 # 2.0% stop-loss (bracket order)
+      UNIVERSE: "SPY,AAPL,MSFT,AMD,NVDA,QQQ,TSLA,SMCI,META,GOOGL"
+      LOG_LEVEL: "INFO"
+
+      # --- Alpaca credentials ---
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+      ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }} # e.g. https://paper-api.alpaca.markets
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -71,43 +49,10 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install alpaca-py yfinance pandas numpy ta pytz
+          pip install alpaca-py pandas yfinance pytz tenacity
 
       - name: Run Equities Engine
         env:
-          # Secrets
-          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
-          
-          # Inputs (10 max for workflow_dispatch)
-          DRY_RUN: ${{ inputs.DRY_RUN || 'false' }}
-          PER_TRADE_USD: ${{ inputs.PER_TRADE_USD || '1000' }}
-          DAILY_CAP_USD: ${{ inputs.DAILY_CAP_USD || '5000' }}
-          MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || '10' }}
-          UNIVERSE_MODE: ${{ inputs.UNIVERSE_MODE || 'SP100' }}
-          UNIVERSE_SIZE: ${{ inputs.UNIVERSE_SIZE || '20' }}
-          EMA_FAST: ${{ inputs.EMA_FAST || '20' }}
-          EMA_SLOW: ${{ inputs.EMA_SLOW || '50' }}
-          TP_PCT: ${{ inputs.TP_PCT || '0.03' }}
-          SL_PCT: ${{ inputs.SL_PCT || '0.02' }}
-
-          # Advanced filters (not exposed as inputs to stay under 10-limit)
-          RSI_MIN: '50'
-          RSI_MAX: '80'
-          MIN_AVG_DOLLAR_VOL: '20000000'
-          USE_BRACKETS: 'true'
+          PYTHONUNBUFFERED: "1"
         run: |
           python -u trader/equities_engine.py
-
-      - name: Commit state changes (optional)
-        run: |
-          mkdir -p .state
-          git config user.email "actions@github.com"
-          git config user.name "github-actions"
-          if [ -n "$(git status --porcelain .state 2>/dev/null)" ]; then
-            git add .state
-            git commit -m "Equities state update [skip ci]"
-            git push
-          else
-            echo "No state changes to commit."
-          fi
