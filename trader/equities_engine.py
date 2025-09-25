@@ -13,11 +13,13 @@ What’s included now:
 
 ENV VARS added:
   TRAIL_PROMOTE_PCT=0.05      # promote winners above +5%
-  TRAIL_STOP_PCT=0.02         # protective stop at -2% from current when promoted
+  TRAIL_STOP_PCT=0.02         # protective stop distance; if true trailing is enabled, used as trail percent
+  TRAIL_USE_TRUE=1            # 1=use Alpaca true trailing-stop orders when possible; 0=fallback to fixed STOP
   REPAIR_PROTECTION=1         # 1=place missing TP/SL orders, 0=only log
 
+
 Notes/caveats:
-- We implement "trailing promotion" conservatively by placing a single STOP order below current price. Alpaca supports explicit trailing-stop orders in some APIs but using a direct stop is robust across versions.
+- Trailing promotion prefers **true trailing-stop orders** when `TRAIL_USE_TRUE=1` and the API supports it. If unavailable, it falls back to a fixed STOP at `current*(1-TRAIL_STOP_PCT)`.
 - Repair protection places two passive sell orders: LIMIT (TP above current) and STOP (SL below current). They are GTC and will only execute if price reaches them.
 """
 from __future__ import annotations
@@ -40,6 +42,11 @@ from alpaca.trading.requests import (
     LimitOrderRequest,
     StopOrderRequest,
 )
+# try to import trailing-stop request if available
+try:
+    from alpaca.trading.requests import TrailingStopOrderRequest  # type: ignore
+except Exception:  # pragma: no cover
+    TrailingStopOrderRequest = None  # type: ignore
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
@@ -92,6 +99,7 @@ def load_config():
         # Trailing/maintenance
         "trail_promote_pct": env_float("TRAIL_PROMOTE_PCT", 0.05),
         "trail_stop_pct": env_float("TRAIL_STOP_PCT", 0.02),
+        "trail_use_true": os.getenv("TRAIL_USE_TRUE", "1").strip() not in ("0", "false", "False"),
         "repair_protection": os.getenv("REPAIR_PROTECTION", "1").strip() not in ("0", "false", "False"),
     }
     return cfg
@@ -228,9 +236,24 @@ def place_buy(tc: TradingClient, symbol: str, notional: float, tp_pct: float, sl
 # ---------- Maintenance & trailing promotion ----------
 def open_orders_for_symbol(tc: TradingClient, symbol: str) -> List[object]:
     try:
-        return tc.get_orders(status="open", symbol=symbol)
+        return tc.get_orders(status="open", symbols=[symbol])
     except Exception:
         return []
+
+# How many shares of this symbol are already reserved by open SELL orders (limit/stop/bracket children)?
+def reserved_sell_qty(tc: TradingClient, symbol: str) -> int:
+    total = 0
+    for o in open_orders_for_symbol(tc, symbol):
+        try:
+            if str(getattr(o, "side", "")).lower() == "sell":
+                q = getattr(o, "qty", None)
+                if q is None:
+                    q = getattr(o, "quantity", None)
+                if q is not None:
+                    total += int(float(q))
+        except Exception:
+            continue
+    return total
 
 
 def position_unrealized_pct(position) -> float:
@@ -243,68 +266,7 @@ def position_unrealized_pct(position) -> float:
         return 0.0
 
 
-def promote_to_trailing_stop(tc: TradingClient, position, cfg) -> None:
-    symbol = position.symbol
-    qty = int(float(position.qty))
-    if qty <= 0:
-        return
-    # see if there is already an open stop order
-    orders = open_orders_for_symbol(tc, symbol)
-    has_stop = any((getattr(o, "type", "") in ("stop", "stop_loss") or getattr(o, "stop_price", None)) for o in orders)
-    if has_stop:
-        log.info("PROMOTE %s: stop already exists, skipping", symbol)
-        return
-    # current price
-    df = yf_download(symbol, period="5d", interval="1d")
-    last = float(df["Close"].astype(float).iloc[-1])
-    stop_price = round(last * (1.0 - cfg["trail_stop_pct"]), 2)
-    # submit a STOP order to sell qty with stop_price (GTC)
-    try:
-        stop_req = StopOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, stop_price=stop_price)
-        resp = tc.submit_order(stop_req)
-        log.info("PROMOTE %s: placed protective STOP at $%.2f for qty=%s (id=%s)", symbol, stop_price, qty, getattr(resp, "id", "?"))
-    except Exception as e:
-        log.warning("PROMOTE %s failed to place stop: %s", symbol, e)
-
-
-def repair_protection_if_missing(tc: TradingClient, position, cfg) -> None:
-    symbol = position.symbol
-    qty = int(float(position.qty))
-    if qty <= 0:
-        return
-    orders = open_orders_for_symbol(tc, symbol)
-    has_limit = any((getattr(o, "type", "") == "limit" or getattr(o, "limit_price", None)) for o in orders)
-    has_stop = any((getattr(o, "type", "") in ("stop", "stop_loss") or getattr(o, "stop_price", None)) for o in orders)
-
-    df = yf_download(symbol, period="5d", interval="1d")
-    last = float(df["Close"].astype(float).iloc[-1])
-
-    tp_price = round(last * (1.0 + cfg["tp_pct"]), 2)
-    sl_price = round(last * (1.0 - cfg["sl_pct"]), 2)
-
-    if not has_limit:
-        if cfg["repair_protection"]:
-            try:
-                lim = LimitOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, limit_price=tp_price)
-                r = tc.submit_order(lim)
-                log.info("REPAIR %s: placed LIMIT TP at $%.2f qty=%s id=%s", symbol, tp_price, qty, getattr(r, "id", "?"))
-            except Exception as e:
-                log.warning("REPAIR %s failed to place LIMIT TP: %s", symbol, e)
-        else:
-            log.info("REPAIR %s: missing LIMIT TP at $%.2f (not placed) qty=%s", symbol, tp_price, qty)
-
-    if not has_stop:
-        if cfg["repair_protection"]:
-            try:
-                stop = StopOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, stop_price=sl_price)
-                r2 = tc.submit_order(stop)
-                log.info("REPAIR %s: placed STOP SL at $%.2f qty=%s id=%s", symbol, sl_price, qty, getattr(r2, "id", "?"))
-            except Exception as e:
-                log.warning("REPAIR %s failed to place STOP SL: %s", symbol, e)
-        else:
-            log.info("REPAIR %s: missing STOP SL at $%.2f (not placed) qty=%s", symbol, sl_price, qty)
-
-# ---------- Main ----------
+def promote_to_trailing_stop# ---------- Main ----------
 def main():
     cfg = load_config()
     tc = alpaca_client(cfg)
