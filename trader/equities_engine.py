@@ -1,9 +1,10 @@
 """
-Alpaca Equities Engine (Paper or Live; multi-buy capable)
+Alpaca Equities Engine (Paper or Live; multi-buy + LIVE auto-trim)
 - Safe to run every 15m via GitHub Actions
 - Skips instantly if market closed
 - Buys up to BUY_PER_RUN bracket orders (TP/SL) per run
 - Respects MAX_POSITIONS and cash guards
+- LIVE-only: if positions > MAX_POSITIONS, trims losers-in-downtrend first
 - Retries transient API errors
 
 ENV:
@@ -18,7 +19,7 @@ ENV:
 from __future__ import annotations
 import os, sys, math, logging
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 import yfinance as yf
 from tenacity import retry, stop_after_attempt, wait_fixed
 
@@ -38,7 +39,7 @@ log = logging.getLogger("equities")
 # ---------- config ----------
 ALPACA_API_KEY = (os.getenv("ALPACA_API_KEY") or "").strip()
 ALPACA_API_SECRET = (os.getenv("ALPACA_API_SECRET") or "").strip()
-ALPACA_PAPER = (os.getenv("ALPACA_PAPER", "true").lower() == "true")  # <- controls paper vs live
+ALPACA_PAPER = (os.getenv("ALPACA_PAPER", "true").lower() == "true")  # True=Paper, False=Live
 
 if not (ALPACA_API_KEY and ALPACA_API_SECRET):
     log.error("Missing Alpaca env vars: ALPACA_API_KEY, ALPACA_API_SECRET")
@@ -57,7 +58,7 @@ log.info(f"Alpaca key loaded (ending …{ALPACA_API_KEY[-4:]}); endpoint={'PAPER
 client = TradingClient(
     api_key=ALPACA_API_KEY,
     secret_key=ALPACA_API_SECRET,
-    paper=ALPACA_PAPER,  # True = Paper, False = Live
+    paper=ALPACA_PAPER,
 )
 
 # ---------- helpers ----------
@@ -81,6 +82,26 @@ def api_err(label: str, e: Exception):
     status = getattr(e, "status_code", None)
     body = getattr(e, "body", None) or getattr(e, "message", None) or str(e)
     log.error(f"{label}: status={status} body={body}")
+
+def yf_downtrend(sym: str) -> bool:
+    """Return True if last close < SMA20 (simple downtrend filter)."""
+    try:
+        df = yf.download(sym, period="30d", interval="1d", progress=False)
+        if df is None or df.empty:
+            return False
+        df = df.dropna()
+        df["SMA20"] = df["Close"].rolling(20).mean()
+        last = df.iloc[-1]
+        return not math.isnan(last["SMA20"]) and float(last["Close"]) < float(last["SMA20"])
+    except Exception as e:
+        log.warning(f"{sym}: downtrend check failed: {e}")
+        return False
+
+def qty_to_int(qty_str: str) -> int:
+    try:
+        return max(1, int(abs(float(qty_str))))
+    except Exception:
+        return 0
 
 # ---------- market-time gate ----------
 try:
@@ -109,12 +130,61 @@ except APIError as e:
 open_symbols = {p.symbol for p in open_positions}
 log.info(f"Cash: ${cash:,.2f} | Open positions: {len(open_positions)} -> {sorted(open_symbols)}")
 
+# ---------- LIVE auto-trim: losers-first + downtrend ----------
+if not ALPACA_PAPER and len(open_positions) > MAX_POSITIONS:
+    excess = len(open_positions) - MAX_POSITIONS
+    trim_pool: List[Tuple[float, str, int]] = []  # (plpc, symbol, qty_int)
+
+    for p in open_positions:
+        sym = p.symbol
+        try:
+            plpc = float(p.unrealized_plpc or 0.0)  # fraction, e.g. -0.023 for -2.3%
+        except Exception:
+            plpc = 0.0
+        if plpc <= 0.0 and yf_downtrend(sym):
+            q = qty_to_int(p.qty)
+            if q > 0:
+                trim_pool.append((plpc, sym, q))
+
+    if trim_pool:
+        # Most negative first
+        trim_pool.sort(key=lambda t: t[0])
+        to_close = trim_pool[:excess]
+        log.info(f"LIVE auto-trim: closing up to {excess} loser(s) in downtrend -> {[(s, q) for _, s, q in to_close]}")
+
+        for _, sym, q in to_close:
+            if DRY_RUN:
+                log.info(f"DRY_RUN: would SELL {sym} x{q} (auto-trim).")
+                continue
+            try:
+                order = submit_order(
+                    MarketOrderRequest(
+                        symbol=sym,
+                        qty=q,
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.DAY,
+                    )
+                )
+                log.info(f"AUTO-TRIM SELL submitted -> id={order.id} {sym} x{q}")
+            except APIError as e:
+                api_err(f"AUTO-TRIM SELL failed for {sym}", e)
+    else:
+        log.info("LIVE auto-trim: over cap but no eligible losers in downtrend; keeping winners and skipping trim.")
+
+# Recompute positions after possible trim (to set buy slots correctly)
+try:
+    open_positions = get_positions()
+except APIError as e:
+    api_err("Post-trim positions fetch failed", e)
+    sys.exit(2)
+open_symbols = {p.symbol for p in open_positions}
+
 slots_left = max(0, MAX_POSITIONS - len(open_positions))
 if slots_left == 0:
     log.info("At MAX_POSITIONS; nothing to buy this run.")
     sys.exit(0)
 
-# ---------- signal: 5/20 SMA cross ----------
+# ---------- signal: 5/20 SMA cross (autopick) ----------
 @dataclass
 class Pick:
     symbol: str
@@ -132,10 +202,10 @@ for sym in UNIVERSE:
         df["SMA5"] = df["Close"].rolling(5).mean()
         df["SMA20"] = df["Close"].rolling(20).mean()
         last = df.iloc[-1]
-        if math.isnan(last.SMA5) or math.isnan(last.SMA20):
+        if math.isnan(last["SMA5"]) or math.isnan(last["SMA20"]):
             continue
-        if last.SMA5 > last.SMA20:
-            candidates.append(Pick(sym, float(last.Close)))
+        if float(last["SMA5"]) > float(last["SMA20"]):
+            candidates.append(Pick(sym, float(last["Close"])))
     except Exception as e:
         log.warning(f"{sym}: data fetch failed: {e}")
 
