@@ -3,8 +3,6 @@ name: Equities Live (Paper, every 15m)
 on:
   workflow_dispatch:
   schedule:
-    # Run every 15 minutes on weekdays. The script itself checks the Alpaca clock
-    # and exits instantly if the market is closed or outside regular hours.
     - cron: "*/15 * * * 1-5"
 
 permissions:
@@ -20,20 +18,19 @@ jobs:
     timeout-minutes: 10
 
     env:
-      # --- Trading config ---
-      DRY_RUN: "false"                 # keep false for live Paper trades
-      EXCHANGE: "alpaca"
-      PER_TRADE_USD: "25"             # dollars per new position
-      MAX_POSITIONS: "3"              # cap how many open positions we allow
-      TP_PCT: "0.035"                 # 3.5% take-profit (bracket order)
-      SL_PCT: "0.020"                 # 2.0% stop-loss (bracket order)
-      UNIVERSE: "SPY,AAPL,MSFT,AMD,NVDA,QQQ,TSLA,SMCI,META,GOOGL"
+      # --- Trading config (PAPER “blast it”) ---
+      DRY_RUN: "false"                 # live Paper trades
+      PER_TRADE_USD: "2000"            # dollars per new position
+      MAX_POSITIONS: "20"              # allow up to 20 open paper positions
+      BUY_PER_RUN: "5"                 # buy up to 5 new names per run (subject to slots/cash)
+      TP_PCT: "0.035"                  # 3.5% take-profit (bracket)
+      SL_PCT: "0.020"                  # 2.0% stop-loss (bracket)
+      UNIVERSE: "SPY,QQQ,VOO,AAPL,MSFT,NVDA,AMD,AVGO,META,GOOGL,AMZN,TSLA,SMCI,ORCL,INTC,CRM,COST,UNH,LIN,PEP,ADBE,TMUS,ASML,NFLX,TXN,AMAT,PLTR,MA,V,IBM,DE,BA,GE,ABBV,MRK,PFE,JNJ,WMT,MCD,NKE,XOM,CVX"
       LOG_LEVEL: "INFO"
 
       # --- Alpaca credentials ---
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
       ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
-      ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }} # e.g. https://paper-api.alpaca.markets
 
     steps:
       - name: Checkout
@@ -50,7 +47,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install "alpaca-py>=0.42.1" pandas yfinance pytz tenacity
-
 
       - name: Run Equities Engine
         env:
