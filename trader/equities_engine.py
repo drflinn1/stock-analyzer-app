@@ -5,15 +5,6 @@ Alpaca Equities Engine (Paper-ready)
 - Buys small bracket orders with TP/SL
 - Never exceeds MAX_POSITIONS
 - Retries transient API errors
-
-ENV (from workflow):
-  DRY_RUN ("true"/"false")
-  PER_TRADE_USD (str->float)
-  MAX_POSITIONS (int)
-  TP_PCT, SL_PCT (floats like 0.035)
-  UNIVERSE (comma list)
-  ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_BASE_URL
-  LOG_LEVEL (DEBUG/INFO)
 """
 from __future__ import annotations
 import os, sys, math, logging
@@ -45,17 +36,17 @@ UNIVERSE = [s.strip().upper() for s in os.getenv("UNIVERSE", "SPY,AAPL").split("
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+# If you later need custom endpoints, we can switch SDKs or add an env switch.
+# For alpaca-py TradingClient, `paper=True` selects the paper base URL automatically.
 
-if not (ALPACA_API_KEY and ALPACA_API_SECRET and ALPACA_BASE_URL):
-    log.error("Missing one or more Alpaca env vars: ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_BASE_URL")
+if not (ALPACA_API_KEY and ALPACA_API_SECRET):
+    log.error("Missing Alpaca env vars: ALPACA_API_KEY, ALPACA_API_SECRET")
     sys.exit(2)
 
 client = TradingClient(
     api_key=ALPACA_API_KEY,
     secret_key=ALPACA_API_SECRET,
-    paper=True,
-    base_url=ALPACA_BASE_URL,  # pass as plain string (fixes ImportError)
+    paper=True,           # selects https://paper-api.alpaca.markets internally
 )
 
 # ---------- helpers ----------
