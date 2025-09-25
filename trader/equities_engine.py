@@ -330,6 +330,13 @@ def repair_protection_if_missing(tc: TradingClient, position, cfg) -> None:
 
     # compute available qty not already reserved by existing SELL orders
     reserved = reserved_sell_qty(tc, symbol)
+    if reserved >= pos_qty:
+        log.info("REPAIR %s: all shares already reserved by existing SELL orders (reserved=%s, pos=%s) — skipping", symbol, reserved, pos_qty)
+        return
+    free_qty = max(0, pos_qty - reserved)
+
+    # compute available qty not already reserved by existing SELL orders
+    reserved = reserved_sell_qty(tc, symbol)
     free_qty = max(0, pos_qty - reserved)
 
     if not has_limit and free_qty > 0:
