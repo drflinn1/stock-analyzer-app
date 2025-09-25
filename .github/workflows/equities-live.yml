@@ -111,3 +111,4 @@ jobs:
             git push
           else
             echo "No state changes to commit."
+          fi
