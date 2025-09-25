@@ -12,8 +12,8 @@ What’s included now:
 - **Maintenance sweep**: every run, scan open positions and (optionally) repair missing TP/SL by placing limit (TP) and stop (SL) sell orders as GTC. This won’t close open positions immediately — TP is above market, SL is below market.
 
 ENV VARS added:
-  TRAIL_PROMOTE_PCT=0.05      # promote winners above +5%
-  TRAIL_STOP_PCT=0.02         # protective stop distance; if true trailing is enabled, used as trail percent
+  TRAIL_PROMOTE_PCT=0.04      # promote winners above +4% (tighter for faster profit lock‑in)
+  TRAIL_STOP_PCT=0.015        # protective stop distance / trail percent (1.5%)
   TRAIL_USE_TRUE=1            # 1=use Alpaca true trailing-stop orders when possible; 0=fallback to fixed STOP
   REPAIR_PROTECTION=1         # 1=place missing TP/SL orders, 0=only log
   REPAIR_SKIP_IF_ACTIVE_SELLS=1  # 1=skip repair when any open SELL orders exist (cool‑down); 0=always attempt
@@ -53,6 +53,15 @@ except Exception:  # pragma: no cover
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 log = logging.getLogger("equities_engine")
+# Throttled logging (per run). Use for noisy, repetitive lines.
+_LOG_ONCE_KEYS: set = set()
+
+def log_once(key: str, level: str, msg: str, *args):
+    if key in _LOG_ONCE_KEYS:
+        return
+    _LOG_ONCE_KEYS.add(key)
+    fn = getattr(log, level, log.info)
+    fn(msg, *args)
 
 @dataclass
 class Pick:
@@ -99,8 +108,8 @@ def load_config():
         "max_pct_symbol": env_float("MAX_PCT_PER_SYMBOL", 10.0),
         "auto_size": env_int("AUTO_UNIVERSE_SIZE", 40),
         # Trailing/maintenance
-        "trail_promote_pct": env_float("TRAIL_PROMOTE_PCT", 0.05),
-        "trail_stop_pct": env_float("TRAIL_STOP_PCT", 0.02),
+        "trail_promote_pct": env_float("TRAIL_PROMOTE_PCT", 0.04),
+        "trail_stop_pct": env_float("TRAIL_STOP_PCT", 0.015),
         "trail_use_true": os.getenv("TRAIL_USE_TRUE", "1").strip() not in ("0", "false", "False"),
         "repair_protection": os.getenv("REPAIR_PROTECTION", "1").strip() not in ("0", "false", "False"),
         "repair_skip_if_sells": os.getenv("REPAIR_SKIP_IF_ACTIVE_SELLS", "1").strip() not in ("0", "false", "False"),
@@ -290,13 +299,13 @@ def promote_to_trailing_stop(tc: TradingClient, position, cfg) -> None:
     orders = open_orders_for_symbol(tc, symbol)
     has_stop = any((str(getattr(o, "side", "")).lower()=="sell") and (getattr(o, "type", "") in ("stop", "stop_loss", "trailing_stop") or getattr(o, "stop_price", None) or getattr(o, "trail_percent", None) or getattr(o, "trail_price", None)) for o in orders)
     if has_stop:
-        log.info("PROMOTE %s: stop already exists, skipping", symbol)
+        log_once(f"promote_stop_exists:{symbol}", "info", "PROMOTE %s: stop already exists, skipping", symbol)
         return
     # Determine available quantity not already reserved by other SELL orders
     reserved = reserved_sell_qty(tc, symbol)
     qty = max(0, pos_qty - reserved)
     if qty <= 0:
-        log.info("PROMOTE %s: no free qty (reserved=%s), skipping", symbol, reserved)
+        log_once(f"promote_no_free_qty:{symbol}", "info", "PROMOTE %s: no free qty (reserved=%s), skipping", symbol, reserved)
         return
 
     # Prefer true trailing stop if available
@@ -314,7 +323,7 @@ def promote_to_trailing_stop(tc: TradingClient, position, cfg) -> None:
             log.info("PROMOTE %s: TRUE trailing-stop placed trail=%.4f%% qty=%s id=%s", symbol, trail_pct, qty, getattr(resp, "id", "?"))
             return
         except Exception as e:
-            log.warning("PROMOTE %s: true trailing unsupported or failed (%s); falling back to fixed STOP.", symbol, e)
+            log_once(f"promote_trail_fallback:{symbol}", "warning", "PROMOTE %s: true trailing unsupported or failed (%s); falling back to fixed STOP.", symbol, e)
 
     # Fallback: fixed STOP at current*(1 - trail_stop_pct)
     df = yf_download(symbol, period="5d", interval="1d")
@@ -335,7 +344,7 @@ def repair_protection_if_missing(tc: TradingClient, position, cfg) -> None:
         return
     # Cool‑down: if ANY open sell orders exist and the flag is on, skip repairs to avoid qty conflicts
     if cfg.get("repair_skip_if_sells", True) and has_any_open_sell(tc, symbol):
-        log.info("REPAIR %s: cool‑down — active SELL orders present; skipping", symbol)
+        log_once(f"repair_cooldown:{symbol}", "info", "REPAIR %s: cool‑down — active SELL orders present; skipping", symbol)
         return
     orders = open_orders_for_symbol(tc, symbol)
     has_limit = any((str(getattr(o, "side", "")).lower()=="sell") and ((getattr(o, "type", "") == "limit") or getattr(o, "limit_price", None)) for o in orders)
@@ -350,7 +359,7 @@ def repair_protection_if_missing(tc: TradingClient, position, cfg) -> None:
     # compute available qty not already reserved by existing SELL orders
     reserved = reserved_sell_qty(tc, symbol)
     if reserved >= pos_qty:
-        log.info("REPAIR %s: all shares already reserved by existing SELL orders (reserved=%s, pos=%s) — skipping", symbol, reserved, pos_qty)
+        log_once(f"repair_all_reserved:{symbol}", "info", "REPAIR %s: all shares already reserved by existing SELL orders (reserved=%s, pos=%s) — skipping", symbol, reserved, pos_qty)
         return
     free_qty = max(0, pos_qty - reserved)
 
@@ -443,18 +452,18 @@ def main():
             break
         # Check symbol cap first
         if would_exceed_symbol_cap(pick.symbol, cfg["per_trade_usd"], equity, by_symbol_value, cfg["max_pct_symbol"]):
-            log.info("SKIP %s: per‑symbol cap %.1f%% of equity would be exceeded.", pick.symbol, cfg["max_pct_symbol"])
+            log_once(f"skip_cap:{pick.symbol}", "info", "SKIP %s: per‑symbol cap %.1f%% of equity would be exceeded.", pick.symbol, cfg["max_pct_symbol"])
             cap_skips.append(pick.symbol)
             continue
         # Auto-size notional by remaining buying power (use 90% safety buffer)
         affordable_notional = min(cfg["per_trade_usd"], max(0.0, remaining_bp) * 0.90)
         if affordable_notional <= 0:
-            log.info("SKIP %s: no remaining buying power.", pick.symbol)
+            log_once(f"skip_no_bp:{pick.symbol}", "info", "SKIP %s: no remaining buying power.", pick.symbol)
             break
         # Require we can afford at least 1 share using ranked close
         need = pick.last_close
         if affordable_notional < max(1.0, need):
-            log.info("SKIP %s: insufficient buying power (need~$%.2f, avail~$%.2f).", pick.symbol, need, remaining_bp)
+            log_once(f"skip_insufficient_bp:{pick.symbol}", "info", "SKIP %s: insufficient buying power (need~$%.2f, avail~$%.2f).", pick.symbol, need, remaining_bp)
             break
         try:
             place_buy(tc, symbol=pick.symbol, notional=affordable_notional, tp_pct=cfg["tp_pct"], sl_pct=cfg["sl_pct"])
