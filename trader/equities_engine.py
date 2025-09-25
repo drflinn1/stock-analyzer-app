@@ -1,8 +1,3 @@
----
-
-## 2) `trader/equities_engine.py`
-
-```python
 """
 Alpaca Equities Engine (Paper-ready)
 - Idempotent, safe to run every 15m via GitHub Actions
@@ -21,7 +16,7 @@ ENV (from workflow):
   LOG_LEVEL (DEBUG/INFO)
 """
 from __future__ import annotations
-import os, sys, time, math, logging
+import os, sys, math, logging
 from dataclasses import dataclass
 from typing import List
 import pandas as pd
@@ -86,15 +81,8 @@ def submit_order(req: MarketOrderRequest):
 # ---------- market-time gate ----------
 clock = get_clock()
 if not clock.is_open:
-    # Allow pre-open / post-close runs to exit quickly with success
     log.info("Market closed (Alpaca clock). Exiting.")
     sys.exit(0)
-
-# Also avoid running before the first 5 minutes after open (data churn)
-ny = timezone("America/New_York")
-now_ny = datetime.now(ny)
-market_open = clock.next_open.astimezone(ny).replace(tzinfo=ny) if now_ny < clock.next_open.astimezone(ny) else clock.timestamp.astimezone(ny)
-# If exactly at session, let it pass; otherwise just continue.
 
 # ---------- portfolio state ----------
 try:
@@ -114,11 +102,11 @@ if slots_left == 0:
     sys.exit(0)
 
 budget = min(cash, PER_TRADE_USD)
-if budget < 5:  # avoid dust orders
+if budget < 5:
     log.info("Insufficient cash (<$5) for new positions this run.")
     sys.exit(0)
 
-# ---------- simple signal: 5/20 SMA cross on today’s data ----------
+# ---------- simple signal: 5/20 SMA cross ----------
 @dataclass
 class Pick:
     symbol: str
@@ -129,7 +117,6 @@ for sym in UNIVERSE:
     if sym in open_symbols:
         continue
     try:
-        # Pull a small window to keep it light
         df = yf.download(sym, period="30d", interval="1d", progress=False)
         if df is None or df.empty:
             continue
@@ -148,7 +135,6 @@ if not candidates:
     log.info("No buy signals this run.")
     sys.exit(0)
 
-# Choose the cheapest candidate to maximize share count with small budgets
 candidates.sort(key=lambda p: p.price)
 pick = candidates[0]
 
@@ -157,8 +143,6 @@ if qty <= 0:
     log.info(f"Signal on {pick.symbol} but budget ${budget:.2f} < price ${pick.price:.2f} -> skip.")
     sys.exit(0)
 
-# Compute TP/SL prices for a bracket via notional percentages
-# Note: Alpaca bracket requires limit_price (take-profit) and stop_loss (stop price)
 entry = pick.price
 tp_price = round(entry * (1 + TP_PCT), 2)
 sl_price = round(entry * (1 - SL_PCT), 2)
@@ -185,7 +169,6 @@ try:
     )
     log.info(f"Submitted bracket BUY -> id={order.id} symbol={order.symbol} qty={order.qty}")
 except Exception as e:
-    # Common failure causes are captured in logs; retry already attempted via tenacity where set.
     log.error(f"Order submit failed: {e}")
     sys.exit(1)
 
