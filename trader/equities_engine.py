@@ -1,275 +1,216 @@
+#!/usr/bin/env python3
 """
-Alpaca Equities Engine (Paper or Live; multi-buy + LIVE auto-trim with floor/limits)
-- Safe to run every 15m via GitHub Actions
-- Skips instantly if market closed
-- Buys up to BUY_PER_RUN bracket orders (TP/SL) per run
-- Respects MAX_POSITIONS and cash guards
-- LIVE-only auto-trim when positions > MAX_POSITIONS:
-    * losers first (unrealized_plpc <= TRIM_LOSS_FLOOR)
-    * AND in downtrend (Close < SMA20)
-    * up to MAX_TRIMS_PER_RUN per run
-- Retries transient API errors
+Equities engine (Alpaca)
+- Scans a universe with a simple SMA5 > SMA20 momentum filter (daily bars)
+- Places MARKET BUY orders sized by PER_TRADE_USD
+- Adds bracket exits: Take‑Profit (TP_PCT) and Stop‑Loss (SL_PCT)
+- Avoids rebuying symbols you already hold when AVOID_REBUY=1
+- Explicit yfinance settings to silence deprecation warnings
 
-ENV:
-  ALPACA_API_KEY, ALPACA_API_SECRET
-  ALPACA_PAPER ("true"|"false") -> selects Paper or Live endpoint
-  DRY_RUN ("true"|"false")
-  PER_TRADE_USD, MAX_POSITIONS, BUY_PER_RUN
-  TP_PCT, SL_PCT
-  TRIM_LOSS_FLOOR  (e.g., -0.01 for -1.0%)  [LIVE only]
-  MAX_TRIMS_PER_RUN (e.g., 2)               [LIVE only]
-  UNIVERSE (comma list)
-  LOG_LEVEL
+ENV VARS (with sensible defaults):
+  ALPACA_API_KEY, ALPACA_API_SECRET  # required
+  ALPACA_PAPER=1                     # 1=paper (default), 0=live
+  UNIVERSE="AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA,AVGO,LIN,ADBE,INTC,AMD,ORCL,IBM,GE,UNH,WMT,XOM"
+  MAX_NEW_ORDERS=4                   # max fresh buys per run
+  PER_TRADE_USD=2000                 # dollar notional per buy
+  TP_PCT=0.035                       # take‑profit +3.5%
+  SL_PCT=0.020                       # stop‑loss   −2.0%
+  AVOID_REBUY=1                      # skip tickers already held
+
+Notes:
+- Uses bracket orders via alpaca‑py 0.42.x
+- yfinance auto_adjust is set explicitly to True to match its new default
+  and to avoid price gaps from splits/dividends.
 """
 from __future__ import annotations
-import os, sys, math, logging
+import os
+import math
+import time
+import logging
 from dataclasses import dataclass
 from typing import List, Tuple
+
 import yfinance as yf
-from tenacity import retry, stop_after_attempt, wait_fixed
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.common.exceptions import APIError
+from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
 
-# ---------- logging ----------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# ---------- Logging ----------
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=logging.INFO,
     format="[%(asctime)s] %(levelname)s - %(message)s",
 )
-log = logging.getLogger("equities")
+log = logging.getLogger("equities_engine")
 
-# ---------- config ----------
-ALPACA_API_KEY = (os.getenv("ALPACA_API_KEY") or "").strip()
-ALPACA_API_SECRET = (os.getenv("ALPACA_API_SECRET") or "").strip()
-ALPACA_PAPER = (os.getenv("ALPACA_PAPER", "true").lower() == "true")  # True=Paper, False=Live
 
-if not (ALPACA_API_KEY and ALPACA_API_SECRET):
-    log.error("Missing Alpaca env vars: ALPACA_API_KEY, ALPACA_API_SECRET")
-    sys.exit(2)
-
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-PER_TRADE_USD = float(os.getenv("PER_TRADE_USD", "25"))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
-BUY_PER_RUN = int(os.getenv("BUY_PER_RUN", "1"))
-TP_PCT = float(os.getenv("TP_PCT", "0.035"))
-SL_PCT = float(os.getenv("SL_PCT", "0.020"))
-UNIVERSE = [s.strip().upper() for s in os.getenv("UNIVERSE", "SPY,AAPL").split(",") if s.strip()]
-
-# LIVE trim knobs
-TRIM_LOSS_FLOOR = float(os.getenv("TRIM_LOSS_FLOOR", "-0.01"))   # only trim if <= -1.0%
-MAX_TRIMS_PER_RUN = int(os.getenv("MAX_TRIMS_PER_RUN", "2"))     # limit trims per run
-
-log.info(f"Alpaca key loaded (ending …{ALPACA_API_KEY[-4:]}); endpoint={'PAPER' if ALPACA_PAPER else 'LIVE'}.")
-
-client = TradingClient(
-    api_key=ALPACA_API_KEY,
-    secret_key=ALPACA_API_SECRET,
-    paper=ALPACA_PAPER,
-)
-
-# ---------- helpers ----------
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def get_clock():
-    return client.get_clock()
-
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def get_positions():
-    return client.get_all_positions()
-
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def get_account():
-    return client.get_account()
-
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def submit_order(req: MarketOrderRequest):
-    return client.submit_order(req)
-
-def api_err(label: str, e: Exception):
-    status = getattr(e, "status_code", None)
-    body = getattr(e, "body", None) or getattr(e, "message", None) or str(e)
-    log.error(f"{label}: status={status} body={body}")
-
-def yf_downtrend(sym: str) -> bool:
-    """True if last close < SMA20 (simple downtrend)."""
-    try:
-        df = yf.download(sym, period="30d", interval="1d", progress=False)
-        if df is None or df.empty:
-            return False
-        df = df.dropna()
-        df["SMA20"] = df["Close"].rolling(20).mean()
-        last = df.iloc[-1]
-        return not math.isnan(last["SMA20"]) and float(last["Close"]) < float(last["SMA20"])
-    except Exception as e:
-        log.warning(f"{sym}: downtrend check failed: {e}")
-        return False
-
-def qty_to_int(qty_str: str) -> int:
-    try:
-        return max(1, int(abs(float(qty_str))))
-    except Exception:
-        return 0
-
-# ---------- market-time gate ----------
-try:
-    clock = get_clock()
-except APIError as e:
-    api_err("Clock fetch failed (likely auth)", e)
-    sys.exit(2)
-if not clock.is_open:
-    log.info("Market closed (Alpaca clock). Exiting.")
-    sys.exit(0)
-
-# ---------- account/positions ----------
-try:
-    acct = get_account()
-    cash = float(acct.cash)
-except APIError as e:
-    api_err("Failed to fetch account", e)
-    sys.exit(2)
-
-try:
-    open_positions = get_positions()
-except APIError as e:
-    api_err("Failed to fetch positions", e)
-    sys.exit(2)
-
-open_symbols = {p.symbol for p in open_positions}
-log.info(f"Cash: ${cash:,.2f} | Open positions: {len(open_positions)} -> {sorted(open_symbols)}")
-
-# ---------- LIVE auto-trim: losers-first + downtrend + floor + max-per-run ----------
-if not ALPACA_PAPER and len(open_positions) > MAX_POSITIONS:
-    excess = len(open_positions) - MAX_POSITIONS
-    trim_pool: List[Tuple[float, str, int]] = []  # (plpc, symbol, qty_int)
-
-    for p in open_positions:
-        sym = p.symbol
-        try:
-            plpc = float(p.unrealized_plpc or 0.0)  # e.g., -0.023 = -2.3%
-        except Exception:
-            plpc = 0.0
-        if plpc <= TRIM_LOSS_FLOOR and yf_downtrend(sym):
-            q = qty_to_int(p.qty)
-            if q > 0:
-                trim_pool.append((plpc, sym, q))
-
-    if trim_pool:
-        trim_pool.sort(key=lambda t: t[0])  # most negative first
-        to_close = trim_pool[: min(excess, MAX_TRIMS_PER_RUN)]
-        log.info(
-            f"LIVE auto-trim: need {excess} -> closing up to {len(to_close)} "
-            f"loser(s) in downtrend (floor {TRIM_LOSS_FLOOR:+.2%}) -> {[(s, q) for _, s, q in to_close]}"
-        )
-        for _, sym, q in to_close:
-            if DRY_RUN:
-                log.info(f"DRY_RUN: would SELL {sym} x{q} (auto-trim).")
-                continue
-            try:
-                order = submit_order(
-                    MarketOrderRequest(
-                        symbol=sym,
-                        qty=q,
-                        side=OrderSide.SELL,
-                        time_in_force=TimeInForce.DAY,
-                    )
-                )
-                log.info(f"AUTO-TRIM SELL submitted -> id={order.id} {sym} x{q}")
-            except APIError as e:
-                api_err(f"AUTO-TRIM SELL failed for {sym}", e)
-    else:
-        log.info("LIVE auto-trim: over cap but no eligible losers below floor and in downtrend; skipping trim.")
-
-# Recompute positions after possible trim (to set buy slots correctly)
-try:
-    open_positions = get_positions()
-except APIError as e:
-    api_err("Post-trim positions fetch failed", e)
-    sys.exit(2)
-open_symbols = {p.symbol for p in open_positions}
-
-slots_left = max(0, MAX_POSITIONS - len(open_positions))
-if slots_left == 0:
-    log.info("At MAX_POSITIONS; nothing to buy this run.")
-    sys.exit(0)
-
-# ---------- signal: 5/20 SMA cross (autopick) ----------
 @dataclass
 class Pick:
     symbol: str
-    price: float
+    last_close: float
 
-candidates: List[Pick] = []
-for sym in UNIVERSE:
-    if sym in open_symbols:
-        continue
+
+# ---------- Config helpers ----------
+def env_float(name: str, default: float) -> float:
     try:
-        df = yf.download(sym, period="30d", interval="1d", progress=False)
-        if df is None or df.empty:
-            continue
-        df = df.dropna()
-        df["SMA5"] = df["Close"].rolling(5).mean()
-        df["SMA20"] = df["Close"].rolling(20).mean()
-        last = df.iloc[-1]
-        if math.isnan(last["SMA5"]) or math.isnan(last["SMA20"]):
-            continue
-        if float(last["SMA5"]) > float(last["SMA20"]):
-            candidates.append(Pick(sym, float(last["Close"])))
-    except Exception as e:
-        log.warning(f"{sym}: data fetch failed: {e}")
+        return float(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
 
-if not candidates:
-    log.info("No buy signals this run.")
-    sys.exit(0)
 
-# Cheaper first to maximize share count with fixed PER_TRADE_USD
-candidates.sort(key=lambda p: p.price)
-
-to_buy = min(slots_left, BUY_PER_RUN, len(candidates))
-remaining_cash = cash
-buys_done = 0
-
-for pick in candidates[:to_buy]:
-    budget = min(remaining_cash, PER_TRADE_USD)
-    if budget < 5:
-        log.info("Remaining cash this run is < $5 — stopping.")
-        break
-    qty = max(1, int(budget // pick.price))
-    if qty <= 0:
-        log.info(f"Skip {pick.symbol}: budget ${budget:.2f} < price ${pick.price:.2f}.")
-        continue
-
-    entry = pick.price
-    tp_price = round(entry * (1 + TP_PCT), 2)
-    sl_price = round(entry * (1 - SL_PCT), 2)
-
-    log.info(f"BUY {pick.symbol} x{qty} @~${entry:.2f} TP ${tp_price:.2f} (+{TP_PCT*100:.1f}%) SL ${sl_price:.2f} (-{SL_PCT*100:.1f}%).")
-
-    if DRY_RUN:
-        continue
-
+def env_int(name: str, default: int) -> int:
     try:
-        order = submit_order(
-            MarketOrderRequest(
-                symbol=pick.symbol,
-                qty=qty,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
-                order_class="bracket",
-                take_profit={"limit_price": tp_price},
-                stop_loss={"stop_price": sl_price},
+        return int(float(os.getenv(name, str(default)).strip()))
+    except Exception:
+        return default
+
+
+def load_config():
+    paper_flag = os.getenv("ALPACA_PAPER", "1").strip() not in ("0", "false", "False")
+    api_key = os.getenv("ALPACA_API_KEY", "").strip()
+    api_secret = os.getenv("ALPACA_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        raise SystemExit("Missing ALPACA_API_KEY/ALPACA_API_SECRET in environment")
+
+    universe_env = os.getenv(
+        "UNIVERSE",
+        "AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA,AVGO,LIN,ADBE,INTC,AMD,ORCL,IBM,GE,UNH,WMT,XOM",
+    )
+    universe = [s.strip().upper() for s in universe_env.split(",") if s.strip()]
+
+    cfg = {
+        "paper": paper_flag,
+        "api_key": api_key,
+        "api_secret": api_secret,
+        "universe": universe,
+        "max_new": env_int("MAX_NEW_ORDERS", 4),
+        "per_trade_usd": env_float("PER_TRADE_USD", 2000.0),
+        "tp_pct": env_float("TP_PCT", 0.035),
+        "sl_pct": env_float("SL_PCT", 0.020),
+        "avoid_rebuy": os.getenv("AVOID_REBUY", "1").strip() not in ("0", "false", "False"),
+    }
+    return cfg
+
+
+# ---------- Alpaca helpers ----------
+def alpaca_client(cfg) -> TradingClient:
+    tc = TradingClient(cfg["api_key"], cfg["api_secret"], paper=cfg["paper"])
+    # Obfuscate key for logs
+    end_key = cfg["api_key"][-4:] if len(cfg["api_key"]) >= 4 else "****"
+    log.info("Alpaca key loaded (ending …%s); endpoint=%s.", end_key, "PAPER" if cfg["paper"] else "LIVE")
+    return tc
+
+
+def get_cash_and_positions(tc: TradingClient) -> Tuple[float, List[str]]:
+    acct = tc.get_account()
+    # Prefer cash over buying_power for clarity, both are strings
+    cash = float(acct.cash)
+    held = [p.symbol for p in tc.get_all_positions()]
+    return cash, held
+
+
+# ---------- Scan logic ----------
+def scan_candidates(universe: List[str]) -> List[Pick]:
+    """Return symbols whose SMA5 > SMA20 on daily bars."""
+    picks: List[Pick] = []
+    for sym in universe:
+        try:
+            # Explicit settings to silence future warnings; download daily close
+            df = yf.download(
+                sym,
+                period="60d",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
             )
-        )
-        log.info(f"Submitted BUY -> id={order.id} symbol={order.symbol} qty={order.qty}")
-        remaining_cash -= qty * entry
-        buys_done += 1
-    except APIError as e:
-        api_err("Order submit failed", e)
+            if df is None or len(df) < 20:
+                continue
+            close = df["Close"].astype(float)
+            sma5 = close.rolling(5).mean()
+            sma20 = close.rolling(20).mean()
 
-if DRY_RUN:
-    log.info("DRY_RUN=true -> no orders placed (log only).")
-elif buys_done == 0:
-    log.info("No orders placed this run.")
-else:
-    log.info(f"Run complete: placed {buys_done} order(s).")
+            sma5_last = float(sma5.iloc[-1]) if not math.isnan(sma5.iloc[-1]) else float("nan")
+            sma20_last = float(sma20.iloc[-1]) if not math.isnan(sma20.iloc[-1]) else float("nan")
+            if math.isnan(sma5_last) or math.isnan(sma20_last):
+                continue
+
+            last_close = float(close.iloc[-1])
+            if sma5_last > sma20_last:
+                picks.append(Pick(sym, last_close))
+        except Exception as e:
+            log.warning("scan: %s failed: %s", sym, e)
+            continue
+    return picks
+
+
+# ---------- Order placement ----------
+def place_buy(tc: TradingClient, symbol: str, notional: float, tp_pct: float, sl_pct: float, mkt_tif: TimeInForce = TimeInForce.DAY):
+    # Fetch a fresh price via yfinance to size qty conservatively
+    px_df = yf.download(symbol, period="5d", interval="1d", auto_adjust=True, progress=False)
+    if px_df is None or px_df.empty:
+        raise RuntimeError(f"no price data for {symbol}")
+    last = float(px_df["Close"].astype(float).iloc[-1])
+    qty = max(1, int(notional // max(0.01, last)))
+
+    tp_price = round(last * (1.0 + tp_pct), 2)
+    sl_price = round(last * (1.0 - sl_pct), 2)
+
+    log.info("BUY %s x%s @~$%.2f TP $%.2f (+%.1f%%) SL $%.2f (-%.1f%%).", symbol, qty, last, tp_price, tp_pct*100, sl_price, sl_pct*100)
+
+    req = MarketOrderRequest(
+        symbol=symbol,
+        qty=qty,
+        side=OrderSide.BUY,
+        time_in_force=mkt_tif,
+        take_profit=TakeProfitRequest(limit_price=tp_price),
+        stop_loss=StopLossRequest(stop_price=sl_price),
+    )
+    resp = tc.submit_order(req)
+    log.info("Submitted BUY -> id=%s symbol=%s qty=%s", getattr(resp, "id", "?"), symbol, qty)
+
+
+# ---------- Main ----------
+def main():
+    cfg = load_config()
+    tc = alpaca_client(cfg)
+
+    cash, held = get_cash_and_positions(tc)
+    log.info("Cash: $%.2f | Open positions: %d -> %s", cash, len(held), held)
+
+    universe = cfg["universe"]
+    if cfg["avoid_rebuy"] and held:
+        universe = [s for s in universe if s not in set(held)]
+
+    # Scan
+    candidates = scan_candidates(universe)
+
+    # Sort strongest by how far SMA5 is above SMA20 (simple proxy) if we captured that;
+    # For now just keep original order (universe ordering) to stay deterministic.
+
+    # Place up to MAX_NEW_ORDERS
+    placed = 0
+    max_new = max(0, cfg["max_new"])
+    for pick in candidates:
+        if placed >= max_new:
+            break
+        try:
+            place_buy(
+                tc,
+                symbol=pick.symbol,
+                notional=cfg["per_trade_usd"],
+                tp_pct=cfg["tp_pct"],
+                sl_pct=cfg["sl_pct"],
+            )
+            placed += 1
+            # small pause to avoid bursts
+            time.sleep(0.25)
+        except Exception as e:
+            log.warning("order: %s failed: %s", pick.symbol, e)
+            continue
+
+    log.info("Run complete: placed %d order(s).", placed)
+
+
+if __name__ == "__main__":
+    main()
