@@ -1,0 +1,51 @@
+name: Equities Live — REAL (every 15m, conservative)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * 1-5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: equities-live-real
+  cancel-in-progress: true
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # --- Trading config (REAL MONEY — conservative) ---
+      ALPACA_PAPER: "false"     # << LIVE endpoint
+      DRY_RUN: "false"          # set "true" if you want to dry-run logs only
+      PER_TRADE_USD: "10"
+      MAX_POSITIONS: "3"
+      BUY_PER_RUN: "1"
+      TP_PCT: "0.035"
+      SL_PCT: "0.020"
+      UNIVERSE: "SPY,AAPL,MSFT,AMD,NVDA,QQQ"
+      LOG_LEVEL: "INFO"
+
+      # --- Secrets ---
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY_LIVE }}
+      ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET_LIVE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install "alpaca-py>=0.42.1" pandas yfinance tenacity
+
+      - name: Run Equities Engine
+        env: { PYTHONUNBUFFERED: "1" }
+        run: python -u trader/equities_engine.py
