@@ -43,10 +43,9 @@ on:
         description: "Stop‑loss percent (e.g., 0.02 = 2%)"
         required: false
         default: "0.02"
-  # schedule:
-  #   # Temporarily disabled during testing to avoid overlapping runs.
-  #   # Every 15 minutes during US market hours (13:00–20:59 UTC = 9:00–16:59 ET).
-  #   # - cron: "*/15 13-20 * * 1-5"
+  schedule:
+  # Every 15 minutes during US market hours (13:00–20:59 UTC = 9:00–16:59 ET)
+  - cron: "*/15 13-20 * * 1-5"
 
 permissions:
   contents: write
