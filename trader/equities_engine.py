@@ -145,14 +145,15 @@ def alpaca_client(cfg) -> TradingClient:
     log.info("Alpaca key loaded (ending …%s); endpoint=%s.", end_key, "PAPER" if cfg["paper"] else "LIVE")
     return tc
 
-def get_cash_positions_equity(tc: TradingClient) -> Tuple[float, List[str], float, Dict[str, float], List[object]]:
+def get_cash_positions_equity(tc: TradingClient) -> Tuple[float, float, List[str], float, Dict[str, float], List[object]]:
     acct = tc.get_account()
     cash = float(acct.cash)
+    buying_power = float(getattr(acct, "buying_power", cash))
     equity = float(acct.equity)
     positions = tc.get_all_positions()
     held = [p.symbol for p in positions]
     by_symbol_value = {p.symbol: float(p.market_value) for p in positions}
-    return cash, held, equity, by_symbol_value, positions
+    return cash, buying_power, held, equity, by_symbol_value, positions
 
 # ---------- Universe helpers ----------
 _CURATED_MEGACAPS: List[str] = [
@@ -387,8 +388,8 @@ def main():
     cfg = load_config()
     tc = alpaca_client(cfg)
 
-    cash, held, equity, by_symbol_value, positions = get_cash_positions_equity(tc)
-    log.info("Cash: $%.2f | Equity: $%.2f | Open positions: %d -> %s", cash, equity, len(held), held)
+    cash, buying_power, held, equity, by_symbol_value, positions = get_cash_positions_equity(tc)
+    log.info("Cash: $%.2f | BuyingPower: $%.2f | Equity: $%.2f | Open positions: %d -> %s", cash, buying_power, equity, len(held), held)
 
     # --- summary trackers ---
     promoted: List[str] = []
@@ -436,16 +437,29 @@ def main():
 
     placed = 0
     max_new = max(0, cfg["max_new"])
+    remaining_bp = max(0.0, buying_power)
     for pick in picks:
         if placed >= max_new:
             break
+        # Check symbol cap first
         if would_exceed_symbol_cap(pick.symbol, cfg["per_trade_usd"], equity, by_symbol_value, cfg["max_pct_symbol"]):
             log.info("SKIP %s: per‑symbol cap %.1f%% of equity would be exceeded.", pick.symbol, cfg["max_pct_symbol"])
             cap_skips.append(pick.symbol)
             continue
+        # Auto-size notional by remaining buying power (use 90% safety buffer)
+        affordable_notional = min(cfg["per_trade_usd"], max(0.0, remaining_bp) * 0.90)
+        if affordable_notional <= 0:
+            log.info("SKIP %s: no remaining buying power.", pick.symbol)
+            break
+        # Require we can afford at least 1 share using ranked close
+        need = pick.last_close
+        if affordable_notional < max(1.0, need):
+            log.info("SKIP %s: insufficient buying power (need~$%.2f, avail~$%.2f).", pick.symbol, need, remaining_bp)
+            break
         try:
-            place_buy(tc, symbol=pick.symbol, notional=cfg["per_trade_usd"], tp_pct=cfg["tp_pct"], sl_pct=cfg["sl_pct"])
-            by_symbol_value[pick.symbol] = by_symbol_value.get(pick.symbol, 0.0) + cfg["per_trade_usd"]
+            place_buy(tc, symbol=pick.symbol, notional=affordable_notional, tp_pct=cfg["tp_pct"], sl_pct=cfg["sl_pct"])
+            by_symbol_value[pick.symbol] = by_symbol_value.get(pick.symbol, 0.0) + affordable_notional
+            remaining_bp = max(0.0, remaining_bp - affordable_notional)
             buys.append(pick.symbol)
             placed += 1
             time.sleep(0.25)
