@@ -1,31 +1,24 @@
 #!/usr/bin/env python3
 """
-Equities engine (Alpaca) — ranked + retry + logs + AUTO‑UNIVERSE + per‑symbol cap
+Equities engine (Alpaca) — ranked + retry + logs + AUTO‑UNIVERSE + per‑symbol cap + trailing promotion + maintenance sweep
 
-What’s new vs your last version:
-1) **AUTO‑UNIVERSE** option that builds a diversified megacap list and UNIONs it with current holdings.
-2) **Per‑symbol exposure cap** so any single name can’t exceed MAX_PCT_PER_SYMBOL of account equity (pre‑check before buying).
+What’s included now:
+- AUTO‑UNIVERSE (UNIVERSE=AUTO)
+- Ranking: SMA5/SMA20 + RSI-14
+- YFinance retry + per-run cache
+- Per-symbol exposure cap
+- Bracket buys (TP/SL)
+- **Trailing-promote**: for winners above TRAIL_PROMOTE_PCT, place a protective stop (trailing-style via fixed stop level at current*(1-TRAIL_STOP_PCT)) if one doesn't exist.
+- **Maintenance sweep**: every run, scan open positions and (optionally) repair missing TP/SL by placing limit (TP) and stop (SL) sell orders as GTC. This won’t close open positions immediately — TP is above market, SL is below market.
 
-Still included:
-- Strength ranking (SMA5/SMA20 edge + RSI‑14 blend)
-- MARKET buys sized by PER_TRADE_USD
-- Bracket exits on entry: TP_PCT / SL_PCT
-- AVOID_REBUY guard
-- yfinance retry‑with‑backoff + per‑run cache
-- Transparent logs of top candidates
+ENV VARS added:
+  TRAIL_PROMOTE_PCT=0.05      # promote winners above +5%
+  TRAIL_STOP_PCT=0.02         # protective stop at -2% from current when promoted
+  REPAIR_PROTECTION=1         # 1=place missing TP/SL orders, 0=only log
 
-ENV VARS (with sensible defaults):
-  ALPACA_API_KEY, ALPACA_API_SECRET
-  ALPACA_PAPER=1                     # 1=paper (default), 0=live
-  UNIVERSE                           # CSV tickers, or the literal word "AUTO" to use auto‑universe
-  MAX_NEW_ORDERS=4                   # fresh buys per run
-  PER_TRADE_USD=2000                 # dollar notional per buy
-  TP_PCT=0.035                       # take‑profit +3.5%
-  SL_PCT=0.020                       # stop‑loss   −2.0%
-  AVOID_REBUY=1                      # skip tickers already held
-  LOG_TOP=10                         # how many ranked candidates to print in logs
-  MAX_PCT_PER_SYMBOL=10              # hard cap per name as % of equity (set 0 to disable)
-  AUTO_UNIVERSE_SIZE=40              # how many of the curated megacaps to keep when UNIVERSE=AUTO
+Notes/caveats:
+- We implement "trailing promotion" conservatively by placing a single STOP order below current price. Alpaca supports explicit trailing-stop orders in some APIs but using a direct stop is robust across versions.
+- Repair protection places two passive sell orders: LIMIT (TP above current) and STOP (SL below current). They are GTC and will only execute if price reaches them.
 """
 from __future__ import annotations
 import os
@@ -39,8 +32,14 @@ import yfinance as yf
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
+from alpaca.trading.requests import (
+    MarketOrderRequest,
+    TakeProfitRequest,
+    StopLossRequest,
+    LimitOrderRequest,
+    StopOrderRequest,
+)
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
@@ -90,6 +89,10 @@ def load_config():
         "log_top": env_int("LOG_TOP", 10),
         "max_pct_symbol": env_float("MAX_PCT_PER_SYMBOL", 10.0),
         "auto_size": env_int("AUTO_UNIVERSE_SIZE", 40),
+        # Trailing/maintenance
+        "trail_promote_pct": env_float("TRAIL_PROMOTE_PCT", 0.05),
+        "trail_stop_pct": env_float("TRAIL_STOP_PCT", 0.02),
+        "repair_protection": os.getenv("REPAIR_PROTECTION", "1").strip() not in ("0", "false", "False"),
     }
     return cfg
 
@@ -131,29 +134,23 @@ def alpaca_client(cfg) -> TradingClient:
     log.info("Alpaca key loaded (ending …%s); endpoint=%s.", end_key, "PAPER" if cfg["paper"] else "LIVE")
     return tc
 
-def get_cash_positions_equity(tc: TradingClient) -> Tuple[float, List[str], float, Dict[str, float]]:
+def get_cash_positions_equity(tc: TradingClient) -> Tuple[float, List[str], float, Dict[str, float], List[object]]:
     acct = tc.get_account()
     cash = float(acct.cash)
     equity = float(acct.equity)
     positions = tc.get_all_positions()
     held = [p.symbol for p in positions]
     by_symbol_value = {p.symbol: float(p.market_value) for p in positions}
-    return cash, held, equity, by_symbol_value
+    return cash, held, equity, by_symbol_value, positions
 
 # ---------- Universe helpers ----------
 _CURATED_MEGACAPS: List[str] = [
-    # Tech + AI infra
     "AAPL","MSFT","NVDA","GOOGL","META","AMZN","AVGO","TSM","ASML","ADBE","CRM","ORCL","AMD","INTC","IBM","QCOM","SMCI","NOW","PANW","UBER",
-    # Industrials / Energy / Materials
     "GE","CAT","DE","BA","LMT","NOC","XOM","CVX","COP","LIN","APD","DOW",
-    # Health
     "UNH","LLY","JNJ","ABBV","MRK","PFE","TMO","DHR",
-    # Financials
     "JPM","BAC","WFC","GS","MS","BLK","V","MA","PYPL",
-    # Staples / Discretionary / Telecom
     "PG","KO","PEP","COST","WMT","HD","LOW","MCD","NKE","SBUX","TMUS","VZ","T",
-    # Software/security/additional large caps
-    "SNOW","SHOP","NET","DDOG","ZS","CRWD","PLTR","INTU","TEAM"
+    "SNOW","SHOP","NET","DDOG","ZS","CRWD","PLTR","INTU","TEAM",
 ]
 
 def build_universe(cfg, held: Iterable[str]) -> List[str]:
@@ -162,12 +159,10 @@ def build_universe(cfg, held: Iterable[str]) -> List[str]:
     if raw.upper() == "AUTO":
         size = max(10, int(cfg["auto_size"]))
         base = _CURATED_MEGACAPS[:size]
-        uni = list(dict.fromkeys(list(held_set) + base))  # preserve order, include holdings first
+        uni = list(dict.fromkeys(list(held_set) + base))
         log.info("AUTO‑UNIVERSE size=%d (holdings=%d included)", len(uni), len(held_set))
         return uni
-    # CSV path
     uni = [s.strip().upper() for s in raw.split(",") if s.strip()]
-    # Always ensure holdings are included (so maintenance/avoid_rebuy can reason about them)
     for s in held_set:
         if s not in uni:
             uni.append(s)
@@ -175,7 +170,6 @@ def build_universe(cfg, held: Iterable[str]) -> List[str]:
 
 # ---------- Scan + Rank logic ----------
 def scan_and_rank(universe: List[str]) -> List[Pick]:
-    """Return symbols where SMA5 > SMA20, scored by blended momentum strength."""
     picks: List[Pick] = []
     for sym in universe:
         try:
@@ -212,7 +206,7 @@ def would_exceed_symbol_cap(symbol: str, add_notional: float, equity: float, by_
     max_allowed = equity * (cap_pct / 100.0)
     return (current + add_notional) > max_allowed
 
-# ---------- Order placement ----------
+# ---------- Order placement (buys) ----------
 def place_buy(tc: TradingClient, symbol: str, notional: float, tp_pct: float, sl_pct: float, mkt_tif: TimeInForce = TimeInForce.DAY):
     px_df = yf_download(symbol, period="5d", interval="1d")
     last = float(px_df["Close"].astype(float).iloc[-1])
@@ -231,12 +225,91 @@ def place_buy(tc: TradingClient, symbol: str, notional: float, tp_pct: float, sl
     resp = tc.submit_order(req)
     log.info("Submitted BUY -> id=%s symbol=%s qty=%s", getattr(resp, "id", "?"), symbol, qty)
 
+# ---------- Maintenance & trailing promotion ----------
+def open_orders_for_symbol(tc: TradingClient, symbol: str) -> List[object]:
+    try:
+        return tc.get_orders(status="open", symbol=symbol)
+    except Exception:
+        return []
+
+
+def position_unrealized_pct(position) -> float:
+    # position.avg_entry_price and current_price may be strings
+    try:
+        entry = float(position.avg_entry_price)
+        cur = float(position.current_price)
+        return (cur - entry) / entry
+    except Exception:
+        return 0.0
+
+
+def promote_to_trailing_stop(tc: TradingClient, position, cfg) -> None:
+    symbol = position.symbol
+    qty = int(float(position.qty))
+    if qty <= 0:
+        return
+    # see if there is already an open stop order
+    orders = open_orders_for_symbol(tc, symbol)
+    has_stop = any((getattr(o, "type", "") in ("stop", "stop_loss") or getattr(o, "stop_price", None)) for o in orders)
+    if has_stop:
+        log.info("PROMOTE %s: stop already exists, skipping", symbol)
+        return
+    # current price
+    df = yf_download(symbol, period="5d", interval="1d")
+    last = float(df["Close"].astype(float).iloc[-1])
+    stop_price = round(last * (1.0 - cfg["trail_stop_pct"]), 2)
+    # submit a STOP order to sell qty with stop_price (GTC)
+    try:
+        stop_req = StopOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, stop_price=stop_price)
+        resp = tc.submit_order(stop_req)
+        log.info("PROMOTE %s: placed protective STOP at $%.2f for qty=%s (id=%s)", symbol, stop_price, qty, getattr(resp, "id", "?"))
+    except Exception as e:
+        log.warning("PROMOTE %s failed to place stop: %s", symbol, e)
+
+
+def repair_protection_if_missing(tc: TradingClient, position, cfg) -> None:
+    symbol = position.symbol
+    qty = int(float(position.qty))
+    if qty <= 0:
+        return
+    orders = open_orders_for_symbol(tc, symbol)
+    has_limit = any((getattr(o, "type", "") == "limit" or getattr(o, "limit_price", None)) for o in orders)
+    has_stop = any((getattr(o, "type", "") in ("stop", "stop_loss") or getattr(o, "stop_price", None)) for o in orders)
+
+    df = yf_download(symbol, period="5d", interval="1d")
+    last = float(df["Close"].astype(float).iloc[-1])
+
+    tp_price = round(last * (1.0 + cfg["tp_pct"]), 2)
+    sl_price = round(last * (1.0 - cfg["sl_pct"]), 2)
+
+    if not has_limit:
+        if cfg["repair_protection"]:
+            try:
+                lim = LimitOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, limit_price=tp_price)
+                r = tc.submit_order(lim)
+                log.info("REPAIR %s: placed LIMIT TP at $%.2f qty=%s id=%s", symbol, tp_price, qty, getattr(r, "id", "?"))
+            except Exception as e:
+                log.warning("REPAIR %s failed to place LIMIT TP: %s", symbol, e)
+        else:
+            log.info("REPAIR %s: missing LIMIT TP at $%.2f (not placed) qty=%s", symbol, tp_price, qty)
+
+    if not has_stop:
+        if cfg["repair_protection"]:
+            try:
+                stop = StopOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, stop_price=sl_price)
+                r2 = tc.submit_order(stop)
+                log.info("REPAIR %s: placed STOP SL at $%.2f qty=%s id=%s", symbol, sl_price, qty, getattr(r2, "id", "?"))
+            except Exception as e:
+                log.warning("REPAIR %s failed to place STOP SL: %s", symbol, e)
+        else:
+            log.info("REPAIR %s: missing STOP SL at $%.2f (not placed) qty=%s", symbol, sl_price, qty)
+
 # ---------- Main ----------
 def main():
     cfg = load_config()
     tc = alpaca_client(cfg)
 
-    cash, held, equity, by_symbol_value = get_cash_positions_equity(tc)
+    cash, held, equity, by_symbol_value, positions = get_cash_positions_equity(tc)
     log.info("Cash: $%.2f | Equity: $%.2f | Open positions: %d -> %s", cash, equity, len(held), held)
 
     universe_all = build_universe(cfg, held)
@@ -245,10 +318,21 @@ def main():
         held_set = set(held)
         universe = [s for s in universe_all if s not in held_set]
 
-    # Scan + rank
+    # Maintenance pass first (scan existing positions)
+    for pos in positions:
+        try:
+            unreal = position_unrealized_pct(pos)
+            # Promote winners
+            if unreal >= cfg["trail_promote_pct"]:
+                promote_to_trailing_stop(tc, pos, cfg)
+            # Repair missing protection
+            repair_protection_if_missing(tc, pos, cfg)
+        except Exception as e:
+            log.warning("maintenance: %s failed: %s", getattr(pos, "symbol", "?"), e)
+
+    # Scan + rank for new buys
     picks = scan_and_rank(universe)
 
-    # Show top-ranked in logs for transparency
     if picks:
         top_n = picks[: cfg["log_top"]]
         pretty = [f"{p.symbol}(score={p.score:.4f}, RSI={p.rsi14:.1f}, edge={(p.sma5/p.sma20-1)*100:.2f}%)" for p in top_n]
@@ -259,13 +343,11 @@ def main():
     for pick in picks:
         if placed >= max_new:
             break
-        # Per‑symbol cap guard
         if would_exceed_symbol_cap(pick.symbol, cfg["per_trade_usd"], equity, by_symbol_value, cfg["max_pct_symbol"]):
             log.info("SKIP %s: per‑symbol cap %.1f%% of equity would be exceeded.", pick.symbol, cfg["max_pct_symbol"])
             continue
         try:
             place_buy(tc, symbol=pick.symbol, notional=cfg["per_trade_usd"], tp_pct=cfg["tp_pct"], sl_pct=cfg["sl_pct"])
-            # update in‑memory position value to reflect the scheduled buy
             by_symbol_value[pick.symbol] = by_symbol_value.get(pick.symbol, 0.0) + cfg["per_trade_usd"]
             placed += 1
             time.sleep(0.25)
