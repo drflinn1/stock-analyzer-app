@@ -312,6 +312,13 @@ def main():
     cash, held, equity, by_symbol_value, positions = get_cash_positions_equity(tc)
     log.info("Cash: $%.2f | Equity: $%.2f | Open positions: %d -> %s", cash, equity, len(held), held)
 
+    # --- summary trackers ---
+    promoted: List[str] = []
+    repaired_tp: List[str] = []
+    repaired_sl: List[str] = []
+    cap_skips: List[str] = []
+    buys: List[str] = []
+
     universe_all = build_universe(cfg, held)
     universe = universe_all
     if cfg["avoid_rebuy"] and held:
@@ -325,8 +332,19 @@ def main():
             # Promote winners
             if unreal >= cfg["trail_promote_pct"]:
                 promote_to_trailing_stop(tc, pos, cfg)
+                promoted.append(pos.symbol)
             # Repair missing protection
+            before_orders = open_orders_for_symbol(tc, pos.symbol)
+            has_limit_before = any((getattr(o, "type", "") == "limit" or getattr(o, "limit_price", None)) for o in before_orders)
+            has_stop_before = any((getattr(o, "type", "") in ("stop", "stop_loss") or getattr(o, "stop_price", None)) for o in before_orders)
             repair_protection_if_missing(tc, pos, cfg)
+            after_orders = open_orders_for_symbol(tc, pos.symbol)
+            has_limit_after = any((getattr(o, "type", "") == "limit" or getattr(o, "limit_price", None)) for o in after_orders)
+            has_stop_after = any((getattr(o, "type", "") in ("stop", "stop_loss") or getattr(o, "stop_price", None)) for o in after_orders)
+            if (not has_limit_before) and has_limit_after:
+                repaired_tp.append(pos.symbol)
+            if (not has_stop_before) and has_stop_after:
+                repaired_sl.append(pos.symbol)
         except Exception as e:
             log.warning("maintenance: %s failed: %s", getattr(pos, "symbol", "?"), e)
 
@@ -345,17 +363,29 @@ def main():
             break
         if would_exceed_symbol_cap(pick.symbol, cfg["per_trade_usd"], equity, by_symbol_value, cfg["max_pct_symbol"]):
             log.info("SKIP %s: per‑symbol cap %.1f%% of equity would be exceeded.", pick.symbol, cfg["max_pct_symbol"])
+            cap_skips.append(pick.symbol)
             continue
         try:
             place_buy(tc, symbol=pick.symbol, notional=cfg["per_trade_usd"], tp_pct=cfg["tp_pct"], sl_pct=cfg["sl_pct"])
             by_symbol_value[pick.symbol] = by_symbol_value.get(pick.symbol, 0.0) + cfg["per_trade_usd"]
+            buys.append(pick.symbol)
             placed += 1
             time.sleep(0.25)
         except Exception as e:
             log.warning("order: %s failed: %s", pick.symbol, e)
             continue
 
+    # --- Summary block ---
+    def _fmt(lst: List[str]) -> str:
+        return ", ".join(lst) if lst else "—"
+
+    log.info(
+        "SUMMARY | buys=%d [%s] | promoted=%d [%s] | repaired_tp=%d [%s] | repaired_sl=%d [%s] | cap_skips=%d [%s]",
+        len(buys), _fmt(buys), len(promoted), _fmt(promoted), len(repaired_tp), _fmt(repaired_tp), len(repaired_sl), _fmt(repaired_sl), len(cap_skips), _fmt(cap_skips)
+    )
+
     log.info("Run complete: placed %d order(s).", placed)
 
 if __name__ == "__main__":
     main()
+
