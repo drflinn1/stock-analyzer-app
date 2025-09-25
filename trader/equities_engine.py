@@ -162,7 +162,7 @@ def get_cash_positions_equity(tc: TradingClient) -> Tuple[float, float, List[str
     last_equity = float(getattr(acct, "last_equity", equity))
     positions = tc.get_all_positions()
     held = [p.symbol for p in positions]
-    by_symbol_value = {p.symbol: float(p.market_value) for p in positions]
+    by_symbol_value = {p.symbol: float(p.market_value) for p in positions}
     return cash, buying_power, held, equity, by_symbol_value, positions, last_equity
 
 # ---------- Universe helpers ----------
