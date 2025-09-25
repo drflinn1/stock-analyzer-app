@@ -16,6 +16,8 @@ ENV VARS added:
   TRAIL_STOP_PCT=0.02         # protective stop distance; if true trailing is enabled, used as trail percent
   TRAIL_USE_TRUE=1            # 1=use Alpaca true trailing-stop orders when possible; 0=fallback to fixed STOP
   REPAIR_PROTECTION=1         # 1=place missing TP/SL orders, 0=only log
+  REPAIR_SKIP_IF_ACTIVE_SELLS=1  # 1=skip repair when any open SELL orders exist (cool‑down); 0=always attempt
+
 
 
 Notes/caveats:
@@ -101,6 +103,7 @@ def load_config():
         "trail_stop_pct": env_float("TRAIL_STOP_PCT", 0.02),
         "trail_use_true": os.getenv("TRAIL_USE_TRUE", "1").strip() not in ("0", "false", "False"),
         "repair_protection": os.getenv("REPAIR_PROTECTION", "1").strip() not in ("0", "false", "False"),
+        "repair_skip_if_sells": os.getenv("REPAIR_SKIP_IF_ACTIVE_SELLS", "1").strip() not in ("0", "false", "False"),
     }
     return cfg
 
@@ -240,6 +243,17 @@ def open_orders_for_symbol(tc: TradingClient, symbol: str) -> List[object]:
     except Exception:
         return []
 
+# Any open SELL orders?
+def has_any_open_sell(tc: TradingClient, symbol: str) -> bool:
+    for o in open_orders_for_symbol(tc, symbol):
+        try:
+            if str(getattr(o, "side", "")).lower() == "sell":
+                return True
+        except Exception:
+            continue
+    return False
+
+
 # How many shares of this symbol are already reserved by open SELL orders (limit/stop/bracket children)?
 def reserved_sell_qty(tc: TradingClient, symbol: str) -> int:
     total = 0
@@ -317,6 +331,10 @@ def repair_protection_if_missing(tc: TradingClient, position, cfg) -> None:
     symbol = position.symbol
     pos_qty = int(float(position.qty))
     if pos_qty <= 0:
+        return
+    # Cool‑down: if ANY open sell orders exist and the flag is on, skip repairs to avoid qty conflicts
+    if cfg.get("repair_skip_if_sells", True) and has_any_open_sell(tc, symbol):
+        log.info("REPAIR %s: cool‑down — active SELL orders present; skipping", symbol)
         return
     orders = open_orders_for_symbol(tc, symbol)
     has_limit = any((str(getattr(o, "side", "")).lower()=="sell") and ((getattr(o, "type", "") == "limit") or getattr(o, "limit_price", None)) for o in orders)
