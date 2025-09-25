@@ -1,10 +1,13 @@
 """
-Alpaca Equities Engine (Paper or Live; multi-buy + LIVE auto-trim)
+Alpaca Equities Engine (Paper or Live; multi-buy + LIVE auto-trim with floor/limits)
 - Safe to run every 15m via GitHub Actions
 - Skips instantly if market closed
 - Buys up to BUY_PER_RUN bracket orders (TP/SL) per run
 - Respects MAX_POSITIONS and cash guards
-- LIVE-only: if positions > MAX_POSITIONS, trims losers-in-downtrend first
+- LIVE-only auto-trim when positions > MAX_POSITIONS:
+    * losers first (unrealized_plpc <= TRIM_LOSS_FLOOR)
+    * AND in downtrend (Close < SMA20)
+    * up to MAX_TRIMS_PER_RUN per run
 - Retries transient API errors
 
 ENV:
@@ -13,6 +16,8 @@ ENV:
   DRY_RUN ("true"|"false")
   PER_TRADE_USD, MAX_POSITIONS, BUY_PER_RUN
   TP_PCT, SL_PCT
+  TRIM_LOSS_FLOOR  (e.g., -0.01 for -1.0%)  [LIVE only]
+  MAX_TRIMS_PER_RUN (e.g., 2)               [LIVE only]
   UNIVERSE (comma list)
   LOG_LEVEL
 """
@@ -52,6 +57,10 @@ BUY_PER_RUN = int(os.getenv("BUY_PER_RUN", "1"))
 TP_PCT = float(os.getenv("TP_PCT", "0.035"))
 SL_PCT = float(os.getenv("SL_PCT", "0.020"))
 UNIVERSE = [s.strip().upper() for s in os.getenv("UNIVERSE", "SPY,AAPL").split(",") if s.strip()]
+
+# LIVE trim knobs
+TRIM_LOSS_FLOOR = float(os.getenv("TRIM_LOSS_FLOOR", "-0.01"))     # only trim if <= -1.0%
+MAX_TRIMS_PER_RUN = int(os.getenv("MAX_TRIMS_PER_RUN", "2"))       # limit sells per run
 
 log.info(f"Alpaca key loaded (ending …{ALPACA_API_KEY[-4:]}); endpoint={'PAPER' if ALPACA_PAPER else 'LIVE'}.")
 
@@ -130,7 +139,7 @@ except APIError as e:
 open_symbols = {p.symbol for p in open_positions}
 log.info(f"Cash: ${cash:,.2f} | Open positions: {len(open_positions)} -> {sorted(open_symbols)}")
 
-# ---------- LIVE auto-trim: losers-first + downtrend ----------
+# ---------- LIVE auto-trim: losers-first + downtrend + floor + max-per-run ----------
 if not ALPACA_PAPER and len(open_positions) > MAX_POSITIONS:
     excess = len(open_positions) - MAX_POSITIONS
     trim_pool: List[Tuple[float, str, int]] = []  # (plpc, symbol, qty_int)
@@ -138,19 +147,22 @@ if not ALPACA_PAPER and len(open_positions) > MAX_POSITIONS:
     for p in open_positions:
         sym = p.symbol
         try:
-            plpc = float(p.unrealized_plpc or 0.0)  # fraction, e.g. -0.023 for -2.3%
+            plpc = float(p.unrealized_plpc or 0.0)  # e.g., -0.023 = -2.3%
         except Exception:
             plpc = 0.0
-        if plpc <= 0.0 and yf_downtrend(sym):
+        if plpc <= TRIM_LOSS_FLOOR and yf_downtrend(sym):
             q = qty_to_int(p.qty)
             if q > 0:
                 trim_pool.append((plpc, sym, q))
 
     if trim_pool:
-        # Most negative first
-        trim_pool.sort(key=lambda t: t[0])
-        to_close = trim_pool[:excess]
-        log.info(f"LIVE auto-trim: closing up to {excess} loser(s) in downtrend -> {[(s, q) for _, s, q in to_close]}")
+        # Most negative first (worst losers)
+        trim_pool.sort(key=lambda t: t[0])  # more negative first
+        to_close = trim_pool[: min(excess, MAX_TRIMS_PER_RUN)]
+        log.info(
+            f"LIVE auto-trim: need {excess} -> closing up to {len(to_close)} "
+            f"loser(s) in downtrend (floor {TRIM_LOSS_FLOOR:+.2%}) -> {[(s, q) for _, s, q in to_close]}"
+        )
 
         for _, sym, q in to_close:
             if DRY_RUN:
@@ -169,7 +181,10 @@ if not ALPACA_PAPER and len(open_positions) > MAX_POSITIONS:
             except APIError as e:
                 api_err(f"AUTO-TRIM SELL failed for {sym}", e)
     else:
-        log.info("LIVE auto-trim: over cap but no eligible losers in downtrend; keeping winners and skipping trim.")
+        log.info(
+            "LIVE auto-trim: over cap but no eligible losers below floor and in downtrend; "
+            "keeping winners/near-breakeven and skipping trim."
+        )
 
 # Recompute positions after possible trim (to set buy slots correctly)
 try:
