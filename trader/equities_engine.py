@@ -17,6 +17,7 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.common.exceptions import APIError  # for better diagnostics
 
 # ---------- logging ----------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -34,19 +35,20 @@ TP_PCT = float(os.getenv("TP_PCT", "0.035"))
 SL_PCT = float(os.getenv("SL_PCT", "0.020"))
 UNIVERSE = [s.strip().upper() for s in os.getenv("UNIVERSE", "SPY,AAPL").split(",") if s.strip()]
 
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
-# If you later need custom endpoints, we can switch SDKs or add an env switch.
-# For alpaca-py TradingClient, `paper=True` selects the paper base URL automatically.
+ALPACA_API_KEY = (os.getenv("ALPACA_API_KEY") or "").strip()
+ALPACA_API_SECRET = (os.getenv("ALPACA_API_SECRET") or "").strip()
 
 if not (ALPACA_API_KEY and ALPACA_API_SECRET):
-    log.error("Missing Alpaca env vars: ALPACA_API_KEY, ALPACA_API_SECRET")
+    log.error("Missing Alpaca env vars: ALPACA_API_KEY, ALPACA_API_SECRET (check GitHub → Settings → Secrets).")
     sys.exit(2)
+
+# Show last 4 chars of key to help verify which pair is loaded (no secrets leaked)
+log.info(f"Alpaca key loaded (ending …{ALPACA_API_KEY[-4:]}); using PAPER endpoint.")
 
 client = TradingClient(
     api_key=ALPACA_API_KEY,
     secret_key=ALPACA_API_SECRET,
-    paper=True,           # selects https://paper-api.alpaca.markets internally
+    paper=True,  # selects paper-api automatically
 )
 
 # ---------- helpers ----------
@@ -66,8 +68,21 @@ def get_account():
 def submit_order(req: MarketOrderRequest):
     return client.submit_order(req)
 
+def describe_api_error(prefix: str, e: Exception) -> None:
+    status = getattr(e, "status_code", None)
+    body = getattr(e, "body", None) or getattr(e, "message", None) or str(e)
+    log.error(f"{prefix}: status={status} body={body}")
+
 # ---------- market-time gate ----------
-clock = get_clock()
+try:
+    clock = get_clock()
+except APIError as e:
+    describe_api_error("Clock fetch failed (likely auth)", e)
+    log.error(
+        "Hints: Verify paper API key/secret, no trailing spaces/newlines, correct names in repo Secrets."
+    )
+    sys.exit(2)
+
 if not clock.is_open:
     log.info("Market closed (Alpaca clock). Exiting.")
     sys.exit(0)
@@ -76,11 +91,23 @@ if not clock.is_open:
 try:
     acct = get_account()
     cash = float(acct.cash)
+except APIError as e:
+    describe_api_error("Failed to fetch account", e)
+    log.error(
+        "Checklist: 1) Paper keys (not live)  2) Exact values in Secrets  "
+        "3) Regenerate a fresh key pair if unsure and update Secrets."
+    )
+    sys.exit(2)
 except Exception as e:
     log.error(f"Failed to fetch account: {e}")
     sys.exit(2)
 
-open_positions = get_positions()
+try:
+    open_positions = get_positions()
+except APIError as e:
+    describe_api_error("Failed to fetch positions", e)
+    sys.exit(2)
+
 open_symbols = {p.symbol for p in open_positions}
 log.info(f"Cash: ${cash:,.2f} | Open positions: {len(open_positions)} -> {sorted(open_symbols)}")
 
@@ -156,6 +183,9 @@ try:
         )
     )
     log.info(f"Submitted bracket BUY -> id={order.id} symbol={order.symbol} qty={order.qty}")
+except APIError as e:
+    describe_api_error("Order submit failed", e)
+    sys.exit(1)
 except Exception as e:
     log.error(f"Order submit failed: {e}")
     sys.exit(1)
