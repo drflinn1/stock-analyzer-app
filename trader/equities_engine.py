@@ -548,56 +548,67 @@ def main():
             except Exception:
                 continue
     from datetime import datetime
-kpi_msg = (
-    "KPI | Equity=$%.2f | Cash=$%.2f | BuyingPower=$%.2f | Invested=$%.2f (%.2f%%) | "
-    "UnrealizedPnL=$%.2f | DailyPnL=$%.2f | TP=%d SL=%d TRL=%d | Positions=%d"
-) % (equity, cash, buying_power, invested, exposure_pct, unrealized_total, daily_pnl, tp_count, sl_count, trl_count, len(positions))
-# Colorize profit line: green when DailyPnL >= 0 and UnrealizedPnL >= 0, red when both negative
-if daily_pnl >= 0 and unrealized_total >= 0:
-    log.info(f"{ANSI_GREEN}{kpi_msg}{ANSI_RESET}")
-elif daily_pnl < 0 and unrealized_total < 0:
-    log.info(f"{ANSI_RED}{kpi_msg}{ANSI_RESET}")
-else:
-    log.info(kpi_msg)
-# Persist KPI/SUMMARY snapshot to CSV (row filled below after SUMMARY is computed)
-_kpi_row = {
-    "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
-    "equity": f"{equity:.2f}",
-    "cash": f"{cash:.2f}",
-    "buying_power": f"{buying_power:.2f}",
-    "invested": f"{invested:.2f}",
-    "exposure_pct": f"{exposure_pct:.2f}",
-    "unrealized_pnl": f"{unrealized_total:.2f}",
-    "daily_pnl": f"{daily_pnl:.2f}",
-    "tp_count": tp_count,
-    "sl_count": sl_count,
-    "trl_count": trl_count,
-    "positions": len(positions),
-}
+
+    # --- KPI block (colorized) ---
+    kpi_msg = (
+        "KPI | Equity=$%.2f | Cash=$%.2f | BuyingPower=$%.2f | Invested=$%.2f (%.2f%%) | "
+        "UnrealizedPnL=$%.2f | DailyPnL=$%.2f | TP=%d SL=%d TRL=%d | Positions=%d"
+    ) % (
+        equity, cash, buying_power, invested, exposure_pct,
+        unrealized_total, daily_pnl, tp_count, sl_count, trl_count, len(positions)
+    )
+    # Colorize profit line: green when DailyPnL >= 0 and UnrealizedPnL >= 0, red when both negative
+    if daily_pnl >= 0 and unrealized_total >= 0:
+        log.info(f"{ANSI_GREEN}{kpi_msg}{ANSI_RESET}")
+    elif daily_pnl < 0 and unrealized_total < 0:
+        log.info(f"{ANSI_RED}{kpi_msg}{ANSI_RESET}")
+    else:
+        log.info(kpi_msg)
+
+    # Persist KPI/SUMMARY snapshot to CSV (row filled below after SUMMARY is computed)
+    _kpi_row = {
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+        "equity": f"{equity:.2f}",
+        "cash": f"{cash:.2f}",
+        "buying_power": f"{buying_power:.2f}",
+        "invested": f"{invested:.2f}",
+        "exposure_pct": f"{exposure_pct:.2f}",
+        "unrealized_pnl": f"{unrealized_total:.2f}",
+        "daily_pnl": f"{daily_pnl:.2f}",
+        "tp_count": tp_count,
+        "sl_count": sl_count,
+        "trl_count": trl_count,
+        "positions": len(positions),
+    }
 
     # --- Summary block ---
     def _fmt(lst: List[str]) -> str:
         return ", ".join(lst) if lst else "—"
 
     summary_msg = (
-    "SUMMARY | buys=%d [%s] | promoted=%d [%s] | repaired_tp=%d [%s] | repaired_sl=%d [%s] | cap_skips=%d [%s]"
-    % (len(buys), _fmt(buys), len(promoted), _fmt(promoted), len(repaired_tp), _fmt(repaired_tp), len(repaired_sl), _fmt(repaired_sl), len(cap_skips), _fmt(cap_skips))
-)
-# Slight highlight when there is positive activity
-if (len(buys) + len(promoted)) > 0:
-    log.info(f"{ANSI_GREEN}{summary_msg}{ANSI_RESET}")
-else:
-    log.info(summary_msg)
-# finalize and write CSV history row
-_kpi_row.update({
-    "buys": len(buys),
-    "promoted": len(promoted),
-    "repaired_tp": len(repaired_tp),
-    "repaired_sl": len(repaired_sl),
-    "cap_skips": len(cap_skips),
-})
-write_history_csv(_kpi_row), _fmt(buys), len(promoted), _fmt(promoted), len(repaired_tp), _fmt(repaired_tp), len(repaired_sl), _fmt(repaired_sl), len(cap_skips), _fmt(cap_skips)
+        "SUMMARY | buys=%d [%s] | promoted=%d [%s] | repaired_tp=%d [%s] | "
+        "repaired_sl=%d [%s] | cap_skips=%d [%s]"
+    ) % (
+        len(buys), _fmt(buys), len(promoted), _fmt(promoted),
+        len(repaired_tp), _fmt(repaired_tp), len(repaired_sl), _fmt(repaired_sl),
+        len(cap_skips), _fmt(cap_skips)
     )
+
+    # Slight highlight when there is positive activity
+    if (len(buys) + len(promoted)) > 0:
+        log.info(f"{ANSI_GREEN}{summary_msg}{ANSI_RESET}")
+    else:
+        log.info(summary_msg)
+
+    # finalize and write CSV history row
+    _kpi_row.update({
+        "buys": len(buys),
+        "promoted": len(promoted),
+        "repaired_tp": len(repaired_tp),
+        "repaired_sl": len(repaired_sl),
+        "cap_skips": len(cap_skips),
+    })
+    write_history_csv(_kpi_row)
 
     log.info("Run complete: placed %d order(s).", placed)
 
