@@ -1,18 +1,33 @@
-name: Crypto Live (Every 15 min — USD only + TP/SL/Trail)
+name: Crypto Live (Every 15m — USD only + TP/SL/Trail)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/15 * * * *"            # runs at :00/:15/:30/:45 UTC
   workflow_dispatch:
+    inputs:
+      RUN_SWITCH:
+        description: 'ON to allow run, OFF to skip'
+        required: true
+        default: 'ON'
+      DRY_RUN:
+        description: 'true = paper (simulated), false = live orders'
+        required: true
+        default: 'true'
+      USD_PER_TRADE:
+        description: 'USD size per buy'
+        required: true
+        default: '10'
+      MAX_POSITIONS:
+        description: 'Max concurrent positions'
+        required: true
+        default: '3'
 
 env:
-  RUN_SWITCH: "ON"        # keep ON so you can manual-run; rules are harmless in DRY_RUN
   PYTHON_VERSION: "3.11"
-  DRY_RUN: "true"         # <<< stays in paper mode
   EXCHANGE_ID: "kraken"
-  # Strategy knobs (optional to tweak from UI):
-  USD_PER_TRADE: "10"
-  MAX_POSITIONS: "3"
+  # defaults for scheduled runs; manual runs can override via inputs:
+  RUN_SWITCH: "ON"
+  DRY_RUN: "true"
   TAKE_PROFIT_PCT: "0.035"
   STOP_LOSS_PCT: "0.020"
   TRAIL_ACTIVATE_PCT: "0.010"
@@ -23,7 +38,8 @@ env:
 
 jobs:
   trade:
-    if: ${{ env.RUN_SWITCH == 'ON' }}
+    # allow manual to override RUN_SWITCH via inputs; scheduled uses env
+    if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.RUN_SWITCH == 'ON') || (github.event_name == 'schedule' && env.RUN_SWITCH == 'ON') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -37,15 +53,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt==4.4.46
 
-      - name: Run trader (dry-run, loud logs)
+      - name: Banner
+        run: |
+          echo "==============================================================="
+          echo " Crypto Live starting — event=${{ github.event_name }}"
+          echo " RUN_SWITCH=${{ github.event.inputs.RUN_SWITCH || env.RUN_SWITCH }}"
+          echo " DRY_RUN=${{ github.event.inputs.DRY_RUN || env.DRY_RUN }}"
+          echo "==============================================================="
+
+      - name: Run trader
         env:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
           KRAKEN_API_PASSWORD: ${{ secrets.KRAKEN_API_PASSWORD }}
-          DRY_RUN: ${{ env.DRY_RUN }}
           EXCHANGE_ID: ${{ env.EXCHANGE_ID }}
-          USD_PER_TRADE: ${{ env.USD_PER_TRADE }}
-          MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
+          # scheduled uses env values; manual uses inputs (fall back to env)
+          DRY_RUN: ${{ github.event.inputs.DRY_RUN || env.DRY_RUN }}
+          USD_PER_TRADE: ${{ github.event.inputs.USD_PER_TRADE || '10' }}
+          MAX_POSITIONS: ${{ github.event.inputs.MAX_POSITIONS || '3' }}
           TAKE_PROFIT_PCT: ${{ env.TAKE_PROFIT_PCT }}
           STOP_LOSS_PCT: ${{ env.STOP_LOSS_PCT }}
           TRAIL_ACTIVATE_PCT: ${{ env.TRAIL_ACTIVATE_PCT }}
