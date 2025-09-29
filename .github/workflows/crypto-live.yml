@@ -1,89 +1,58 @@
-name: Crypto Live (Every 4h — Auto-Pick + $100 Reserve)
+name: Crypto Live (Every 15 min — USD only + TP/SL/Trail)
 
 on:
   schedule:
-    - cron: "0 */4 * * *"   # every 4 hours
+    - cron: "*/15 * * * *"
   workflow_dispatch:
+
+env:
+  RUN_SWITCH: "ON"        # keep ON so you can manual-run; rules are harmless in DRY_RUN
+  PYTHON_VERSION: "3.11"
+  DRY_RUN: "true"         # <<< stays in paper mode
+  EXCHANGE_ID: "kraken"
+  # Strategy knobs (optional to tweak from UI):
+  USD_PER_TRADE: "10"
+  MAX_POSITIONS: "3"
+  TAKE_PROFIT_PCT: "0.035"
+  STOP_LOSS_PCT: "0.020"
+  TRAIL_ACTIVATE_PCT: "0.010"
+  TRAIL_ATR_MULT: "0.8"
+  ATR_PERIOD: "14"
+  TIMEFRAME: "15m"
+  UNIVERSE: "BTC/USD,ETH/USD,SOL/USD,XRP/USD,DOGE/USD"
 
 jobs:
   trade:
+    if: ${{ env.RUN_SWITCH == 'ON' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt ccxt
+          pip install ccxt==4.4.46
 
-      # (Optional) show which key names are present (never prints values)
-      - name: Sanity check which API env names are present (no values shown)
+      - name: Run trader (dry-run, loud logs)
         env:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          KRAKEN_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          KRAKEN_API_PASSWORD: ${{ secrets.KRAKEN_API_PASSWORD }}
+          DRY_RUN: ${{ env.DRY_RUN }}
+          EXCHANGE_ID: ${{ env.EXCHANGE_ID }}
+          USD_PER_TRADE: ${{ env.USD_PER_TRADE }}
+          MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
+          TAKE_PROFIT_PCT: ${{ env.TAKE_PROFIT_PCT }}
+          STOP_LOSS_PCT: ${{ env.STOP_LOSS_PCT }}
+          TRAIL_ACTIVATE_PCT: ${{ env.TRAIL_ACTIVATE_PCT }}
+          TRAIL_ATR_MULT: ${{ env.TRAIL_ATR_MULT }}
+          ATR_PERIOD: ${{ env.ATR_PERIOD }}
+          TIMEFRAME: ${{ env.TIMEFRAME }}
+          UNIVERSE: ${{ env.UNIVERSE }}
         run: |
-          for v in KRAKEN_API_KEY KRAKEN_API_SECRET KRAKEN_KEY KRAKEN_SECRET API_KEY API_SECRET; do
-            if [ -z "${!v}" ]; then echo "$v=EMPTY"; else echo "$v=SET"; fi
-          done
-
-      # NEW: compute how many buys to allow while keeping a $100 reserve
-      - name: Compute dynamic PICKS to enforce reserve
-        env:
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          RESERVE_USD: "100"         # <-- keep this much cash untouched
-          PER_TRADE_USD: "25"        # must match the env below
-          PICKS_CAP: "3"             # never exceed this many buys per run
-        run: |
-          python - << 'PY'
-          import os, math, ccxt
-          key=os.environ['KRAKEN_API_KEY']; sec=os.environ['KRAKEN_API_SECRET']
-          ex=ccxt.kraken({'apiKey':key,'secret':sec})
-          bal=ex.fetch_balance()
-          usd = float(bal['total'].get('USD',0) or 0) + float(bal['total'].get('ZUSD',0) or 0)
-          reserve = float(os.environ.get('RESERVE_USD', '100'))
-          per = float(os.environ.get('PER_TRADE_USD', '25'))
-          cap = int(os.environ.get('PICKS_CAP','3'))
-          spendable = max(0.0, usd - reserve)
-          buys = int(spendable // per)
-          buys = max(0, min(buys, cap))
-          print(f"[Reserve] USD={usd:.2f}  reserve={reserve:.2f}  spendable={spendable:.2f}  buys_this_run={buys}")
-          with open(os.environ['GITHUB_ENV'],'a') as f:
-              f.write(f"PICKS_DYNAMIC={buys}\n")
-          PY
-
-      - name: Run Crypto Trader (Auto-Pick)
-        env:
-          DRY_RUN: "False"
-          EXCHANGE: "kraken"
-          QUOTE: "USD"
-          AUTO_PICK: "True"
-          PICKS: "${{ env.PICKS_DYNAMIC }}"   # <-- computed above
-          PER_TRADE_USD: "25"
-          DAILY_CAP_USD: "1000000"
-          MIN_QUOTE_VOL_USD: "2000000"
-          MIN_RAISE_USD: "10"
-          AVOID_REBUY: "False"
-          TP_PCT: "0.035"    # 3.5% take-profit
-          SL_PCT: "0.02"     # 2.0% stop-loss
-          TREND_FILTER: "True"
-          COOL: "60m"
-          # key names for the engine
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          KRAKEN_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-        run: |
-          echo "PICKS_DYNAMIC resolved to: $PICKS"
-          python trader/crypto_engine.py
+          mkdir -p .state
+          python -u trader/crypto_engine.py
