@@ -1,0 +1,41 @@
+name: Crypto — FORCE LIQUIDATE (Kraken → USD)
+
+on:
+  workflow_dispatch:
+    inputs:
+      CONFIRM:
+        description: 'Type EXACTLY: I UNDERSTAND THIS WILL SELL ALL NON-USD ASSETS'
+        required: true
+      DRY_RUN:
+        description: 'true = simulate only, false = place real sells'
+        required: true
+        default: 'true'
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  nuke:
+    if: ${{ github.event.inputs.CONFIRM == 'I UNDERSTAND THIS WILL SELL ALL NON-USD ASSETS' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt==4.4.46
+
+      - name: Force Liquidate (Kraken → USD)
+        env:
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          KRAKEN_API_PASSWORD: ${{ secrets.KRAKEN_API_PASSWORD }} # if you use it; else leave unset
+          DRY_RUN: ${{ github.event.inputs.DRY_RUN }}
+        run: |
+          python -u scripts/force_liquidate_kraken.py
