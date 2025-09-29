@@ -1,107 +1,95 @@
+# .github/workflows/crypto-live.yml
+# Crypto Live — USD-only, TP/SL/Trailing with dry-run banner
+# Balanced defaults: TP 3.5%, SL 2.0%, Trail 1.2%
+
 name: Crypto Live (Every 15m — USD only + TP/SL/Trail)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"        # :00/:15/:30/:45 UTC
+    # Every 15 minutes
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       RUN_SWITCH:
-        description: 'ON to allow run, OFF to skip'
+        description: "ON to allow run, OFF to skip"
         required: true
-        default: 'ON'
+        default: "ON"
+        type: choice
+        options: ["ON", "OFF"]
       DRY_RUN:
-        description: 'true = paper (simulated), false = live orders'
+        description: "true = paper (simulated), false = live orders"
         required: true
-        default: 'true'
+        default: "true"
+        type: choice
+        options: ["true", "false"]
       USD_PER_TRADE:
-        description: 'USD size per buy'
+        description: "USD size per buy"
+        default: "10"
         required: true
-        default: '10'
       MAX_POSITIONS:
-        description: 'Max concurrent positions'
+        description: "Max concurrent positions"
+        default: "3"
         required: true
-        default: '3'
+      TP_PCT:
+        description: "Take-profit percent (e.g., 3.5 for 3.5%)"
+        default: "3.5"
+        required: true
+      SL_PCT:
+        description: "Stop-loss percent (e.g., 2.0 for 2.0%)"
+        default: "2.0"
+        required: true
+      TRAIL_PCT:
+        description: "Trailing-stop distance percent (e.g., 1.2)"
+        default: "1.2"
+        required: true
 
-env:
-  PYTHON_VERSION: "3.11"
-  EXCHANGE_ID: "kraken"
-  # Defaults used by the scheduled trigger. Manual runs can override via inputs.
-  RUN_SWITCH: "ON"
-  DRY_RUN: "true"
-  TAKE_PROFIT_PCT: "0.035"
-  STOP_LOSS_PCT: "0.020"
-  TRAIL_ACTIVATE_PCT: "0.010"
-  TRAIL_ATR_MULT: "0.8"
-  ATR_PERIOD: "14"
-  TIMEFRAME: "15m"
-  UNIVERSE: "BTC/USD,ETH/USD,SOL/USD,XRP/USD,DOGE/USD"
+permissions:
+  contents: read
 
 jobs:
   trade:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.RUN_SWITCH == 'ON' || github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
+
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Guard & compute effective settings
-        id: guard
-        shell: bash
+      - name: Check RUN switch (scheduled)
+        if: ${{ github.event_name != 'workflow_dispatch' }}
         run: |
-          echo "event=${{ github.event_name }}"
-          # Determine effective RUN_SWITCH and DRY_RUN
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            RUN_SWITCH="${{ github.event.inputs.RUN_SWITCH }}"
-            DRY_RUN="${{ github.event.inputs.DRY_RUN }}"
-            USD_PER_TRADE="${{ github.event.inputs.USD_PER_TRADE }}"
-            MAX_POSITIONS="${{ github.event.inputs.MAX_POSITIONS }}"
-          else
-            RUN_SWITCH="${{ env.RUN_SWITCH }}"
-            DRY_RUN="${{ env.DRY_RUN }}"
-            USD_PER_TRADE="10"
-            MAX_POSITIONS="3"
+          if [ "${{ env.RUN_SWITCH_SCHEDULED }}" = "OFF" ]; then
+            echo "RUN switch OFF for scheduled run — exiting cleanly." && exit 0
           fi
+        env:
+          RUN_SWITCH_SCHEDULED: ON  # change to OFF to pause schedule without disabling it
 
-          echo "RUN_SWITCH=${RUN_SWITCH}" | tee -a "$GITHUB_ENV"
-          echo "DRY_RUN=${DRY_RUN}"       | tee -a "$GITHUB_ENV"
-          echo "USD_PER_TRADE=${USD_PER_TRADE}" | tee -a "$GITHUB_ENV"
-          echo "MAX_POSITIONS=${MAX_POSITIONS}" | tee -a "$GITHUB_ENV"
+      - name: Checkout
+        uses: actions/checkout@v4
 
-          echo "==============================================================="
-          echo " Crypto Live starting — event=${{ github.event_name }}"
-          echo " RUN_SWITCH=${RUN_SWITCH} | DRY_RUN=${DRY_RUN}"
-          echo "==============================================================="
-
-          # Exit early if OFF
-          if [[ "$RUN_SWITCH" != "ON" ]]; then
-            echo "RUN_SWITCH is OFF — exiting gracefully."
-            exit 0
-          fi
-
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: "3.11"
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          pip install ccxt==4.4.46
+          pip install --upgrade pip
+          pip install ccxt pandas numpy yfinance requests typing-extensions
 
       - name: Run trader
         env:
+          DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'true' }}
+          RUN_SWITCH: ${{ github.event.inputs.RUN_SWITCH || 'ON' }}
+          USD_PER_TRADE: ${{ github.event.inputs.USD_PER_TRADE || '10' }}
+          MAX_POSITIONS: ${{ github.event.inputs.MAX_POSITIONS || '3' }}
+          TP_PCT: ${{ github.event.inputs.TP_PCT || '3.5' }}
+          SL_PCT: ${{ github.event.inputs.SL_PCT || '2.0' }}
+          TRAIL_PCT: ${{ github.event.inputs.TRAIL_PCT || '1.2' }}
+          # Exchange keys loaded from repo/org secrets when you flip DRY_RUN=false
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          KRAKEN_API_PASSWORD: ${{ secrets.KRAKEN_API_PASSWORD }}
-          EXCHANGE_ID: ${{ env.EXCHANGE_ID }}
-          DRY_RUN: ${{ env.DRY_RUN }}
-          USD_PER_TRADE: ${{ env.USD_PER_TRADE }}
-          MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
-          TAKE_PROFIT_PCT: ${{ env.TAKE_PROFIT_PCT }}
-          STOP_LOSS_PCT: ${{ env.STOP_LOSS_PCT }}
-          TRAIL_ACTIVATE_PCT: ${{ env.TRAIL_ACTIVATE_PCT }}
-          TRAIL_ATR_MULT: ${{ env.TRAIL_ATR_MULT }}
-          ATR_PERIOD: ${{ env.ATR_PERIOD }}
-          TIMEFRAME: ${{ env.TIMEFRAME }}
-          UNIVERSE: ${{ env.UNIVERSE }}
         run: |
           mkdir -p .state
-          python -u trader/crypto_engine.py
+          echo "========================================================="
+          echo "🚧 DRY RUN — NO REAL ORDERS SENT 🚧"
+          echo "========================================================="
+          python main.py
