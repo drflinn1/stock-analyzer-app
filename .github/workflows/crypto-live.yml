@@ -1,47 +1,71 @@
-# .github/workflows/crypto-live.yml
-# Crypto Live — USD-only, TP/SL/Trailing with dry-run banner
-# Balanced defaults: TP 3.5%, SL 2.0%, Trail 1.2%
-
-name: Crypto Live (Every 15m — USD only + TP/SL/Trail)
+name: Crypto Live (Every 15m — USD only + TP/SL/Trail + Guards)
 
 on:
   schedule:
-    # Every 15 minutes
     - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       RUN_SWITCH:
         description: "ON to allow run, OFF to skip"
+        type: choice
         required: true
         default: "ON"
-        type: choice
-        options: ["ON", "OFF"]
+        options: ["ON","OFF"]
       DRY_RUN:
-        description: "true = paper (simulated), false = live orders"
+        description: "true = paper (simulated), false = live"
+        type: choice
         required: true
         default: "true"
-        type: choice
-        options: ["true", "false"]
+        options: ["true","false"]
       USD_PER_TRADE:
         description: "USD size per buy"
-        default: "10"
         required: true
+        default: "10"
       MAX_POSITIONS:
         description: "Max concurrent positions"
+        required: true
         default: "3"
-        required: true
       TP_PCT:
-        description: "Take-profit percent (e.g., 3.5 for 3.5%)"
+        description: "Take-profit %"
+        required: true
         default: "3.5"
-        required: true
       SL_PCT:
-        description: "Stop-loss percent (e.g., 2.0 for 2.0%)"
+        description: "Stop-loss %"
+        required: true
         default: "2.0"
-        required: true
       TRAIL_PCT:
-        description: "Trailing-stop distance percent (e.g., 1.2)"
-        default: "1.2"
+        description: "Trailing-stop distance %"
         required: true
+        default: "1.2"
+      # --- Guard Pack knobs ---
+      RESERVE_USD:
+        description: "Keep at least this much in cash"
+        required: true
+        default: "100"
+      DAILY_LOSS_CAP_USD:
+        description: "Pause buys if P/L ≤ -X USD"
+        required: true
+        default: "5"
+      DAILY_LOSS_CAP_PCT:
+        description: "…or P/L ≤ -X% of start cash"
+        required: true
+        default: "2"
+      MAX_ENTRIES_PER_DAY:
+        description: "Max new entries per UTC day"
+        required: true
+        default: "6"
+      COOLDOWN_MIN:
+        description: "No-rebuy cooldown (minutes)"
+        required: true
+        default: "120"
+      TOPK:
+        description: "Pick from top K ranked"
+        required: true
+        default: "3"
+      PICK_MODE:
+        description: "random or rotate"
+        required: true
+        default: "random"
 
 permissions:
   contents: read
@@ -57,10 +81,10 @@ jobs:
         if: ${{ github.event_name != 'workflow_dispatch' }}
         run: |
           if [ "${{ env.RUN_SWITCH_SCHEDULED }}" = "OFF" ]; then
-            echo "RUN switch OFF for scheduled run — exiting cleanly." && exit 0
+            echo "RUN switch OFF for scheduled run — exiting." && exit 0
           fi
         env:
-          RUN_SWITCH_SCHEDULED: ON  # change to OFF to pause schedule without disabling it
+          RUN_SWITCH_SCHEDULED: ON  # set to OFF to pause the cron without disabling it
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -72,24 +96,28 @@ jobs:
 
       - name: Install deps
         run: |
-          pip install --upgrade pip
-          pip install ccxt pandas numpy yfinance requests typing-extensions
+          python -m pip install --upgrade pip
+          pip install ccxt
 
       - name: Run trader
         env:
-          DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'true' }}
-          RUN_SWITCH: ${{ github.event.inputs.RUN_SWITCH || 'ON' }}
-          USD_PER_TRADE: ${{ github.event.inputs.USD_PER_TRADE || '10' }}
-          MAX_POSITIONS: ${{ github.event.inputs.MAX_POSITIONS || '3' }}
-          TP_PCT: ${{ github.event.inputs.TP_PCT || '3.5' }}
-          SL_PCT: ${{ github.event.inputs.SL_PCT || '2.0' }}
-          TRAIL_PCT: ${{ github.event.inputs.TRAIL_PCT || '1.2' }}
-          # Exchange keys loaded from repo/org secrets when you flip DRY_RUN=false
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          RUN_SWITCH:     ${{ github.event.inputs.RUN_SWITCH     || 'ON'    }}
+          DRY_RUN:        ${{ github.event.inputs.DRY_RUN        || 'true'  }}
+          USD_PER_TRADE:  ${{ github.event.inputs.USD_PER_TRADE  || '10'    }}
+          MAX_POSITIONS:  ${{ github.event.inputs.MAX_POSITIONS  || '3'     }}
+          TP_PCT:         ${{ github.event.inputs.TP_PCT         || '3.5'   }}
+          SL_PCT:         ${{ github.event.inputs.SL_PCT         || '2.0'   }}
+          TRAIL_PCT:      ${{ github.event.inputs.TRAIL_PCT      || '1.2'   }}
+          RESERVE_USD:        ${{ github.event.inputs.RESERVE_USD        || '100'  }}
+          DAILY_LOSS_CAP_USD: ${{ github.event.inputs.DAILY_LOSS_CAP_USD || '5'    }}
+          DAILY_LOSS_CAP_PCT: ${{ github.event.inputs.DAILY_LOSS_CAP_PCT || '2'    }}
+          MAX_ENTRIES_PER_DAY:${{ github.event.inputs.MAX_ENTRIES_PER_DAY|| '6'    }}
+          COOLDOWN_MIN:       ${{ github.event.inputs.COOLDOWN_MIN       || '120'  }}
+          TOPK:               ${{ github.event.inputs.TOPK               || '3'    }}
+          PICK_MODE:          ${{ github.event.inputs.PICK_MODE          || 'random' }}
+          # Kraken keys are only used when DRY_RUN=false
+          KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           mkdir -p .state
-          echo "========================================================="
-          echo "🚧 DRY RUN — NO REAL ORDERS SENT 🚧"
-          echo "========================================================="
           python main.py
