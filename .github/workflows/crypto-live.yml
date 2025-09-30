@@ -37,37 +37,18 @@ on:
         description: "Trailing-stop distance %"
         required: true
         default: "1.2"
-      # --- Guard Pack knobs ---
       RESERVE_USD:
-        description: "Keep at least this much in cash"
+        description: "Keep at least this much cash"
         required: true
         default: "100"
       DAILY_LOSS_CAP_USD:
         description: "Pause buys if P/L ≤ -X USD"
         required: true
         default: "5"
-      DAILY_LOSS_CAP_PCT:
-        description: "…or P/L ≤ -X% of start cash"
-        required: true
-        default: "2"
-      MAX_ENTRIES_PER_DAY:
-        description: "Max new entries per UTC day"
-        required: true
-        default: "6"
-      COOLDOWN_MIN:
-        description: "No-rebuy cooldown (minutes)"
-        required: true
-        default: "120"
       TOPK:
         description: "Pick from top K ranked"
         required: true
         default: "3"
-      PICK_MODE:
-        description: "random or rotate"
-        type: choice
-        options: ["random","rotate"]
-        required: true
-        default: "random"
 
 permissions:
   contents: read
@@ -112,12 +93,13 @@ jobs:
           TRAIL_PCT:            ${{ github.event.inputs.TRAIL_PCT            || '1.2'    }}
           RESERVE_USD:          ${{ github.event.inputs.RESERVE_USD          || '100'    }}
           DAILY_LOSS_CAP_USD:   ${{ github.event.inputs.DAILY_LOSS_CAP_USD   || '5'      }}
-          DAILY_LOSS_CAP_PCT:   ${{ github.event.inputs.DAILY_LOSS_CAP_PCT   || '2'      }}
-          MAX_ENTRIES_PER_DAY:  ${{ github.event.inputs.MAX_ENTRIES_PER_DAY  || '6'      }}
-          COOLDOWN_MIN:         ${{ github.event.inputs.COOLDOWN_MIN         || '120'    }}
           TOPK:                 ${{ github.event.inputs.TOPK                 || '3'      }}
-          PICK_MODE:            ${{ github.event.inputs.PICK_MODE            || 'random' }}
-          # Kraken keys are only used when DRY_RUN=false
+          # --- hard defaults (edit here if you want) ---
+          DAILY_LOSS_CAP_PCT:   "2"
+          MAX_ENTRIES_PER_DAY:  "6"
+          COOLDOWN_MIN:         "120"
+          PICK_MODE:            "random"
+          # Kraken keys used only when DRY_RUN=false
           KRAKEN_API_KEY:       ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET:    ${{ secrets.KRAKEN_API_SECRET }}
         run: |
