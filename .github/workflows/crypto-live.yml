@@ -1,162 +1,102 @@
-name: Crypto Live (Every 15 min - Guarded)
+name: Crypto Live (Every 15 min — CONCENTRATED + PYRAMID + SWEEP + TAX)
 
 on:
+  workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: "Simulate only (true/false)"
+        required: true
+        default: "true"
+      EXCHANGE_ID:
+        description: "CCXT exchange id (e.g., kraken)"
+        required: true
+        default: "kraken"
+      BASE_CURRENCY:
+        description: "Quote/settle currency"
+        required: true
+        default: "USD"
+      UNIVERSE:
+        description: "Comma list or 'auto'"
+        required: true
+        default: "auto"
+      MAX_POSITIONS:
+        description: "Cap of open positions"
+        required: true
+        default: "4"
+      PER_TRADE_USD:
+        description: "Notional per entry"
+        required: true
+        default: "25"
+      RESERVE_USD:
+        description: "Cash reserve not used"
+        required: true
+        default: "100"
+      DAILY_LOSS_CAP_USD:
+        description: "Stop trading for the day after this net loss"
+        required: true
+        default: "40"
+      RUN_SWEEPER:
+        description: "Run Dust Sweeper after bot (true/false)"
+        required: true
+        default: "true"
   schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch: {}
+    - cron: "*/15 * * * *"  # every 15 minutes
 
 jobs:
-  trade:
+  crypto:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     env:
-      # --- Core bot env (adjust as needed) ---
-      EXCHANGE: kraken
-      DRY_RUN: "true"                 # set "false" when you go live
-      UNIVERSE_MODE: "auto"
-      TOP_K: "4"
-      QUOTE_CCY: "USD"
-      DAILY_LOSS_CAP_PCT: "3"
-      MAX_DAILY_ENTRIES: "3"
-      RESERVE_USD: "100"
-
-      # --- Dust Sweeper knobs ---
-      SWEEP_ENABLE: "true"
-      SWEEP_DRY_RUN: "true"           # flip to "false" to actually sell dust
-      SWEEP_MIN_NOTIONAL_USD: "1.00"
-      SWEEP_WHITELIST: "BTC,ETH,SOL,DOGE,USD,USDT,USDC"
-
-      # Keys (must be present in repo secrets)
-      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+      DRY_RUN: ${{ inputs.DRY_RUN || 'true' }}
+      EXCHANGE_ID: ${{ inputs.EXCHANGE_ID || 'kraken' }}
+      BASE_CURRENCY: ${{ inputs.BASE_CURRENCY || 'USD' }}
+      UNIVERSE: ${{ inputs.UNIVERSE || 'auto' }}
+      MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || '4' }}
+      PER_TRADE_USD: ${{ inputs.PER_TRADE_USD || '25' }}
+      RESERVE_USD: ${{ inputs.RESERVE_USD || '100' }}
+      DAILY_LOSS_CAP_USD: ${{ inputs.DAILY_LOSS_CAP_USD || '40' }}
+      RUN_SWEEPER: ${{ inputs.RUN_SWEEPER || 'true' }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Show inputs
+        run: |
+          echo "DRY_RUN=${DRY_RUN}"
+          echo "EXCHANGE_ID=${EXCHANGE_ID}"
+          echo "BASE_CURRENCY=${BASE_CURRENCY}"
+          echo "UNIVERSE=${UNIVERSE}"
+          echo "MAX_POSITIONS=${MAX_POSITIONS}"
+          echo "PER_TRADE_USD=${PER_TRADE_USD}"
+          echo "RESERVE_USD=${RESERVE_USD}"
+          echo "DAILY_LOSS_CAP_USD=${DAILY_LOSS_CAP_USD}"
+          echo "RUN_SWEEPER=${RUN_SWEEPER}"
+
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install deps (ccxt only — fast)
         run: |
           python -m pip install --upgrade pip
-          pip install ccxt pandas
+          pip install ccxt
 
-      - name: Run Crypto Bot
-        shell: bash
+      - name: Run Crypto Bot (auto-select engine)
+        env:
+          CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
+          CCXT_API_SECRET: ${{ secrets.CCXT_API_SECRET }}
+          CCXT_API_PASSWORD: ${{ secrets.CCXT_API_PASSWORD }}
         run: |
-          set -euo pipefail
-          echo "Starting Crypto Bot (filesystem-first launcher)..."
-          echo "Repo tree (top level):"; ls -la
-          echo "Trader dir:"; ls -la trader || true
+          python -u trader/launcher.py
 
-          if [ -f "trader/crypto_engine.py" ]; then
-            echo "[go] python trader/crypto_engine.py"
-            python trader/crypto_engine.py
-          elif [ -f "trader/main.py" ]; then
-            echo "[go] python trader/main.py"
-            python trader/main.py
-          elif [ -f "trader/engine.py" ]; then
-            echo "[warn] Falling back to trader/engine.py"
-            python trader/engine.py
-          else
-            echo "[error] No crypto engine found (expected trader/crypto_engine.py or trader/main.py)."
-            echo "Files under trader/:"
-            ls -la trader || true
-            exit 1
-          fi
-
-      - name: KPI Artifact (optional)
-        run: |
-          echo "timestamp,pl_percent" > kpi.csv
-          date -u +%FT%TZ | awk '{print $0",0.00"}' >> kpi.csv
-        continue-on-error: true
-
-      # ---- DUST SWEEPER (after trading) ----
       - name: Dust Sweeper
-        if: env.SWEEP_ENABLE == 'true'
-        shell: bash
+        if: env.RUN_SWEEPER == 'true'
+        env:
+          CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
+          CCXT_API_SECRET: ${{ secrets.CCXT_API_SECRET }}
+          CCXT_API_PASSWORD: ${{ secrets.CCXT_API_PASSWORD }}
         run: |
-          set -euo pipefail
-          echo "Dust Sweeper (dry-run=${SWEEP_DRY_RUN})"
-          printf '%s\n' \
-            'import os, time' \
-            'import ccxt' \
-            '' \
-            'def as_bool(v, default=False):' \
-            '    if v is None: return default' \
-            '    return str(v).strip().lower() in ("1","true","yes","on")' \
-            '' \
-            'print("[1/5] init exchange")' \
-            'ex = ccxt.kraken({' \
-            "    'apiKey': os.getenv('KRAKEN_API_KEY','')," \
-            "    'secret': os.getenv('KRAKEN_API_SECRET','')," \
-            "    'enableRateLimit': True," \
-            "    'timeout': 20000," \
-            '})' \
-            'dry_run = as_bool(os.getenv("SWEEP_DRY_RUN","true"), True)' \
-            'min_usd = float(os.getenv("SWEEP_MIN_NOTIONAL_USD","1.0"))' \
-            'keep = set([s.strip().upper() for s in os.getenv(\"SWEEP_WHITELIST\",\"\" ).split(\",\") if s.strip()])' \
-            'print(f\"keep={sorted(keep)}  min_usd={min_usd}  dry_run={dry_run}\")' \
-            '' \
-            'print("[2/5] fetch balance")' \
-            'bal = ex.fetch_balance()' \
-            '' \
-            'print("[3/5] load markets")' \
-            'ex.load_markets()' \
-            '' \
-            'print("[4/5] build USD prices")' \
-            'prices = {}' \
-            'for m in ex.markets.values():' \
-            '    if m.get("quote") == "USD":' \
-            '        base = (m.get("base") or "").upper()' \
-            '        if not base: continue' \
-            '        try:' \
-            '            t = ex.fetch_ticker(m["symbol"])' \
-            '            prices[base] = float(t.get("last") or 0.0)' \
-            '        except Exception:' \
-            '            pass' \
-            '' \
-            'print("[5/5] scan balances")' \
-            'sells = []' \
-            'for asset, qty in (bal.get("total") or {}).items():' \
-            '    qty = float(qty or 0)' \
-            '    sym = (asset or "").upper()' \
-            '    if qty <= 0 or not sym: continue' \
-            '    if sym in keep: continue' \
-            '    px = prices.get(sym, 0.0)' \
-            '    notional = qty * px if px > 0 else 0.0' \
-            '    if px == 0.0:' \
-            '        print(f"[?] No USD price for {sym}; qty={qty}")' \
-            '    if notional < min_usd:' \
-            '        market = None' \
-            '        for q in ("USD","USDT","USDC"):' \
-            '            pair = f"{sym}/{q}"' \
-            '            if pair in ex.markets:' \
-            '                market = pair; break' \
-            '        if market:' \
-            '            sells.append((sym, qty, market, notional))' \
-            '        else:' \
-            '            print(f"[skip] No market to exit {sym} to USD/USDT/USDC")' \
-            '' \
-            'if not sells:' \
-            '    print("No dust below threshold.")' \
-            'else:' \
-            '    print(f"Would clean {len(sells)} dust positions:")' \
-            '    for sym, qty, market, notional in sells:' \
-            '        print(f" - {sym}: qty={qty:.8f}, notional~${notional:.2f}, market={market}")' \
-            '    if dry_run:' \
-            '        print("DRY-RUN: no orders sent")' \
-            '    else:' \
-            '        for sym, qty, market, _ in sells:' \
-            '            try:' \
-            '                print(f"sell {market} size={qty}")' \
-            "                ex.create_order(market, 'market', 'sell', qty)" \
-            '            except Exception as e:' \
-            '                print(f"[error] {market} {e}")' \
-            > sweep.py
-          python sweep.py
-
-      - name: Done
-        run: echo "Run complete."
+          python -u trader/dust_sweeper.py
