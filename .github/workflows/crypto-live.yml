@@ -46,8 +46,56 @@ jobs:
       - name: Run Crypto Bot
         shell: bash
         run: |
-          echo "Starting Crypto Bot (python -m trader.main)..."
-          python -m trader.main
+          echo "Starting Crypto Bot (adaptive launcher)..."
+          printf '%s\n' \
+            'import os, sys, importlib, traceback' \
+            '' \
+            'candidates = [' \
+            "    ('trader.main', 'main')," \
+            "    ('trader.engine', 'main')," \
+            "    ('trader.crypto_engine', 'main')," \
+            "    ('main', 'main')," \
+            ']' \
+            '' \
+            'def try_run(mod_name, func_name):' \
+            '    try:' \
+            '        mod = importlib.import_module(mod_name)' \
+            '    except ModuleNotFoundError:' \
+            '        print(f\"[skip] Module not found: {mod_name}\")' \
+            '        return False' \
+            '    fn = getattr(mod, func_name, None)' \
+            '    if callable(fn):' \
+            '        print(f\"[go] Launching {mod_name}.{func_name}()\")' \
+            '        fn()' \
+            '        return True' \
+            '    # If no function, but it is a script module, attempt running via run() if present' \
+            '    if hasattr(mod, \"run\") and callable(getattr(mod, \"run\")):' \
+            '        print(f\"[go] Launching {mod_name}.run()\")' \
+            '        mod.run()' \
+            '        return True' \
+            '    print(f\"[skip] {mod_name} loaded but no {func_name}() or run() entrypoint\")' \
+            '    return False' \
+            '' \
+            'ok = False' \
+            'for m, f in candidates:' \
+            '    if try_run(m, f):' \
+            '        ok = True' \
+            '        break' \
+            '' \
+            'if not ok:' \
+            '    print(\"[error] No known entrypoint found. Looked for:\")' \
+            '    for m, f in candidates:' \
+            '        print(f\"  - {m}.{f}()\")' \
+            '    # Show repo tree for debugging' \
+            '    try:' \
+            '        import pathlib' \
+            '        for p in pathlib.Path(\".\").rglob(\"*.py\"):' \
+            '            print(\"  \", p)' \
+            '    except Exception:' \
+            '        traceback.print_exc()' \
+            '    sys.exit(1)' \
+            > run_bot.py
+          python run_bot.py
 
       - name: KPI Artifact (optional)
         run: |
