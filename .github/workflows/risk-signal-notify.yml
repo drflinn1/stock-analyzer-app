@@ -1,9 +1,8 @@
-# .github/workflows/risk-signal-notify.yml
 name: Risk Signal Notifier
 
 on:
   schedule:
-    # 14:00 UTC (≈ 7:00 AM PT). Change this to taste.
+    # 14:00 UTC (~7:00 AM PT). Change as needed.
     - cron: "0 14 * * *"
   workflow_dispatch: {}
 
@@ -14,7 +13,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Read current signal + prior
+      - name: Read current signal and prior
         id: read
         run: |
           set -euo pipefail
@@ -42,7 +41,6 @@ jobs:
           git config user.name  "github-actions"
           git add .state/last_risk_signal.txt
           git commit -m "chore: update last_risk_signal.txt to ${{ steps.read.outputs.current }}" || echo "No changes"
-          # No push — this job is read-mostly; commit just anchors the file in the run logs.
 
       - name: Print banner
         run: |
@@ -51,13 +49,12 @@ jobs:
           echo " Prev:        ${{ steps.read.outputs.previous }}"
           echo "=============================="
 
-      # Intentionally fail on flip so you get a GitHub email
-      - name: Flip notifier (fail-on-purpose to email you)
+      - name: Flip notifier (fail intentionally to email)
         if: steps.flip.outputs.flip == 'true'
         run: |
-          echo "Risk signal FLIPPED: ${{ steps.read.outputs.previous }} → ${{ steps.read.outputs.current }}"
+          echo "Risk signal FLIPPED: ${{ steps.read.outputs.previous }} -> ${{ steps.read.outputs.current }}"
           exit 1
 
       - name: No flip detected
         if: steps.flip.outputs.flip != 'true'
-        run: echo "No flip detected — success."
+        run: echo "No flip detected - success."
