@@ -1,0 +1,91 @@
+name: Crypto Live — RISK-ON (manual)
+
+on:
+  workflow_dispatch:  # run by clicking "Run workflow" (no schedule so it won't overlap)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crypto-live-riskon-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    name: Run Crypto Bot (Risk-On)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt pandas numpy python-dateutil pytz requests
+
+      - name: Run trader (Risk-On Preset)
+        env:
+          # core
+          DRY_RUN: ${{ vars.DRY_RUN || 'true' }}      # 'true' keeps it paper/sim until you're ready
+          EXCHANGE_ID: ${{ vars.EXCHANGE_ID || 'kraken' }}
+          CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
+          CCXT_API_SECRET: ${{ secrets.CCXT_API_SECRET }}
+          CCXT_API_PASSWORD: ${{ secrets.CCXT_API_PASSWORD }}
+          LOG_LEVEL: INFO
+
+          # quote + universe
+          QUOTE: USD
+          WHITELIST: BTC,ETH,SOL,DOGE
+
+          # 🚀 Risk-On Preset (more/faster trades, tighter exits)
+          LOOKBACK_MIN: "90"          # react faster to moves (≈1.5h vs 4h)
+          TOP_K: "3"                  # up to 3 coins at once
+          DOLLARS_PER_TRADE: "35"     # bigger per-trade size
+          TP_PCT: "0.028"             # take profits at +2.8%
+          SL_PCT: "0.015"             # cut losers quicker at -1.5%
+          TRAIL_ARM_PCT: "0.012"      # arm trailing earlier (+1.2%)
+          TRAIL_GIVEBACK_PCT: "0.008" # tighter giveback (0.8%)
+          COOLDOWN_MIN: "25"          # faster re-entries after sells
+          MAX_DAILY_ENTRIES: "8"      # allow more shots in a day
+
+          # guards
+          MIN_NOTIONAL: "10"
+        run: |
+          python main.py
+
+      - name: KPI tail (last line)
+        if: always()
+        run: |
+          echo "---- KPI SUMMARY (tail of kpi_history.csv) ----"
+          tail -n 1 .state/kpi_history.csv || true
+
+      - name: Debug .state contents
+        if: always()
+        run: |
+          echo "ls -la .state"; ls -la .state || true
+          echo "tree -a .state"
+          sudo apt-get update >/dev/null 2>&1 || true
+          sudo apt-get install -y tree >/dev/null 2>&1 || true
+          tree -a .state || true
+          echo "----- day_state.json -----"
+          cat .state/day_state.json || true
+
+      - name: Save state (upload .state)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-riskon-${{ github.run_id }}
+          path: |
+            ${{ github.workspace }}/.state/**
+            ${{ github.workspace }}/.state/*
+            ${{ github.workspace }}/.state
+          if-no-files-found: warn
+          retention-days: 7
