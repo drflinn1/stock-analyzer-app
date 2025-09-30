@@ -1,81 +1,63 @@
-name: Risk Signal — Daily Notifier
+# .github/workflows/risk-signal-notify.yml
+name: Risk Signal Notifier
 
 on:
   schedule:
-    # 14:00 UTC ≈ 7:00 AM PT
+    # 14:00 UTC (≈ 7:00 AM PT). Change this to taste.
     - cron: "0 14 * * *"
-  workflow_dispatch:
-
-permissions:
-  contents: write
+  workflow_dispatch: {}
 
 jobs:
   notify:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
+      - name: Read current signal + prior
+        id: read
         run: |
-          python -m pip install --upgrade pip
-          pip install ccxt
+          set -euo pipefail
+          CUR=$(cat .state/risk_signal.txt 2>/dev/null || echo "UNKNOWN")
+          PREV=$(cat .state/last_risk_signal.txt 2>/dev/null || echo "UNKNOWN")
+          echo "current=$CUR" >> $GITHUB_OUTPUT
+          echo "previous=$PREV" >> $GITHUB_OUTPUT
+          echo "RISK SIGNAL: $CUR (prev: $PREV)"
 
-      - name: Banner (for logs)
-        env:
-          EXCHANGE_ID: kraken
-        run: |
-          python -m trader.risk_signal
-
-      - name: Detect flip + write state
+      - name: Decide flip
         id: flip
-        shell: bash
         run: |
-          python - << 'PY'
-          from pathlib import Path
-          from trader.risk_signal import risk_signal
-          state = Path(".state/last_risk_signal.txt")
-          state.parent.mkdir(parents=True, exist_ok=True)
-
-          signal, _ = risk_signal()
-          prev = state.read_text().strip() if state.exists() else "UNKNOWN"
-          flipped = (prev != signal)
-          state.write_text(signal)
-
-          Path(".state/.flip_marker").write_text(f"{prev}->{signal}" if flipped else "")
-          PY
-
-          if [ -s ".state/.flip_marker" ]; then
-            echo "flip=true" >> "$GITHUB_OUTPUT"
-            echo "flip_message=$(cat .state/.flip_marker)" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          if [ "${{ steps.read.outputs.current }}" != "${{ steps.read.outputs.previous }}" ]; then
+            echo "flip=true" >> $GITHUB_OUTPUT
           else
-            echo "flip=false" >> "$GITHUB_OUTPUT"
+            echo "flip=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Commit last signal (on flip)
-        if: steps.flip.outputs.flip == 'true'
+      - name: Store last signal
         run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
+          mkdir -p .state
+          echo "${{ steps.read.outputs.current }}" > .state/last_risk_signal.txt
+          git config user.email "actions@users.noreply.github.com"
+          git config user.name  "github-actions"
           git add .state/last_risk_signal.txt
-          git commit -m "Risk Signal flip: ${{ steps.flip.outputs.flip_message }}"
-          git push
+          git commit -m "chore: update last_risk_signal.txt to ${{ steps.read.outputs.current }}" || echo "No changes"
+          # No push — this job is read-mostly; commit just anchors the file in the run logs.
 
-      # FIXED: correct GitHub expression (no stray braces/spaces)
-      - name: Send email via failure (on flip)
-        if: steps.flip.outputs.flip == 'true'
-        shell: bash
+      - name: Print banner
         run: |
-          echo "::error::Risk Signal FLIP ${{ steps.flip.outputs.flip_message }}"
+          echo "=============================="
+          echo " RISK SIGNAL: ${{ steps.read.outputs.current }}"
+          echo " Prev:        ${{ steps.read.outputs.previous }}"
+          echo "=============================="
+
+      # Intentionally fail on flip so you get a GitHub email
+      - name: Flip notifier (fail-on-purpose to email you)
+        if: steps.flip.outputs.flip == 'true'
+        run: |
+          echo "Risk signal FLIPPED: ${{ steps.read.outputs.previous }} → ${{ steps.read.outputs.current }}"
           exit 1
 
-      - name: No flip (success)
+      - name: No flip detected
         if: steps.flip.outputs.flip != 'true'
-        run: echo "No flip detected."
+        run: echo "No flip detected — success."
