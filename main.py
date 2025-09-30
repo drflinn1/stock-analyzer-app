@@ -1,6 +1,14 @@
-# main.py — Crypto Live with Guard Pack (writes .state, dry-run balance okay)
+# stock-analyzer-app/main.py
+# USD-QUOTE, MAJORS-ONLY, TOP-K ROTATION
+# - Whitelist: BTC/ETH/SOL/DOGE (USD pairs only)
+# - Dry-run banner + simulated fills
+# - Take-profit / Stop-loss / Trailing stop
+# - Cooldown after sells
+# - Writes .state: .keep, day_state.json, kpi_history.csv, positions.json, cooldown.json
+# - Safe if secrets are missing (paper by default)
+
 from __future__ import annotations
-import os, json, random, csv
+import os, csv, json, math, time, random
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -9,344 +17,291 @@ try:
 except Exception as e:
     raise SystemExit(f"ccxt is required: {e}")
 
-# ---------- ENV & DEFAULTS ----------
+# --------------------- ENV --------------------- #
+def getenv(name: str, default: str) -> str:
+    v = os.environ.get(name)
+    return v if v not in (None, "") else default
 
-def _as_bool(v: Optional[str], d: bool) -> bool:
-    if v is None: return d
-    return str(v).strip().lower() in {"1","true","yes","on"}
+DRY_RUN          = getenv("DRY_RUN", "true").lower() in ("1","true","yes","on")
+EXCHANGE_ID      = getenv("EXCHANGE_ID", "kraken").lower()
+QUOTE            = getenv("QUOTE", "USD").upper()                  # force USD quote
+WHITELIST_RAW    = getenv("WHITELIST", "BTC,ETH,SOL,DOGE")
+TOP_K            = int(getenv("TOP_K", "2"))
+DOLLARS_PER_TRADE= float(getenv("DOLLARS_PER_TRADE", "25"))
+TP_PCT           = float(getenv("TP_PCT", "0.035"))                # 3.5% take profit
+SL_PCT           = float(getenv("SL_PCT", "0.020"))                # 2.0% stop loss
+TRAIL_ARM_PCT    = float(getenv("TRAIL_ARM_PCT", "0.015"))         # arm when +1.5%
+TRAIL_GIVEBACK_PCT=float(getenv("TRAIL_GIVEBACK_PCT","0.010"))     # give back 1.0%
+COOLDOWN_MIN     = int(getenv("COOLDOWN_MIN", "45"))               # mins after a sell
+LOOKBACK_MIN     = int(getenv("LOOKBACK_MIN", "240"))              # momentum window
+MIN_NOTIONAL     = float(getenv("MIN_NOTIONAL", "10"))             # exchange min guard
+MAX_DAILY_ENTRIES= int(getenv("MAX_DAILY_ENTRIES", "6"))           # sanity cap
 
-def _as_float(v: Optional[str], d: float) -> float:
+WHITELIST = [t.strip().upper() for t in WHITELIST_RAW.split(",") if t.strip()]
+
+# --------------------- FS STATE --------------------- #
+STATE_DIR = ".state"
+KEEP_FILE = os.path.join(STATE_DIR, ".keep")
+DAY_STATE = os.path.join(STATE_DIR, "day_state.json")
+KPI_CSV   = os.path.join(STATE_DIR, "kpi_history.csv")
+POSITIONS = os.path.join(STATE_DIR, "positions.json")
+COOLDOWN  = os.path.join(STATE_DIR, "cooldown.json")
+
+def ensure_state():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if not os.path.exists(KEEP_FILE):
+        open(KEEP_FILE, "w").write(".")
+
+def load_json(path: str, default: Any) -> Any:
     try:
-        return float(v) if v is not None and str(v).strip() != "" else d
-    except: return d
-
-def _as_int(v: Optional[str], d: int) -> int:
-    try:
-        return int(float(v)) if v is not None and str(v).strip() != "" else d
-    except: return d
-
-DRY_RUN        = _as_bool(os.getenv("DRY_RUN"), True)
-RUN_SWITCH     = os.getenv("RUN_SWITCH", "ON").upper()
-USD_PER_TRADE  = _as_float(os.getenv("USD_PER_TRADE"), 10.0)
-MAX_POSITIONS  = _as_int(os.getenv("MAX_POSITIONS"), 3)
-
-# Balanced exits
-TP_PCT    = _as_float(os.getenv("TP_PCT"), 3.5)
-SL_PCT    = _as_float(os.getenv("SL_PCT"), 2.0)
-TRAIL_PCT = _as_float(os.getenv("TRAIL_PCT"), 1.2)
-
-# Guard Pack
-RESERVE_USD         = _as_float(os.getenv("RESERVE_USD"), 100.0)
-DAILY_LOSS_CAP_USD  = _as_float(os.getenv("DAILY_LOSS_CAP_USD"), 5.0)
-DAILY_LOSS_CAP_PCT  = _as_float(os.getenv("DAILY_LOSS_CAP_PCT"), 2.0)   # % of start cash
-MAX_ENTRIES_PER_DAY = _as_int(os.getenv("MAX_ENTRIES_PER_DAY"), 6)
-COOLDOWN_MIN        = _as_int(os.getenv("COOLDOWN_MIN"), 120)
-TOPK                = max(1, _as_int(os.getenv("TOPK"), 3))
-PICK_MODE           = os.getenv("PICK_MODE", "random").lower()  # random|rotate
-EMERGENCY_SL_PCT    = _as_float(os.getenv("EMERGENCY_SL_PCT"), 3.5)
-
-# Paper-only balance fallback (used if fetch_balance fails in DRY RUN)
-SIM_USD_BALANCE     = _as_float(os.getenv("SIM_USD_BALANCE"), 300.0)
-
-STATE_DIR      = ".state"
-POSITIONS_FILE = os.path.join(STATE_DIR, "positions.json")
-DAY_FILE       = os.path.join(STATE_DIR, "day_state.json")
-COOLDOWN_FILE  = os.path.join(STATE_DIR, "cooldown.json")
-PAUSE_FILE     = os.path.join(STATE_DIR, "guard_pause.json")
-HISTORY_CSV    = os.path.join(STATE_DIR, "kpi_history.csv")
-ROTATE_FILE    = os.path.join(STATE_DIR, "rotate_idx.json")
-
-USD_KEYS  = ("USD", "ZUSD")
-UNIVERSE  = ["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD"]
-
-os.makedirs(STATE_DIR, exist_ok=True)
-# ensure folder is non-empty so the artifact step always has something to grab
-with open(os.path.join(STATE_DIR, ".keep"), "w", encoding="utf-8") as _f:
-    _f.write("state\n")
-
-# ---------- UTIL
-
-def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
-
-def _utcnow():
-    return datetime.now(timezone.utc)
-
-def _load_json(path: str, default):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
+        with open(path, "r") as f: return json.load(f)
+    except Exception:
         return default
 
-def _save_json(path: str, data):
+def save_json(path: str, obj: Any):
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2, sort_keys=True)
     os.replace(tmp, path)
 
-def _append_history(row: Dict[str, Any]):
-    header = ["ts","dry_run","open","cap_left","usd","pnl_today","entries_today","guards"]
-    newfile = not os.path.exists(HISTORY_CSV)
-    with open(HISTORY_CSV, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=header)
-        if newfile: w.writeheader()
-        w.writerow({k: row.get(k) for k in header})
+def kpi_append(row: Dict[str, Any]):
+    exists = os.path.exists(KPI_CSV)
+    with open(KPI_CSV, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "ts","mode","universe","topk","entries","exits","pnl","cash_est"
+        ])
+        if not exists: w.writeheader()
+        w.writerow(row)
 
-# ---------- EXCHANGE / BALANCE
+# --------------------- BROKER --------------------- #
+def make_exchange() -> ccxt.Exchange:
+    # Public-only by default; if secrets exist, authenticated calls will work.
+    klass = getattr(ccxt, EXCHANGE_ID)
+    ex = klass({
+        "enableRateLimit": True,
+        "timeout": 20000,
+        "options": {"adjustForTimeDifference": True}
+    })
+    key = os.environ.get("CCXT_API_KEY")
+    sec = os.environ.get("CCXT_API_SECRET")
+    pwd = os.environ.get("CCXT_API_PASSWORD")
+    if key and sec:
+        ex.apiKey = key
+        ex.secret = sec
+        if pwd: ex.password = pwd
+    return ex
 
-def _get_exchange():
-    api_key = os.getenv("KRAKEN_API_KEY")
-    api_secret = os.getenv("KRAKEN_API_SECRET")
-    cfg = {"enableRateLimit": True}
-    # Use keys if present EVEN IN DRY RUN so private balance endpoints work
-    if api_key and api_secret:
-        cfg.update({"apiKey": api_key, "secret": api_secret})
-    return ccxt.kraken(cfg)
+def quote_filter(symbol: str) -> bool:
+    # enforce strict '/USD' quote (Kraken returns like 'BTC/USD')
+    return symbol.endswith(f"/{QUOTE}")
 
-def _usd_balance(ex) -> float:
-    bal = ex.fetch_balance({})
-    total = 0.0
-    total_d = bal.get("total", {})
-    for k in USD_KEYS:
-        if k in total_d:
-            total += float(total_d[k] or 0)
-        elif k in bal:
-            total += float(bal.get(k) or 0)
-    return float(total)
+# --------------------- SIGNALS --------------------- #
+def pct(a: float, b: float) -> float:
+    return (a/b - 1.0) if b else 0.0
 
-# ---------- PRICES / RANKING
+def momentum_score(bars: List[List[float]]) -> float:
+    # bars: [ts, open, high, low, close, vol]
+    if len(bars) < 2: return -9e9
+    c0 = bars[0][4]; c1 = bars[-1][4]
+    return pct(c1, c0)
 
-def _last_price(ex, sym: str) -> Optional[float]:
-    try:
-        t = ex.fetch_ticker(sym)
-        px = t.get("last") or t.get("close") or t.get("bid") or t.get("ask")
-        return float(px) if px else None
-    except Exception:
-        return None
+def pick_universe(ex: ccxt.Exchange) -> List[str]:
+    markets = ex.load_markets()
+    # Strict USD pairs only, majors whitelist.
+    candidates = []
+    for base in WHITELIST:
+        sym = f"{base}/{QUOTE}"
+        if sym in markets:
+            candidates.append(sym)
+    return candidates
 
-def _momentum_score(ex, sym: str, tf: str = "15m", lookback: int = 12) -> float:
-    try:
-        ohlcv = ex.fetch_ohlcv(sym, timeframe=tf, limit=lookback)
-        if not ohlcv or len(ohlcv) < 2: return 0.0
-        first, last = float(ohlcv[0][4]), float(ohlcv[-1][4])
-        return (last - first) / first
-    except Exception:
-        return 0.0
+def scan_topk(ex: ccxt.Exchange, symbols: List[str]) -> List[Tuple[str,float]]:
+    scores = []
+    now = ex.milliseconds()
+    since = now - LOOKBACK_MIN * 60_000
+    for s in symbols:
+        try:
+            # 5m bars gives ~LOOKBACK_MIN/5 candles
+            bars = ex.fetch_ohlcv(s, timeframe="5m", since=since, limit=LOOKBACK_MIN//5 + 10)
+            sc = momentum_score(bars)
+            scores.append((s, sc))
+        except Exception as e:
+            print(f"[WARN] fetch_ohlcv failed for {s}: {e}")
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return scores[:TOP_K]
 
-# ---------- STATE
+# --------------------- POSITION ENGINE --------------------- #
+def now_utc_iso() -> str:
+    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
-def _load_positions():  return _load_json(POSITIONS_FILE, [])
-def _save_positions(p): _save_json(POSITIONS_FILE, p)
+def load_positions() -> Dict[str, Any]:
+    return load_json(POSITIONS, {})
 
-def _load_cooldown() -> Dict[str, float]:
-    data = _load_json(COOLDOWN_FILE, {})
-    now = _utcnow().timestamp()
-    data = {s: exp for s, exp in data.items() if exp > now}
-    _save_json(COOLDOWN_FILE, data)
-    return data
+def save_positions(p: Dict[str, Any]):
+    save_json(POSITIONS, p)
 
-def _set_cooldown(sym: str):
-    data = _load_json(COOLDOWN_FILE, {})
-    exp = (_utcnow() + timedelta(minutes=COOLDOWN_MIN)).timestamp()
-    data[sym] = exp
-    _save_json(COOLDOWN_FILE, data)
+def load_cooldown() -> Dict[str, float]:
+    return load_json(COOLDOWN, {})
 
-def _load_day_state(now_usd: float) -> Dict[str, Any]:
-    today = _utcnow().date().isoformat()
-    ds = _load_json(DAY_FILE, {})
-    if ds.get("date") != today:
-        ds = {"date": today, "start_cash": now_usd, "pnl_today": 0.0, "entries_today": 0}
-        if os.path.exists(PAUSE_FILE):
-            try: os.remove(PAUSE_FILE)
-            except: pass
-    _save_json(DAY_FILE, ds)
-    return ds
+def save_cooldown(c: Dict[str, float]):
+    save_json(COOLDOWN, c)
 
-# ---------- BROKER OPS
+def in_cooldown(sym: str, ctab: Dict[str, float]) -> bool:
+    t = ctab.get(sym)
+    if not t: return False
+    return (time.time() - t) < COOLDOWN_MIN*60
 
-def _market_buy(ex, sym: str, usd: float) -> Tuple[float, float]:
-    px = _last_price(ex, sym) or 0.0
-    amt = 0.0 if px <= 0 else usd / px
+def arm_trailing(pos: Dict[str, Any], price: float):
+    # Arm trailing when profit passes TRAIL_ARM_PCT
+    if pos.get("trail_armed"): return
+    if price >= pos["entry"] * (1 + TRAIL_ARM_PCT):
+        pos["trail_armed"] = True
+        pos["trail_peak"] = price
+
+def update_trailing(pos: Dict[str, Any], price: float) -> bool:
+    # returns True if should exit due to trailing giveback
+    if not pos.get("trail_armed"): return False
+    pos["trail_peak"] = max(pos.get("trail_peak", price), price)
+    trigger = pos["trail_peak"] * (1 - TRAIL_GIVEBACK_PCT)
+    return price <= trigger
+
+def should_take_profit(pos: Dict[str, Any], price: float) -> bool:
+    return price >= pos["entry"] * (1 + TP_PCT)
+
+def should_stop_loss(pos: Dict[str, Any], price: float) -> bool:
+    return price <= pos["entry"] * (1 - SL_PCT)
+
+def est_qty(notional: float, price: float) -> float:
+    if price <= 0: return 0.0
+    # round to 6 decimals for most majors
+    return max(0.0, round(notional / price, 6))
+
+def market_price(ex: ccxt.Exchange, symbol: str) -> float:
+    # ticker last or close
+    t = ex.fetch_ticker(symbol)
+    return float(t.get("last") or t.get("close") or 0.0)
+
+def place_order_or_sim(ex: ccxt.Exchange, side: str, symbol: str, qty: float, price: float) -> Dict[str, Any]:
+    if qty <= 0: raise ValueError("qty<=0")
     if DRY_RUN:
-        print(f"{_ts()} INFO: [DRY RUN] ccxt BUY {sym} amount={amt:.8f} (~${usd:.2f}) @~{px}")
-        return px, amt
-    try:
-        order = ex.create_market_buy_order(sym, amt)
-        px2 = float(order.get("average") or px); amt2 = float(order.get("amount") or amt)
-        print(f"{_ts()} INFO: LIVE BUY executed: {sym} ${usd:.2f} avg~{px2}")
-        return px2, amt2
-    except Exception as e:
-        print(f"{_ts()} ERROR: BUY failed: {e}")
-        return px, amt
-
-def _market_sell(ex, sym: str, qty: float) -> float:
-    px = _last_price(ex, sym) or 0.0
-    if DRY_RUN:
-        print(f"{_ts()} INFO: [DRY RUN] ccxt SELL {sym} qty={qty:.8f}")
-        print(f"{_ts()} INFO: SELL executed: {sym} qty={qty:.8f}")
-        return px
-    try:
-        order = ex.create_market_sell_order(sym, qty)
-        px2 = float(order.get("average") or px)
-        print(f"{_ts()} INFO: LIVE SELL executed: {sym} qty={qty:.8f} avg~{px2}")
-        return px2
-    except Exception as e:
-        print(f"{_ts()} ERROR: SELL failed: {e}")
-        return px
-
-# ---------- POSITION
-
-class Position:
-    def __init__(self, sym: str, qty: float, entry: float, tp: float, sl: float, trail: float):
-        self.symbol, self.qty, self.entry = sym, qty, entry
-        self.high = entry
-        self.tp_pct, self.sl_pct, self.trail_pct = tp, sl, trail
-        self.ts = _utcnow().isoformat()
-
-    @staticmethod
-    def from_d(d: Dict[str, Any]) -> "Position":
-        p = Position(d["symbol"], float(d["qty"]), float(d["entry"]),
-                     float(d["tp_pct"]), float(d["sl_pct"]), float(d["trail_pct"]))
-        p.high = float(d.get("high", p.entry)); p.ts = d.get("ts", p.ts); return p
-
-    def to_d(self) -> Dict[str, Any]:
-        return {"symbol": self.symbol, "qty": self.qty, "entry": self.entry,
-                "high": self.high, "tp_pct": self.tp_pct, "sl_pct": self.sl_pct,
-                "trail_pct": self.trail_pct, "ts": self.ts}
-
-    def check_exits(self, price: float) -> Optional[str]:
-        if price > self.high: self.high = price
-        change = (price - self.entry) / self.entry * 100.0
-        trail_stop = self.high * (1.0 - self.trail_pct/100.0)
-        if change <= -EMERGENCY_SL_PCT:   return f"EMERGENCY_SL {EMERGENCY_SL_PCT:.2f}%"
-        if change >= self.tp_pct:         return f"TAKE_PROFIT hit at {self.tp_pct:.2f}%"
-        if change <= -self.sl_pct:        return f"STOP_LOSS hit at {self.sl_pct:.2f}%"
-        if price <= trail_stop and self.high > self.entry:
-            fall = (price - self.high)/self.high * 100.0
-            return f"TRAIL_STOP hit at {abs(fall):.2f}% from high"
-        return None
-
-# ---------- MAIN
-
-def main():
-    print("=========================================================")
-    print("🚧 DRY RUN — NO REAL ORDERS SENT 🚧" if DRY_RUN else "⚠️ LIVE MODE — REAL ORDERS ENABLED ⚠️")
-    print("=========================================================")
-
-    if RUN_SWITCH == "OFF":
-        print(f"{_ts()} WARN: RUN_SWITCH=OFF — exiting early."); return
-
-    ex = _get_exchange()
-    print(f"{_ts()} INFO: Starting trader in CRYPTO mode. Dry run={DRY_RUN}. Broker=ccxt")
-    print(f"{_ts()} INFO: Using crypto broker class: CryptoBroker")
-
-    # Balance (keys may be used in DRY RUN; fall back to simulated)
-    try:
-        usd = _usd_balance(ex)
-        print(f"{_ts()} INFO: [ccxt] USD balance detected: ${usd:.2f}")
-    except Exception as e:
-        if DRY_RUN:
-            usd = SIM_USD_BALANCE
-            print(f"{_ts()} WARN: DRY RUN balance fetch failed ({e}). Simulating USD balance: ${usd:.2f}")
-        else:
-            usd = 0.0
-            print(f"{_ts()} ERROR: Balance fetch failed: {e}")
-    print(f"{_ts()} INFO: Balance via get_balance: ${usd:.2f}")
-    print(f"{_ts()} INFO: Available balance: ${usd:.2f}")
-
-    # State
-    day = _load_day_state(usd)
-    positions = [Position.from_d(p) for p in _load_positions()]
-    cooldown = _load_cooldown()
-
-    # Rank universe
-    scored = [(s, _momentum_score(ex, s, tf="15m", lookback=12)) for s in UNIVERSE]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    ranked = [s for s,_ in scored]
-    print(f"{_ts()} INFO: Universe: {ranked}")
-
-    # Exits for open positions
-    realized_pnl = 0.0
-    keep: List[Position] = []
-    for pos in positions:
-        px = _last_price(ex, pos.symbol) or pos.entry
-        reason = pos.check_exits(px)
-        if reason:
-            print(f"{_ts()} INFO: {reason}")
-            sell_px = _market_sell(ex, pos.symbol, pos.qty)
-            realized_pnl += (sell_px - pos.entry) * pos.qty
-            _set_cooldown(pos.symbol)
-        else:
-            keep.append(pos)
-    positions = keep
-
-    # Update day PnL
-    day["pnl_today"] = round(float(day.get("pnl_today", 0.0)) + realized_pnl, 2)
-    _save_json(DAY_FILE, day)
-
-    # Guards
-    guards = {"reserve": False, "daily_cap": False, "cooldown": False, "max_entries": False, "paused": False}
-
-    if _load_json(PAUSE_FILE, {}).get("date") == _utcnow().date().isoformat():
-        guards["paused"] = True
-
-    start_cash = float(day.get("start_cash", usd)) or usd
-    cap_usd = DAILY_LOSS_CAP_USD
-    cap_pct_usd = start_cash * (DAILY_LOSS_CAP_PCT/100.0)
-    hard_cap = -min(cap_usd, cap_pct_usd)
-
-    if hard_cap < 0 and day["pnl_today"] <= hard_cap and not guards["paused"]:
-        print(f"{_ts()} WARN: Guard DAILY_LOSS_CAP reached ({day['pnl_today']:.2f} ≤ {hard_cap:.2f}). Pausing buys for the day.")
-        _save_json(PAUSE_FILE, {"date": _utcnow().date().isoformat(), "reason": "DAILY_LOSS_CAP"})
-        guards["daily_cap"] = True; guards["paused"] = True
-
-    # Candidates
-    held = {p.symbol for p in positions}
-    now_ts = _utcnow().timestamp()
-    candidates = [s for s in ranked if s not in held and _load_json(COOLDOWN_FILE, {}).get(s, 0) <= now_ts]
-
-    cap_left = max(0, MAX_POSITIONS - len(positions))
-    if guards["paused"]:
-        pass
-    elif day.get("entries_today", 0) >= MAX_ENTRIES_PER_DAY:
-        print(f"{_ts()} WARN: Guard MAX_ENTRIES_PER_DAY hit ({day['entries_today']}/{MAX_ENTRIES_PER_DAY}).")
-        guards["max_entries"] = True
-    elif usd - RESERVE_USD < USD_PER_TRADE:
-        print(f"{_ts()} WARN: Guard RESERVE_USD active (reserve ${RESERVE_USD:.2f}). Skipping buys.")
-        guards["reserve"] = True
-    elif cap_left <= 0:
-        print(f"{_ts()} INFO: Capacity full (open={len(positions)}/{MAX_POSITIONS}). No buys this run.")
-    elif not candidates:
-        print(f"{_ts()} INFO: No candidates (cooldown/held filtered). No buys this run.")
-        guards["cooldown"] = True
+        print(f"SIM {side.upper()} {symbol} qty={qty} @ {price:.2f}")
+        return {"id": f"sim-{int(time.time()*1000)}", "symbol": symbol, "side": side, "price": price, "filled": qty}
     else:
-        k = min(TOPK, len(candidates))
-        top = candidates[:k]
-        if PICK_MODE == "rotate":
-            rot = _load_json(ROTATE_FILE, {"idx": 0}); idx = rot.get("idx", 0) % k
-            pick = top[idx]; rot["idx"] = (idx + 1) % k; _save_json(ROTATE_FILE, rot)
-        else:
-            random.seed(_utcnow().strftime("%Y%m%d%H"))
-            pick = random.choice(top)
-        px, qty = _market_buy(ex, pick, USD_PER_TRADE)
-        if qty > 0 and px > 0:
-            positions.append(Position(pick, qty, px, TP_PCT, SL_PCT, TRAIL_PCT))
-            day["entries_today"] = int(day.get("entries_today", 0)) + 1
-            _save_json(DAY_FILE, day)
+        # live market order (be careful!)
+        try:
+            if side == "buy":
+                o = ex.create_market_buy_order(symbol, qty)
+            else:
+                o = ex.create_market_sell_order(symbol, qty)
+            return o
+        except Exception as e:
+            print(f"[ERROR] live order failed: {e}")
+            raise
 
-    _save_positions([p.to_d() for p in positions])
+# --------------------- MAIN LOOP (one pass) --------------------- #
+def main():
+    ensure_state()
+    ex = make_exchange()
 
-    guards_str = json.dumps(guards, separators=(",", ":"))
-    cap_left = max(0, MAX_POSITIONS - len(positions))
-    print(f"{_ts()} INFO: KPI SUMMARY | dry_run={DRY_RUN} | open={len(positions)} | cap_left={cap_left} | usd=${usd:.2f} | pnl_today=${day['pnl_today']:.2f} | entries_today={day.get('entries_today',0)} | guards={guards_str}")
-    _append_history({"ts": _utcnow().isoformat(), "dry_run": DRY_RUN, "open": len(positions),
-                     "cap_left": cap_left, "usd": usd, "pnl_today": day["pnl_today"],
-                     "entries_today": day.get("entries_today", 0), "guards": guards_str})
+    if DRY_RUN:
+        print("🚧 DRY RUN — NO REAL ORDERS SENT 🚧")
+
+    print(f"broker={EXCHANGE_ID} quote={QUOTE} whitelist={','.join(WHITELIST)} topk={TOP_K}")
+
+    universe = [s for s in pick_universe(ex) if quote_filter(s)]
+    positions = load_positions()
+    cooldown = load_cooldown()
+
+    # --- exits first ---
+    exits = 0; entries = 0; pnl = 0.0
+    for sym, pos in list(positions.items()):
+        if sym not in universe:
+            print(f"[WARN] dropping unknown symbol from positions: {sym}")
+            del positions[sym]; continue
+
+        price = market_price(ex, sym)
+        # trailing logic
+        arm_trailing(pos, price)
+        trail_exit = update_trailing(pos, price)
+        tp = should_take_profit(pos, price)
+        sl = should_stop_loss(pos, price)
+        reason = None
+        if trail_exit: reason = "TRAIL"
+        elif tp: reason = "TP"
+        elif sl: reason = "SL"
+
+        if reason:
+            qty = float(pos["qty"])
+            o = place_order_or_sim(ex, "sell", sym, qty, price)
+            pnl += (price - pos["entry"]) * qty
+            exits += 1
+            cooldown[sym] = time.time()
+            print(f"EXIT {sym} via {reason}: qty={qty} @ {price:.2f} PnL={(price-pos['entry'])*qty:.2f}")
+            del positions[sym]
+
+    # --- entries: scan momentum, avoid cooldown, respect caps ---
+    # crude daily entry throttle
+    day = load_json(DAY_STATE, {})
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    if day.get("date") != today:
+        day = {"date": today, "entries": 0}
+    remaining_entries = max(0, MAX_DAILY_ENTRIES - int(day.get("entries", 0)))
+
+    picks = [s for s,_ in scan_topk(ex, universe)]
+    for sym in picks:
+        if remaining_entries <= 0: break
+        if sym in positions: continue
+        if in_cooldown(sym, cooldown): 
+            print(f"SKIP {sym} (cooldown)")
+            continue
+
+        price = market_price(ex, sym)
+        if DOLLARS_PER_TRADE < MIN_NOTIONAL:
+            print(f"[WARN] notional ${DOLLARS_PER_TRADE:.2f} < MIN_NOTIONAL ${MIN_NOTIONAL:.2f}; skipping entries")
+            break
+        qty = est_qty(DOLLARS_PER_TRADE, price)
+        if qty <= 0: 
+            print(f"[WARN] zero qty for {sym} @ {price}")
+            continue
+
+        place_order_or_sim(ex, "buy", sym, qty, price)
+        positions[sym] = {
+            "entry": price,
+            "qty": qty,
+            "ts": now_utc_iso(),
+            "trail_armed": False,
+            "trail_peak": price
+        }
+        entries += 1
+        remaining_entries -= 1
+        day["entries"] = int(day.get("entries", 0)) + 1
+
+    # persist
+    save_positions(positions)
+    save_cooldown(cooldown)
+    save_json(DAY_STATE, day)
+
+    # KPI
+    kpi = {
+        "ts": now_utc_iso(),
+        "mode": "DRY" if DRY_RUN else "LIVE",
+        "universe": ",".join(universe),
+        "topk": len(picks),
+        "entries": entries,
+        "exits": exits,
+        "pnl": round(pnl, 2),
+        "cash_est": ""  # could fetch balances if authenticated
+    }
+    kpi_append(kpi)
+
+    # summary
+    green = "\033[92m"; yellow="\033[93m"; red="\033[91m"; reset="\033[0m"
+    color = green if pnl > 0 or (entries>0 and exits==0) else (yellow if pnl==0 else red)
+    print(color + f"KPI SUMMARY | mode={kpi['mode']} entries={entries} exits={exits} pnl={pnl:.2f} topk={kpi['topk']}" + reset)
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"{_ts()} ERROR: Unhandled exception: {e}")
+        print(f"\n[ERROR] Unhandled: {e}")
         raise
