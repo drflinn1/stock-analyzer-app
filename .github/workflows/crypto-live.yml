@@ -1,4 +1,4 @@
-name: Crypto Live - every 15m
+name: Crypto Live — every 15m
 
 on:
   workflow_dispatch:
@@ -34,10 +34,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt pandas numpy python-dateutil pytz requests
 
-      # Runs the root entry point (python main.py), which you said maps to stock-analyzer-app/main.py
       - name: Run trader
         env:
-          DRY_RUN: ${{ vars.DRY_RUN || 'true' }}   # keep 'true' for paper/sim
+          DRY_RUN: ${{ vars.DRY_RUN || 'true' }}
           EXCHANGE_ID: ${{ vars.EXCHANGE_ID || 'kraken' }}
           CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
           CCXT_API_SECRET: ${{ secrets.CCXT_API_SECRET }}
@@ -46,14 +45,12 @@ jobs:
         run: |
           python main.py
 
-      # Optional: show the last KPI line for quick confirmation
       - name: KPI tail (last line)
         if: always()
         run: |
           echo "---- KPI SUMMARY (tail of kpi_history.csv) ----"
           tail -n 1 .state/kpi_history.csv || true
 
-      # Debug listing of everything in .state so you can see files each run
       - name: Debug .state contents
         if: always()
         run: |
@@ -66,7 +63,6 @@ jobs:
           echo "----- day_state.json -----"
           cat .state/day_state.json || true
 
-      # IMPORTANT: upload the .state folder as an artifact with explicit globs
       - name: Save state (upload .state)
         if: always()
         uses: actions/upload-artifact@v4
