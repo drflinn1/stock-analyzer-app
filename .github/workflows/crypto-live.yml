@@ -10,24 +10,23 @@ jobs:
   trade:
     runs-on: ubuntu-latest
     env:
-      # --- Core bot env (example — keep your real values/whitelist as you have them) ---
+      # --- Core bot env (adjust to your liking) ---
       EXCHANGE: kraken
-      DRY_RUN: "true"            # <— trading bot dry-run (set false when you go live)
-      UNIVERSE_MODE: "auto"      # auto-pick top-K
+      DRY_RUN: "true"                  # set "false" when you go live
+      UNIVERSE_MODE: "auto"
       TOP_K: "4"
       QUOTE_CCY: "USD"
       DAILY_LOSS_CAP_PCT: "3"
       MAX_DAILY_ENTRIES: "3"
       RESERVE_USD: "100"
-      # ... your other existing ENV knobs ...
 
       # --- Dust Sweeper knobs ---
-      SWEEP_ENABLE: "true"       # quick on/off for the step
-      SWEEP_DRY_RUN: "true"      # <— flip to "false" to actually clean dust
-      SWEEP_MIN_NOTIONAL_USD: "1.00"  # ignore balances smaller than this
-      SWEEP_WHITELIST: "BTC,ETH,SOL,DOGE,USD,USDT,USDC"  # symbols to KEEP (not sold)
+      SWEEP_ENABLE: "true"
+      SWEEP_DRY_RUN: "true"            # flip to "false" to actually sell dust
+      SWEEP_MIN_NOTIONAL_USD: "1.00"
+      SWEEP_WHITELIST: "BTC,ETH,SOL,DOGE,USD,USDT,USDC"
 
-      # Keys must already be set in repo/environment secrets
+      # Keys (already in repo secrets)
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
@@ -47,13 +46,12 @@ jobs:
 
       - name: Run Crypto Bot
         run: |
-          echo "Starting Crypto Bot…"
+          echo "Starting Crypto Bot..."
           python - <<'PY'
 import os, sys, time
 print("🚧 DRY RUN — NO REAL ORDERS SENT 🚧" if os.getenv("DRY_RUN","true").lower()=="true" else "🟢 LIVE TRADING")
-# This is a placeholder runner — replace with your repo's actual entrypoint, e.g.:
-#   python -m trader.main
-# Keeping a simple stub so the workflow is copy/paste-safe.
+# NOTE: replace this stub with your real entrypoint, e.g.:
+#   import trader.main as app; app.main()
 time.sleep(2)
 print("KPI: +0.00%  (stub)")
 PY
@@ -70,14 +68,14 @@ PY
         run: |
           echo "Dust Sweeper (dry-run=${SWEEP_DRY_RUN})"
           python - <<'PY'
-import os, math
+import os
 import ccxt
 
 def as_bool(v, default=False):
     if v is None: return default
     return str(v).strip().lower() in ("1","true","yes","on")
 
-exchange = ccxt.kraken({
+ex = ccxt.kraken({
     'apiKey': os.getenv('KRAKEN_API_KEY',''),
     'secret': os.getenv('KRAKEN_API_SECRET',''),
 })
@@ -85,48 +83,42 @@ dry_run = as_bool(os.getenv("SWEEP_DRY_RUN","true"), True)
 min_usd = float(os.getenv("SWEEP_MIN_NOTIONAL_USD","1.0"))
 keep = set([s.strip().upper() for s in os.getenv("SWEEP_WHITELIST","").split(",") if s.strip()])
 
-print(f"Connecting to Kraken… dry_run={dry_run}, min_usd={min_usd}, keep={sorted(keep)}")
+print(f"Connecting to Kraken... dry_run={dry_run}, min_usd={min_usd}, keep={sorted(keep)}")
 
-# Fetch balances and tickers for valuation
-bal = exchange.fetch_balance()
-tickers = exchange.load_markets()
+bal = ex.fetch_balance()
+ex.load_markets()
+
+# Build quick USD prices
 prices = {}
-for sym, m in tickers.items():
+for m in ex.markets.values():
     if m.get("quote") == "USD":
+        base = m.get("base", "").upper()
         try:
-            prices[m["base"].upper()] = exchange.fetch_ticker(sym)["last"] or 0.0
+            prices[base] = ex.fetch_ticker(m["symbol"])["last"] or 0.0
         except Exception:
             pass
 
 sells = []
-for asset, info in bal.get("total", {}).items():
-    qty = float(info or 0)
-    if qty <= 0: 
+for asset, qty in (bal.get("total") or {}).items():
+    qty = float(qty or 0)
+    sym = (asset or "").upper()
+    if qty <= 0 or not sym: 
         continue
-    sym = asset.upper()
-
-    # Always skip whitelisted assets
     if sym in keep:
         continue
 
-    # Value in USD if we can price it
     px = prices.get(sym, 0.0)
     notional = qty * px if px > 0 else 0.0
-
-    # If no USD price known, consider it dust anyway (user will see logs)
     if px == 0.0:
-        print(f"[?] No USD price for {sym}; qty={qty}. Treating as potential dust.")
+        print(f"[?] No USD price for {sym}; qty={qty}. Considering as potential dust.")
 
-    # Decide if this is dust
     if notional < min_usd:
-        # attempt to find a market to sell into USD
-        market = f"{sym}/USD" if f"{sym}/USD" in exchange.markets else None
-        if not market:
-            # try USDT or USDC as fallback if USD not present
-            for q in ("USDT","USDC"):
-                if f"{sym}/{q}" in exchange.markets:
-                    market = f"{sym}/{q}"
-                    break
+        market = None
+        for q in ("USD","USDT","USDC"):
+            pair = f"{sym}/{q}"
+            if pair in ex.markets:
+                market = pair
+                break
         if market:
             sells.append((sym, qty, market, notional))
         else:
@@ -144,7 +136,7 @@ else:
         for sym, qty, market, _ in sells:
             try:
                 print(f"Submitting market sell: {market} size={qty}")
-                exchange.create_order(market, 'market', 'sell', qty)
+                ex.create_order(market, 'market', 'sell', qty)
             except Exception as e:
                 print(f"[error] Sell {market} size={qty}: {e}")
 PY
