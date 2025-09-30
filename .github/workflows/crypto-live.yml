@@ -99,18 +99,27 @@ jobs:
           MAX_ENTRIES_PER_DAY:  "6"
           COOLDOWN_MIN:         "120"
           PICK_MODE:            "random"
-          # Kraken keys used only when DRY_RUN=false (but main.py can read them even in dry for balances)
+          # Kraken keys (used when DRY_RUN=false; main.py can still read them in dry for balance)
           KRAKEN_API_KEY:       ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET:    ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           mkdir -p .state
           python main.py
 
-      # ⬇️ NEW: upload .state as an artifact so you can download history from each run
+      # Debug what's in .state, then upload it (history only)
+      - name: Debug .state contents
+        if: always()
+        run: |
+          echo "pwd: $(pwd)"; ls -la
+          echo "--- .state ---"; ls -la .state || echo "no .state dir"
+
       - name: Save state (.state folder)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
-          path: .state/**
+          path: |
+            .state
+            .state/**
+          if-no-files-found: ignore
           retention-days: 14
