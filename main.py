@@ -1,4 +1,4 @@
-# main.py — Crypto Live with Guard Pack (fixed DRY-RUN balance + daily-cap edge case)
+# main.py — Crypto Live with Guard Pack (writes .state, dry-run balance okay)
 from __future__ import annotations
 import os, json, random, csv
 from datetime import datetime, timezone, timedelta
@@ -60,6 +60,9 @@ USD_KEYS  = ("USD", "ZUSD")
 UNIVERSE  = ["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD"]
 
 os.makedirs(STATE_DIR, exist_ok=True)
+# ensure folder is non-empty so the artifact step always has something to grab
+with open(os.path.join(STATE_DIR, ".keep"), "w", encoding="utf-8") as _f:
+    _f.write("state\n")
 
 # ---------- UTIL
 
@@ -238,7 +241,7 @@ def main():
     print(f"{_ts()} INFO: Starting trader in CRYPTO mode. Dry run={DRY_RUN}. Broker=ccxt")
     print(f"{_ts()} INFO: Using crypto broker class: CryptoBroker")
 
-    # Balance (use keys in DRY RUN; fallback to simulated if missing)
+    # Balance (keys may be used in DRY RUN; fall back to simulated)
     try:
         usd = _usd_balance(ex)
         print(f"{_ts()} INFO: [ccxt] USD balance detected: ${usd:.2f}")
@@ -263,7 +266,7 @@ def main():
     ranked = [s for s,_ in scored]
     print(f"{_ts()} INFO: Universe: {ranked}")
 
-    # Exits
+    # Exits for open positions
     realized_pnl = 0.0
     keep: List[Position] = []
     for pos in positions:
@@ -293,7 +296,6 @@ def main():
     cap_pct_usd = start_cash * (DAILY_LOSS_CAP_PCT/100.0)
     hard_cap = -min(cap_usd, cap_pct_usd)
 
-    # Only trip daily-cap if it's actually negative (avoid -0.00 edge)
     if hard_cap < 0 and day["pnl_today"] <= hard_cap and not guards["paused"]:
         print(f"{_ts()} WARN: Guard DAILY_LOSS_CAP reached ({day['pnl_today']:.2f} ≤ {hard_cap:.2f}). Pausing buys for the day.")
         _save_json(PAUSE_FILE, {"date": _utcnow().date().isoformat(), "reason": "DAILY_LOSS_CAP"})
