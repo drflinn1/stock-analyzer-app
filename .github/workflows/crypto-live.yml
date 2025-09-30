@@ -46,19 +46,8 @@ jobs:
       - name: Run Crypto Bot
         shell: bash
         run: |
-          echo "Starting Crypto Bot..."
-          printf '%s\n' \
-            'import os, time' \
-            'if os.getenv("DRY_RUN","true").lower()=="true":' \
-            '    print("DRY RUN - NO REAL ORDERS SENT")' \
-            'else:' \
-            '    print("LIVE TRADING")' \
-            '# NOTE: replace this stub with your real entrypoint, e.g.:' \
-            '#   import trader.main as app; app.main()' \
-            'time.sleep(2)' \
-            'print("KPI: +0.00%  (stub)")' \
-            > run_bot.py
-          python run_bot.py
+          echo "Starting Crypto Bot (python -m trader.main)..."
+          python -m trader.main
 
       - name: KPI Artifact (optional)
         run: |
