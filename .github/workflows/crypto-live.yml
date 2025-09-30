@@ -27,13 +27,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt pandas
 
+      # ---- YOUR ENGINE (unchanged) ----
       - name: Run Crypto Engine
         env:
           EXCHANGE_ID: kraken
           CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
           CCXT_API_SECRET: ${{ secrets.CCXT_API_SECRET }}
           CCXT_API_PASSWORD: ${{ secrets.CCXT_API_PASSWORD }}
-          DRY_RUN: "true"
+          DRY_RUN: "true"     # set to "false" when you want to place real orders
         run: |
           python - << 'PY'
           import importlib
@@ -45,14 +46,14 @@ jobs:
             mod.main()
           PY
 
-      # === KPI log helper that prints RISK SIGNAL ===
+      # ---- KPI helper: prints RISK SIGNAL banner ----
       - name: Risk Signal (log only)
         env:
           EXCHANGE_ID: kraken
         run: |
           python -m trader.risk_signal
 
-      # === NEW: After-run snapshot (positions + recent trades) ===
+      # ---- After-run snapshot (balances, open positions, recent trades) ----
       - name: After-Run Snapshot (positions + recent trades)
         env:
           EXCHANGE_ID: kraken
@@ -61,3 +62,16 @@ jobs:
           CCXT_API_PASSWORD: ${{ secrets.CCXT_API_PASSWORD }}
         run: |
           python -m trader.afterrun_snapshot
+
+      # ---- NEW: Dust Sweeper (auto-sell tiny non-whitelist leftovers) ----
+      - name: Dust Sweeper (sell tiny non-whitelist balances)
+        env:
+          EXCHANGE_ID: kraken
+          DRY_RUN: "true"              # leave "true" for now; flip to "false" to actually sell
+          DUST_MAX_USD: "5"            # sell if est value < $5
+          WHITELIST: "BTC,ETH,SOL,DOGE"
+          CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
+          CCXT_API_SECRET: ${{ secrets.CCXT_API_SECRET }}
+          CCXT_API_PASSWORD: ${{ secrets.CCXT_API_PASSWORD }}
+        run: |
+          python -m trader.dust_sweeper
