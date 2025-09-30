@@ -1,4 +1,4 @@
-name: Crypto Live (Every 15 min — Guarded)
+name: Crypto Live (Every 15 min - Guarded)
 
 on:
   schedule:
@@ -47,17 +47,17 @@ jobs:
         shell: bash
         run: |
           echo "Starting Crypto Bot..."
-          cat > run_bot.py << 'PY'
+          cat > run_bot.py <<EOF
 import os, time
 if os.getenv("DRY_RUN","true").lower()=="true":
-    print("DRY RUN — NO REAL ORDERS SENT")
+    print("DRY RUN - NO REAL ORDERS SENT")
 else:
     print("LIVE TRADING")
 # NOTE: replace this stub with your real entrypoint, e.g.:
 #   import trader.main as app; app.main()
 time.sleep(2)
 print("KPI: +0.00%  (stub)")
-PY
+EOF
           python run_bot.py
 
       - name: KPI Artifact (optional)
@@ -72,7 +72,7 @@ PY
         shell: bash
         run: |
           echo "Dust Sweeper (dry-run=${SWEEP_DRY_RUN})"
-          cat > sweep.py << 'PY'
+          cat > sweep.py <<EOF
 import os
 import ccxt
 
@@ -147,7 +147,7 @@ else:
                 ex.create_order(market, 'market', 'sell', qty)
             except Exception as e:
                 print(f"[error] Sell {market} size={qty}: {e}")
-PY
+EOF
           python sweep.py
 
       - name: Done
