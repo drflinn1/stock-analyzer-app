@@ -1,125 +1,80 @@
-name: Crypto Live (Every 15m — USD only + TP/SL/Trail + Guards)
+name: Crypto Live
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"
   workflow_dispatch:
-    inputs:
-      RUN_SWITCH:
-        description: "ON to allow run, OFF to skip"
-        type: choice
-        required: true
-        default: "ON"
-        options: ["ON","OFF"]
-      DRY_RUN:
-        description: "true = paper (simulated), false = live"
-        type: choice
-        required: true
-        default: "true"
-        options: ["true","false"]
-      USD_PER_TRADE:
-        description: "USD size per buy"
-        required: true
-        default: "10"
-      MAX_POSITIONS:
-        description: "Max concurrent positions"
-        required: true
-        default: "3"
-      TP_PCT:
-        description: "Take-profit %"
-        required: true
-        default: "3.5"
-      SL_PCT:
-        description: "Stop-loss %"
-        required: true
-        default: "2.0"
-      TRAIL_PCT:
-        description: "Trailing-stop distance %"
-        required: true
-        default: "1.2"
-      RESERVE_USD:
-        description: "Keep at least this much cash"
-        required: true
-        default: "100"
-      DAILY_LOSS_CAP_USD:
-        description: "Pause buys if P/L ≤ -X USD"
-        required: true
-        default: "5"
-      TOPK:
-        description: "Pick from top K ranked"
-        required: true
-        default: "3"
+  schedule:
+    # runs every 15 minutes (UTC)
+    - cron: "*/15 * * * *"
 
 permissions:
   contents: read
 
+concurrency:
+  group: crypto-live-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  trade:
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.RUN_SWITCH == 'ON') || github.event_name != 'workflow_dispatch' }}
+  run:
+    name: Run Crypto Bot
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     steps:
-      - name: Check RUN switch (scheduled)
-        if: ${{ github.event_name != 'workflow_dispatch' }}
-        run: |
-          if [ "${{ env.RUN_SWITCH_SCHEDULED }}" = "OFF" ]; then
-            echo "RUN switch OFF for scheduled run — exiting." && exit 0
-          fi
-        env:
-          RUN_SWITCH_SCHEDULED: ON  # set to OFF to pause the cron without disabling it
-
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ccxt
+          pip install ccxt pandas numpy python-dateutil pytz requests
 
+      # Runs the root entry point (python main.py), which you said maps to stock-analyzer-app/main.py
       - name: Run trader
         env:
-          RUN_SWITCH:           ${{ github.event.inputs.RUN_SWITCH           || 'ON'     }}
-          DRY_RUN:              ${{ github.event.inputs.DRY_RUN              || 'true'   }}
-          USD_PER_TRADE:        ${{ github.event.inputs.USD_PER_TRADE        || '10'     }}
-          MAX_POSITIONS:        ${{ github.event.inputs.MAX_POSITIONS        || '3'      }}
-          TP_PCT:               ${{ github.event.inputs.TP_PCT               || '3.5'    }}
-          SL_PCT:               ${{ github.event.inputs.SL_PCT               || '2.0'    }}
-          TRAIL_PCT:            ${{ github.event.inputs.TRAIL_PCT            || '1.2'    }}
-          RESERVE_USD:          ${{ github.event.inputs.RESERVE_USD          || '100'    }}
-          DAILY_LOSS_CAP_USD:   ${{ github.event.inputs.DAILY_LOSS_CAP_USD   || '5'      }}
-          TOPK:                 ${{ github.event.inputs.TOPK                 || '3'      }}
-          # --- hard defaults (edit here if you want) ---
-          DAILY_LOSS_CAP_PCT:   "2"
-          MAX_ENTRIES_PER_DAY:  "6"
-          COOLDOWN_MIN:         "120"
-          PICK_MODE:            "random"
-          # Kraken keys (used when DRY_RUN=false; main.py can still read them in dry for balance)
-          KRAKEN_API_KEY:       ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET:    ${{ secrets.KRAKEN_API_SECRET }}
+          DRY_RUN: ${{ vars.DRY_RUN || 'true' }}   # keep 'true' for paper/sim
+          EXCHANGE_ID: ${{ vars.EXCHANGE_ID || 'kraken' }}
+          CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
+          CCXT_API_SECRET: ${{ secrets.CCXT_API_SECRET }}
+          CCXT_API_PASSWORD: ${{ secrets.CCXT_API_PASSWORD }}
+          LOG_LEVEL: INFO
         run: |
-          mkdir -p .state
           python main.py
 
-      # Debug what's in .state, then upload it (history only)
+      # Optional: show the last KPI line for quick confirmation
+      - name: KPI tail (last line)
+        if: always()
+        run: |
+          echo "---- KPI SUMMARY (tail of kpi_history.csv) ----"
+          tail -n 1 .state/kpi_history.csv || true
+
+      # Debug listing of everything in .state so you can see files each run
       - name: Debug .state contents
         if: always()
         run: |
-          echo "pwd: $(pwd)"; ls -la
-          echo "--- .state ---"; ls -la .state || echo "no .state dir"
+          echo "ls -la .state"
+          ls -la .state || true
+          echo "tree -a .state"
+          sudo apt-get update >/dev/null 2>&1 || true
+          sudo apt-get install -y tree >/dev/null 2>&1 || true
+          tree -a .state || true
+          echo "----- day_state.json -----"
+          cat .state/day_state.json || true
 
-      - name: Save state (.state folder)
+      # IMPORTANT: upload the .state folder as an artifact with explicit globs
+      - name: Save state (upload .state)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
           path: |
-            .state
             .state/**
-          if-no-files-found: ignore
-          retention-days: 14
+            .state/*
+            .state
+          if-no-files-found: warn
+          retention-days: 7
