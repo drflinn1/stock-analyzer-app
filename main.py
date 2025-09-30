@@ -104,7 +104,6 @@ def _get_exchange():
 def _usd_balance(ex) -> float:
     bal = ex.fetch_balance({})
     total = 0.0
-    # prefer bal["total"] if present, else flat keys
     total_d = bal.get("total", {})
     for k in USD_KEYS:
         if k in total_d:
