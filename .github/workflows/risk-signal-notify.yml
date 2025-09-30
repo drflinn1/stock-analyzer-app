@@ -1,0 +1,88 @@
+name: Risk Signal — Daily Notifier
+
+on:
+  schedule:
+    # 14:00 UTC ~ 7:00 AM PT. Adjust if you want.
+    - cron: "0 14 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to commit the last-signal file
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt
+
+      # Print the banner for your logs (same as the 15m job)
+      - name: Risk Signal (banner)
+        env:
+          EXCHANGE_ID: kraken
+        run: |
+          python -m trader.risk_signal
+
+      # Compare with last stored signal and mark flip
+      - name: Detect flip and write state
+        id: flip
+        shell: bash
+        env:
+          EXCHANGE_ID: kraken
+        run: |
+          python - << 'PY'
+          from pathlib import Path
+          from trader.risk_signal import risk_signal
+          state_path = Path(".state/last_risk_signal.txt")
+          state_path.parent.mkdir(parents=True, exist_ok=True)
+
+          signal, info = risk_signal()
+          prev = state_path.read_text().strip() if state_path.exists() else "UNKNOWN"
+          flip = (prev != signal)
+          print(f"Prev={prev} -> Now={signal} | FLIP={flip}")
+          # write current
+          state_path.write_text(signal)
+          # drop a marker file if flipped
+          if flip:
+              Path(".state/.flip_marker").write_text(f"{prev}->{signal}")
+          PY
+
+          if [ -f ".state/.flip_marker" ]; then
+            echo "flip=true" >> $GITHUB_OUTPUT
+            echo "flip_message=$(cat .state/.flip_marker)" >> $GITHUB_OUTPUT
+          else
+            echo "flip=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Commit the updated last-signal (so next day we can compare properly)
+      - name: Commit last signal
+        if: steps.flip.outputs.flip == 'true'
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add .state/last_risk_signal.txt
+          git commit -m "Risk Signal flip: ${{ steps.flip.outputs.flip_message }}"
+          git push
+
+      # Force a FAILURE on flip so GitHub emails you (same channel as run-failed)
+      - name: Send email via failure
+        if: steps.flip.outputs.flip == 'true'
+        run: |
+          echo "::error::Risk Signal FLIP ${ { steps.flip.outputs.flip_message } }"
+          exit 1
+
+      - name: No flip (success)
+        if: steps.flip.outputs.flip != 'true'
+        run: echo "No flip detected. Exiting successfully."
