@@ -1,4 +1,4 @@
-name: Crypto Live
+name: Crypto Live - every 15m
 
 on:
   workflow_dispatch:
