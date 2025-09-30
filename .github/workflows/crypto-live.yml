@@ -9,9 +9,9 @@ jobs:
   trade:
     runs-on: ubuntu-latest
     env:
-      # --- Core bot env (adjust to your liking) ---
+      # --- Core bot env (adjust as needed) ---
       EXCHANGE: kraken
-      DRY_RUN: "true"                  # set "false" when you go live
+      DRY_RUN: "true"                 # set "false" when you go live
       UNIVERSE_MODE: "auto"
       TOP_K: "4"
       QUOTE_CCY: "USD"
@@ -21,11 +21,11 @@ jobs:
 
       # --- Dust Sweeper knobs ---
       SWEEP_ENABLE: "true"
-      SWEEP_DRY_RUN: "true"            # flip to "false" to actually sell dust
+      SWEEP_DRY_RUN: "true"           # flip to "false" to actually sell dust
       SWEEP_MIN_NOTIONAL_USD: "1.00"
       SWEEP_WHITELIST: "BTC,ETH,SOL,DOGE,USD,USDT,USDC"
 
-      # Keys (already in repo secrets)
+      # Keys (must be present in repo secrets)
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
@@ -72,82 +72,82 @@ jobs:
         shell: bash
         run: |
           echo "Dust Sweeper (dry-run=${SWEEP_DRY_RUN})"
-          cat > sweep.py <<EOF
-import os
-import ccxt
-
-def as_bool(v, default=False):
-    if v is None: return default
-    return str(v).strip().lower() in ("1","true","yes","on")
-
-ex = ccxt.kraken({
-    'apiKey': os.getenv('KRAKEN_API_KEY',''),
-    'secret': os.getenv('KRAKEN_API_SECRET',''),
-})
-dry_run = as_bool(os.getenv("SWEEP_DRY_RUN","true"), True)
-min_usd = float(os.getenv("SWEEP_MIN_NOTIONAL_USD","1.0"))
-keep = set([s.strip().upper() for s in os.getenv("SWEEP_WHITELIST","").split(",") if s.strip()])
-
-print(f"Connecting to Kraken... dry_run={dry_run}, min_usd={min_usd}, keep={sorted(keep)}")
-
-bal = ex.fetch_balance()
-ex.load_markets()
-
-# Build quick USD prices
-prices = {}
-for m in ex.markets.values():
-    if m.get("quote") == "USD":
-        base = (m.get("base") or "").upper()
-        if not base:
-            continue
-        try:
-            t = ex.fetch_ticker(m["symbol"])
-            prices[base] = float(t.get("last") or 0.0)
-        except Exception:
-            pass
-
-sells = []
-for asset, qty in (bal.get("total") or {}).items():
-    qty = float(qty or 0)
-    sym = (asset or "").upper()
-    if qty <= 0 or not sym:
-        continue
-    if sym in keep:
-        continue
-
-    px = prices.get(sym, 0.0)
-    notional = qty * px if px > 0 else 0.0
-    if px == 0.0:
-        print(f"[?] No USD price for {sym}; qty={qty}. Considering as potential dust.")
-
-    if notional < min_usd:
-        market = None
-        for q in ("USD","USDT","USDC"):
-            pair = f"{sym}/{q}"
-            if pair in ex.markets:
-                market = pair
-                break
-        if market:
-            sells.append((sym, qty, market, notional))
-        else:
-            print(f"[skip] No market to exit {sym} to USD/USDT/USDC; leaving as-is.")
-
-if not sells:
-    print("No dust found below threshold.")
-else:
-    print(f"Found {len(sells)} dust positions:")
-    for sym, qty, market, notional in sells:
-        print(f" - {sym}: qty={qty:.8f}, notional~${notional:.2f}, market={market}")
-    if dry_run:
-        print("DRY-RUN: No sell orders will be sent.")
-    else:
-        for sym, qty, market, _ in sells:
-            try:
-                print(f"Submitting market sell: {market} size={qty}")
-                ex.create_order(market, 'market', 'sell', qty)
-            except Exception as e:
-                print(f"[error] Sell {market} size={qty}: {e}")
-EOF
+          printf '%s\n' \
+            'import os' \
+            'import ccxt' \
+            '' \
+            'def as_bool(v, default=False):' \
+            '    if v is None: return default' \
+            '    return str(v).strip().lower() in ("1","true","yes","on")' \
+            '' \
+            'ex = ccxt.kraken({' \
+            "    'apiKey': os.getenv('KRAKEN_API_KEY','')," \
+            "    'secret': os.getenv('KRAKEN_API_SECRET','')," \
+            '})' \
+            'dry_run = as_bool(os.getenv("SWEEP_DRY_RUN","true"), True)' \
+            'min_usd = float(os.getenv("SWEEP_MIN_NOTIONAL_USD","1.0"))' \
+            'keep = set([s.strip().upper() for s in os.getenv("SWEEP_WHITELIST","").split(",") if s.strip()])' \
+            '' \
+            'print(f"Connecting to Kraken... dry_run={dry_run}, min_usd={min_usd}, keep={sorted(keep)}")' \
+            '' \
+            'bal = ex.fetch_balance()' \
+            'ex.load_markets()' \
+            '' \
+            '# Build quick USD prices' \
+            'prices = {}' \
+            'for m in ex.markets.values():' \
+            '    if m.get("quote") == "USD":' \
+            '        base = (m.get("base") or "").upper()' \
+            '        if not base:' \
+            '            continue' \
+            '        try:' \
+            '            t = ex.fetch_ticker(m["symbol"])' \
+            '            prices[base] = float(t.get("last") or 0.0)' \
+            '        except Exception:' \
+            '            pass' \
+            '' \
+            'sells = []' \
+            'for asset, qty in (bal.get("total") or {}).items():' \
+            '    qty = float(qty or 0)' \
+            '    sym = (asset or "").upper()' \
+            '    if qty <= 0 or not sym:' \
+            '        continue' \
+            '    if sym in keep:' \
+            '        continue' \
+            '' \
+            '    px = prices.get(sym, 0.0)' \
+            '    notional = qty * px if px > 0 else 0.0' \
+            '    if px == 0.0:' \
+            '        print(f"[?] No USD price for {sym}; qty={qty}. Considering as potential dust.")' \
+            '' \
+            '    if notional < min_usd:' \
+            '        market = None' \
+            '        for q in ("USD","USDT","USDC"):' \
+            '            pair = f"{sym}/{q}"' \
+            '            if pair in ex.markets:' \
+            '                market = pair' \
+            '                break' \
+            '        if market:' \
+            '            sells.append((sym, qty, market, notional))' \
+            '        else:' \
+            '            print(f"[skip] No market to exit {sym} to USD/USDT/USDC; leaving as-is.")' \
+            '' \
+            'if not sells:' \
+            '    print("No dust found below threshold.")' \
+            'else:' \
+            '    print(f"Found {len(sells)} dust positions:")' \
+            '    for sym, qty, market, notional in sells:' \
+            '        print(f" - {sym}: qty={qty:.8f}, notional~${notional:.2f}, market={market}")' \
+            '    if dry_run:' \
+            '        print("DRY-RUN: No sell orders will be sent.")' \
+            '    else:' \
+            '        for sym, qty, market, _ in sells:' \
+            '            try:' \
+            '                print(f"Submitting market sell: {market} size={qty}")' \
+            "                ex.create_order(market, 'market', 'sell', qty)" \
+            '            except Exception as e:' \
+            '                print(f"[error] Sell {market} size={qty}: {e}")' \
+            > sweep.py
           python sweep.py
 
       - name: Done
