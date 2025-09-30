@@ -46,51 +46,47 @@ jobs:
       - name: Run Crypto Bot
         shell: bash
         run: |
-          echo "Starting Crypto Bot (adaptive launcher)..."
+          echo "Starting Crypto Bot (adaptive launcher v2)..."
           printf '%s\n' \
-            'import os, sys, importlib, traceback' \
+            'import sys, importlib, runpy, pathlib' \
             '' \
             'candidates = [' \
-            "    ('trader.main', 'main')," \
-            "    ('trader.engine', 'main')," \
-            "    ('trader.crypto_engine', 'main')," \
-            "    ('main', 'main')," \
+            "  ('trader.main', 'main')," \
+            "  ('trader.engine', 'main')," \
+            "  ('trader.crypto_engine', 'main')," \
+            "  ('main', 'main')," \
             ']' \
             '' \
-            'def try_run(mod_name, func_name):' \
+            'def run_candidate(mod_name, func_name):' \
             '    try:' \
-            '        mod = importlib.import_module(mod_name)' \
-            '    except ModuleNotFoundError:' \
-            '        print(f"[skip] Module not found: {mod_name}")' \
+            '        spec = importlib.util.find_spec(mod_name)' \
+            '    except Exception:' \
+            '        spec = None' \
+            '    if spec is None:' \
+            '        print(f"[skip] Not found: {mod_name}")' \
             '        return False' \
+            '    print(f"[load] {mod_name}")' \
+            '    mod = importlib.import_module(mod_name)' \
             '    fn = getattr(mod, func_name, None)' \
             '    if callable(fn):' \
-            '        print(f"[go] Launching {mod_name}.{func_name}()")' \
+            '        print(f"[go] {mod_name}.{func_name}()")' \
             '        fn()' \
             '        return True' \
-            '    if hasattr(mod, "run") and callable(getattr(mod, "run")):' \
-            '        print(f"[go] Launching {mod_name}.run()")' \
-            '        mod.run()' \
-            '        return True' \
-            '    print(f"[skip] {mod_name} loaded but no {func_name}() or run() entrypoint")' \
-            '    return False' \
+            '    # Try running module as a script if no main()' \
+            '    print(f"[fallback] running {mod_name} via runpy.run_module")' \
+            '    runpy.run_module(mod_name, run_name="__main__")' \
+            '    return True' \
             '' \
             'ok = False' \
             'for m, f in candidates:' \
-            '    if try_run(m, f):' \
+            '    if run_candidate(m, f):' \
             '        ok = True' \
             '        break' \
             '' \
             'if not ok:' \
-            '    print("[error] No known entrypoint found. Looked for:")' \
-            '    for m, f in candidates:' \
-            '        print(f"  - {m}.{f}()")' \
-            '    try:' \
-            '        import pathlib' \
-            '        for p in pathlib.Path(".").rglob("*.py"):' \
-            '            print("  ", p)' \
-            '    except Exception:' \
-            '        traceback.print_exc()' \
+            '    print("[error] No crypto engine module found. Python files visible:")' \
+            '    for p in pathlib.Path(".").rglob("*.py"):' \
+            '        print("  ", p)' \
             '    sys.exit(1)' \
             > run_bot.py
           python run_bot.py
@@ -108,80 +104,80 @@ jobs:
         run: |
           echo "Dust Sweeper (dry-run=${SWEEP_DRY_RUN})"
           printf '%s\n' \
-            'import os' \
+            'import os, time' \
             'import ccxt' \
             '' \
             'def as_bool(v, default=False):' \
             '    if v is None: return default' \
             '    return str(v).strip().lower() in ("1","true","yes","on")' \
             '' \
+            'print("[1/5] init exchange")' \
             'ex = ccxt.kraken({' \
             "    'apiKey': os.getenv('KRAKEN_API_KEY','')," \
             "    'secret': os.getenv('KRAKEN_API_SECRET','')," \
+            "    'enableRateLimit': True," \
+            "    'timeout': 20000," \
             '})' \
             'dry_run = as_bool(os.getenv("SWEEP_DRY_RUN","true"), True)' \
             'min_usd = float(os.getenv("SWEEP_MIN_NOTIONAL_USD","1.0"))' \
             'keep = set([s.strip().upper() for s in os.getenv("SWEEP_WHITELIST","").split(",") if s.strip()])' \
+            'print(f"keep={sorted(keep)}  min_usd={min_usd}  dry_run={dry_run}")' \
             '' \
-            'print(f"Connecting to Kraken... dry_run={dry_run}, min_usd={min_usd}, keep={sorted(keep)}")' \
-            '' \
+            'print("[2/5] fetch balance")' \
             'bal = ex.fetch_balance()' \
+            '' \
+            'print("[3/5] load markets")' \
             'ex.load_markets()' \
             '' \
-            '# Build quick USD prices' \
+            'print("[4/5] build USD prices")' \
             'prices = {}' \
             'for m in ex.markets.values():' \
             '    if m.get("quote") == "USD":' \
             '        base = (m.get("base") or "").upper()' \
-            '        if not base:' \
-            '            continue' \
+            '        if not base: continue' \
             '        try:' \
             '            t = ex.fetch_ticker(m["symbol"])' \
             '            prices[base] = float(t.get("last") or 0.0)' \
             '        except Exception:' \
             '            pass' \
             '' \
+            'print("[5/5] scan balances")' \
             'sells = []' \
             'for asset, qty in (bal.get("total") or {}).items():' \
             '    qty = float(qty or 0)' \
             '    sym = (asset or "").upper()' \
-            '    if qty <= 0 or not sym:' \
-            '        continue' \
-            '    if sym in keep:' \
-            '        continue' \
-            '' \
+            '    if qty <= 0 or not sym: continue' \
+            '    if sym in keep: continue' \
             '    px = prices.get(sym, 0.0)' \
             '    notional = qty * px if px > 0 else 0.0' \
             '    if px == 0.0:' \
-            '        print(f"[?] No USD price for {sym}; qty={qty}. Considering as potential dust.")' \
-            '' \
+            '        print(f"[?] No USD price for {sym}; qty={qty}")' \
             '    if notional < min_usd:' \
             '        market = None' \
             '        for q in ("USD","USDT","USDC"):' \
             '            pair = f"{sym}/{q}"' \
             '            if pair in ex.markets:' \
-            '                market = pair' \
-            '                break' \
+            '                market = pair; break' \
             '        if market:' \
             '            sells.append((sym, qty, market, notional))' \
             '        else:' \
-            '            print(f"[skip] No market to exit {sym} to USD/USDT/USDC; leaving as-is.")' \
+            '            print(f"[skip] No market to exit {sym} to USD/USDT/USDC")' \
             '' \
             'if not sells:' \
-            '    print("No dust found below threshold.")' \
+            '    print("No dust below threshold.")' \
             'else:' \
-            '    print(f"Found {len(sells)} dust positions:")' \
+            '    print(f"Would clean {len(sells)} dust positions:")' \
             '    for sym, qty, market, notional in sells:' \
             '        print(f" - {sym}: qty={qty:.8f}, notional~${notional:.2f}, market={market}")' \
             '    if dry_run:' \
-            '        print("DRY-RUN: No sell orders will be sent.")' \
+            '        print("DRY-RUN: no orders sent")' \
             '    else:' \
             '        for sym, qty, market, _ in sells:' \
             '            try:' \
-            '                print(f"Submitting market sell: {market} size={qty}")' \
+            '                print(f"sell {market} size={qty}")' \
             "                ex.create_order(market, 'market', 'sell', qty)" \
             '            except Exception as e:' \
-            '                print(f"[error] Sell {market} size={qty}: {e}")' \
+            '                print(f"[error] {market} {e}")' \
             > sweep.py
           python sweep.py
 
