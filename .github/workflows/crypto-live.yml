@@ -47,17 +47,17 @@ jobs:
         shell: bash
         run: |
           echo "Starting Crypto Bot..."
-          cat > run_bot.py <<EOF
-import os, time
-if os.getenv("DRY_RUN","true").lower()=="true":
-    print("DRY RUN - NO REAL ORDERS SENT")
-else:
-    print("LIVE TRADING")
-# NOTE: replace this stub with your real entrypoint, e.g.:
-#   import trader.main as app; app.main()
-time.sleep(2)
-print("KPI: +0.00%  (stub)")
-EOF
+          printf '%s\n' \
+            'import os, time' \
+            'if os.getenv("DRY_RUN","true").lower()=="true":' \
+            '    print("DRY RUN - NO REAL ORDERS SENT")' \
+            'else:' \
+            '    print("LIVE TRADING")' \
+            '# NOTE: replace this stub with your real entrypoint, e.g.:' \
+            '#   import trader.main as app; app.main()' \
+            'time.sleep(2)' \
+            'print("KPI: +0.00%  (stub)")' \
+            > run_bot.py
           python run_bot.py
 
       - name: KPI Artifact (optional)
