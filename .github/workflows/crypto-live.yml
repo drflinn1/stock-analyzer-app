@@ -71,17 +71,13 @@ jobs:
 
       - name: Prepare state directory and seed files
         shell: bash
-        env:
-          STATE_PATH: ${{ github.workspace }}/.state
         run: |
           set -e
-          mkdir -p "$STATE_PATH"
-          # Seed files (non-empty)
-          [ -s "$STATE_PATH/anchors.json" ] || echo "{}" > "$STATE_PATH/anchors.json"
-          [ -s "$STATE_PATH/kpi_history.csv" ] || echo "ts,dry_run,picked,scores,hot_list,usd_free,actions" > "$STATE_PATH/kpi_history.csv"
-          [ -f "$STATE_PATH/last_risk_signal.txt" ] || echo "UNKNOWN" > "$STATE_PATH/last_risk_signal.txt"
-          echo "Prepared $STATE_PATH contents:"
-          ls -la "$STATE_PATH"
+          mkdir -p .state
+          [ -s .state/anchors.json ] || echo "{}" > .state/anchors.json
+          [ -s .state/kpi_history.csv ] || echo "ts,dry_run,picked,scores,hot_list,usd_free,actions" > .state/kpi_history.csv
+          [ -f .state/last_risk_signal.txt ] || echo "UNKNOWN" > .state/last_risk_signal.txt
+          echo "Prepared .state contents:" && ls -la .state
 
       - name: Confirm live/dry status
         run: |
@@ -101,20 +97,25 @@ jobs:
         run: |
           python -u main.py
 
-      - name: List state before upload (debug)
+      - name: List state before pack (debug)
         if: always()
-        shell: bash
-        env:
-          STATE_PATH: ${{ github.workspace }}/.state
         run: |
           echo "Workspace:" && pwd
-          echo "State dir listing:" && ls -la "$STATE_PATH" || true
+          echo "State dir listing:" && ls -la .state || true
 
-      - name: Upload state artifacts
+      - name: Pack .state into zip
+        if: always()
+        run: |
+          rm -f state_${{ github.run_id }}.zip
+          # zip handles dot-folders reliably across runners
+          zip -r state_${{ github.run_id }}.zip .state >/dev/null
+          ls -l state_${{ github.run_id }}.zip
+
+      - name: Upload state artifact (zip)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
-          path: ${{ github.workspace }}/.state
-          if-no-files-found: warn
+          path: state_${{ github.run_id }}.zip
+          if-no-files-found: error
           retention-days: 7
