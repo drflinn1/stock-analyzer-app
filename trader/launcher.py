@@ -1,10 +1,13 @@
 # trader/launcher.py
-# Auto-selects engine file and runs it. Order:
+# Auto-select engine and run it.
+# Order:
 #   1) trader/crypto_engine.py
 #   2) trader/main.py
 #   3) trader/engine.py
-# Prints a clear [go] line with the chosen file. If none exist, prints an error
-# and lists the contents of trader/.
+#
+# If trader/__init__.py exists AND the chosen engine is trader/crypto_engine.py,
+# run it as a module:  python -m trader.crypto_engine
+# Otherwise run the file directly.
 
 from __future__ import annotations
 import os, sys, subprocess
@@ -30,6 +33,20 @@ def list_trader_dir() -> None:
         for f in sorted(files):
             print(os.path.join(root, f))
 
+def run_python(target: str) -> int:
+    has_pkg = os.path.isfile("trader/__init__.py")
+    # Prefer module execution for crypto_engine when we have a package
+    if has_pkg and target == "trader/crypto_engine.py":
+        print("[launcher] Package detected; running as module")
+        print("[go] python -m trader.crypto_engine")
+        cmd = [sys.executable, "-u", "-m", "trader.crypto_engine"]
+    else:
+        print(f"[go] python {target}")
+        cmd = [sys.executable, "-u", target]
+
+    proc = subprocess.run(cmd, check=False)
+    return proc.returncode
+
 def main() -> int:
     chosen = pick_engine()
     if not chosen:
@@ -38,14 +55,8 @@ def main() -> int:
         return 1
 
     print(f"[launcher] Selected engine: {chosen}")
-    print(f"[go] python {chosen}")
-
-    # Pass through current environment (DRY_RUN, EXCHANGE_ID, etc.)
     try:
-        # Use the same Python that launched this script
-        cmd = [sys.executable, "-u", chosen]
-        proc = subprocess.run(cmd, check=False)
-        return proc.returncode
+        return run_python(chosen)
     except Exception as e:
         print(f"[launcher] Failed to run {chosen}: {e}")
         return 1
