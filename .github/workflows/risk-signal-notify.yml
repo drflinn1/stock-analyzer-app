@@ -3,7 +3,7 @@ name: Risk Signal Notifier
 on:
   workflow_dispatch:
   schedule:
-    # Daily at 15:00 UTC (08:00 AM PT by default)
+    # Daily at 15:00 UTC (08:00 AM PT)
     - cron: "0 15 * * *"
 
 permissions:
@@ -27,30 +27,26 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run notifier
-        shell: bash
+      - name: Run notifier (inline Python, no heredoc)
+        shell: python
         run: |
-          set -e
-          mkdir -p .state
-          cat > _notify.py <<'PY'
-import os, json, pathlib, sys, random
+          import random, sys
+          from pathlib import Path
 
-p = pathlib.Path(".state"); p.mkdir(parents=True, exist_ok=True)
-last_file = p / "last_risk_signal.txt"
+          p = Path(".state"); p.mkdir(parents=True, exist_ok=True)
+          last_file = p / "last_risk_signal.txt"
 
-# Simple placeholder risk metric (replace with your real one if present)
-signal = "ON" if (random.random() > 0.5) else "OFF"
+          # Placeholder signal (swap with your real indicator if you have one)
+          signal = "ON" if random.random() > 0.5 else "OFF"
 
-prev = last_file.read_text().strip() if last_file.exists() else ""
-flip = (prev != "") and (prev != signal)
-last_file.write_text(signal)
+          prev = last_file.read_text().strip() if last_file.exists() else ""
+          flip = (prev != "") and (prev != signal)
+          last_file.write_text(signal)
 
-print(f"RISK SIGNAL: {signal}")
-if flip:
-    print(f"Flip detected: {prev} -> {signal}")
-    # Fail on purpose so GitHub emails you on flips
-    sys.exit(42)
-else:
-    print("No flip detected.")
-PY
-          python _notify.py
+          print(f"RISK SIGNAL: {signal}")
+          if flip:
+              print(f"Flip detected: {prev} -> {signal}")
+              # Fail intentionally so GitHub emails you on flips
+              sys.exit(42)
+          else:
+              print("No flip detected.")
