@@ -1,4 +1,4 @@
-name: Crypto Live (Every 15 min — CONCENTRATED + PYRAMID + SWEEP + TAX)
+name: Crypto Live — Guarded
 
 on:
   workflow_dispatch:
@@ -8,112 +8,138 @@ on:
         required: true
         default: "true"
       EXCHANGE_ID:
-        description: "CCXT exchange id (e.g., kraken)"
+        description: "CCXT exchange id"
         required: true
         default: "kraken"
-      BASE_CURRENCY:
-        description: "Quote/settle currency"
+      MAX_ENTRIES_PER_RUN:
+        description: "How many new buys per run"
         required: true
-        default: "USD"
-      UNIVERSE:
-        description: "Comma list or 'auto'"
+        default: "1"
+      USD_PER_TRADE:
+        description: "Notional USD per buy"
         required: true
-        default: "auto"
-      MAX_POSITIONS:
-        description: "Cap of open positions"
+        default: "10"
+      TAKE_PROFIT_PCT:
+        description: "e.g., 0.035 = 3.5% TP"
         required: true
-        default: "4"
-      PER_TRADE_USD:
-        description: "Notional per entry"
+        default: "0.035"
+      STOP_LOSS_PCT:
+        description: "e.g., 0.020 = 2.0% SL"
         required: true
-        default: "25"
+        default: "0.020"
+      TRAIL_PCT:
+        description: "Trailing stop percent, e.g., 0.025"
+        required: true
+        default: "0.025"
+      DAILY_LOSS_CAP_PCT:
+        description: "Pause if realized P/L below this (e.g., -0.02)"
+        required: true
+        default: "-0.02"
       RESERVE_USD:
-        description: "Cash reserve not used"
+        description: "Keep this much USD in cash"
         required: true
         default: "100"
-      DAILY_LOSS_CAP_USD:
-        description: "Stop trading for the day after this net loss"
+      UNIVERSE_MODE:
+        description: "auto or whitelist"
         required: true
-        default: "40"
-      RUN_SWEEPER:
-        description: "Run Dust Sweeper after bot (true/false)"
+        default: "whitelist"
+      WHITELIST:
+        description: "Comma-separated symbols (only if UNIVERSE_MODE=whitelist)"
+        required: true
+        default: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
+      TOPK:
+        description: "If auto-pick, how many symbols to consider"
+        required: true
+        default: "8"
+      MAX_POSITIONS:
+        description: "Cap total concurrent open positions"
+        required: true
+        default: "6"
+      AVOID_STABLES:
+        description: "Filter out obvious stables (true/false)"
         required: true
         default: "true"
-      AUTO_TOP_K:
-        description: "Auto-pick: number of symbols (defaults to MAX_POSITIONS)"
-        required: true
-        default: "4"
 
   schedule:
-    - cron: "*/15 * * * *"  # every 15 minutes
+    # Every 15 minutes
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crypto-live-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  crypto:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 14
 
     env:
-      # Core
-      DRY_RUN: ${{ inputs.DRY_RUN || 'true' }}
-      EXCHANGE_ID: ${{ inputs.EXCHANGE_ID || 'kraken' }}
-      BASE_CURRENCY: ${{ inputs.BASE_CURRENCY || 'USD' }}
-      UNIVERSE: ${{ inputs.UNIVERSE || 'auto' }}
-      MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || '4' }}
-      PER_TRADE_USD: ${{ inputs.PER_TRADE_USD || '25' }}
-      RESERVE_USD: ${{ inputs.RESERVE_USD || '100' }}
-      DAILY_LOSS_CAP_USD: ${{ inputs.DAILY_LOSS_CAP_USD || '40' }}
-      RUN_SWEEPER: ${{ inputs.RUN_SWEEPER || 'true' }}
-
-      # Auto-pick (read by trader/crypto_engine.py)
-      AUTO_TOP_K: ${{ inputs.AUTO_TOP_K || inputs.MAX_POSITIONS || '4' }}
-      # The following come from repository VARIABLES (Settings → Variables → Actions), not inputs:
-      AUTO_MIN_USD_VOL: ${{ vars.AUTO_MIN_USD_VOL || '2000000' }}   # e.g., 2000000 = $2M
-      AUTO_MIN_PRICE:   ${{ vars.AUTO_MIN_PRICE   || '0.05' }}      # e.g., 0.05 = 5¢
-      AUTO_EXCLUDE:     ${{ vars.AUTO_EXCLUDE     || 'USDT/USD,USDC/USD,EUR/USD,GBP/USD,USD/USD,SPX/USD,PUMP/USD,BABY/USD,ALKIMI/USD' }}
+      # Secrets (set in repo → Settings → Secrets and variables → Actions)
+      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+      # General
+      DRY_RUN: ${{ inputs.DRY_RUN }}
+      EXCHANGE_ID: ${{ inputs.EXCHANGE_ID }}
+      MAX_ENTRIES_PER_RUN: ${{ inputs.MAX_ENTRIES_PER_RUN }}
+      USD_PER_TRADE: ${{ inputs.USD_PER_TRADE }}
+      TAKE_PROFIT_PCT: ${{ inputs.TAKE_PROFIT_PCT }}
+      STOP_LOSS_PCT: ${{ inputs.STOP_LOSS_PCT }}
+      TRAIL_PCT: ${{ inputs.TRAIL_PCT }}
+      DAILY_LOSS_CAP_PCT: ${{ inputs.DAILY_LOSS_CAP_PCT }}
+      RESERVE_USD: ${{ inputs.RESERVE_USD }}
+      UNIVERSE_MODE: ${{ inputs.UNIVERSE_MODE }}
+      WHITELIST: ${{ inputs.WHITELIST }}
+      TOPK: ${{ inputs.TOPK }}
+      MAX_POSITIONS: ${{ inputs.MAX_POSITIONS }}
+      AVOID_STABLES: ${{ inputs.AVOID_STABLES }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show inputs
-        run: |
-          echo "DRY_RUN=${DRY_RUN}"
-          echo "EXCHANGE_ID=${EXCHANGE_ID}"
-          echo "BASE_CURRENCY=${BASE_CURRENCY}"
-          echo "UNIVERSE=${UNIVERSE}"
-          echo "MAX_POSITIONS=${MAX_POSITIONS}"
-          echo "PER_TRADE_USD=${PER_TRADE_USD}"
-          echo "RESERVE_USD=${RESERVE_USD}"
-          echo "DAILY_LOSS_CAP_USD=${DAILY_LOSS_CAP_USD}"
-          echo "RUN_SWEEPER=${RUN_SWEEPER}"
-          echo "AUTO_TOP_K=${AUTO_TOP_K}"
-          echo "AUTO_MIN_USD_VOL=${AUTO_MIN_USD_VOL}"
-          echo "AUTO_MIN_PRICE=${AUTO_MIN_PRICE}"
-          echo "AUTO_EXCLUDE=${AUTO_EXCLUDE}"
-
-      - name: Setup Python 3.11
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps (ccxt only — fast)
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-py311-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-py311-
+
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install ccxt
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install ccxt==4.4.38 pandas==2.2.2
+          fi
 
-      - name: Run Crypto Bot (auto-select engine)
-        env:
-          CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
-          CCXT_API_SECRET: ${{ secrets.CCXT_API_SECRET }}
-          CCXT_API_PASSWORD: ${{ secrets.CCXT_API_PASSWORD }}
+      - name: Show inputs
         run: |
-          python -u trader/launcher.py
+          echo "DRY_RUN=${DRY_RUN}"
+          echo "EXCHANGE_ID=${EXCHANGE_ID}"
+          echo "UNIVERSE_MODE=${UNIVERSE_MODE}"
+          echo "WHITELIST=${WHITELIST}"
 
-      - name: Dust Sweeper
-        if: env.RUN_SWEEPER == 'true'
-        env:
-          CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
-          CCXT_API_SECRET: ${{ secrets.CCXT_API_SECRET }}
-          CCXT_API_PASSWORD: ${{ secrets.CCXT_API_PASSWORD }}
+      - name: Run Crypto Live
         run: |
-          python -u trader/dust_sweeper.py
+          python -u trader/main.py
+
+      - name: Upload KPI history
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kpi-history
+          path: |
+            .state/kpi_history.csv
+            .state/summary_last.txt
+            .state/positions.json
+          if-no-files-found: ignore
