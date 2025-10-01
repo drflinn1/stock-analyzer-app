@@ -4,13 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: "Simulate only (true/false) — ignored if LIVE_CONFIRM != I_UNDERSTAND"
+        description: "Simulate only (true/false). Manual runs only — schedules run LIVE."
         required: true
         default: "true"
-      LIVE_CONFIRM:
-        description: 'Type EXACTLY: I_UNDERSTAND to allow live orders'
-        required: false
-        default: ""
       EXCHANGE_ID:
         description: "CCXT exchange id (e.g., kraken, binanceus)"
         required: true
@@ -44,7 +40,7 @@ on:
         required: true
         default: '{"TAKE_PROFIT_PCT":0.035,"STOP_LOSS_PCT":0.020,"TRAIL_PCT":0.025,"DAILY_LOSS_CAP_PCT":-0.02,"RESERVE_USD":100,"AVOID_STABLES":true}'
 
-  # Every 15 minutes
+  # Every 15 minutes (these runs will be LIVE by default)
   schedule:
     - cron: "*/15 * * * *"
 
@@ -65,9 +61,7 @@ jobs:
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-      # Inputs (schedule runs provide these as empty strings)
-      DRY_RUN: ${{ inputs.DRY_RUN }}
-      LIVE_CONFIRM: ${{ inputs.LIVE_CONFIRM }}
+      # Simple inputs
       EXCHANGE_ID: ${{ inputs.EXCHANGE_ID }}
       UNIVERSE_MODE: ${{ inputs.UNIVERSE_MODE }}
       WHITELIST: ${{ inputs.WHITELIST }}
@@ -76,6 +70,11 @@ jobs:
       MAX_ENTRIES_PER_RUN: ${{ inputs.MAX_ENTRIES_PER_RUN }}
       MAX_POSITIONS: ${{ inputs.MAX_POSITIONS }}
       CONFIG: ${{ inputs.CONFIG }}
+
+      # One switch:
+      # - manual: use the UI input
+      # - schedule: force LIVE (false)
+      DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || inputs.DRY_RUN }}
 
     steps:
       - name: Checkout
@@ -121,11 +120,10 @@ jobs:
           print("CONFIG applied:", cfg)
           PY
 
-      - name: Show inputs
+      - name: Show resolved env
         run: |
           echo "event=${{ github.event_name }}"
           echo "DRY_RUN=${DRY_RUN}"
-          echo "LIVE_CONFIRM=${LIVE_CONFIRM}"
           echo "EXCHANGE_ID=${EXCHANGE_ID}"
           echo "UNIVERSE_MODE=${UNIVERSE_MODE}"
           echo "WHITELIST=${WHITELIST}"
