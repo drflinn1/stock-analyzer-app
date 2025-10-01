@@ -73,7 +73,7 @@ jobs:
         env:
           PYTHONWARNINGS: "ignore"
         run: |
-          python -u trader/main.py
+          python -u main.py
 
       - name: Upload state artifacts
         if: always()
