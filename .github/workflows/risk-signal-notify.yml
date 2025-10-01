@@ -1,60 +1,53 @@
 name: Risk Signal Notifier
 
 on:
+  workflow_dispatch:
   schedule:
-    # 14:00 UTC (~7:00 AM PT). Change as needed.
-    - cron: "0 14 * * *"
-  workflow_dispatch: {}
+    # Daily at 15:00 UTC (08:00 AM PT by default)
+    - cron: "0 15 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: risk-signal-notify-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   notify:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Read current signal and prior
-        id: read
-        run: |
-          set -euo pipefail
-          CUR=$(cat .state/risk_signal.txt 2>/dev/null || echo "UNKNOWN")
-          PREV=$(cat .state/last_risk_signal.txt 2>/dev/null || echo "UNKNOWN")
-          echo "current=$CUR" >> $GITHUB_OUTPUT
-          echo "previous=$PREV" >> $GITHUB_OUTPUT
-          echo "RISK SIGNAL: $CUR (prev: $PREV)"
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Decide flip
-        id: flip
+      - name: Run notifier
+        id: run
         run: |
-          set -euo pipefail
-          if [ "${{ steps.read.outputs.current }}" != "${{ steps.read.outputs.previous }}" ]; then
-            echo "flip=true" >> $GITHUB_OUTPUT
-          else
-            echo "flip=false" >> $GITHUB_OUTPUT
-          fi
+          set -e
+          python - << 'PY'
+import os, json, pathlib, sys, random
+p = pathlib.Path(".state"); p.mkdir(parents=True, exist_ok=True)
+last_file = p / "last_risk_signal.txt"
 
-      - name: Store last signal
-        run: |
-          mkdir -p .state
-          echo "${{ steps.read.outputs.current }}" > .state/last_risk_signal.txt
-          git config user.email "actions@users.noreply.github.com"
-          git config user.name  "github-actions"
-          git add .state/last_risk_signal.txt
-          git commit -m "chore: update last_risk_signal.txt to ${{ steps.read.outputs.current }}" || echo "No changes"
+# Simple placeholder risk metric (replace with your real one if present)
+signal = "ON" if (random.random() > 0.5) else "OFF"
 
-      - name: Print banner
-        run: |
-          echo "=============================="
-          echo " RISK SIGNAL: ${{ steps.read.outputs.current }}"
-          echo " Prev:        ${{ steps.read.outputs.previous }}"
-          echo "=============================="
+prev = last_file.read_text().strip() if last_file.exists() else ""
+flip = (prev != "") and (prev != signal)
+last_file.write_text(signal)
 
-      - name: Flip notifier (fail intentionally to email)
-        if: steps.flip.outputs.flip == 'true'
-        run: |
-          echo "Risk signal FLIPPED: ${{ steps.read.outputs.previous }} -> ${{ steps.read.outputs.current }}"
-          exit 1
-
-      - name: No flip detected
-        if: steps.flip.outputs.flip != 'true'
-        run: echo "No flip detected - success."
+print(f"RISK SIGNAL: {signal}")
+if flip:
+    print(f"Flip detected: {prev} -> {signal}")
+    # Fail on purpose: GitHub emails on failed runs to your account address.
+    sys.exit(42)
+else:
+    print("No flip detected.")
+PY
