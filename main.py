@@ -1,9 +1,13 @@
 # main.py — Dual-mode:
-# - Default GUARD mode: prints SPEC Gate Report + demo SELL/TAKE_PROFIT/STOP_LOSS/TRAIL markers
-# - TRADE mode (BOT_MODE=TRADE): runs your real trading engine (trader.crypto_engine)
+# GUARD (default): SPEC Gate Report + SELL/TAKE_PROFIT/STOP_LOSS/TRAIL tokens for CI.
+# TRADE (BOT_MODE=TRADE): auto-launch your real trading engine module.
 #
-# NOTE: The SELL/TRAIL tokens remain in the source so the Sell Logic Guard passes,
-#       but they are only *executed* in GUARD mode (not during live trading runs).
+# Auto-detect order in TRADE mode:
+#   1) trader.crypto_engine
+#   2) trader.engine
+#   3) trader.main
+#
+# No need to set TRADER_MODULE anymore (optional override still supported).
 
 from __future__ import annotations
 import os
@@ -13,7 +17,7 @@ from typing import List, Dict, Tuple
 
 BOT_MODE = os.getenv("BOT_MODE", "GUARD").upper().strip()  # GUARD (default) or TRADE
 
-# ---------- Guard-visible SELL config (names used by your guard regex) ----------
+# ---------- Guard-visible SELL config (keep these names for the guard regex) ----------
 TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "3.5"))   # %
 STOP_LOSS   = float(os.getenv("STOP_LOSS", "2.0"))     # %
 TRAIL_PCT   = float(os.getenv("TRAIL_PCT", "1.2"))     # %
@@ -126,23 +130,34 @@ def demo_sell_block() -> None:
 # TRADE MODE IMPLEMENTATION
 # =========================
 def run_trade_mode() -> int:
-    """
-    Launch your real trading engine without assuming function names.
-    We execute the module as __main__ so your existing if __name__ == '__main__' paths work.
-    """
-    import runpy
-    module_name = os.getenv("TRADER_MODULE", "trader.crypto_engine")  # override if needed
-    print(f"[TRADE] Launching {module_name} (BOT_MODE=TRADE) ...")
-    try:
-        runpy.run_module(module_name, run_name="__main__")
-        return 0
-    except ModuleNotFoundError as e:
-        print(f"[TRADE] ERROR: Module not found: {e}. "
-              f"Set TRADER_MODULE env to your entrypoint (e.g., 'trader.engine' or 'trader.main').")
-        return 1
-    except Exception as e:
-        print(f"[TRADE] Unhandled exception from trading engine: {e}")
-        return 2
+    import runpy, importlib
+    # Optional manual override still supported:
+    override = os.getenv("TRADER_MODULE", "").strip()
+    candidates = ([override] if override else []) + [
+        "trader.crypto_engine",
+        "trader.engine",
+        "trader.main",
+    ]
+    print(f"[TRADE] BOT_MODE=TRADE — searching entrypoint: {', '.join([c for c in candidates if c])}")
+    for mod in candidates:
+        if not mod:
+            continue
+        try:
+            importlib.import_module(mod)  # quick existence check
+            print(f"[TRADE] Launching {mod} …")
+            runpy.run_module(mod, run_name="__main__")
+            return 0
+        except ModuleNotFoundError:
+            continue
+        except SystemExit as e:
+            # propagate engine's exit code
+            return int(getattr(e, "code", 0) or 0)
+        except Exception as e:
+            print(f"[TRADE] {mod} raised: {e}")
+            return 2
+    print("[TRADE] ERROR: No trading entrypoint found. Expected one of: trader.crypto_engine / trader.engine / trader.main "
+          " (or set TRADER_MODULE to your module).")
+    return 1
 
 # ---------- Main ----------
 def main() -> None:
