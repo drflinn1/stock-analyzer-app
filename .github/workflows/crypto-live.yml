@@ -51,7 +51,7 @@ jobs:
       # Position sizing & caps (tune to taste)
       USD_PER_TRADE: "10"
       MAX_POSITIONS: "6"
-      RESERVE_USD: "50"
+      RESERVE_USD: "100"
       DAILY_MAX_TRADES: "6"
 
     steps:
