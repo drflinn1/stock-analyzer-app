@@ -71,14 +71,18 @@ jobs:
 
       - name: Prepare state directory and seed files
         run: |
+          set -e
           mkdir -p .state
-          # Seed anchors.json if missing
-          [ -f .state/anchors.json ] || echo "{}" > .state/anchors.json
-          # Seed KPI CSV with header if missing
-          if [ ! -f .state/kpi_history.csv ]; then
+          # Seed anchors.json with non-empty JSON if file missing or empty
+          if [ ! -s .state/anchors.json ]; then
+            echo "{}" > .state/anchors.json
+          fi
+          # Seed KPI CSV with header if file missing or empty
+          if [ ! -s .state/kpi_history.csv ]; then
             echo "ts,dry_run,picked,scores,hot_list,usd_free,actions" > .state/kpi_history.csv
           fi
-          echo "Prepared .state with seed files."
+          echo "Prepared .state contents:"
+          ls -l .state
 
       - name: Confirm live/dry status
         run: |
