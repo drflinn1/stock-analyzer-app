@@ -11,54 +11,34 @@ on:
         description: "CCXT exchange id"
         required: true
         default: "kraken"
-      MAX_ENTRIES_PER_RUN:
-        description: "How many new buys per run"
-        required: true
-        default: "1"
-      USD_PER_TRADE:
-        description: "Notional USD per buy"
-        required: true
-        default: "10"
-      TAKE_PROFIT_PCT:
-        description: "e.g., 0.035 = 3.5% TP"
-        required: true
-        default: "0.035"
-      STOP_LOSS_PCT:
-        description: "e.g., 0.020 = 2.0% SL"
-        required: true
-        default: "0.020"
-      TRAIL_PCT:
-        description: "Trailing stop percent, e.g., 0.025"
-        required: true
-        default: "0.025"
-      DAILY_LOSS_CAP_PCT:
-        description: "Pause if realized P/L below this (e.g., -0.02)"
-        required: true
-        default: "-0.02"
-      RESERVE_USD:
-        description: "Keep this much USD in cash"
-        required: true
-        default: "100"
       UNIVERSE_MODE:
         description: "auto or whitelist"
         required: true
         default: "whitelist"
       WHITELIST:
-        description: "Comma-separated symbols (only if UNIVERSE_MODE=whitelist)"
+        description: "If UNIVERSE_MODE=whitelist"
         required: true
         default: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
       TOPK:
-        description: "If auto-pick, how many symbols to consider"
+        description: "If auto-pick, how many symbols to scan"
         required: true
         default: "8"
+      USD_PER_TRADE:
+        description: "Notional USD per buy"
+        required: true
+        default: "10"
+      MAX_ENTRIES_PER_RUN:
+        description: "New buys per run"
+        required: true
+        default: "1"
       MAX_POSITIONS:
-        description: "Cap total concurrent open positions"
+        description: "Cap concurrent positions"
         required: true
         default: "6"
-      AVOID_STABLES:
-        description: "Filter out obvious stables (true/false)"
+      CONFIG:
+        description: "Advanced JSON (TP/SL/TRAIL/LOSSCAP/RESERVE/AVOID_STABLES)"
         required: true
-        default: "true"
+        default: '{"TAKE_PROFIT_PCT":0.035,"STOP_LOSS_PCT":0.020,"TRAIL_PCT":0.025,"DAILY_LOSS_CAP_PCT":-0.02,"RESERVE_USD":100,"AVOID_STABLES":true}'
 
   schedule:
     # Every 15 minutes
@@ -80,21 +60,19 @@ jobs:
       # Secrets (set in repo → Settings → Secrets and variables → Actions)
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-      # General
+
+      # Simple inputs
       DRY_RUN: ${{ inputs.DRY_RUN }}
       EXCHANGE_ID: ${{ inputs.EXCHANGE_ID }}
-      MAX_ENTRIES_PER_RUN: ${{ inputs.MAX_ENTRIES_PER_RUN }}
-      USD_PER_TRADE: ${{ inputs.USD_PER_TRADE }}
-      TAKE_PROFIT_PCT: ${{ inputs.TAKE_PROFIT_PCT }}
-      STOP_LOSS_PCT: ${{ inputs.STOP_LOSS_PCT }}
-      TRAIL_PCT: ${{ inputs.TRAIL_PCT }}
-      DAILY_LOSS_CAP_PCT: ${{ inputs.DAILY_LOSS_CAP_PCT }}
-      RESERVE_USD: ${{ inputs.RESERVE_USD }}
       UNIVERSE_MODE: ${{ inputs.UNIVERSE_MODE }}
       WHITELIST: ${{ inputs.WHITELIST }}
       TOPK: ${{ inputs.TOPK }}
+      USD_PER_TRADE: ${{ inputs.USD_PER_TRADE }}
+      MAX_ENTRIES_PER_RUN: ${{ inputs.MAX_ENTRIES_PER_RUN }}
       MAX_POSITIONS: ${{ inputs.MAX_POSITIONS }}
-      AVOID_STABLES: ${{ inputs.AVOID_STABLES }}
+
+      # Packed advanced config (JSON)
+      CONFIG: ${{ inputs.CONFIG }}
 
     steps:
       - name: Checkout
@@ -122,12 +100,33 @@ jobs:
             pip install ccxt==4.4.38 pandas==2.2.2
           fi
 
+      - name: Parse CONFIG → env
+        run: |
+          python - << 'PY'
+          import os, json, sys
+          dflt = {"TAKE_PROFIT_PCT":0.035,"STOP_LOSS_PCT":0.020,"TRAIL_PCT":0.025,"DAILY_LOSS_CAP_PCT":-0.02,"RESERVE_USD":100,"AVOID_STABLES":True}
+          raw = os.getenv("CONFIG","") or ""
+          try:
+              cfg = dflt | json.loads(raw)
+          except Exception:
+              cfg = dflt
+          # Write to GITHUB_ENV so main.py can read normal env vars
+          envp = os.environ["GITHUB_ENV"]
+          with open(envp,"a",encoding="utf-8") as f:
+              for k in ("TAKE_PROFIT_PCT","STOP_LOSS_PCT","TRAIL_PCT","DAILY_LOSS_CAP_PCT","RESERVE_USD","AVOID_STABLES"):
+                  v = cfg.get(k, dflt[k])
+                  if isinstance(v, bool): v = str(v).lower()
+                  f.write(f"{k}={v}\n")
+          print("CONFIG applied:", cfg)
+          PY
+
       - name: Show inputs
         run: |
           echo "DRY_RUN=${DRY_RUN}"
           echo "EXCHANGE_ID=${EXCHANGE_ID}"
           echo "UNIVERSE_MODE=${UNIVERSE_MODE}"
           echo "WHITELIST=${WHITELIST}"
+          echo "CONFIG=${CONFIG}"
 
       - name: Run Crypto Live
         run: |
