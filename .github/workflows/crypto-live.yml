@@ -39,6 +39,25 @@ on:
         description: "Run Dust Sweeper after bot (true/false)"
         required: true
         default: "true"
+
+      # ----- Auto-pick controls (now visible in the UI) -----
+      AUTO_TOP_K:
+        description: "Auto-pick: number of symbols to choose"
+        required: true
+        default: "4"
+      AUTO_MIN_USD_VOL:
+        description: "Auto-pick: minimum 24h USD volume (e.g., 2000000 = $2M)"
+        required: true
+        default: "2000000"
+      AUTO_MIN_PRICE:
+        description: "Auto-pick: minimum last price (e.g., 0.05)"
+        required: true
+        default: "0.05"
+      AUTO_EXCLUDE:
+        description: "Auto-pick: exclude list (comma symbols)"
+        required: true
+        default: "USDT/USD,USDC/USD,EUR/USD,GBP/USD,USD/USD,SPX/USD,PUMP/USD,BABY/USD,ALKIMI/USD"
+
   schedule:
     - cron: "*/15 * * * *"  # every 15 minutes
 
@@ -48,6 +67,7 @@ jobs:
     timeout-minutes: 30
 
     env:
+      # Core
       DRY_RUN: ${{ inputs.DRY_RUN || 'true' }}
       EXCHANGE_ID: ${{ inputs.EXCHANGE_ID || 'kraken' }}
       BASE_CURRENCY: ${{ inputs.BASE_CURRENCY || 'USD' }}
@@ -57,6 +77,12 @@ jobs:
       RESERVE_USD: ${{ inputs.RESERVE_USD || '100' }}
       DAILY_LOSS_CAP_USD: ${{ inputs.DAILY_LOSS_CAP_USD || '40' }}
       RUN_SWEEPER: ${{ inputs.RUN_SWEEPER || 'true' }}
+
+      # Auto-pick (read by trader/crypto_engine.py)
+      AUTO_TOP_K: ${{ inputs.AUTO_TOP_K || inputs.MAX_POSITIONS || '4' }}
+      AUTO_MIN_USD_VOL: ${{ inputs.AUTO_MIN_USD_VOL || '2000000' }}
+      AUTO_MIN_PRICE: ${{ inputs.AUTO_MIN_PRICE || '0.05' }}
+      AUTO_EXCLUDE: ${{ inputs.AUTO_EXCLUDE || 'USDT/USD,USDC/USD,EUR/USD,GBP/USD,USD/USD,SPX/USD,PUMP/USD,BABY/USD,ALKIMI/USD' }}
 
     steps:
       - name: Checkout
@@ -73,6 +99,10 @@ jobs:
           echo "RESERVE_USD=${RESERVE_USD}"
           echo "DAILY_LOSS_CAP_USD=${DAILY_LOSS_CAP_USD}"
           echo "RUN_SWEEPER=${RUN_SWEEPER}"
+          echo "AUTO_TOP_K=${AUTO_TOP_K}"
+          echo "AUTO_MIN_USD_VOL=${AUTO_MIN_USD_VOL}"
+          echo "AUTO_MIN_PRICE=${AUTO_MIN_PRICE}"
+          echo "AUTO_EXCLUDE=${AUTO_EXCLUDE}"
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
