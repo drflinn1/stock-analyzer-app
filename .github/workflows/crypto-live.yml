@@ -1,4 +1,4 @@
-name: Crypto Live — Guarded Auto-Pick + Hot Movers Bias
+name: Crypto Live — Guarded Auto-Pick + Hot Movers Bias (LIVE)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       DRY_RUN:
         description: 'true = simulate orders; false = send real orders'
         required: true
-        default: 'true'
+        default: 'false'
       RUN_SWITCH:
         description: 'ON to run, OFF to skip early'
         required: true
@@ -26,7 +26,7 @@ jobs:
       CCXT_API_PASSWORD: ${{ secrets.CCXT_API_PASSWORD }}
 
       # ---- Master switches ----
-      DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'true' }}
+      DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'false' }}   # default LIVE
       RUN_SWITCH: ${{ github.event.inputs.RUN_SWITCH || 'ON' }}
 
       # ---- Universe / filters ----
@@ -47,8 +47,8 @@ jobs:
       SL_PCT: "0.020"                # 2.0% stop-loss
       TRAIL_PCT: "0.025"             # 2.5% trailing stop
 
-      # ---- Hot movers bias (this upgrade) ----
-      HOT_LIST: "ZEC/USD"            # comma-separated; you can add more
+      # ---- Hot movers bias ----
+      HOT_LIST: "ZEC/USD"            # add comma-separated symbols to bias
       HOT_BIAS_BPS: "50"             # +0.50% score bump for HOT_LIST names
 
       # ---- Files & outputs ----
@@ -68,6 +68,29 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install ccxt==4.3.82
+
+      - name: Prepare state directory and seed files
+        run: |
+          mkdir -p .state
+          # Seed anchors.json if missing
+          [ -f .state/anchors.json ] || echo "{}" > .state/anchors.json
+          # Seed KPI CSV with header if missing
+          if [ ! -f .state/kpi_history.csv ]; then
+            echo "ts,dry_run,picked,scores,hot_list,usd_free,actions" > .state/kpi_history.csv
+          fi
+          echo "Prepared .state with seed files."
+
+      - name: Confirm live/dry status
+        run: |
+          echo "RUN_SWITCH=${RUN_SWITCH}"
+          echo "DRY_RUN=${DRY_RUN}"
+          if [ "${RUN_SWITCH}" = "OFF" ]; then
+            echo "RUN_SWITCH=OFF → exiting early."; exit 0; fi
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "🚧 DRY RUN — NO REAL ORDERS WILL BE SENT 🚧"
+          else
+            echo "✅ LIVE MODE — REAL ORDERS ENABLED"
+          fi
 
       - name: Run Crypto Live
         env:
