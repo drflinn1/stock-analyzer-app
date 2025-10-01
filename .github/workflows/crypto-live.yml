@@ -1,80 +1,59 @@
-name: Crypto Live — Guarded
+name: Crypto Live — Guarded Auto-Pick + Hot Movers Bias
 
 on:
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: "Simulate only (true/false). Manual runs only — schedules run LIVE."
+        description: 'true = simulate orders; false = send real orders'
         required: true
-        default: "true"
-      EXCHANGE_ID:
-        description: "CCXT exchange id (e.g., kraken, binanceus)"
+        default: 'true'
+      RUN_SWITCH:
+        description: 'ON to run, OFF to skip early'
         required: true
-        default: "kraken"
-      UNIVERSE_MODE:
-        description: "auto or whitelist"
-        required: true
-        default: "whitelist"
-      WHITELIST:
-        description: "If UNIVERSE_MODE=whitelist"
-        required: true
-        default: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
-      TOPK:
-        description: "If auto-pick, how many symbols to scan"
-        required: true
-        default: "8"
-      USD_PER_TRADE:
-        description: "Notional USD per buy"
-        required: true
-        default: "10"
-      MAX_ENTRIES_PER_RUN:
-        description: "New buys per run"
-        required: true
-        default: "1"
-      MAX_POSITIONS:
-        description: "Cap concurrent positions"
-        required: true
-        default: "6"
-      CONFIG:
-        description: "Advanced JSON (TP/SL/TRAIL/LOSSCAP/RESERVE/AVOID_STABLES)"
-        required: true
-        default: '{"TAKE_PROFIT_PCT":0.035,"STOP_LOSS_PCT":0.020,"TRAIL_PCT":0.025,"DAILY_LOSS_CAP_PCT":-0.02,"RESERVE_USD":100,"AVOID_STABLES":true}'
-
-  # Every 15 minutes (these runs will be LIVE by default)
+        default: 'ON'
   schedule:
-    - cron: "*/15 * * * *"
-
-permissions:
-  contents: read
-
-concurrency:
-  group: crypto-live-${{ github.ref }}
-  cancel-in-progress: true
+    - cron: '*/15 * * * *'
 
 jobs:
-  run:
+  crypto_live:
     runs-on: ubuntu-latest
-    timeout-minutes: 14
-
+    if: ${{ github.event.inputs.RUN_SWITCH != 'OFF' }}
     env:
-      # Secrets
-      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+      # ---- Broker / CCXT ----
+      EXCHANGE_ID: kraken
+      CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
+      CCXT_API_SECRET: ${{ secrets.CCXT_API_SECRET }}
+      CCXT_API_PASSWORD: ${{ secrets.CCXT_API_PASSWORD }}
 
-      # Simple inputs
-      EXCHANGE_ID: ${{ inputs.EXCHANGE_ID }}
-      UNIVERSE_MODE: ${{ inputs.UNIVERSE_MODE }}
-      WHITELIST: ${{ inputs.WHITELIST }}
-      TOPK: ${{ inputs.TOPK }}
-      USD_PER_TRADE: ${{ inputs.USD_PER_TRADE }}
-      MAX_ENTRIES_PER_RUN: ${{ inputs.MAX_ENTRIES_PER_RUN }}
-      MAX_POSITIONS: ${{ inputs.MAX_POSITIONS }}
-      CONFIG: ${{ inputs.CONFIG }}
+      # ---- Master switches ----
+      DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'true' }}
+      RUN_SWITCH: ${{ github.event.inputs.RUN_SWITCH || 'ON' }}
 
-      # One switch:
-      # - manual: use the UI input
-      # - schedule: force LIVE (false)
-      DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || inputs.DRY_RUN }}
+      # ---- Universe / filters ----
+      WHITELIST_CSV: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD,ZEC/USD"
+      MAX_SPREAD_BPS: "40"           # skip if (ask-bid)/mid > 0.40%
+      MAX_POSITIONS: "4"
+      TOP_K: "3"                     # evaluate & consider top-K
+      MIN_USD_BAL: "100"             # keep this much cash in reserve
+      USD_PER_TRADE: "10"            # per-market notional
+      MIN_ORDER_USD: "5"             # guard: do not place dust orders
+
+      # ---- P&L guards ----
+      MAX_DAILY_NEW_ENTRIES: "4"
+      MAX_DAILY_LOSS_USD: "25"       # auto-pause if day P/L below this
+
+      # ---- Exits / management ----
+      TP_PCT: "0.035"                # 3.5% take-profit
+      SL_PCT: "0.020"                # 2.0% stop-loss
+      TRAIL_PCT: "0.025"             # 2.5% trailing stop
+
+      # ---- Hot movers bias (this upgrade) ----
+      HOT_LIST: "ZEC/USD"            # comma-separated; you can add more
+      HOT_BIAS_BPS: "50"             # +0.50% score bump for HOT_LIST names
+
+      # ---- Files & outputs ----
+      KPI_CSV: ".state/kpi_history.csv"
+      STATE_DIR: ".state"
 
     steps:
       - name: Checkout
@@ -83,62 +62,24 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-py311-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            pip-${{ runner.os }}-py311-
+          python-version: '3.11'
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install ccxt==4.4.38 pandas==2.2.2
-          fi
-
-      - name: Parse CONFIG → env
-        run: |
-          python - << 'PY'
-          import os, json
-          dflt = {"TAKE_PROFIT_PCT":0.035,"STOP_LOSS_PCT":0.020,"TRAIL_PCT":0.025,"DAILY_LOSS_CAP_PCT":-0.02,"RESERVE_USD":100,"AVOID_STABLES":True}
-          raw = os.getenv("CONFIG","") or ""
-          try:
-              cfg = {**dflt, **json.loads(raw)}
-          except Exception:
-              cfg = dflt
-          with open(os.environ["GITHUB_ENV"],"a",encoding="utf-8") as f:
-              for k in ("TAKE_PROFIT_PCT","STOP_LOSS_PCT","TRAIL_PCT","DAILY_LOSS_CAP_PCT","RESERVE_USD","AVOID_STABLES"):
-                  v = cfg[k]
-                  if isinstance(v, bool): v = str(v).lower()
-                  f.write(f"{k}={v}\n")
-          print("CONFIG applied:", cfg)
-          PY
-
-      - name: Show resolved env
-        run: |
-          echo "event=${{ github.event_name }}"
-          echo "DRY_RUN=${DRY_RUN}"
-          echo "EXCHANGE_ID=${EXCHANGE_ID}"
-          echo "UNIVERSE_MODE=${UNIVERSE_MODE}"
-          echo "WHITELIST=${WHITELIST}"
+          pip install ccxt==4.3.82
 
       - name: Run Crypto Live
+        env:
+          PYTHONWARNINGS: "ignore"
         run: |
-          python -u main.py
+          python -u trader/main.py
 
-      - name: Upload KPI history
+      - name: Upload state artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kpi-history
+          name: state-${{ github.run_id }}
           path: |
-            .state/kpi_history.csv
-            .state/summary_last.txt
-            .state/positions.json
-          if-no-files-found: ignore
+            .state/**
+            !.state/**/*.tmp
