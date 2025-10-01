@@ -31,25 +31,25 @@ jobs:
 
       # ---- Universe / filters ----
       WHITELIST_CSV: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD,ZEC/USD"
-      MAX_SPREAD_BPS: "40"           # skip if (ask-bid)/mid > 0.40%
+      MAX_SPREAD_BPS: "40"
       MAX_POSITIONS: "4"
-      TOP_K: "3"                     # evaluate & consider top-K
-      MIN_USD_BAL: "100"             # keep this much cash in reserve
-      USD_PER_TRADE: "10"            # per-market notional
-      MIN_ORDER_USD: "5"             # guard: do not place dust orders
+      TOP_K: "3"
+      MIN_USD_BAL: "100"
+      USD_PER_TRADE: "10"
+      MIN_ORDER_USD: "5"
 
       # ---- P&L guards ----
       MAX_DAILY_NEW_ENTRIES: "4"
-      MAX_DAILY_LOSS_USD: "25"       # auto-pause if day P/L below this
+      MAX_DAILY_LOSS_USD: "25"
 
       # ---- Exits / management ----
-      TP_PCT: "0.035"                # 3.5% take-profit
-      SL_PCT: "0.020"                # 2.0% stop-loss
-      TRAIL_PCT: "0.025"             # 2.5% trailing stop
+      TP_PCT: "0.035"
+      SL_PCT: "0.020"
+      TRAIL_PCT: "0.025"
 
       # ---- Hot movers bias ----
-      HOT_LIST: "ZEC/USD"            # add comma-separated symbols to bias
-      HOT_BIAS_BPS: "50"             # +0.50% score bump for HOT_LIST names
+      HOT_LIST: "ZEC/USD"
+      HOT_BIAS_BPS: "50"
 
       # ---- Files & outputs ----
       KPI_CSV: ".state/kpi_history.csv"
@@ -74,15 +74,13 @@ jobs:
           set -e
           mkdir -p .state
           # Seed anchors.json with non-empty JSON if file missing or empty
-          if [ ! -s .state/anchors.json ]; then
-            echo "{}" > .state/anchors.json
-          fi
+          [ -s .state/anchors.json ] || echo "{}" > .state/anchors.json
           # Seed KPI CSV with header if file missing or empty
-          if [ ! -s .state/kpi_history.csv ]; then
-            echo "ts,dry_run,picked,scores,hot_list,usd_free,actions" > .state/kpi_history.csv
-          fi
+          [ -s .state/kpi_history.csv ] || echo "ts,dry_run,picked,scores,hot_list,usd_free,actions" > .state/kpi_history.csv
+          # Optional: a last_risk_signal file if other jobs expect it
+          [ -f .state/last_risk_signal.txt ] || echo "UNKNOWN" > .state/last_risk_signal.txt
           echo "Prepared .state contents:"
-          ls -l .state
+          ls -la .state
 
       - name: Confirm live/dry status
         run: |
@@ -102,11 +100,17 @@ jobs:
         run: |
           python -u main.py
 
+      - name: List state before upload (debug)
+        if: always()
+        run: |
+          echo "Workspace:" && pwd
+          echo "State dir listing:" && ls -la .state || true
+
       - name: Upload state artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
-          path: |
-            .state/**
-            !.state/**/*.tmp
+          path: .state
+          if-no-files-found: warn
+          retention-days: 7
