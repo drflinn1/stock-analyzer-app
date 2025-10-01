@@ -1,13 +1,9 @@
-# main.py — Crypto Live with Core + Speculative tiers
-# - CORE: your usual coins w/ HOT bias (e.g., ZEC), spread cap, TP/SL/Trail
-# - SPEC: opt-in sandbox for pumps (e.g., SPX/PENGU/PUMP) with strict gates:
-#   * require strong 24h USD volume and positive 15m momentum
-#   * looser spread cap than CORE but still bounded
-#   * tiny size, max 1 spec position, max 1 new spec entry/day
-#   * tighter SL/Trail and fast-drop kill within first N minutes
-#
-# Anchors (entry/tp/sl/peak/tier/opened_at) are persisted in .state/anchors.json.
-# Logs include TAKE_PROFIT / STOP_LOSS / TRAILING_STOP tokens for CI.
+# main.py — Crypto Live with Core + Spec tiers
+# Now with exchange-aware min-notional preflight:
+#  - Before any BUY, we read ccxt market limits (cost/amount) and bump the USD
+#    notional up to the required minimum so Kraken won't reject with "minimum not met".
+#  - We still obey your reserve cash floor (MIN_USD_BAL). If the bumped notional
+#    would violate reserve, we skip the trade safely.
 
 from __future__ import annotations
 import os, json, math, csv, time
@@ -26,44 +22,36 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 def as_bool(val: Optional[str], default: bool) -> bool:
-    if val is None:
-        return default
+    if val is None: return default
     v = val.strip().lower()
     if v in ("1","true","yes","on","y","t"): return True
     if v in ("0","false","no","off","n","f"): return False
     return default
 
 def as_float(val: Optional[str], default: float) -> float:
-    try:
-        return float(val) if val is not None else default
-    except:
-        return default
+    try: return float(val) if val is not None else default
+    except: return default
 
 def as_int(val: Optional[str], default: int) -> int:
-    try:
-        return int(val) if val is not None else default
-    except:
-        return default
+    try: return int(val) if val is not None else default
+    except: return default
 
 def to_bps(x: float) -> float:
     return x * 10000.0
 
 def ensure_dir(p: str) -> None:
-    if p:
-        os.makedirs(p, exist_ok=True)
+    if p: os.makedirs(p, exist_ok=True)
 
 def read_json(path: str, default: Any) -> Any:
     try:
-        with open(path, "r") as f:
-            return json.load(f)
+        with open(path, "r") as f: return json.load(f)
     except Exception:
         return default
 
 def write_json(path: str, obj: Any) -> None:
     ensure_dir(os.path.dirname(path))
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(obj, f, indent=2, sort_keys=True)
+    with open(tmp, "w") as f: json.dump(obj, f, indent=2, sort_keys=True)
     os.replace(tmp, path)
 
 # --------- ENV --------- #
@@ -91,7 +79,7 @@ TRAIL_PCT  = as_float(os.getenv("TRAIL_PCT"), 0.025)
 HOT_LIST        = [s.strip() for s in os.getenv("HOT_LIST", "ZEC/USD").split(",") if s.strip()]
 HOT_BIAS_BPS    = as_float(os.getenv("HOT_BIAS_BPS"), 50.0)
 
-# SPECULATIVE sandbox
+# SPEC sandbox
 SPEC_ENABLE                 = as_bool(os.getenv("SPEC_ENABLE"), False)
 SPEC_LIST                   = [s.strip() for s in os.getenv("SPEC_LIST", "").split(",") if s.strip()]
 SPEC_MAX_POSITIONS          = as_int(os.getenv("SPEC_MAX_POSITIONS"), 1)
@@ -111,7 +99,7 @@ STATE_DIR   = os.getenv("STATE_DIR", ".state")
 KPI_CSV     = os.getenv("KPI_CSV", ".state/kpi_history.csv")
 ANCHORS_JSON= os.path.join(STATE_DIR, "anchors.json")
 
-USD_KEYS = ("USD", "ZUSD")  # Kraken sometimes uses ZUSD
+USD_KEYS = ("USD", "ZUSD")  # Kraken may use ZUSD
 
 # --------- Exchange helpers --------- #
 
@@ -127,33 +115,27 @@ def build_exchange() -> Any:
     return ex
 
 def get_usd_balance(ex: Any) -> float:
-    try:
-        bal = ex.fetch_balance()
+    try: bal = ex.fetch_balance()
     except Exception as e:
-        print(f"[WARN] fetch_balance error: {e}")
-        return 0.0
+        print(f"[WARN] fetch_balance error: {e}"); return 0.0
     for k in USD_KEYS:
         if k in bal and isinstance(bal[k], dict) and "free" in bal[k]:
             return float(bal[k]["free"] or 0.0)
     free_map = bal.get("free") or {}
     for k in USD_KEYS:
-        if k in free_map:
-            return float(free_map.get(k) or 0.0)
+        if k in free_map: return float(free_map.get(k) or 0.0)
     return 0.0
 
 def list_positions(ex: Any, all_symbols: List[str]) -> Dict[str, float]:
-    try:
-        bal = ex.fetch_balance()
+    try: bal = ex.fetch_balance()
     except Exception as e:
-        print(f"[WARN] fetch_balance (positions) error: {e}")
-        return {}
+        print(f"[WARN] fetch_balance (positions) error: {e}"); return {}
     pos: Dict[str, float] = {}
     for s in all_symbols:
         base, _ = s.split("/")
         acct = bal.get(base) or {}
         qty = float(acct.get("total") or acct.get("free") or 0.0)
-        if qty > 0:
-            pos[s] = qty
+        if qty > 0: pos[s] = qty
     return pos
 
 def fetch_bid_ask(ex: Any, symbol: str) -> Tuple[float, float]:
@@ -177,9 +159,6 @@ def usd_to_base(usd: float, ask: float) -> float:
     return usd / ask
 
 def fetch_ohlcv_change(ex: Any, symbol: str, timeframe: str, bars: int) -> float:
-    """
-    Returns (last_close / first_close - 1) over 'bars' bars for given timeframe.
-    """
     try:
         ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=bars)
         if not ohlcv or len(ohlcv) < 2: return 0.0
@@ -191,19 +170,41 @@ def fetch_ohlcv_change(ex: Any, symbol: str, timeframe: str, bars: int) -> float
         return 0.0
 
 def estimate_24h_quote_volume_usd(ex: Any, symbol: str) -> float:
-    """
-    Approximate 24h quote volume in USD using 24 x 1h bars: sum(volume_base * close_price).
-    """
     try:
         ohlcv = ex.fetch_ohlcv(symbol, timeframe="1h", limit=24)
         if not ohlcv: return 0.0
         total = 0.0
-        for ts, o, h, l, c, v in ohlcv:
-            total += float(v) * float(c)
+        for _, _, _, _, close, vol_base in ohlcv:
+            total += float(vol_base) * float(close)
         return total
     except Exception as e:
         print(f"[WARN] vol24h {symbol}: {e}")
         return 0.0
+
+# ===== NEW: exchange min-notional preflight ===== #
+
+def required_min_usd(ex: Any, symbol: str, ask: float) -> float:
+    """
+    Compute the minimum USD notional Kraken/ccxt requires for this symbol.
+    Uses market.limits.cost.min and amount.min * ask, plus our own MIN_ORDER_USD.
+    """
+    req = MIN_ORDER_USD
+    try:
+        m = ex.market(symbol)  # requires ex.load_markets() called once
+        limits = m.get("limits") or {}
+        cost_min = float((limits.get("cost") or {}).get("min") or 0.0)
+        amt_min  = float((limits.get("amount") or {}).get("min") or 0.0)
+        req = max(req, cost_min, amt_min * max(ask, 0.0))
+    except Exception as e:
+        print(f"[WARN] required_min_usd fallback for {symbol}: {e}")
+    return req
+
+def bump_notional_to_min(ex: Any, symbol: str, ask: float, desired_usd: float) -> float:
+    req = required_min_usd(ex, symbol, ask)
+    if desired_usd + 1e-9 < req:
+        print(f"[MIN] {symbol} required_min≈${req:.2f} → bumping notional from ${desired_usd:.2f} → ${req:.2f}")
+        return req
+    return desired_usd
 
 # --------- Selection with tiers --------- #
 
@@ -224,49 +225,41 @@ class Candidate:
     ask: float
 
 def core_candidates(ex: Any) -> List[Candidate]:
-    cands: List[Candidate] = []
+    out: List[Candidate] = []
     for sym in CORE_LIST:
         bid, ask = fetch_bid_ask(ex, sym)
         sp_bps   = compute_spread_bps(bid, ask)
         if sp_bps > MAX_SPREAD_BPS:
-            print(f"[SKIP CORE] {sym} spread {sp_bps:.1f} bps > {MAX_SPREAD_BPS:.1f} bps")
-            continue
+            print(f"[SKIP CORE] {sym} spread {sp_bps:.1f} bps > {MAX_SPREAD_BPS:.1f} bps"); continue
         mom24 = fetch_ohlcv_change(ex, sym, "1h", 25)
-        mom15 = fetch_ohlcv_change(ex, sym, "5m", 4)  # ~15m
+        mom15 = fetch_ohlcv_change(ex, sym, "5m", 4)
         hot_bps = HOT_BIAS_BPS if sym in HOT_LIST else 0.0
         score = to_bps(mom24) + hot_bps - sp_bps * 0.25
-        cands.append(Candidate(sym, "core", sp_bps, mom24, mom15, 0.0, hot_bps, score, bid, ask))
-    cands.sort(key=lambda x: x.score, reverse=True)
-    return cands[:max(TOP_K, 1)]
+        out.append(Candidate(sym, "core", sp_bps, mom24, mom15, 0.0, hot_bps, score, bid, ask))
+    out.sort(key=lambda x: x.score, reverse=True)
+    return out[:max(TOP_K, 1)]
 
 def spec_candidates(ex: Any) -> List[Candidate]:
-    if not SPEC_ENABLE or not SPEC_LIST:
-        return []
-    cands: List[Candidate] = []
+    if not SPEC_ENABLE or not SPEC_LIST: return []
+    out: List[Candidate] = []
     for sym in SPEC_LIST:
         bid, ask = fetch_bid_ask(ex, sym)
         sp_bps   = compute_spread_bps(bid, ask)
         if sp_bps > SPEC_MAX_SPREAD_BPS:
-            print(f"[SKIP SPEC] {sym} spread {sp_bps:.1f} bps > {SPEC_MAX_SPREAD_BPS:.1f} bps")
-            continue
+            print(f"[SKIP SPEC] {sym} spread {sp_bps:.1f} bps > {SPEC_MAX_SPREAD_BPS:.1f} bps"); continue
         vol24 = estimate_24h_quote_volume_usd(ex, sym)
         if vol24 < SPEC_MIN_VOL24H_USD:
-            print(f"[SKIP SPEC] {sym} vol24h ${vol24:,.0f} < ${SPEC_MIN_VOL24H_USD:,.0f}")
-            continue
+            print(f"[SKIP SPEC] {sym} vol24h ${vol24:,.0f} < ${SPEC_MIN_VOL24H_USD:,.0f}"); continue
         mom24 = fetch_ohlcv_change(ex, sym, "1h", 25)
         if to_bps(mom24) < SPEC_MIN_MOM24H_BPS:
-            print(f"[SKIP SPEC] {sym} mom24h {to_bps(mom24):.0f}bps < {SPEC_MIN_MOM24H_BPS:.0f}bps")
-            continue
+            print(f"[SKIP SPEC] {sym} mom24h {to_bps(mom24):.0f}bps < {SPEC_MIN_MOM24H_BPS:.0f}bps"); continue
         mom15 = fetch_ohlcv_change(ex, sym, "5m", 4)
         if SPEC_REQUIRE_MOM15M_POS and mom15 <= 0:
-            print(f"[SKIP SPEC] {sym} mom15m {to_bps(mom15):.0f}bps <= 0bps")
-            continue
-        # Spec score: overweight short-term momentum, underweight spread penalty
+            print(f"[SKIP SPEC] {sym} mom15m {to_bps(mom15):.0f}bps <= 0bps"); continue
         score = to_bps(mom24) * 0.7 + to_bps(mom15) * 0.6 - sp_bps * 0.15
-        cands.append(Candidate(sym, "spec", sp_bps, mom24, mom15, vol24, 0.0, score, bid, ask))
-    cands.sort(key=lambda x: x.score, reverse=True)
-    # only consider top 1–2 spec names
-    return cands[: min(2, len(cands))]
+        out.append(Candidate(sym, "spec", sp_bps, mom24, mom15, vol24, 0.0, score, bid, ask))
+    out.sort(key=lambda x: x.score, reverse=True)
+    return out[: min(2, len(out))]
 
 # --------- Orders --------- #
 
@@ -310,20 +303,17 @@ def save_anchors(anchors: Dict[str, Any]) -> None:
     write_json(ANCHORS_JSON, anchors)
 
 def tier_params(tier: str) -> Tuple[float,float,float]:
-    if tier == "spec":
-        return (SPEC_TP_PCT, SPEC_SL_PCT, SPEC_TRAIL_PCT)
+    if tier == "spec": return (SPEC_TP_PCT, SPEC_SL_PCT, SPEC_TRAIL_PCT)
     return (TP_PCT, SL_PCT, TRAIL_PCT)
 
 def ensure_anchor_on_buy(anchors: Dict[str, Any], symbol: str, entry_price: float, tier: str) -> None:
-    if symbol in anchors:  # don't overwrite
-        return
+    if symbol in anchors: return
     tp, sl, tr = tier_params(tier)
     anchors[symbol] = {
-        "tier": tier,
-        "entry": entry_price,
+        "tier": tier, "entry": entry_price,
         "tp": entry_price * (1.0 + tp),
         "sl": entry_price * (1.0 - sl),
-        "peak": entry_price,          # for trailing stop
+        "peak": entry_price,
         "opened_at": now_utc().isoformat()
     }
 
@@ -334,43 +324,31 @@ def manage_positions(ex: Any, positions: Dict[str, float], anchors: Dict[str, An
         price = (bid + ask) / 2.0 if bid > 0 and ask > 0 else max(bid, ask)
         a = anchors.get(sym)
         if not a:
-            # fallback seed
-            ensure_anchor_on_buy(anchors, sym, price, "core")
-            a = anchors.get(sym)
+            ensure_anchor_on_buy(anchors, sym, price, "core"); a = anchors.get(sym)
         tier = a.get("tier", "core")
         tp_pct, sl_pct, trail_pct = tier_params(tier)
 
-        # track peak
-        if price > a["peak"]:
-            a["peak"] = price
+        if price > a["peak"]: a["peak"] = price
 
-        # compute conditions
         tp_hit = price >= a["tp"]
         sl_hit = price <= a["sl"]
         trail_floor = a["peak"] * (1.0 - trail_pct)
         trail_hit = price <= trail_floor and price > 0
 
-        # spec fast-drop kill within window
         fast_hit = False
         if tier == "spec":
-            try:
-                opened_at = datetime.fromisoformat(a.get("opened_at"))
-            except Exception:
-                opened_at = now_utc()
+            try: opened_at = datetime.fromisoformat(a.get("opened_at"))
+            except Exception: opened_at = now_utc()
             age_min = max(0, int((now_utc() - opened_at).total_seconds() // 60))
             if age_min <= SPEC_FAST_DROP_WINDOW_MIN:
                 fast_floor = a["entry"] * (1.0 - SPEC_FAST_DROP_PCT)
                 fast_hit = price <= fast_floor
 
         reason = None
-        if tp_hit:
-            reason = "TAKE_PROFIT"
-        elif sl_hit:
-            reason = "STOP_LOSS"
-        elif fast_hit:
-            reason = "FAST_DROP"
-        elif trail_hit:
-            reason = "TRAILING_STOP"
+        if tp_hit: reason = "TAKE_PROFIT"
+        elif sl_hit: reason = "STOP_LOSS"
+        elif fast_hit: reason = "FAST_DROP"
+        elif trail_hit: reason = "TRAILING_STOP"
 
         if reason:
             res = place_market_sell(ex, sym, qty, bid if bid > 0 else price, reason, tier)
@@ -378,7 +356,6 @@ def manage_positions(ex: Any, positions: Dict[str, float], anchors: Dict[str, An
             anchors.pop(sym, None)
         else:
             anchors[sym] = a
-
     return actions, anchors
 
 # --------- KPI / CSV --------- #
@@ -419,7 +396,6 @@ def main() -> None:
     core = core_candidates(ex)
     spec = spec_candidates(ex)
 
-    # pretty print
     def fmt(c: Candidate) -> str:
         base = f"{c.symbol} | {c.tier} | score={c.score:+.1f} bps"
         extra = f"(24h={to_bps(c.mom_24h):+.0f}bps, 15m={to_bps(c.mom_15m):+.0f}bps, spread={c.spread_bps:.1f}bps"
@@ -439,38 +415,43 @@ def main() -> None:
     picked_syms = [c.symbol for c in (core + spec)]
     score_blurbs = [f"{c.symbol}:{c.tier}:{c.score:+.0f}bps" for c in (core + spec)]
 
-    # Buy loop: core then spec
+    # ---- Buy loop: CORE ----
     for c in core:
         if core_can_open <= 0: break
         if c.symbol in positions: continue
-        if usd_free - USD_PER_TRADE < MIN_USD_BAL:
-            print(f"[HALT] Reserve floor reached: need >= ${MIN_USD_BAL:.2f} after buy"); break
-        res = place_market_buy(ex, c.symbol, USD_PER_TRADE, c.ask, "core")
+        # bump notional to exchange min
+        notional = bump_notional_to_min(ex, c.symbol, c.ask, USD_PER_TRADE)
+        if usd_free - notional < MIN_USD_BAL:
+            print(f"[HALT] Reserve floor reached for {c.symbol}: need >= ${MIN_USD_BAL:.2f} after buy (would spend ${notional:.2f})"); break
+        res = place_market_buy(ex, c.symbol, notional, c.ask, "core")
         actions.append(f"buy:{c.symbol}:{res.get('status')}")
         if res.get("status") in ("filled","simulated"):
             entry_price = float(res.get("price") or c.ask)
             ensure_anchor_on_buy(anchors, c.symbol, entry_price, "core")
-            usd_free -= USD_PER_TRADE
+            usd_free -= notional
             core_can_open -= 1
 
+    # ---- Buy loop: SPEC ----
     for c in spec:
         if spec_can_open <= 0: break
         if c.symbol in positions: continue
-        if usd_free - SPEC_USD_PER_TRADE < MIN_USD_BAL:
-            print(f"[HALT SPEC] Reserve floor reached for spec buy; need >= ${MIN_USD_BAL:.2f} after buy"); break
-        res = place_market_buy(ex, c.symbol, SPEC_USD_PER_TRADE, c.ask, "spec")
+        desired = SPEC_USD_PER_TRADE
+        notional = bump_notional_to_min(ex, c.symbol, c.ask, desired)
+        if usd_free - notional < MIN_USD_BAL:
+            print(f"[HALT SPEC] Reserve floor for {c.symbol}: need >= ${MIN_USD_BAL:.2f} after buy (would spend ${notional:.2f})"); break
+        res = place_market_buy(ex, c.symbol, notional, c.ask, "spec")
         actions.append(f"buy:{c.symbol}:{res.get('status')}")
         if res.get("status") in ("filled","simulated"):
             entry_price = float(res.get("price") or c.ask)
             ensure_anchor_on_buy(anchors, c.symbol, entry_price, "spec")
-            usd_free -= SPEC_USD_PER_TRADE
+            usd_free -= notional
             spec_can_open -= 1
 
     # Manage exits
     exit_actions, anchors = manage_positions(ex, positions, anchors)
     actions.extend(exit_actions)
 
-    # Persist and report
+    # Persist & report
     save_anchors(anchors)
     print("\n==== SUMMARY ====")
     print(f"Picked: {picked_syms}")
