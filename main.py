@@ -29,6 +29,11 @@ def env_b(k:str, d:bool) -> bool:
 
 # ---------- ENV ----------
 DRY_RUN = env_b("DRY_RUN", True)
+LIVE_CONFIRM = env_str("LIVE_CONFIRM", "")
+# Safety: unless LIVE_CONFIRM is exactly 'I_UNDERSTAND', force dry-run.
+if LIVE_CONFIRM != "I_UNDERSTAND":
+    DRY_RUN = True
+
 # Hard fallback so schedule runs don't break even if EXCHANGE_ID=""
 EXCHANGE_ID = (env_str("EXCHANGE_ID", "kraken") or "kraken").lower()
 MAX_ENTRIES_PER_RUN = env_i("MAX_ENTRIES_PER_RUN", 1)
@@ -102,7 +107,6 @@ def get_exchange():
                 "enableRateLimit": True
             })
         else:
-            # Guard against unknown exchange ids
             if not hasattr(ccxt, EXCHANGE_ID):
                 raise ValueError(f"Unknown EXCHANGE_ID: {EXCHANGE_ID}")
             ex = getattr(ccxt, EXCHANGE_ID)({"enableRateLimit": True})
@@ -228,7 +232,7 @@ def run():
         positions.pop(sym, None)
 
     # -------- GUARDS --------
-    equity_ref = 1.0  # placeholder reference for daily P/L percent
+    equity_ref = 1.0
     daily_pl_pct = (realized_today / equity_ref) if equity_ref > 0 else 0.0
     allow_buys = daily_pl_pct >= DAILY_LOSS_CAP_PCT
     if not allow_buys:
