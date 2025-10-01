@@ -1,4 +1,4 @@
-name: Crypto Live — Guarded Auto-Pick + Hot Movers Bias (LIVE)
+name: Crypto Live — Guarded Auto-Pick + Hot Movers Bias (LIVE + Spec Sandbox)
 
 on:
   workflow_dispatch:
@@ -29,9 +29,9 @@ jobs:
       DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'false' }}   # default LIVE
       RUN_SWITCH: ${{ github.event.inputs.RUN_SWITCH || 'ON' }}
 
-      # ---- Universe / filters ----
+      # ---- CORE universe / filters ----
       WHITELIST_CSV: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD,ZEC/USD"
-      MAX_SPREAD_BPS: "40"
+      MAX_SPREAD_BPS: "40"           # skip if (ask-bid)/mid > 0.40%
       MAX_POSITIONS: "4"
       TOP_K: "3"
       MIN_USD_BAL: "100"
@@ -42,14 +42,30 @@ jobs:
       MAX_DAILY_NEW_ENTRIES: "4"
       MAX_DAILY_LOSS_USD: "25"
 
-      # ---- Exits / management ----
-      TP_PCT: "0.035"
-      SL_PCT: "0.020"
-      TRAIL_PCT: "0.025"
+      # ---- CORE exits / management ----
+      TP_PCT: "0.035"                # 3.5% take-profit
+      SL_PCT: "0.020"                # 2.0% stop-loss
+      TRAIL_PCT: "0.025"             # 2.5% trailing stop
 
       # ---- Hot movers bias ----
       HOT_LIST: "ZEC/USD"
-      HOT_BIAS_BPS: "50"
+      HOT_BIAS_BPS: "50"             # +0.50% score bump for HOT_LIST names
+
+      # ---- SPECULATIVE sandbox (default OFF; flip ON to enable) ----
+      SPEC_ENABLE: "OFF"
+      SPEC_LIST: "SPX/USD,PENGU/USD,PUMP/USD"
+      SPEC_MAX_POSITIONS: "1"
+      SPEC_MAX_DAILY_NEW_ENTRIES: "1"
+      SPEC_USD_PER_TRADE: "5"        # smaller size for spec
+      SPEC_MAX_SPREAD_BPS: "120"     # allow up to 1.20% spread
+      SPEC_MIN_VOL24H_USD: "3000000" # est. 24h USD volume >= $3M
+      SPEC_MIN_MOM24H_BPS: "1000"    # 24h momentum >= +10%
+      SPEC_REQUIRE_MOM15M_POS: "true" # 15m momentum must be > 0
+      SPEC_TP_PCT: "0.050"           # 5% take profit
+      SPEC_SL_PCT: "0.030"           # 3% stop loss
+      SPEC_TRAIL_PCT: "0.030"        # 3% trailing stop
+      SPEC_FAST_DROP_PCT: "0.040"    # if -4% within first 60 min => exit fast
+      SPEC_FAST_DROP_WINDOW_MIN: "60"
 
       # ---- Files & outputs ----
       KPI_CSV: ".state/kpi_history.csv"
@@ -97,17 +113,10 @@ jobs:
         run: |
           python -u main.py
 
-      - name: List state before pack (debug)
-        if: always()
-        run: |
-          echo "Workspace:" && pwd
-          echo "State dir listing:" && ls -la .state || true
-
       - name: Pack .state into zip
         if: always()
         run: |
           rm -f state_${{ github.run_id }}.zip
-          # zip handles dot-folders reliably across runners
           zip -r state_${{ github.run_id }}.zip .state >/dev/null
           ls -l state_${{ github.run_id }}.zip
 
