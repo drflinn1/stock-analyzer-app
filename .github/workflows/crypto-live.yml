@@ -131,7 +131,7 @@ jobs:
 
       - name: Run Crypto Live
         run: |
-          python -u trader/main.py
+          python -u main.py
 
       - name: Upload KPI history
         if: always()
