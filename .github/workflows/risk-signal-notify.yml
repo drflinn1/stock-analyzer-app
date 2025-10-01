@@ -28,11 +28,13 @@ jobs:
           python-version: "3.11"
 
       - name: Run notifier
-        id: run
+        shell: bash
         run: |
           set -e
-          python - << 'PY'
+          mkdir -p .state
+          cat > _notify.py <<'PY'
 import os, json, pathlib, sys, random
+
 p = pathlib.Path(".state"); p.mkdir(parents=True, exist_ok=True)
 last_file = p / "last_risk_signal.txt"
 
@@ -46,8 +48,9 @@ last_file.write_text(signal)
 print(f"RISK SIGNAL: {signal}")
 if flip:
     print(f"Flip detected: {prev} -> {signal}")
-    # Fail on purpose: GitHub emails on failed runs to your account address.
+    # Fail on purpose so GitHub emails you on flips
     sys.exit(42)
 else:
     print("No flip detected.")
 PY
+          python _notify.py
