@@ -1,10 +1,4 @@
 # main.py — Crypto Live with Guard Pack (root-level, FULL FILE)
-# - DRY-RUN banner + simulated orders
-# - USD-only accounting (Kraken: USD/ZUSD aware)
-# - Universe: whitelist or auto-pick by 24h quoteVolume
-# - TP/SL/Trailing logic (price-triggered exits)
-# - Daily loss cap + reserve cash + max positions + max new entries
-# - Color-coded logs + KPI history CSV
 
 from __future__ import annotations
 import os, json, time, math, csv, sys
@@ -20,7 +14,6 @@ STATE_DIR = ".state"
 POSITIONS_F = os.path.join(STATE_DIR, "positions.json")
 KPI_CSV = os.path.join(STATE_DIR, "kpi_history.csv")
 SUMMARY_F = os.path.join(STATE_DIR, "summary_last.txt")
-
 os.makedirs(STATE_DIR, exist_ok=True)
 
 def env_str(k:str, d:str="") -> str: return str(os.getenv(k, d)).strip()
@@ -36,7 +29,8 @@ def env_b(k:str, d:bool) -> bool:
 
 # ---------- ENV ----------
 DRY_RUN = env_b("DRY_RUN", True)
-EXCHANGE_ID = env_str("EXCHANGE_ID", "kraken")
+# Hard fallback so schedule runs don't break even if EXCHANGE_ID=""
+EXCHANGE_ID = (env_str("EXCHANGE_ID", "kraken") or "kraken").lower()
 MAX_ENTRIES_PER_RUN = env_i("MAX_ENTRIES_PER_RUN", 1)
 USD_PER_TRADE = env_f("USD_PER_TRADE", 10.0)
 TAKE_PROFIT_PCT = env_f("TAKE_PROFIT_PCT", 0.035)
@@ -51,7 +45,6 @@ MAX_POSITIONS = env_i("MAX_POSITIONS", 6)
 AVOID_STABLES = env_b("AVOID_STABLES", True)
 
 GREEN = "\033[92m"; YELLOW="\033[93m"; RED="\033[91m"; RESET="\033[0m"
-
 def log_good(msg): print(GREEN + msg + RESET, flush=True)
 def log_warn(msg): print(YELLOW + msg + RESET, flush=True)
 def log_error(msg): print(RED + msg + RESET, flush=True)
@@ -99,18 +92,24 @@ def fetch_usd_free(ex) -> float:
     return total
 
 def get_exchange():
-    if EXCHANGE_ID == "kraken":
-        apiKey = os.getenv("KRAKEN_API_KEY","")
-        secret = os.getenv("KRAKEN_API_SECRET","")
-        ex = ccxt.kraken({
-            "apiKey": apiKey,
-            "secret": secret,
-            "enableRateLimit": True
-        })
-    else:
-        ex = getattr(ccxt, EXCHANGE_ID)({"enableRateLimit": True})
-    ex.load_markets()
-    return ex
+    try:
+        if EXCHANGE_ID == "kraken":
+            apiKey = os.getenv("KRAKEN_API_KEY","")
+            secret = os.getenv("KRAKEN_API_SECRET","")
+            ex = ccxt.kraken({
+                "apiKey": apiKey,
+                "secret": secret,
+                "enableRateLimit": True
+            })
+        else:
+            # Guard against unknown exchange ids
+            if not hasattr(ccxt, EXCHANGE_ID):
+                raise ValueError(f"Unknown EXCHANGE_ID: {EXCHANGE_ID}")
+            ex = getattr(ccxt, EXCHANGE_ID)({"enableRateLimit": True})
+        ex.load_markets()
+        return ex
+    except Exception as e:
+        raise SystemExit(f"exchange init failed: {e}")
 
 def universe_auto(ex) -> List[str]:
     tickers = ex.fetch_tickers()
@@ -162,7 +161,6 @@ def simulate_or_place_buy(ex, symbol: str, usd: float) -> Tuple[bool,str]:
 def simulate_or_place_sell(ex, symbol: str, qty: float) -> Tuple[bool,str]:
     if DRY_RUN:
         log_warn("🚧 DRY RUN — NO REAL ORDERS SENT 🚧")
-        # Note: both SIM_SELL and SELL tokens are present in this file
         return True, f"SIM_SELL {symbol} qty={qty:.8f}"
     try:
         ex.create_order(symbol, "market", "sell", qty)
