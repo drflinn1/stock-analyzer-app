@@ -39,24 +39,10 @@ on:
         description: "Run Dust Sweeper after bot (true/false)"
         required: true
         default: "true"
-
-      # ----- Auto-pick controls (now visible in the UI) -----
       AUTO_TOP_K:
-        description: "Auto-pick: number of symbols to choose"
+        description: "Auto-pick: number of symbols (defaults to MAX_POSITIONS)"
         required: true
         default: "4"
-      AUTO_MIN_USD_VOL:
-        description: "Auto-pick: minimum 24h USD volume (e.g., 2000000 = $2M)"
-        required: true
-        default: "2000000"
-      AUTO_MIN_PRICE:
-        description: "Auto-pick: minimum last price (e.g., 0.05)"
-        required: true
-        default: "0.05"
-      AUTO_EXCLUDE:
-        description: "Auto-pick: exclude list (comma symbols)"
-        required: true
-        default: "USDT/USD,USDC/USD,EUR/USD,GBP/USD,USD/USD,SPX/USD,PUMP/USD,BABY/USD,ALKIMI/USD"
 
   schedule:
     - cron: "*/15 * * * *"  # every 15 minutes
@@ -80,9 +66,10 @@ jobs:
 
       # Auto-pick (read by trader/crypto_engine.py)
       AUTO_TOP_K: ${{ inputs.AUTO_TOP_K || inputs.MAX_POSITIONS || '4' }}
-      AUTO_MIN_USD_VOL: ${{ inputs.AUTO_MIN_USD_VOL || '2000000' }}
-      AUTO_MIN_PRICE: ${{ inputs.AUTO_MIN_PRICE || '0.05' }}
-      AUTO_EXCLUDE: ${{ inputs.AUTO_EXCLUDE || 'USDT/USD,USDC/USD,EUR/USD,GBP/USD,USD/USD,SPX/USD,PUMP/USD,BABY/USD,ALKIMI/USD' }}
+      # The following come from repository VARIABLES (Settings → Variables → Actions), not inputs:
+      AUTO_MIN_USD_VOL: ${{ vars.AUTO_MIN_USD_VOL || '2000000' }}   # e.g., 2000000 = $2M
+      AUTO_MIN_PRICE:   ${{ vars.AUTO_MIN_PRICE   || '0.05' }}      # e.g., 0.05 = 5¢
+      AUTO_EXCLUDE:     ${{ vars.AUTO_EXCLUDE     || 'USDT/USD,USDC/USD,EUR/USD,GBP/USD,USD/USD,SPX/USD,PUMP/USD,BABY/USD,ALKIMI/USD' }}
 
     steps:
       - name: Checkout
