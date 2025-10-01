@@ -1,19 +1,26 @@
 # trader/crypto_engine.py
-# Minimal engine that:
-#  - Reads DRY_RUN/EXCHANGE_ID/BASE_CURRENCY/UNIVERSE from env
-#  - Builds CCXT via CCXTCryptoBroker (accepts CCXT_* or KRAKEN_* keys)
-#  - Prints balance & KPI SUMMARY
-#  - Returns 0 (success) every run in DRY_RUN
+# Minimal engine with robust imports:
+# - Tries package import first (trader.broker_crypto_ccxt)
+# - Falls back to local import when executed as a plain script
+
 from __future__ import annotations
-import os, sys, time
+import os, sys
 from datetime import datetime, timezone
 
-from trader.broker_crypto_ccxt import CCXTCryptoBroker
+# ---- robust import of broker ----
+try:
+    from trader.broker_crypto_ccxt import CCXTCryptoBroker  # when run as a module/package
+except ModuleNotFoundError:
+    # when run as a script: add current dir to sys.path and import locally
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    from broker_crypto_ccxt import CCXTCryptoBroker  # type: ignore
 
 def now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def as_bool(s: str, default: bool = True) -> bool:
+def as_bool(s: str | None, default: bool = True) -> bool:
     if s is None:
         return default
     s = s.strip().lower()
@@ -42,11 +49,8 @@ def main() -> int:
     uni_list = [] if uni == "auto" else [u.strip() for u in uni.split(",") if u.strip()]
     print(f"{now_utc()} INFO: Universe ({env['BASE']}-only): {uni_list if uni_list else 'auto'}")
 
-    # Build broker (reads CCXT_* or KRAKEN_*)
-    broker = CCXTCryptoBroker(
-        exchange_id=env["EXCHANGE_ID"],
-        dry_run=env["DRY_RUN"],
-    )
+    # Build broker (reads CCXT_* or KRAKEN_* envs, prints source)
+    broker = CCXTCryptoBroker(exchange_id=env["EXCHANGE_ID"], dry_run=env["DRY_RUN"])
 
     usd = 0.0
     try:
@@ -56,7 +60,6 @@ def main() -> int:
     except Exception as e:
         print(f"{now_utc()} WARN: Could not fetch USD/ZUSD balance: {e}")
 
-    # (Placeholder selection logic; respects empty list if auto and no data)
     open_positions = 0
     cap_left = env["MAX_POSITIONS"] - open_positions
     if (uni != "auto") and uni_list:
