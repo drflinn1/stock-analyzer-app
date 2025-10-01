@@ -40,7 +40,6 @@ on:
         required: true
         default: '{"TAKE_PROFIT_PCT":0.035,"STOP_LOSS_PCT":0.020,"TRAIL_PCT":0.025,"DAILY_LOSS_CAP_PCT":-0.02,"RESERVE_USD":100,"AVOID_STABLES":true}'
 
-  # Every 15 minutes
   schedule:
     - cron: "*/15 * * * *"
 
@@ -57,11 +56,10 @@ jobs:
     timeout-minutes: 14
 
     env:
-      # Secrets (repo → Settings → Secrets and variables → Actions)
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-      # Inputs (may be empty on schedule runs)
+      # Inputs
       DRY_RUN: ${{ inputs.DRY_RUN }}
       EXCHANGE_ID: ${{ inputs.EXCHANGE_ID }}
       UNIVERSE_MODE: ${{ inputs.UNIVERSE_MODE }}
@@ -97,21 +95,6 @@ jobs:
           else
             pip install ccxt==4.4.38 pandas==2.2.2
           fi
-
-      - name: Apply defaults for schedule runs
-        run: |
-          # If EXCHANGE_ID is blank (schedule runs), default to kraken
-          if [ -z "${EXCHANGE_ID}" ]; then echo "EXCHANGE_ID=kraken" >> "$GITHUB_ENV"; fi
-          # DRY_RUN default true if blank
-          if [ -z "${DRY_RUN}" ]; then echo "DRY_RUN=true" >> "$GITHUB_ENV"; fi
-          # Provide safe defaults for other inputs if schedule leaves them empty
-          [ -z "${UNIVERSE_MODE}" ] && echo "UNIVERSE_MODE=whitelist" >> "$GITHUB_ENV"
-          [ -z "${WHITELIST}" ] && echo "WHITELIST=BTC/USD,ETH/USD,SOL/USD,DOGE/USD" >> "$GITHUB_ENV"
-          [ -z "${TOPK}" ] && echo "TOPK=8" >> "$GITHUB_ENV"
-          [ -z "${USD_PER_TRADE}" ] && echo "USD_PER_TRADE=10" >> "$GITHUB_ENV"
-          [ -z "${MAX_ENTRIES_PER_RUN}" ] && echo "MAX_ENTRIES_PER_RUN=1" >> "$GITHUB_ENV"
-          [ -z "${MAX_POSITIONS}" ] && echo "MAX_POSITIONS=6" >> "$GITHUB_ENV"
-          [ -z "${CONFIG}" ] && echo 'CONFIG={"TAKE_PROFIT_PCT":0.035,"STOP_LOSS_PCT":0.020,"TRAIL_PCT":0.025,"DAILY_LOSS_CAP_PCT":-0.02,"RESERVE_USD":100,"AVOID_STABLES":true}' >> "$GITHUB_ENV"
 
       - name: Parse CONFIG → env
         run: |
