@@ -1,130 +1,78 @@
-name: Crypto Live — Guarded Auto-Pick + Hot Movers Bias (LIVE + Spec ON)
+name: crypto live
 
 on:
   workflow_dispatch:
-    inputs:
-      DRY_RUN:
-        description: 'true = simulate orders; false = send real orders'
-        required: true
-        default: 'false'   # default LIVE
-      RUN_SWITCH:
-        description: 'ON to run, OFF to skip early'
-        required: true
-        default: 'ON'
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: "*/15 * * * *"   # every 15 minutes
+
+permissions:
+  contents: read
 
 jobs:
-  crypto_live:
+  crypto-live:
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.RUN_SWITCH != 'OFF' }}
+    timeout-minutes: 25
+
     env:
-      # ---- Broker / CCXT ----
-      EXCHANGE_ID: kraken
-      CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
-      CCXT_API_SECRET: ${{ secrets.CCXT_API_SECRET }}
-      CCXT_API_PASSWORD: ${{ secrets.CCXT_API_PASSWORD }}
+      # --- Mode toggles ---
+      BOT_MODE: TRADE            # << run real trader (GUARD prints demo instead)
+      DRY_RUN: "false"           # << LIVE MODE (set "true" for simulator)
+      RUN_SWITCH: "on"
 
-      # ---- Master switches ----
-      DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'false' }}   # default LIVE
-      RUN_SWITCH: ${{ github.event.inputs.RUN_SWITCH || 'ON' }}
+      # --- Exchange keys (ensure these secrets exist) ---
+      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-      # ---- CORE universe / filters ----
-      WHITELIST_CSV: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD,ZEC/USD"
-      MAX_SPREAD_BPS: "40"           # 0.40% max spread for core
-      MAX_POSITIONS: "4"
-      TOP_K: "3"
-      MIN_USD_BAL: "100"
-      USD_PER_TRADE: "10"
-      MIN_ORDER_USD: "5"
+      # --- Trading knobs (optional; your engine may read these) ---
+      TAKE_PROFIT: "3.5"
+      STOP_LOSS: "2.0"
+      TRAIL_PCT: "1.2"
 
-      # ---- P&L guards ----
-      MAX_DAILY_NEW_ENTRIES: "4"
-      MAX_DAILY_LOSS_USD: "25"
+      # --- Spec-tier defaults (used only in GUARD mode) ---
+      SPEC_MAX_SPREAD_PCT: "1.0"
+      SPEC_MIN_DOLLAR_VOL: "25000"
+      SPEC_MAX_AGE_HRS: "48"
 
-      # ---- CORE exits / management ----
-      TP_PCT: "0.035"                # 3.5% take-profit
-      SL_PCT: "0.020"                # 2.0% stop-loss
-      TRAIL_PCT: "0.025"             # 2.5% trailing stop
-
-      # ---- Hot movers bias (core) ----
-      HOT_LIST: "ZEC/USD"
-      HOT_BIAS_BPS: "50"             # +0.50% score bump for HOT_LIST names
-
-      # ---- SPECULATIVE sandbox (ON by default) ----
-      SPEC_ENABLE: "ON"
-      SPEC_LIST: "SPX/USD,PENGU/USD,PUMP/USD"
-      SPEC_MAX_POSITIONS: "1"
-      SPEC_MAX_DAILY_NEW_ENTRIES: "1"
-      SPEC_USD_PER_TRADE: "5"        # smaller sizing for spec
-      SPEC_MAX_SPREAD_BPS: "120"     # up to 1.20% spread allowed
-      SPEC_MIN_VOL24H_USD: "3000000" # require ≥ $3M est. 24h USD volume
-      SPEC_MIN_MOM24H_BPS: "1000"    # require ≥ +10% 24h momentum
-      SPEC_REQUIRE_MOM15M_POS: "true" # 15m momentum must be positive
-      SPEC_TP_PCT: "0.050"           # 5% TP
-      SPEC_SL_PCT: "0.030"           # 3% SL
-      SPEC_TRAIL_PCT: "0.030"        # 3% trailing
-      SPEC_FAST_DROP_PCT: "0.040"    # kill if -4% within first 60 min
-      SPEC_FAST_DROP_WINDOW_MIN: "60"
-
-      # ---- Files & outputs ----
-      KPI_CSV: ".state/kpi_history.csv"
-      STATE_DIR: ".state"
+      # Optional: point to a different entry module if not trader.crypto_engine
+      # TRADER_MODULE: "trader.crypto_engine"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install ccxt==4.3.82
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install ccxt pandas; fi
 
-      - name: Prepare state directory and seed files
-        shell: bash
-        run: |
-          set -e
-          mkdir -p .state
-          [ -s .state/anchors.json ] || echo "{}" > .state/anchors.json
-          [ -s .state/kpi_history.csv ] || echo "ts,dry_run,picked,scores,hot_list,usd_free,actions" > .state/kpi_history.csv
-          [ -f .state/last_risk_signal.txt ] || echo "UNKNOWN" > .state/last_risk_signal.txt
-          echo "Prepared .state contents:" && ls -la .state
-
-      - name: Confirm live/dry status
+      - name: Confirm mode
         run: |
           echo "RUN_SWITCH=${RUN_SWITCH}"
           echo "DRY_RUN=${DRY_RUN}"
-          if [ "${RUN_SWITCH}" = "OFF" ]; then
-            echo "RUN_SWITCH=OFF → exiting early."; exit 0; fi
+          echo "BOT_MODE=${BOT_MODE}"
           if [ "${DRY_RUN}" = "true" ]; then
-            echo "🚧 DRY RUN — NO REAL ORDERS WILL BE SENT 🚧"
+            echo "🚧 DRY RUN — NO REAL ORDERS SENT 🚧"
           else
-            echo "✅ LIVE MODE — REAL ORDERS ENABLED"
+            echo "⚠️ LIVE MODE — REAL ORDERS ENABLED"
           fi
 
       - name: Run Crypto Live
-        env:
-          PYTHONWARNINGS: "ignore"
         run: |
           python -u main.py
 
       - name: Pack .state into zip
-        if: always()
         run: |
-          rm -f state_${{ github.run_id }}.zip
-          zip -r state_${{ github.run_id }}.zip .state >/dev/null
-          ls -l state_${{ github.run_id }}.zip
+          mkdir -p .state
+          zip -r "state_${GITHUB_RUN_ID}.zip" .state || true
 
       - name: Upload state artifact (zip)
-        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: state-${{ github.run_id }}
-          path: state_${{ github.run_id }}.zip
-          if-no-files-found: error
-          retention-days: 7
+          name: state_${{ github.run_id }}
+          path: "state_${{ github.run_id }}.zip"
+          if-no-files-found: ignore
