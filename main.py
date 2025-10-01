@@ -28,14 +28,8 @@ def env_b(k:str, d:bool) -> bool:
     return v in ("1","true","yes","y")
 
 # ---------- ENV ----------
-DRY_RUN = env_b("DRY_RUN", True)
-LIVE_CONFIRM = env_str("LIVE_CONFIRM", "")
-# Safety: unless LIVE_CONFIRM is exactly 'I_UNDERSTAND', force dry-run.
-if LIVE_CONFIRM != "I_UNDERSTAND":
-    DRY_RUN = True
-
-# Hard fallback so schedule runs don't break even if EXCHANGE_ID=""
-EXCHANGE_ID = (env_str("EXCHANGE_ID", "kraken") or "kraken").lower()
+DRY_RUN = env_b("DRY_RUN", True)  # one switch, already set by workflow for schedule/manual
+EXCHANGE_ID = (env_str("EXCHANGE_ID", "kraken") or "kraken").lower()  # hard fallback
 MAX_ENTRIES_PER_RUN = env_i("MAX_ENTRIES_PER_RUN", 1)
 USD_PER_TRADE = env_f("USD_PER_TRADE", 10.0)
 TAKE_PROFIT_PCT = env_f("TAKE_PROFIT_PCT", 0.035)
