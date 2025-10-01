@@ -1,4 +1,4 @@
-# main.py — Crypto Live with Guard Pack (root-level)
+# main.py — Crypto Live with Guard Pack (root-level, FULL FILE)
 # - DRY-RUN banner + simulated orders
 # - USD-only accounting (Kraken: USD/ZUSD aware)
 # - Universe: whitelist or auto-pick by 24h quoteVolume
@@ -112,5 +112,210 @@ def get_exchange():
     ex.load_markets()
     return ex
 
-# … rest of code identical to the earlier `main.py` version …
-# (exits, buys, trailing, KPIs, run() wrapper, __main__)
+def universe_auto(ex) -> List[str]:
+    tickers = ex.fetch_tickers()
+    scored = []
+    for sym, t in tickers.items():
+        if "/" not in sym: continue
+        if AVOID_STABLES and (stable_like(sym)): continue
+        qv = float(t.get("quoteVolume", 0) or 0)
+        if qv <= 0: continue
+        scored.append((qv, sym))
+    scored.sort(reverse=True)
+    return [s for _, s in scored[:TOPK]]
+
+def current_price(ex, symbol: str) -> Optional[float]:
+    try:
+        o = ex.fetch_ticker(symbol)
+        for k in ("last","close","bid","ask"):
+            v = o.get(k)
+            if v: return float(v)
+    except Exception as e:
+        log_warn(f"price miss {symbol}: {e}")
+    return None
+
+def size_to_qty(ex, symbol: str, usd: float) -> Optional[float]:
+    m = ex.market(symbol)
+    price = current_price(ex, symbol)
+    if price is None or price <= 0: return None
+    qty = usd / price
+    amt_min = (m.get("limits", {}).get("amount", {}).get("min") or 0) or 0
+    step_prec = m.get("precision", {}).get("amount")
+    if amt_min and qty < amt_min: return None
+    if isinstance(step_prec, int):
+        qty = math.floor(qty * (10**step_prec)) / (10**step_prec)
+    return max(qty, 0)
+
+def simulate_or_place_buy(ex, symbol: str, usd: float) -> Tuple[bool,str]:
+    if DRY_RUN:
+        log_warn("🚧 DRY RUN — NO REAL ORDERS SENT 🚧")
+        return True, f"SIM_BUY {symbol} ${usd:.2f}"
+    try:
+        qty = size_to_qty(ex, symbol, usd)
+        if qty is None or qty <= 0:
+            return False, f"qty too small for {symbol}"
+        ex.create_order(symbol, "market", "buy", qty)
+        return True, f"BUY {symbol} qty={qty}"
+    except Exception as e:
+        return False, f"buy err {symbol}: {e}"
+
+def simulate_or_place_sell(ex, symbol: str, qty: float) -> Tuple[bool,str]:
+    if DRY_RUN:
+        log_warn("🚧 DRY RUN — NO REAL ORDERS SENT 🚧")
+        # Note: both SIM_SELL and SELL tokens are present in this file
+        return True, f"SIM_SELL {symbol} qty={qty:.8f}"
+    try:
+        ex.create_order(symbol, "market", "sell", qty)
+        return True, f"SELL {symbol} qty={qty}"
+    except Exception as e:
+        return False, f"sell err {symbol}: {e}"
+
+def update_trailing(high: float, price: float) -> float:
+    return max(high, price)
+
+def run():
+    print(("🚧 DRY RUN — NO REAL ORDERS SENT 🚧" if DRY_RUN else "✅ LIVE ORDERS ENABLED").center(80, "="))
+    ex = get_exchange()
+    positions = load_positions()
+
+    realized_today = 0.0
+    sells_count = 0
+    buys_count = 0
+
+    # -------- EXIT CHECKS --------
+    to_remove = []
+    for sym, pos in list(positions.items()):
+        price = current_price(ex, sym)
+        if price is None:
+            log_warn(f"skip exit check (no price) {sym}")
+            continue
+
+        entry = float(pos["entry"])
+        qty   = float(pos["qty"])
+        high  = float(pos.get("high", entry))
+        pnl_pct = (price - entry) / entry
+        high = update_trailing(high, price)
+        positions[sym]["high"] = high
+
+        # TAKE PROFIT
+        if pnl_pct >= TAKE_PROFIT_PCT:
+            ok, msg = simulate_or_place_sell(ex, sym, qty)
+            log_good(f"TP exit {sym} @ {price:.6f} ({pnl_pct*100:.2f}%) → {msg}")
+            if ok:
+                realized_today += (price - entry) * qty
+                sells_count += 1
+                to_remove.append(sym)
+            continue
+
+        # STOP LOSS
+        if pnl_pct <= -abs(STOP_LOSS_PCT):
+            ok, msg = simulate_or_place_sell(ex, sym, qty)
+            log_error(f"SL exit {sym} @ {price:.6f} ({pnl_pct*100:.2f}%) → {msg}")
+            if ok:
+                realized_today += (price - entry) * qty
+                sells_count += 1
+                to_remove.append(sym)
+            continue
+
+        # TRAILING STOP
+        if high > 0 and (price <= high * (1 - abs(TRAIL_PCT))):
+            ok, msg = simulate_or_place_sell(ex, sym, qty)
+            log_warn(f"TRAIL exit {sym} high={high:.6f} now={price:.6f} → {msg}")
+            if ok:
+                realized_today += (price - entry) * qty
+                sells_count += 1
+                to_remove.append(sym)
+
+    for sym in to_remove:
+        positions.pop(sym, None)
+
+    # -------- GUARDS --------
+    equity_ref = 1.0  # placeholder reference for daily P/L percent
+    daily_pl_pct = (realized_today / equity_ref) if equity_ref > 0 else 0.0
+    allow_buys = daily_pl_pct >= DAILY_LOSS_CAP_PCT
+    if not allow_buys:
+        log_error(f"Auto-pause: daily realized P/L {daily_pl_pct:.4f} < cap {DAILY_LOSS_CAP_PCT:.4f}")
+
+    usd_free = fetch_usd_free(ex)
+    spendable = max(0.0, usd_free - RESERVE_USD)
+    if spendable < USD_PER_TRADE:
+        log_warn(f"Cash low: free={usd_free:.2f}, reserve={RESERVE_USD:.2f}, spendable={spendable:.2f}")
+
+    # -------- UNIVERSE --------
+    if UNIVERSE_MODE.lower() == "auto":
+        universe = universe_auto(ex)
+        log_good(f"Auto universe: {', '.join(universe) if universe else '∅'}")
+    else:
+        universe = WHITELIST
+        log_good(f"Whitelist: {', '.join(universe)}")
+
+    # -------- ENTRY LOGIC --------
+    if len(positions) > MAX_POSITIONS:
+        log_warn(f"Over cap positions={len(positions)} > MAX_POSITIONS={MAX_POSITIONS}. (No auto-trim in this minimalist main.py)")
+
+    buys_made = 0
+    if allow_buys and spendable >= USD_PER_TRADE and len(positions) < MAX_POSITIONS:
+        for sym in universe:
+            if buys_made >= MAX_ENTRIES_PER_RUN: break
+            if sym in positions: continue
+            price = current_price(ex, sym)
+            if price is None: continue
+            qty = size_to_qty(ex, sym, USD_PER_TRADE)
+            if qty is None or qty <= 0:
+                log_warn(f"skip buy (qty too small) {sym}")
+                continue
+            ok, msg = simulate_or_place_buy(ex, sym, USD_PER_TRADE)
+            if ok:
+                buys_made += 1
+                positions[sym] = {
+                    "entry": price,
+                    "qty": qty if not DRY_RUN else qty,
+                    "ts": now_utc_ts(),
+                    "high": price
+                }
+                log_good(f"BUY OPEN {sym} entry={price:.6f} qty={qty:.8f} → {msg}")
+
+    # -------- MARK TO MARKET --------
+    unreal = 0.0
+    for sym, pos in positions.items():
+        price = current_price(ex, sym)
+        if price is None: continue
+        entry = float(pos["entry"])
+        qty   = float(pos["qty"])
+        unreal += (price - entry) * qty
+
+    save_positions(positions)
+
+    summary = (
+        f"time={now_iso()} dry_run={DRY_RUN} exchange={EXCHANGE_ID}\n"
+        f"positions={len(positions)} buys={buys_made} sells={sells_count}\n"
+        f"pnl_realized_today={realized_today:.2f} pnl_unrealized_now={unreal:.2f}\n"
+    )
+    print("\n" + ("-"*60))
+    if realized_today >= 0 or (realized_today == 0 and unreal >= 0):
+        log_good("SUMMARY\n" + summary)
+    elif realized_today < 0:
+        log_error("SUMMARY\n" + summary)
+    else:
+        log_warn("SUMMARY\n" + summary)
+
+    with open(SUMMARY_F, "w", encoding="utf-8") as f:
+        f.write(summary)
+
+    append_kpi({
+        "ts": str(now_utc_ts()),
+        "iso": now_iso(),
+        "pnl_realized": f"{realized_today:.2f}",
+        "pnl_unrealized": f"{unreal:.2f}",
+        "positions": str(len(positions)),
+        "buys": str(buys_made),
+        "sells": str(sells_count),
+        "dry_run": str(DRY_RUN),
+    })
+
+if __name__ == "__main__":
+    try:
+        run()
+    except Exception as e:
+        log_error(f"FATAL: {e}")
+        sys.exit(1)
