@@ -3,7 +3,7 @@ name: crypto live
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes
+    - cron: "*/15 * * * *"
 
 permissions:
   contents: read
@@ -15,26 +15,44 @@ jobs:
 
     env:
       # --- Mode toggles ---
-      BOT_MODE: TRADE            # << run real trader (GUARD prints demo instead)
-      DRY_RUN: "false"           # << LIVE MODE (set "true" for simulator)
+      BOT_MODE: TRADE
+      DRY_RUN: "false"
       RUN_SWITCH: "on"
 
-      # --- Exchange keys (ensure these secrets exist) ---
+      # --- Broker keys (Kraken) ---
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-      # --- Trading knobs (optional; your engine may read these) ---
+      # --- Core trading knobs (your engine already reads these) ---
       TAKE_PROFIT: "3.5"
       STOP_LOSS: "2.0"
       TRAIL_PCT: "1.2"
 
-      # --- Spec-tier defaults (used only in GUARD mode) ---
-      SPEC_MAX_SPREAD_PCT: "1.0"
-      SPEC_MIN_DOLLAR_VOL: "25000"
-      SPEC_MAX_AGE_HRS: "48"
+      # ---------- UNIVERSE / FILTERS ----------
+      # Allow both USD and USDT quotes so spec pairs aren’t dropped
+      QUOTE_ALLOW: "USD,USDT"
 
-      # Optional: point to a different entry module if not trader.crypto_engine
-      # TRADER_MODULE: "trader.crypto_engine"
+      # Keep conservative core names but allow a SPEC tier explicitly
+      CORE_WHITELIST: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
+
+      # Enable SPEC tier and list the three you asked for.
+      # If your exchange only lists them in USDT, keep the /USDT versions.
+      ALLOW_SPEC: "true"
+      SPEC_SYMBOLS: "SPX/USDT,PENGU/USDT,PUMP/USDT"
+
+      # Remove the broad blocklist that previously excluded these
+      PAIR_BLOCKLIST: ""
+
+      # Loosen spec gates just enough to allow entries, but still sane
+      SPEC_MAX_SPREAD_PCT: "3.0"     # was 1.0
+      SPEC_MIN_DOLLAR_VOL: "15000"   # was 25000
+      SPEC_MAX_AGE_HRS: "168"        # allow up to 7 days old
+
+      # Position sizing & caps (tune to taste)
+      USD_PER_TRADE: "10"
+      MAX_POSITIONS: "6"
+      RESERVE_USD: "100"
+      DAILY_MAX_TRADES: "6"
 
     steps:
       - name: Checkout
@@ -55,6 +73,9 @@ jobs:
           echo "RUN_SWITCH=${RUN_SWITCH}"
           echo "DRY_RUN=${DRY_RUN}"
           echo "BOT_MODE=${BOT_MODE}"
+          echo "QUOTE_ALLOW=${QUOTE_ALLOW}"
+          echo "CORE_WHITELIST=${CORE_WHITELIST}"
+          echo "SPEC_SYMBOLS=${SPEC_SYMBOLS}"
           if [ "${DRY_RUN}" = "true" ]; then
             echo "🚧 DRY RUN — NO REAL ORDERS SENT 🚧"
           else
