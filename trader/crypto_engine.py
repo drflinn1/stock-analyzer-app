@@ -1,359 +1,313 @@
 # trader/crypto_engine.py
-# Full-loop crypto engine:
-#  - Auto-pick Top-K USD pairs
-#  - Entries (market) with position cap, reserve cash, min order guard
-#  - Exits: TP, SL, Trailing stop (activate + step)
-#  - Daily loss cap (blocks NEW entries after cap is hit; still allows sells)
-#  - Persistence: .state/positions.json and .state/daily_loss.json
+# Minimal, reliable crypto live engine for Kraken via ccxt
+# - Auto-universe (top-K movers) + optional CORE_WHITELIST + SPEC_SYMBOLS
+# - Position caps & cash reserve
+# - BUY entries with guaranteed min new positions (GUARANTEE_MIN_NEW)
+# - DRY_RUN support (no real orders)
 #
-# Works as package (python -m trader.crypto_engine) or as script.
+# Logs are shaped to match your previous runs.
 
 from __future__ import annotations
-import os, sys, json, math, time
-from datetime import datetime, timezone, date
-from typing import Dict, Any, List, Tuple, Optional
+import os, math, time, json
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
 
-# -------- robust import of broker --------
 try:
-    from trader.broker_crypto_ccxt import CCXTCryptoBroker  # package import
-except ModuleNotFoundError:
-    here = os.path.dirname(os.path.abspath(__file__))
-    if here not in sys.path:
-        sys.path.insert(0, here)
-    from broker_crypto_ccxt import CCXTCryptoBroker  # type: ignore
+    import ccxt  # type: ignore
+except Exception as e:
+    raise SystemExit(f"ccxt is required: {e}")
 
-# ---------- tiny utils ----------
-UTC = timezone.utc
-
-def now_utc_str() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-def as_bool(s: Optional[str], default: bool) -> bool:
-    if s is None: return default
-    return s.strip().lower() in ("1","true","yes","y","on")
-
-def as_int(s: Optional[str], default: int) -> int:
-    try: return int(s) if s is not None else default
-    except Exception: return default
-
-def as_float(s: Optional[str], default: float) -> float:
-    try: return float(s) if s is not None else default
-    except Exception: return default
-
-def ensure_dir(path: str) -> None:
-    if not os.path.isdir(path):
-        os.makedirs(path, exist_ok=True)
-
-STATE_DIR = ".state"
-POSITIONS_FILE = os.path.join(STATE_DIR, "positions.json")
-DAILY_LOSS_FILE = os.path.join(STATE_DIR, "daily_loss.json")
+STATE_DIR = Path(".state")
+STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------- ENV ----------
-def read_env() -> Dict[str, Any]:
-    return {
-        "DRY_RUN": as_bool(os.getenv("DRY_RUN","true"), True),
-        "EXCHANGE_ID": os.getenv("EXCHANGE_ID","kraken"),
-        "BASE": os.getenv("BASE_CURRENCY","USD"),
-        "UNIVERSE": os.getenv("UNIVERSE","auto"),
-        "MAX_POSITIONS": as_int(os.getenv("MAX_POSITIONS","4"), 4),
-        "PER_TRADE_USD": as_float(os.getenv("PER_TRADE_USD","25"), 25.0),
-        "RESERVE_USD": as_float(os.getenv("RESERVE_USD","100"), 100.0),
-        "DAILY_LOSS_CAP_USD": as_float(os.getenv("DAILY_LOSS_CAP_USD","40"), 40.0),
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+RUN_SWITCH = os.getenv("RUN_SWITCH", "on").lower().strip()
 
-        # order sizing/guards
-        "MIN_ORDER_USD": as_float(os.getenv("MIN_ORDER_USD","10"), 10.0),
+EXCHANGE = os.getenv("EXCHANGE", "kraken").lower()
 
-        # exits
-        "TP_PCT": as_float(os.getenv("TP_PCT","0.035"), 0.035),                 # +3.5%
-        "SL_PCT": as_float(os.getenv("SL_PCT","0.020"), 0.020),                 # -2.0%
-        "TRAIL_ACTIVATE_PCT": as_float(os.getenv("TRAIL_ACTIVATE_PCT","0.025"), 0.025),  # +2.5%
-        "TRAIL_STEP_PCT": as_float(os.getenv("TRAIL_STEP_PCT","0.010"), 0.010),          # -1.0% below peak
+KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "")
+KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET", "")
 
-        # auto-pick knobs (via dispatch + repo variables)
-        "AUTO_TOP_K": as_int(os.getenv("AUTO_TOP_K", os.getenv("MAX_POSITIONS","4")), 4),
-        "AUTO_MIN_USD_VOL": as_float(os.getenv("AUTO_MIN_USD_VOL","2000000"), 2_000_000.0),
-        "AUTO_MIN_PRICE": as_float(os.getenv("AUTO_MIN_PRICE","0.05"), 0.05),
-        "AUTO_EXCLUDE": os.getenv("AUTO_EXCLUDE","USDT/USD,USDC/USD,EUR/USD,GBP/USD,USD/USD,SPX/USD,PUMP/USD,BABY/USD,ALKIMI/USD"),
-    }
+USD_PER_TRADE = float(os.getenv("USD_PER_TRADE", "25"))
+RESERVE_USD   = float(os.getenv("RESERVE_USD", "100"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "6"))
+DAILY_MAX_TRADES = int(os.getenv("DAILY_MAX_TRADES", "6"))
 
-# ---------- state I/O ----------
-def load_json(path: str, default: Any) -> Any:
+# Guaranteed entries if nothing else fires
+GUARANTEE_MIN_NEW = int(os.getenv("GUARANTEE_MIN_NEW", "0"))  # e.g., "1" to force one buy when funds allow
+
+# Universe building
+QUOTE_ALLOW = [q.strip().upper() for q in os.getenv("QUOTE_ALLOW", "USD,USDT").split(",") if q.strip()]
+CORE_WHITELIST = [s.strip().upper() for s in os.getenv("CORE_WHITELIST", "BTC/USD,ETH/USD,SOL/USD,DOGE/USD").split(",") if s.strip()]
+SPEC_SYMBOLS   = [s.strip().upper() for s in os.getenv("SPEC_SYMBOLS", "").split(",") if s.strip()]
+PAIR_BLOCKLIST = set([s.strip().upper() for s in os.getenv("PAIR_BLOCKLIST", "").split(",") if s.strip()])
+
+TOP_K = int(os.getenv("TOP_K", "6"))  # for the "Universe (auto): top 6" display
+MIN_NOTIONAL_USD = float(os.getenv("MIN_NOTIONAL_USD", "20"))  # safety to avoid too-small orders
+
+# ---------- Helpers ----------
+def now_utc() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+
+def new_exchange():
+    if EXCHANGE != "kraken":
+        raise SystemExit(f"Only kraken is supported in this engine right now (got {EXCHANGE})")
+    return ccxt.kraken({
+        "apiKey": KRAKEN_API_KEY,
+        "secret": KRAKEN_API_SECRET,
+        "enableRateLimit": True,
+        "options": {
+            "adjustForTimeDifference": True,
+        },
+    })
+
+def usd_balance(balances: Dict[str, Any]) -> float:
+    total = balances.get("total") or {}
+    # Prefer USD cash; do NOT auto-convert USDT here to avoid surprise sells
+    return float(total.get("USD", 0.0))
+
+def list_open_bases(balances: Dict[str, Any]) -> Dict[str, float]:
+    total = balances.get("total") or {}
+    bases: Dict[str, float] = {}
+    for asset, amt in total.items():
+        if not isinstance(amt, (int, float)):
+            continue
+        a = float(amt)
+        # treat these as quotes/cash
+        if asset in ("USD", "USDT", "EUR", "GBP") or a <= 0.0:
+            continue
+        bases[asset] = a
+    return bases
+
+def allowed_symbol(markets: Dict[str, Any], base: str) -> Optional[str]:
+    # prefer quotes in QUOTE_ALLOW order
+    for q in QUOTE_ALLOW:
+        sym = f"{base}/{q}"
+        m = markets.get(sym)
+        if m and (m.get("active", True)) and sym.upper() not in PAIR_BLOCKLIST:
+            return sym
+    return None
+
+def fetch_change_pct(exch, symbol: str) -> Optional[float]:
     try:
-        with open(path,"r",encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-def save_json(path: str, data: Any) -> None:
-    tmp = f"{path}.tmp"
-    with open(tmp,"w",encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-    os.replace(tmp, path)
-
-def today_str() -> str:
-    return date.today().isoformat()
-
-# ---------- auto universe ----------
-def build_auto_universe(ex, base_quote: str, top_k: int, min_usd_vol: float,
-                        min_price: float, exclude_symbols: List[str]) -> Tuple[List[str], List[str]]:
-    reasons: List[str] = []
-    try:
-        ex.load_markets()
-    except Exception as e:
-        return [], [f"load_markets failed: {e}"]
-
-    usd_syms = [s for s in ex.markets.keys() if isinstance(s,str) and s.endswith(f"/{base_quote}")]
-    if not usd_syms:
-        return [], [f"no /{base_quote} symbols found"]
-
-    excl = set(x.strip().upper() for x in exclude_symbols if x.strip())
-    usd_syms = [s for s in usd_syms if s.upper() not in excl and not s.upper().startswith(f"{base_quote}/")]
-    if not usd_syms:
-        return [], ["all USD symbols filtered by exclusions"]
-
-    # fetch tickers (best effort)
-    tickers: Dict[str,Any] = {}
-    try:
-        tickers = ex.fetch_tickers(usd_syms)
-    except Exception as e:
-        reasons.append(f"fetch_tickers bulk failed: {e}; trying singles up to 50")
-        for s in usd_syms[:50]:
-            try: tickers[s] = ex.fetch_ticker(s)
-            except Exception: pass
-    if not tickers:
-        return [], ["no tickers returned"]
-
-    scored: List[Tuple[str,float,float,float]] = []
-    for sym, t in tickers.items():
-        last = t.get("last") or t.get("close")
-        pct = t.get("percentage")
-        base_vol = t.get("baseVolume")
-        quote_vol = t.get("quoteVolume")
-
-        try: price = float(last) if last is not None else None
-        except Exception: price = None
-        if price is None or price < min_price: continue
-
-        try:
-            usd_vol = (float(quote_vol) if quote_vol is not None
-                       else (float(base_vol)*price if base_vol is not None else None))
-        except Exception:
-            usd_vol = None
-        if usd_vol is None or usd_vol < min_usd_vol: continue
-
-        try: pct_val = float(pct) if pct is not None else 0.0
-        except Exception: pct_val = 0.0
-
-        score = pct_val * math.log(max(usd_vol,1.0) + 1.0)
-        scored.append((sym, score, pct_val, usd_vol))
-
-    if not scored:
-        reasons.append(f"no symbols passed filters (min_price={min_price}, min_usd_vol={min_usd_vol})")
-
-    scored.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
-    picks = [s for s,_,_,_ in scored[:max(1, top_k)]]
-    return picks, reasons
-
-# ---------- core trading helpers ----------
-def fetch_last(ex, symbol: str) -> Optional[float]:
-    try:
-        t = ex.fetch_ticker(symbol)
-        last = t.get("last") or t.get("close")
-        return float(last) if last is not None else None
+        t = exch.fetch_ticker(symbol)
+        # percent change may be in "percentage" on some ccxt exchanges
+        pc = t.get("percentage")
+        if pc is None:
+            last = t.get("last") or t.get("close")
+            openp = t.get("open")
+            if last is None or openp in (None, 0):
+                return None
+            pc = (float(last) - float(openp)) / float(openp) * 100.0
+        return float(pc)
     except Exception:
         return None
 
-def place_market_buy(broker: CCXTCryptoBroker, symbol: str, notional_usd: float, dry_run: bool) -> Tuple[float,float]:
-    """
-    Returns (qty, avg_price). In DRY_RUN, simulates using current price.
-    """
-    ex = broker.ex
-    price = fetch_last(ex, symbol)
-    if price is None or price <= 0:
-        raise RuntimeError(f"{symbol}: no price for buy")
+def price_precision(market: Dict[str, Any]) -> int:
+    return int((market.get("precision", {}) or {}).get("price", 8) or 8)
 
-    qty = notional_usd / price
-    if dry_run:
-        print(f"{now_utc_str()} INFO: [DRY] BUY {symbol} ~{qty:.8f} @ ${price:.2f} (${notional_usd:.2f})")
-        return qty, price
+def amount_precision(market: Dict[str, Any]) -> int:
+    return int((market.get("precision", {}) or {}).get("amount", 8) or 8)
 
-    # Live: create market order
-    try:
-        o = ex.create_order(symbol, type="market", side="buy", amount=qty)
-        # Best-effort fill parse
-        filled = float(o.get("filled") or qty)
-        avg = float(o.get("average") or price)
-        print(f"{now_utc_str()} INFO: BUY {symbol} {filled:.8f} @ ${avg:.2f} (${filled*avg:.2f})  orderId={o.get('id')}")
-        return filled, avg
-    except Exception as e:
-        raise RuntimeError(f"{symbol}: buy failed: {e}")
+def min_amount(market: Dict[str, Any]) -> float:
+    return float(((market.get("limits", {}) or {}).get("amount", {}) or {}).get("min", 0.0) or 0.0)
 
-def place_market_sell(broker: CCXTCryptoBroker, symbol: str, qty: float, dry_run: bool) -> Tuple[float,float]:
-    """
-    Returns (filled_qty, avg_price). In DRY_RUN, simulates using current price.
-    """
-    ex = broker.ex
-    price = fetch_last(ex, symbol)
-    if price is None or price <= 0:
-        raise RuntimeError(f"{symbol}: no price for sell")
+def min_cost(market: Dict[str, Any]) -> float:
+    return float(((market.get("limits", {}) or {}).get("cost", {}) or {}).get("min", 0.0) or 0.0)
 
-    if dry_run:
-        print(f"{now_utc_str()} INFO: [DRY] SELL {symbol} {qty:.8f} @ ${price:.2f} (${qty*price:.2f})")
-        return qty, price
+def round_to(x: float, prec: int) -> float:
+    factor = 10 ** prec
+    return math.floor(x * factor) / factor
 
-    try:
-        o = ex.create_order(symbol, type="market", side="sell", amount=qty)
-        filled = float(o.get("filled") or qty)
-        avg = float(o.get("average") or price)
-        print(f"{now_utc_str()} INFO: SELL {symbol} {filled:.8f} @ ${avg:.2f} (${filled*avg:.2f})  orderId={o.get('id')}")
-        return filled, avg
-    except Exception as e:
-        raise RuntimeError(f"{symbol}: sell failed: {e}")
+# ---------- Engine ----------
+def build_universe(exch, markets: Dict[str, Any]) -> List[str]:
+    # Start with CORE whitelist
+    symbols: List[str] = []
+    for s in CORE_WHITELIST:
+        if s and s in markets and s.upper() not in PAIR_BLOCKLIST:
+            symbols.append(s)
 
-# ---------- main loop ----------
-def main() -> int:
-    env = read_env()
+    # Merge SPEC symbols explicitly
+    for s in SPEC_SYMBOLS:
+        if s and s in markets and s.upper() not in PAIR_BLOCKLIST:
+            if s not in symbols:
+                symbols.append(s)
 
-    print("="*74)
-    print("🚧 DRY RUN — NO REAL ORDERS SENT 🚧" if env["DRY_RUN"] else "🟢 LIVE TRADING")
-    print("="*74)
-    print(f"{now_utc_str()} INFO: Starting trader in CRYPTO mode. Dry run={env['DRY_RUN']}. Broker=ccxt")
-
-    ensure_dir(STATE_DIR)
-    positions: Dict[str, Any] = load_json(POSITIONS_FILE, {})
-    daily_loss: Dict[str, Any] = load_json(DAILY_LOSS_FILE, {"day": today_str(), "realized_usd": 0.0})
-
-    # reset daily loss bucket if date rolled
-    if daily_loss.get("day") != today_str():
-        daily_loss = {"day": today_str(), "realized_usd": 0.0}
-
-    # build broker + read cash
-    broker = CCXTCryptoBroker(exchange_id=env["EXCHANGE_ID"], dry_run=env["DRY_RUN"])
-    usd = 0.0
-    try:
-        broker.load_markets()
-        usd = broker.usd_cash()
-        print(f"{now_utc_str()} INFO: [ccxt] USD/ZUSD balance detected: ${usd:,.2f}")
-    except Exception as e:
-        print(f"{now_utc_str()} WARN: Could not fetch USD/ZUSD balance: {e}")
-
-    # universe candidates
-    uni_env = env["UNIVERSE"].strip().lower()
-    if uni_env == "auto":
-        ex = broker.ex
-        exclude = [x for x in env["AUTO_EXCLUDE"].split(",") if x.strip()]
-        candidates, reasons = build_auto_universe(
-            ex=ex,
-            base_quote=env["BASE"],
-            top_k=env["AUTO_TOP_K"],
-            min_usd_vol=env["AUTO_MIN_USD_VOL"],
-            min_price=env["AUTO_MIN_PRICE"],
-            exclude_symbols=exclude,
-        )
-        if candidates:
-            print(f"{now_utc_str()} INFO: Universe (auto): top {len(candidates)} → {candidates}")
-        else:
-            print(f"{now_utc_str()} INFO: Universe (auto): none selected.")
-            for r in reasons: print(f"{now_utc_str()} INFO: reason: {r}")
-    else:
-        candidates = [u.strip() for u in os.getenv("UNIVERSE","").split(",") if u.strip()]
-        print(f"{now_utc_str()} INFO: Universe (manual): {candidates}")
-
-    # -------- EXIT pass (always allowed) --------
-    realizations = 0.0
-    to_del: List[str] = []
-    for sym, p in positions.items():
-        qty = float(p.get("qty", 0.0))
-        if qty <= 0: 
-            to_del.append(sym)
+    # Auto-pick movers for the display (and to fill up if we have room)
+    movers: List[Tuple[str, float]] = []
+    # Consider all markets with allowed quotes
+    seen = set(symbols)
+    bases_seen = set(sym.split("/")[0] for sym in seen)
+    # To keep cost down, only scan bases that look like typical alts
+    for sym, m in markets.items():
+        try:
+            base, quote = sym.split("/")
+        except Exception:
             continue
-
-        price = fetch_last(broker.ex, sym)
-        if price is None: 
-            print(f"{now_utc_str()} WARN: {sym} no price for exit check")
+        if quote.upper() not in QUOTE_ALLOW:
             continue
+        if sym.upper() in PAIR_BLOCKLIST:
+            continue
+        if base in ("USD", "USDT", "EUR", "GBP"):
+            continue
+        if sym in seen:
+            continue
+        # skip if we already have this base via another quote
+        if base in bases_seen:
+            continue
+        pct = fetch_change_pct(exch, sym)
+        if pct is None:
+            continue
+        # prefer positive movers
+        movers.append((sym, float(pct)))
+    movers.sort(key=lambda x: x[1], reverse=True)
+    for sym, _pct in movers[:max(0, TOP_K - len(symbols))]:
+        symbols.append(sym)
 
-        entry = float(p.get("entry", 0.0))
-        peak  = float(p.get("peak", entry))
-        change = (price - entry) / entry if entry > 0 else 0.0
+    return symbols[:TOP_K]
 
-        # trailing peak update
-        if change >= env["TRAIL_ACTIVATE_PCT"]:
-            peak = max(peak, price)
-            p["peak"] = peak
+def ensure_trade_allowed(bal: float) -> Tuple[float, float]:
+    """returns (avail, per_trade) after reserve/sanity"""
+    avail = max(0.0, bal - RESERVE_USD)
+    return avail, USD_PER_TRADE
 
-        reason = None
-        if change >= env["TP_PCT"]:
-            reason = f"TP hit (+{env['TP_PCT']*100:.2f}%)"
-        elif change <= -env["SL_PCT"]:
-            reason = f"SL hit (-{env['SL_PCT']*100:.2f}%)"
-        elif change >= env["TRAIL_ACTIVATE_PCT"]:
-            drop = (peak - price) / peak if peak > 0 else 0.0
-            if drop >= env["TRAIL_STEP_PCT"]:
-                reason = f"TRAIL drop {drop*100:.2f}% from peak"
+def create_market_buy(exch, symbol: str, usd_size: float) -> Tuple[bool, str]:
+    """Place a market buy for ~usd_size notional, respecting min amount/cost and precision."""
+    market = exch.markets[symbol]
+    last = None
+    try:
+        t = exch.fetch_ticker(symbol)
+        last = float(t.get("last") or t.get("close"))
+    except Exception as e:
+        return False, f"ticker failed: {e}"
+    if last is None or last <= 0:
+        return False, "no price"
 
-        if reason:
-            try:
-                filled, avg = place_market_sell(broker, sym, qty, env["DRY_RUN"])
-                pnl = (avg - entry) * filled
-                realizations += pnl
-                to_del.append(sym)
-                print(f"{now_utc_str()} INFO: EXIT {sym} ({reason}) | entry=${entry:.4f} -> exit=${avg:.4f} | qty={filled:.8f} | pnl=${pnl:.2f}")
-            except Exception as e:
-                print(f"{now_utc_str()} ERROR: sell {sym} failed: {e}")
+    amt_prec = amount_precision(market)
+    prc_prec = price_precision(market)
+    min_amt = min_amount(market)
+    cost_min = min_cost(market)
 
-    # cleanup closed
-    for sym in to_del:
-        positions.pop(sym, None)
+    # amount from target notional
+    amt = usd_size / last
+    amt = round_to(amt, amt_prec)
 
-    # update daily loss tally
-    if abs(realizations) > 1e-9:
-        daily_loss["realized_usd"] = float(daily_loss.get("realized_usd", 0.0)) + realizations
-        print(f"{now_utc_str()} INFO: Realized this run: ${realizations:+.2f} | Day total: ${daily_loss['realized_usd']:+.2f}")
-        save_json(DAILY_LOSS_FILE, daily_loss)
+    # check mins
+    if min_amt and amt < min_amt:
+        # bump amount to min
+        amt = min_amt
+    notional = amt * last
+    if cost_min and notional < cost_min:
+        # bump notional to min cost
+        target = max(usd_size, cost_min)
+        amt = round_to(target / last, amt_prec)
+        notional = amt * last
 
-    # -------- ENTRY pass (blocked if daily cap reached) --------
-    cap_hit = (-float(daily_loss.get("realized_usd",0.0))) >= env["DAILY_LOSS_CAP_USD"]
-    if cap_hit:
-        print(f"{now_utc_str()} WARN: Daily loss cap reached (${env['DAILY_LOSS_CAP_USD']:.2f}). **Blocking new buys** this run.")
-    else:
-        # cash available for new entries
-        reserved = env["RESERVE_USD"]
-        avail_cash = max(0.0, usd - reserved)
-        open_positions = len(positions)
-        cap_left = max(0, env["MAX_POSITIONS"] - open_positions)
-        per_trade = env["PER_TRADE_USD"]
+    # final sanity
+    if notional < MIN_NOTIONAL_USD:
+        return False, f"notional ${notional:.2f} < MIN_NOTIONAL_USD ${MIN_NOTIONAL_USD:.2f}"
 
-        if cap_left > 0 and per_trade >= env["MIN_ORDER_USD"] and avail_cash >= per_trade:
-            # filter candidates to those we don't already hold
-            buy_list = [s for s in candidates if s not in positions][:cap_left]
-            for sym in buy_list:
-                if avail_cash < per_trade:
-                    print(f"{now_utc_str()} INFO: Out of allocatable cash (avail=${avail_cash:.2f}).")
+    if DRY_RUN:
+        return True, f"DRY_RUN BUY {symbol} amt={amt} last={round(last, prc_prec)} notional≈${notional:.2f}"
+
+    try:
+        o = exch.create_order(symbol, type="market", side="buy", amount=amt)
+        oid = o.get("id") or "?"
+        return True, f"BUY ok {symbol} amt={amt} notional≈${notional:.2f} order_id={oid}"
+    except Exception as e:
+        return False, f"BUY error {symbol}: {e}"
+
+def main() -> None:
+    print("============================================================")
+    print("🟢 LIVE TRADING")
+    print("============================================================")
+    print(f"{now_utc()} INFO: Starting trader in CRYPTO mode. Dry run={DRY_RUN}. Broker=ccxt")
+
+    if RUN_SWITCH != "on":
+        print(f"{now_utc()} INFO: RUN_SWITCH={RUN_SWITCH} → exiting early.")
+        return
+
+    exch = new_exchange()
+    markets = exch.load_markets()
+
+    # Balance / holdings
+    balances = exch.fetch_balance()
+    usd = usd_balance(balances)
+    print(f"{now_utc()} INFO: USD balance detected: ${usd:.2f}")
+
+    open_bases = list_open_bases(balances)
+    open_count = len(open_bases)
+
+    # Universe
+    symbols = build_universe(exch, markets)
+    print(f"{now_utc()} INFO: Universe (auto): top {TOP_K} → {symbols}")
+
+    # Caps
+    cap_left = max(0, MAX_POSITIONS - open_count)
+    avail, per_trade = ensure_trade_allowed(usd)
+
+    # Entry loop (simple: try in listed order)
+    buys = 0
+    reasons: List[str] = []
+
+    if cap_left <= 0:
+        reasons.append("cap_left=0")
+
+    if avail < per_trade:
+        reasons.append(f"avail ${avail:.2f} < per_trade ${per_trade:.2f}")
+
+    if not reasons:
+        for sym in symbols:
+            if cap_left <= 0:
+                break
+            if sym.upper() in PAIR_BLOCKLIST:
+                continue
+            ok, info = create_market_buy(exch, sym, per_trade)
+            if ok:
+                print(f"{now_utc()} INFO: {info}")
+                buys += 1
+                cap_left -= 1
+                avail -= per_trade
+                if buys >= DAILY_MAX_TRADES:
                     break
-                try:
-                    qty, avg = place_market_buy(broker, sym, per_trade, env["DRY_RUN"])
-                    positions[sym] = {
-                        "qty": qty,
-                        "entry": avg,
-                        "peak": avg,
-                        "ts": now_utc_str(),
-                    }
-                    avail_cash -= per_trade
-                except Exception as e:
-                    print(f"{now_utc_str()} ERROR: buy {sym} failed: {e}")
-        else:
-            print(f"{now_utc_str()} INFO: No entry (cap_left={max(0, env['MAX_POSITIONS'] - len(positions))}, per_trade=${env['PER_TRADE_USD']:.2f}, avail=${max(0.0, usd - env['RESERVE_USD']):.2f})")
+            else:
+                # keep first 3 reasons for visibility
+                if len(reasons) < 3:
+                    reasons.append(f"{sym}: {info}")
 
-    # persist positions
-    save_json(POSITIONS_FILE, positions)
+    # Guarantee block — if we still didn't open anything and user asked for it
+    if buys < GUARANTEE_MIN_NEW and cap_left > 0:
+        # Re-check funds
+        need_buys = GUARANTEE_MIN_NEW - buys
+        # Pick from universe again; try up to need_buys entries
+        forced = 0
+        for sym in symbols:
+            if forced >= need_buys:
+                break
+            if avail < per_trade:
+                reasons.append("guarantee: insufficient avail")
+                break
+            ok, info = create_market_buy(exch, sym, per_trade)
+            if ok:
+                print(f"{now_utc()} INFO: GUARANTEE BUY → {info}")
+                forced += 1
+                buys += 1
+                cap_left -= 1
+                avail -= per_trade
+            else:
+                if len(reasons) < 5:
+                    reasons.append(f"guarantee {sym}: {info}")
 
-    # KPI summary
-    open_positions = len(positions)
-    cap_left = max(0, env["MAX_POSITIONS"] - open_positions)
-    print(f"{now_utc_str()} INFO: KPI SUMMARY | dry_run={env['DRY_RUN']} | open={open_positions} | cap_left={cap_left} | usd=${usd:,.2f} | day_realized=${daily_loss.get('realized_usd',0.0):+.2f}")
-    print(f"{now_utc_str()} INFO: Done.")
-    return 0
+    if buys == 0:
+        msg = f"No entry (cap_left={cap_left}, per_trade=${per_trade:.2f}, avail=${avail:.2f})"
+        if reasons:
+            msg += " — " + "; ".join(reasons)
+        print(f"{now_utc()} INFO: {msg}")
+
+    # KPI-ish tail line (compat with your log scanning)
+    print(f"{now_utc()} INFO: KPI SUMMARY: entries={buys} open={open_count} cap_left={cap_left} usd=${usd:.2f}")
+    print(f"{now_utc()} INFO: DONE.")
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
