@@ -35,9 +35,9 @@ jobs:
       PAIR_BLOCKLIST: ""
 
       # ---- Sizing / caps ----
-      USD_PER_TRADE: "10"      # lets you buy with $17.33 avail
+      USD_PER_TRADE: "25"      # lets you buy with $17.33 avail
       MAX_POSITIONS: "6"
-      RESERVE_USD: "100"
+      RESERVE_USD: "80"
       DAILY_MAX_TRADES: "6"
 
       # ---- STALE (Aggressive) ----
