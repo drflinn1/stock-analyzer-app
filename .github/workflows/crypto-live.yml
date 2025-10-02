@@ -1,118 +1,93 @@
-name: crypto live
+name: Crypto Live (Every 15 min — ROTATE + TP/SL/TRAIL)
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 min
-
-permissions:
-  contents: read
+    - cron: '*/15 * * * *'   # every 15 minutes
+  workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: 'true = simulate orders, false = place real orders'
+        required: true
+        default: 'true'
+      USD_PER_TRADE:
+        description: 'USD to spend per buy'
+        required: false
+        default: '15'
+      RESERVE_USD:
+        description: 'Keep at least this much cash unspent'
+        required: false
+        default: '80'
+      MAX_POSITIONS:
+        description: 'Max concurrent positions'
+        required: false
+        default: '6'
 
 jobs:
-  crypto-live:
+  live:
+    name: Run Crypto Bot
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 12
+    concurrency:
+      group: crypto-live
+      cancel-in-progress: false
 
     env:
-      # ---- Modes ----
-      BOT_MODE: TRADE          # main.py auto-launches trader.crypto_engine
-      DRY_RUN: "false"         # LIVE MODE
-      RUN_SWITCH: "on"
+      # -------- Exchange + creds --------
+      EXCHANGE: kraken
+      API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+      API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-      # ---- Broker (Kraken) ----
-      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+      # -------- Run mode --------
+      # Manual runs can override DRY_RUN/position sizing via workflow_dispatch inputs
+      DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'true' }}
 
-      # ---- Core exits ----
-      TAKE_PROFIT: "3.5"
-      STOP_LOSS:  "2.0"
-      TRAIL_PCT:  "1.2"
+      # -------- Core sizing/limits --------
+      USD_PER_TRADE: ${{ github.event.inputs.USD_PER_TRADE || '15' }}
+      RESERVE_USD:   ${{ github.event.inputs.RESERVE_USD   || '80' }}
+      MAX_POSITIONS: ${{ github.event.inputs.MAX_POSITIONS || '6' }}
 
-      # ---- Universe / quotes ----
-      QUOTE_ALLOW: "USD,USDT"
-      CORE_WHITELIST: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD,ENA/USD,ENA/USDT"
-      SPEC_SYMBOLS: ""                   # let auto-movers fill remaining spots
-      PAIR_BLOCKLIST: ""                 # <— not blocking anything
+      # -------- Rotation (cash-short upgrade) --------
+      ROTATE_WHEN_CASH_SHORT: 'true'   # optional knob (defaults true in code, explicit here)
+      ROTATE_MIN_EDGE_PCT: '2.0'       # rotate if (best - worst) momentum ≥ this %
+      COOLDOWN_RUNS: '1'               # 1-run cooldown after rotating into a symbol
 
-      # ---- Sizing / caps ----
-      USD_PER_TRADE: "35"                # big enough to clear min-cost comfortably
-      MAX_POSITIONS: "6"
-      RESERVE_USD: "80"
-      DAILY_MAX_TRADES: "6"
+      # -------- Sell Guards (must include these tokens for your guard workflow) --------
+      TAKE_PROFIT_PCT: '3.5'           # TAKE_PROFIT threshold (+%)
+      STOP_LOSS_PCT:   '2.0'           # STOP_LOSS threshold (−%)
+      TRAIL_ARM_PCT:   '1.0'           # Arm trailing after +1.0% gain
+      TRAIL_PCT:       '1.5'           # TRAIL distance (%) from high watermark
 
-      # ---- Force at least N new buys & prefer these first (if listed) ----
-      GUARANTEE_MIN_NEW: "1"
-      GUARANTEE_PICK: "ENA/USD,ENA/USDT,SOL/USD,BTC/USD"
-
-      # ---- Engine safety floor for tiny orders ----
-      MIN_NOTIONAL_USD: "18"
-
-      # ---- STALE (Aggressive) ----
-      STALE_MAX_HOURS: "6"
-      STALE_MIN_MOVE_PCT: "0.8"
-      STALE_MIN_RANGE_PCT: "3.0"
-      STALE_COOLDOWN_HOURS: "6"
-
-      # ---- ROTATION (replace slow coin with stronger one) ----
-      ROTATE_ENABLED: "true"
-      ROTATE_MIN_EDGE_PCT: "2.0"          # candidate must beat worst holding by ≥ 2%
-      ROTATE_MAX_SWITCHES_PER_RUN: "1"    # protect from churn
-      ROTATE_COOLDOWN_HOURS: "6"          # don't rotate same symbol too often
+      # -------- Universe --------
+      SYMBOL_WHITELIST: 'BTC/USD,ETH/USD,SOL/USD,DOGE/USD,ZEC/USD,ENA/USD'
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install ccxt pandas
-          fi
+          pip install ccxt
 
-      - name: Confirm mode
+      - name: Echo config (non-secret)
         run: |
-          echo "RUN_SWITCH=${RUN_SWITCH}"
           echo "DRY_RUN=${DRY_RUN}"
-          echo "BOT_MODE=${BOT_MODE}"
-          echo "QUOTE_ALLOW=${QUOTE_ALLOW}"
-          echo "CORE_WHITELIST=${CORE_WHITELIST}"
-          echo "SPEC_SYMBOLS=${SPEC_SYMBOLS}"
-          echo "PAIR_BLOCKLIST=${PAIR_BLOCKLIST}"
-          echo "USD_PER_TRADE=${USD_PER_TRADE}  RESERVE_USD=${RESERVE_USD}"
-          echo "GUARANTEE_MIN_NEW=${GUARANTEE_MIN_NEW}  GUARANTEE_PICK=${GUARANTEE_PICK}"
-          echo "MIN_NOTIONAL_USD=${MIN_NOTIONAL_USD}"
-          echo "STALE_MAX_HOURS=${STALE_MAX_HOURS}  STALE_MIN_MOVE_PCT=${STALE_MIN_MOVE_PCT}  STALE_MIN_RANGE_PCT=${STALE_MIN_RANGE_PCT}"
-          echo "ROTATE_ENABLED=${ROTATE_ENABLED}  ROTATE_MIN_EDGE_PCT=${ROTATE_MIN_EDGE_PCT}  ROTATE_MAX_SWITCHES_PER_RUN=${ROTATE_MAX_SWITCHES_PER_RUN}  ROTATE_COOLDOWN_HOURS=${ROTATE_COOLDOWN_HOURS}"
-          if [ "${DRY_RUN}" = "true" ]; then
-            echo "🚧 DRY RUN — NO REAL ORDERS SENT 🚧"
-          else
-            echo "⚠️ LIVE MODE — REAL ORDERS ENABLED"
-          fi
+          echo "USD_PER_TRADE=${USD_PER_TRADE}"
+          echo "RESERVE_USD=${RESERVE_USD}"
+          echo "MAX_POSITIONS=${MAX_POSITIONS}"
+          echo "ROTATE_WHEN_CASH_SHORT=${ROTATE_WHEN_CASH_SHORT}"
+          echo "ROTATE_MIN_EDGE_PCT=${ROTATE_MIN_EDGE_PCT}"
+          echo "COOLDOWN_RUNS=${COOLDOWN_RUNS}"
+          echo "TAKE_PROFIT_PCT=${TAKE_PROFIT_PCT}"
+          echo "STOP_LOSS_PCT=${STOP_LOSS_PCT}"
+          echo "TRAIL_ARM_PCT=${TRAIL_ARM_PCT}"
+          echo "TRAIL_PCT=${TRAIL_PCT}"
+          echo "SYMBOL_WHITELIST=${SYMBOL_WHITELIST}"
 
-      - name: Run Crypto Live
-        run: |
-          python -u main.py
-
-      - name: Stale Sweeper (time stop)
-        run: |
-          python -u trader/stale_sweeper.py
-
-      - name: Pack .state into zip
-        run: |
-          mkdir -p .state
-          zip -r "state_${GITHUB_RUN_ID}.zip" .state || true
-
-      - name: Upload state artifact (zip)
-        uses: actions/upload-artifact@v4
-        with:
-          name: state_${{ github.run_id }}
-          path: "state_${{ github.run_id }}.zip"
-          if-no-files-found: ignore
+      - name: Run bot
+        run: python main.py
