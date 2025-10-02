@@ -15,7 +15,7 @@ jobs:
 
     env:
       # ---- Modes ----
-      BOT_MODE: TRADE          # runs real trader via main.py auto-detect
+      BOT_MODE: TRADE          # main.py auto-launches trader.crypto_engine
       DRY_RUN: "false"         # LIVE MODE
       RUN_SWITCH: "on"
 
@@ -35,13 +35,19 @@ jobs:
       PAIR_BLOCKLIST: ""
 
       # ---- Sizing / caps ----
-      USD_PER_TRADE: "30"      # lets you buy with $17.33 avail
+      USD_PER_TRADE: "30"      # (2) bump per-trade so Kraken min-cost clears
       MAX_POSITIONS: "6"
-      RESERVE_USD: "80"
+      RESERVE_USD: "80"        # (2) keep most of your reserve
       DAILY_MAX_TRADES: "6"
 
+      # ---- Force at least N new buys when funds allow ----
+      GUARANTEE_MIN_NEW: "1"   # (1)
+
+      # ---- Engine safety floor for tiny orders ----
+      MIN_NOTIONAL_USD: "18"   # (3) internal floor; Kraken still applies its own mins
+
       # ---- STALE (Aggressive) ----
-      STALE_MAX_HOURS: "6"     # close if position stagnates ≥ 6h
+      STALE_MAX_HOURS: "6"
       STALE_MIN_MOVE_PCT: "0.8"
       STALE_MIN_RANGE_PCT: "3.0"
       STALE_COOLDOWN_HOURS: "6"
@@ -70,7 +76,10 @@ jobs:
           echo "DRY_RUN=${DRY_RUN}"
           echo "BOT_MODE=${BOT_MODE}"
           echo "QUOTE_ALLOW=${QUOTE_ALLOW}"
+          echo "CORE_WHITELIST=${CORE_WHITELIST}"
+          echo "SPEC_SYMBOLS=${SPEC_SYMBOLS}"
           echo "USD_PER_TRADE=${USD_PER_TRADE}  RESERVE_USD=${RESERVE_USD}"
+          echo "GUARANTEE_MIN_NEW=${GUARANTEE_MIN_NEW}  MIN_NOTIONAL_USD=${MIN_NOTIONAL_USD}"
           echo "STALE_MAX_HOURS=${STALE_MAX_HOURS}  STALE_MIN_MOVE_PCT=${STALE_MIN_MOVE_PCT}  STALE_MIN_RANGE_PCT=${STALE_MIN_RANGE_PCT}"
           if [ "${DRY_RUN}" = "true" ]; then
             echo "🚧 DRY RUN — NO REAL ORDERS SENT 🚧"
