@@ -41,11 +41,6 @@ on:
         required: true
         default: "75"
         type: string
-      COOLDOWN_MINUTES:
-        description: "Post-trade cooldown minutes"
-        required: true
-        default: "10"
-        type: string
       ROTATE_WEAKEST_STRICT:
         description: "If weakest cannot be sold, skip rotation"
         required: true
@@ -53,7 +48,7 @@ on:
         type: choice
         options: ["true","false"]
       PARTIAL_ASSIST:
-        description: "Free a small slice of next-weakest if needed"
+        description: "Sell tiny slice of next-weakest to free cash if needed"
         required: true
         default: "true"
         type: choice
@@ -64,31 +59,6 @@ on:
         default: "true"
         type: choice
         options: ["true","false"]
-      TAKE_PROFIT_PCT:
-        description: "Take profit threshold (e.g., 0.05 = 5%)"
-        required: true
-        default: "0.05"
-        type: string
-      STOP_LOSS_PCT:
-        description: "Stop loss threshold (e.g., 0.03 = 3%)"
-        required: true
-        default: "0.03"
-        type: string
-      TRAILING_STOP_PCT:
-        description: "Trailing stop drawdown (e.g., 0.02 = 2%)"
-        required: true
-        default: "0.02"
-        type: string
-      UNIVERSE:
-        description: "Optional comma-list universe (empty = autodetect USD markets)"
-        required: false
-        default: ""
-        type: string
-      IGNORE_TICKERS:
-        description: "Comma list never rotated (XRP, USDT/USDC/USD/EUR/GBP by default)"
-        required: false
-        default: "USDT,USDC,USD,EUR,GBP,XRP"
-        type: string
 
 permissions:
   contents: read
@@ -116,17 +86,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt
 
-      # ✅ New: fail early with a clear error if secrets aren’t present.
+      # Fail early if secrets are missing
       - name: Check Kraken secrets
         shell: bash
         run: |
           if [[ -z "${{ secrets.KRAKEN_API_KEY }}" || -z "${{ secrets.KRAKEN_API_SECRET }}" ]]; then
             echo "::error title=Missing Kraken Secrets::KRAKEN_API_KEY and/or KRAKEN_API_SECRET are not available to this workflow run."
-            echo "Go to: Repository → Settings → Secrets and variables → Actions → New repository secret"
-            echo "Add KRAKEN_API_KEY and KRAKEN_API_SECRET (values from Kraken)."
             exit 1
           fi
-          echo "Secrets are present (values are hidden)."
+          echo "Kraken secrets detected."
 
       - name: Echo config (non-secret)
         run: |
@@ -137,15 +105,9 @@ jobs:
           echo "USD_PER_TRADE=${{ inputs.USD_PER_TRADE || '10' }}"
           echo "MIN_COST_PER_ORDER=${{ inputs.MIN_COST_PER_ORDER || '5.0' }}"
           echo "MAX_SPREAD_BPS=${{ inputs.MAX_SPREAD_BPS || '75' }}"
-          echo "COOLDOWN_MINUTES=${{ inputs.COOLDOWN_MINUTES || '10' }}"
           echo "ROTATE_WEAKEST_STRICT=${{ inputs.ROTATE_WEAKEST_STRICT || 'false' }}"
           echo "PARTIAL_ASSIST=${{ inputs.PARTIAL_ASSIST || 'true' }}"
           echo "WHY_NOT_LOGS=${{ inputs.WHY_NOT_LOGS || 'true' }}"
-          echo "TAKE_PROFIT_PCT=${{ inputs.TAKE_PROFIT_PCT || '0.05' }}"
-          echo "STOP_LOSS_PCT=${{ inputs.STOP_LOSS_PCT || '0.03' }}"
-          echo "TRAILING_STOP_PCT=${{ inputs.TRAILING_STOP_PCT || '0.02' }}"
-          echo "UNIVERSE='${{ inputs.UNIVERSE }}'"
-          echo "IGNORE_TICKERS='${{ inputs.IGNORE_TICKERS || 'USDT,USDC,USD,EUR,GBP,XRP' }}'"
 
       - name: Run bot
         env:
@@ -154,7 +116,7 @@ jobs:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-          # Behavior (dispatch inputs override sensible defaults)
+          # Dispatch-controlled knobs (10 inputs max)
           DRY_RUN: ${{ inputs.DRY_RUN || 'true' }}
           TOP_K: ${{ inputs.TOP_K || '6' }}
           EDGE_THRESHOLD: ${{ inputs.EDGE_THRESHOLD || '0.004' }}
@@ -162,14 +124,16 @@ jobs:
           USD_PER_TRADE: ${{ inputs.USD_PER_TRADE || '10' }}
           MIN_COST_PER_ORDER: ${{ inputs.MIN_COST_PER_ORDER || '5.0' }}
           MAX_SPREAD_BPS: ${{ inputs.MAX_SPREAD_BPS || '75' }}
-          COOLDOWN_MINUTES: ${{ inputs.COOLDOWN_MINUTES || '10' }}
           ROTATE_WEAKEST_STRICT: ${{ inputs.ROTATE_WEAKEST_STRICT || 'false' }}
           PARTIAL_ASSIST: ${{ inputs.PARTIAL_ASSIST || 'true' }}
           WHY_NOT_LOGS: ${{ inputs.WHY_NOT_LOGS || 'true' }}
-          TAKE_PROFIT_PCT: ${{ inputs.TAKE_PROFIT_PCT || '0.05' }}
-          STOP_LOSS_PCT: ${{ inputs.STOP_LOSS_PCT || '0.03' }}
-          TRAILING_STOP_PCT: ${{ inputs.TRAILING_STOP_PCT || '0.02' }}
-          UNIVERSE: ${{ inputs.UNIVERSE }}
-          IGNORE_TICKERS: ${{ inputs.IGNORE_TICKERS || 'USDT,USDC,USD,EUR,GBP,XRP' }}
+
+          # Fixed env defaults (edit here if you want)
+          COOLDOWN_MINUTES: "10"
+          TAKE_PROFIT_PCT: "0.05"
+          STOP_LOSS_PCT: "0.03"
+          TRAILING_STOP_PCT: "0.02"
+          UNIVERSE: ""
+          IGNORE_TICKERS: "USDT,USDC,USD,EUR,GBP,XRP"
         run: |
           python main.py
