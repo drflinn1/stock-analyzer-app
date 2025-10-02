@@ -1,5 +1,6 @@
-# main.py — Crypto Live with Cash-Short Rotation + Sell Guards (TP/SL/TRAIL)
-# (Kraken-safe sells: checks min amount/cost, shows diagnostics, avoids tiny remainders)
+# main.py — Cash-Short Rotation + Sell Guards (TP/SL/TRAIL) + Dust-aware holdings
+# - Ignores tiny "dust" balances when picking holdings for guards/rotation (DUST_MIN_USD)
+# - Kraken-safe min amount/cost checks with diagnostics
 
 from __future__ import annotations
 import os, json, pathlib, traceback
@@ -52,6 +53,9 @@ STOP_LOSS_PCT   = as_float(os.getenv("STOP_LOSS_PCT"), 2.0)
 TRAIL_ARM_PCT   = as_float(os.getenv("TRAIL_ARM_PCT"), 1.0)
 TRAIL_PCT       = as_float(os.getenv("TRAIL_PCT"), 1.5)
 
+# NEW: any holding valued below this is treated as "dust" and ignored for guards/rotation
+DUST_MIN_USD    = as_float(os.getenv("DUST_MIN_USD"), 1.0)
+
 STATE_DIR = pathlib.Path(".state"); STATE_DIR.mkdir(parents=True, exist_ok=True)
 COOLDOWN_PATH = STATE_DIR / "rotation_cooldowns.json"
 ENTRIES_PATH  = STATE_DIR / "entries.json"
@@ -103,16 +107,47 @@ def canonical_symbol(ex: ccxt.Exchange, base: str) -> Optional[str]:
         if s in ex.markets: return s
     return None
 
-def list_current_positions(ex: ccxt.Exchange, bal: Dict) -> List[str]:
-    held: List[str] = []
+def get_base_totals(bal: Dict, base: str) -> Tuple[float,float]:
+    """return free,total for a base currency in ccxt balance dict"""
+    free = total = 0.0
+    if base in bal and isinstance(bal[base], dict):
+        free  = float(bal[base].get("free",  0) or 0)
+        total = float(bal[base].get("total", 0) or 0)
+    elif base in bal:
+        try:
+            total = float(bal[base] or 0); free = total
+        except: pass
+    return free, total
+
+def positions_with_values(ex: ccxt.Exchange, bal: Dict) -> List[Tuple[str,float,float]]:
+    """
+    Returns [(symbol, amount_total, est_usd_value)] for non-USD/USDT balances.
+    Filters out anything with value < DUST_MIN_USD.
+    """
+    out: List[Tuple[str,float,float]] = []
     for cur, obj in bal.items():
-        if cur in USD_KEYS or cur in STABLE_KEYS: continue
-        try: amt = float(obj.get("total",0) if isinstance(obj,dict) else obj)
-        except: amt = 0.0
-        if amt > 0:
-            sym = canonical_symbol(ex, cur)
-            if sym: held.append(sym)
-    return [s for s in dict.fromkeys(held) if s in ex.markets]
+        if cur in USD_KEYS or cur in STABLE_KEYS: 
+            continue
+        try:
+            total = float(obj.get("total",0) if isinstance(obj,dict) else obj)
+        except:
+            total = 0.0
+        if total <= 0:
+            continue
+        sym = canonical_symbol(ex, cur)
+        if not sym:
+            continue
+        price = 0.0
+        try:
+            price = last_price(ex, sym)
+        except:
+            price = 0.0
+        value = total * price if price > 0 else 0.0
+        if value >= DUST_MIN_USD:
+            out.append((sym, total, value))
+    return out
+
+# ---------- scoring ----------
 
 def momentum_score_1h(ex: ccxt.Exchange, symbol: str) -> float:
     try:
@@ -142,7 +177,7 @@ def dec_cooldowns(cd: Dict[str,int]) -> Dict[str,int]:
 def get_entries() -> Dict[str,float]: return load_json(ENTRIES_PATH, {})
 def get_highs() -> Dict[str,float]:   return load_json(HIGHS_PATH, {})
 
-# ---------- order helpers with Kraken-safe checks ----------
+# ---------- min-limit helpers + orders ----------
 
 def _market_limits(ex: ccxt.Exchange, symbol: str):
     m = ex.market(symbol)
@@ -150,37 +185,17 @@ def _market_limits(ex: ccxt.Exchange, symbol: str):
     cost_min = (m.get("limits",{}) or {}).get("cost",  {}).get("min")
     return float(amt_min or 0), float(cost_min or 0)
 
-def _free_and_total_base(ex: ccxt.Exchange, symbol: str):
-    bal = ex.fetch_balance()
-    base = symbol.split("/")[0]
-    free = total = 0.0
-    if base in bal and isinstance(bal[base], dict):
-        free  = float(bal[base].get("free",  0) or 0)
-        total = float(bal[base].get("total", 0) or 0)
-    elif base in bal:
-        try:
-            total = float(bal[base] or 0); free = total
-        except: pass
-    return free, total
-
 def place_sell(ex: ccxt.Exchange, symbol: str, pct_of_position: float = 1.0) -> Tuple[bool,str]:
-    """
-    Kraken-safe sell:
-      - if free == 0 but total > 0 and no open orders, use total
-      - respect min amount / min cost
-      - show diagnostics if skipping
-    """
     try:
-        free, total = _free_and_total_base(ex, symbol)
+        bal = ex.fetch_balance()
+        base = symbol.split("/")[0]
+        free, total = get_base_totals(bal, base)
 
-        # If nothing free, check open orders; if none, use total
+        # If nothing free, but total > 0 and no open orders, use total
         if free <= 0 and total > 0:
-            try:
-                open_orders = ex.fetch_open_orders(symbol)
-            except Exception:
-                open_orders = []
-            if not open_orders:
-                free = total
+            try: open_orders = ex.fetch_open_orders(symbol)
+            except Exception: open_orders = []
+            if not open_orders: free = total
 
         amt = max(0.0, min(free, total)) * max(0.0, min(1.0, pct_of_position))
         if amt <= 0:
@@ -191,8 +206,6 @@ def place_sell(ex: ccxt.Exchange, symbol: str, pct_of_position: float = 1.0) -> 
             return False, f"SELL skip {symbol} — price unknown"
 
         min_amt, min_cost = _market_limits(ex, symbol)
-
-        # Round to precision first, then re-check thresholds
         amt_precise = float(ex.amount_to_precision(symbol, amt))
         est_cost = amt_precise * price
 
@@ -226,8 +239,7 @@ def place_buy(ex: ccxt.Exchange, symbol: str, spend_usd: float) -> Tuple[bool,st
             return False, f"BUY skip {symbol} — price unknown"
 
         min_amt, min_cost = _market_limits(ex, symbol)
-        amt = spend_usd / price
-        amt = float(ex.amount_to_precision(symbol, amt))
+        amt = float(ex.amount_to_precision(symbol, spend_usd / price))
         est_cost = amt * price
 
         if min_amt and amt < min_amt:
@@ -297,6 +309,7 @@ def main() -> None:
     print(f"Exchange={EXCHANGE_ID}  MaxPos={MAX_POS}  USD_PER_TRADE=${USD_PER_TRADE:.2f}  Reserve=${RESERVE_USD:.2f}")
     print(f"RotateWhenCashShort={ROTATE_WHEN_CASH_SHORT}  RotateEdge≥{ROTATE_MIN_EDGE_PCT:.2f}%  CooldownRuns={COOLDOWN_RUNS}")
     print(f"TAKE_PROFIT={TAKE_PROFIT_PCT:.2f}%  STOP_LOSS={STOP_LOSS_PCT:.2f}%  TRAIL arm={TRAIL_ARM_PCT:.2f}% dist={TRAIL_PCT:.2f}%")
+    print(f"DUST_MIN_USD=${DUST_MIN_USD:.2f}")
     print("Whitelist:", ", ".join(SYMBOL_WHITELIST))
     print("============================================================")
 
@@ -308,8 +321,12 @@ def main() -> None:
 
     bal = ex.fetch_balance()
     free_cash = get_free_cash_usd(bal)
-    held_syms = list_current_positions(ex, bal)
-    print(f"Free cash ≈ ${free_cash:.2f} | Held positions: {len(held_syms)} → {', '.join(held_syms) if held_syms else '(none)'}")
+
+    # Use dust-aware positions
+    pos = positions_with_values(ex, bal)  # [(symbol, amount, usd_value)] filtered by DUST_MIN_USD
+    held_syms = [s for (s,_,_) in pos]
+
+    print(f"Free cash ≈ ${free_cash:.2f} | Real positions (≥${DUST_MIN_USD:.2f}): {len(held_syms)} → {', '.join(held_syms) if held_syms else '(none)'}")
 
     # init entries for discovered holdings
     for s in held_syms:
@@ -321,7 +338,7 @@ def main() -> None:
                     print(f"Init entry: {s} = {p:.6f}")
             except: pass
 
-    # SELL guards pass
+    # SELL guards pass over real holdings only
     for s in list(held_syms):
         try:
             price = last_price(ex, s)
@@ -337,6 +354,9 @@ def main() -> None:
                     entries.pop(s, None); highs.pop(s, None)
                     try: bal = ex.fetch_balance()
                     except: pass
+                    # rebuild positions after a sell
+                    pos = positions_with_values(ex, bal)
+                    held_syms = [x for (x,_,_) in pos]
                     continue
 
             did_trail, highs = check_trailing(s, entry, price, highs, TRAIL_ARM_PCT, TRAIL_PCT)
@@ -347,15 +367,18 @@ def main() -> None:
                     entries.pop(s, None); highs.pop(s, None)
                     try: bal = ex.fetch_balance()
                     except: pass
+                    pos = positions_with_values(ex, bal)
+                    held_syms = [x for (x,_,_) in pos]
                     continue
         except Exception as e:
             print(f"Guard error on {s}: {e}")
 
-    # refresh after possible sells
+    # refresh after potential sells
     try: bal = ex.fetch_balance()
     except: pass
     free_cash = get_free_cash_usd(bal)
-    held_syms = list_current_positions(ex, bal)
+    pos = positions_with_values(ex, bal)
+    held_syms = [s for (s,_,_) in pos]
 
     # candidates / holdings ranking
     cooled_whitelist = [s for s in SYMBOL_WHITELIST if cooldowns.get(s,0)==0]
@@ -373,7 +396,7 @@ def main() -> None:
     else:
         print("ROTATE scan: (no candidate / no data)")
 
-    # cash-short rotation
+    # cash-short rotation (uses *real* holdings only)
     did_rotate = False
     if ROTATE_WHEN_CASH_SHORT and free_cash < RESERVE_USD and best_symbol and worst_symbol and best_symbol != worst_symbol:
         edge = best_score - worst_score
