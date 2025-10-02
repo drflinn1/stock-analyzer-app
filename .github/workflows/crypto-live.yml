@@ -1,10 +1,9 @@
-# .github/workflows/crypto-live.yml  (replace the whole file if you want)
 name: crypto live
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/15 * * * *"   # every 15 min
 
 permissions:
   contents: read
@@ -15,36 +14,36 @@ jobs:
     timeout-minutes: 25
 
     env:
-      # --- Mode toggles ---
-      BOT_MODE: TRADE
-      DRY_RUN: "false"
+      # ---- Modes ----
+      BOT_MODE: TRADE          # runs real trader via main.py auto-detect
+      DRY_RUN: "false"         # LIVE MODE
       RUN_SWITCH: "on"
 
-      # --- Broker keys (Kraken) ---
+      # ---- Broker (Kraken) ----
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-      # --- Core exits ---
+      # ---- Core exits ----
       TAKE_PROFIT: "3.5"
-      STOP_LOSS: "2.0"
-      TRAIL_PCT: "1.2"
+      STOP_LOSS:  "2.0"
+      TRAIL_PCT:  "1.2"
 
-      # --- Universe / quotes ---
+      # ---- Universe / quotes ----
       QUOTE_ALLOW: "USD,USDT"
       CORE_WHITELIST: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
       SPEC_SYMBOLS: "SPX/USDT,PENGU/USDT,PUMP/USDT"
       PAIR_BLOCKLIST: ""
 
-      # --- Sizing / caps (tune as you like) ---
-      USD_PER_TRADE: "10"
+      # ---- Sizing / caps ----
+      USD_PER_TRADE: "10"      # lets you buy with $17.33 avail
       MAX_POSITIONS: "6"
       RESERVE_USD: "100"
       DAILY_MAX_TRADES: "6"
 
-      # --- STALE rule knobs ---
-      STALE_MAX_HOURS: "24"
+      # ---- STALE (Aggressive) ----
+      STALE_MAX_HOURS: "6"     # close if position stagnates ≥ 6h
       STALE_MIN_MOVE_PCT: "0.8"
-      STALE_MIN_RANGE_PCT: "1.0"
+      STALE_MIN_RANGE_PCT: "3.0"
       STALE_COOLDOWN_HOURS: "6"
 
     steps:
@@ -59,7 +58,11 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install ccxt pandas; fi
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install ccxt pandas
+          fi
 
       - name: Confirm mode
         run: |
@@ -67,7 +70,8 @@ jobs:
           echo "DRY_RUN=${DRY_RUN}"
           echo "BOT_MODE=${BOT_MODE}"
           echo "QUOTE_ALLOW=${QUOTE_ALLOW}"
-          echo "SPEC_SYMBOLS=${SPEC_SYMBOLS}"
+          echo "USD_PER_TRADE=${USD_PER_TRADE}  RESERVE_USD=${RESERVE_USD}"
+          echo "STALE_MAX_HOURS=${STALE_MAX_HOURS}  STALE_MIN_MOVE_PCT=${STALE_MIN_MOVE_PCT}  STALE_MIN_RANGE_PCT=${STALE_MIN_RANGE_PCT}"
           if [ "${DRY_RUN}" = "true" ]; then
             echo "🚧 DRY RUN — NO REAL ORDERS SENT 🚧"
           else
