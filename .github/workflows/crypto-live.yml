@@ -1,3 +1,4 @@
+# .github/workflows/crypto-live.yml  (replace the whole file if you want)
 name: crypto live
 
 on:
@@ -23,36 +24,28 @@ jobs:
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-      # --- Core trading knobs (your engine already reads these) ---
+      # --- Core exits ---
       TAKE_PROFIT: "3.5"
       STOP_LOSS: "2.0"
       TRAIL_PCT: "1.2"
 
-      # ---------- UNIVERSE / FILTERS ----------
-      # Allow both USD and USDT quotes so spec pairs aren’t dropped
+      # --- Universe / quotes ---
       QUOTE_ALLOW: "USD,USDT"
-
-      # Keep conservative core names but allow a SPEC tier explicitly
       CORE_WHITELIST: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
-
-      # Enable SPEC tier and list the three you asked for.
-      # If your exchange only lists them in USDT, keep the /USDT versions.
-      ALLOW_SPEC: "true"
       SPEC_SYMBOLS: "SPX/USDT,PENGU/USDT,PUMP/USDT"
-
-      # Remove the broad blocklist that previously excluded these
       PAIR_BLOCKLIST: ""
 
-      # Loosen spec gates just enough to allow entries, but still sane
-      SPEC_MAX_SPREAD_PCT: "3.0"     # was 1.0
-      SPEC_MIN_DOLLAR_VOL: "15000"   # was 25000
-      SPEC_MAX_AGE_HRS: "168"        # allow up to 7 days old
-
-      # Position sizing & caps (tune to taste)
+      # --- Sizing / caps (tune as you like) ---
       USD_PER_TRADE: "10"
       MAX_POSITIONS: "6"
       RESERVE_USD: "100"
       DAILY_MAX_TRADES: "6"
+
+      # --- STALE rule knobs ---
+      STALE_MAX_HOURS: "24"
+      STALE_MIN_MOVE_PCT: "0.8"
+      STALE_MIN_RANGE_PCT: "1.0"
+      STALE_COOLDOWN_HOURS: "6"
 
     steps:
       - name: Checkout
@@ -74,7 +67,6 @@ jobs:
           echo "DRY_RUN=${DRY_RUN}"
           echo "BOT_MODE=${BOT_MODE}"
           echo "QUOTE_ALLOW=${QUOTE_ALLOW}"
-          echo "CORE_WHITELIST=${CORE_WHITELIST}"
           echo "SPEC_SYMBOLS=${SPEC_SYMBOLS}"
           if [ "${DRY_RUN}" = "true" ]; then
             echo "🚧 DRY RUN — NO REAL ORDERS SENT 🚧"
@@ -85,6 +77,10 @@ jobs:
       - name: Run Crypto Live
         run: |
           python -u main.py
+
+      - name: Stale Sweeper (time stop)
+        run: |
+          python -u trader/stale_sweeper.py
 
       - name: Pack .state into zip
         run: |
