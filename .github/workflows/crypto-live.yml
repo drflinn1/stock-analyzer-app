@@ -30,27 +30,34 @@ jobs:
 
       # ---- Universe / quotes ----
       QUOTE_ALLOW: "USD,USDT"
-      CORE_WHITELIST: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
-      SPEC_SYMBOLS: "SPX/USDT,PENGU/USDT,PUMP/USDT"
-      PAIR_BLOCKLIST: ""
+      CORE_WHITELIST: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD,ENA/USD,ENA/USDT"
+      SPEC_SYMBOLS: ""                   # let auto-movers fill remaining spots
+      PAIR_BLOCKLIST: ""                 # <— not blocking anything
 
       # ---- Sizing / caps ----
-      USD_PER_TRADE: "30"      # (2) bump per-trade so Kraken min-cost clears
+      USD_PER_TRADE: "35"                # big enough to clear min-cost comfortably
       MAX_POSITIONS: "6"
-      RESERVE_USD: "80"        # (2) keep most of your reserve
+      RESERVE_USD: "80"
       DAILY_MAX_TRADES: "6"
 
-      # ---- Force at least N new buys when funds allow ----
-      GUARANTEE_MIN_NEW: "1"   # (1)
+      # ---- Force at least N new buys & prefer these first (if listed) ----
+      GUARANTEE_MIN_NEW: "1"
+      GUARANTEE_PICK: "ENA/USD,ENA/USDT,SOL/USD,BTC/USD"
 
       # ---- Engine safety floor for tiny orders ----
-      MIN_NOTIONAL_USD: "18"   # (3) internal floor; Kraken still applies its own mins
+      MIN_NOTIONAL_USD: "18"
 
       # ---- STALE (Aggressive) ----
       STALE_MAX_HOURS: "6"
       STALE_MIN_MOVE_PCT: "0.8"
       STALE_MIN_RANGE_PCT: "3.0"
       STALE_COOLDOWN_HOURS: "6"
+
+      # ---- ROTATION (replace slow coin with stronger one) ----
+      ROTATE_ENABLED: "true"
+      ROTATE_MIN_EDGE_PCT: "2.0"          # candidate must beat worst holding by ≥ 2%
+      ROTATE_MAX_SWITCHES_PER_RUN: "1"    # protect from churn
+      ROTATE_COOLDOWN_HOURS: "6"          # don't rotate same symbol too often
 
     steps:
       - name: Checkout
@@ -78,9 +85,12 @@ jobs:
           echo "QUOTE_ALLOW=${QUOTE_ALLOW}"
           echo "CORE_WHITELIST=${CORE_WHITELIST}"
           echo "SPEC_SYMBOLS=${SPEC_SYMBOLS}"
+          echo "PAIR_BLOCKLIST=${PAIR_BLOCKLIST}"
           echo "USD_PER_TRADE=${USD_PER_TRADE}  RESERVE_USD=${RESERVE_USD}"
-          echo "GUARANTEE_MIN_NEW=${GUARANTEE_MIN_NEW}  MIN_NOTIONAL_USD=${MIN_NOTIONAL_USD}"
+          echo "GUARANTEE_MIN_NEW=${GUARANTEE_MIN_NEW}  GUARANTEE_PICK=${GUARANTEE_PICK}"
+          echo "MIN_NOTIONAL_USD=${MIN_NOTIONAL_USD}"
           echo "STALE_MAX_HOURS=${STALE_MAX_HOURS}  STALE_MIN_MOVE_PCT=${STALE_MIN_MOVE_PCT}  STALE_MIN_RANGE_PCT=${STALE_MIN_RANGE_PCT}"
+          echo "ROTATE_ENABLED=${ROTATE_ENABLED}  ROTATE_MIN_EDGE_PCT=${ROTATE_MIN_EDGE_PCT}  ROTATE_MAX_SWITCHES_PER_RUN=${ROTATE_MAX_SWITCHES_PER_RUN}  ROTATE_COOLDOWN_HOURS=${ROTATE_COOLDOWN_HOURS}"
           if [ "${DRY_RUN}" = "true" ]; then
             echo "🚧 DRY RUN — NO REAL ORDERS SENT 🚧"
           else
