@@ -1,93 +1,175 @@
-name: Crypto Live (Every 15 min — ROTATE + TP/SL/TRAIL)
+name: Crypto Live (Every 15 min — Rotation + Exits)
 
 on:
   schedule:
-    - cron: '*/15 * * * *'   # every 15 minutes
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: 'true = simulate orders, false = place real orders'
+        description: "Dry run (no real orders)"
         required: true
-        default: 'true'
+        default: "true"
+        type: choice
+        options: ["true","false"]
+      TOP_K:
+        description: "Hold up to this many symbols"
+        required: true
+        default: "6"
+        type: string
+      EDGE_THRESHOLD:
+        description: "Min edge (e.g., 0.004 = 0.4%)"
+        required: true
+        default: "0.004"
+        type: string
+      RESERVE_CASH_USD:
+        description: "Keep at least this much USD"
+        required: true
+        default: "25"
+        type: string
       USD_PER_TRADE:
-        description: 'USD to spend per buy'
+        description: "USD per buy"
+        required: true
+        default: "10"
+        type: string
+      MIN_COST_PER_ORDER:
+        description: "USD min notional per order"
+        required: true
+        default: "5.0"
+        type: string
+      MAX_SPREAD_BPS:
+        description: "Skip markets wider than this (bps)"
+        required: true
+        default: "75"
+        type: string
+      COOLDOWN_MINUTES:
+        description: "Post-trade cooldown minutes"
+        required: true
+        default: "10"
+        type: string
+      ROTATE_WEAKEST_STRICT:
+        description: "If weakest cannot be sold, skip rotation"
+        required: true
+        default: "false"
+        type: choice
+        options: ["true","false"]
+      PARTIAL_ASSIST:
+        description: "Free a small slice of next-weakest if needed"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true","false"]
+      WHY_NOT_LOGS:
+        description: "Verbose reasons for rejections"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true","false"]
+      TAKE_PROFIT_PCT:
+        description: "Take profit threshold (e.g., 0.05 = 5%)"
+        required: true
+        default: "0.05"
+        type: string
+      STOP_LOSS_PCT:
+        description: "Stop loss threshold (e.g., 0.03 = 3%)"
+        required: true
+        default: "0.03"
+        type: string
+      TRAILING_STOP_PCT:
+        description: "Trailing stop drawdown (e.g., 0.02 = 2%)"
+        required: true
+        default: "0.02"
+        type: string
+      UNIVERSE:
+        description: "Optional comma-list universe (empty = autodetect USD markets)"
         required: false
-        default: '15'
-      RESERVE_USD:
-        description: 'Keep at least this much cash unspent'
+        default: ""
+        type: string
+      IGNORE_TICKERS:
+        description: "Comma list never rotated (XRP, USDT/USDC/USD/EUR/GBP by default)"
         required: false
-        default: '80'
-      MAX_POSITIONS:
-        description: 'Max concurrent positions'
-        required: false
-        default: '6'
+        default: "USDT,USDC,USD,EUR,GBP,XRP"
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
-  live:
+  run:
     name: Run Crypto Bot
     runs-on: ubuntu-latest
-    timeout-minutes: 12
-    concurrency:
-      group: crypto-live
-      cancel-in-progress: false
-
-    env:
-      # -------- Exchange + creds --------
-      EXCHANGE: kraken
-      API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-      API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-
-      # -------- Run mode --------
-      # Manual runs can override DRY_RUN/position sizing via workflow_dispatch inputs
-      DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'true' }}
-
-      # -------- Core sizing/limits --------
-      USD_PER_TRADE: ${{ github.event.inputs.USD_PER_TRADE || '15' }}
-      RESERVE_USD:   ${{ github.event.inputs.RESERVE_USD   || '80' }}
-      MAX_POSITIONS: ${{ github.event.inputs.MAX_POSITIONS || '6' }}
-
-      # -------- Rotation (cash-short upgrade) --------
-      ROTATE_WHEN_CASH_SHORT: 'true'   # optional knob (defaults true in code, explicit here)
-      ROTATE_MIN_EDGE_PCT: '2.0'       # rotate if (best - worst) momentum ≥ this %
-      COOLDOWN_RUNS: '1'               # 1-run cooldown after rotating into a symbol
-
-      # -------- Sell Guards (must include these tokens for your guard workflow) --------
-      TAKE_PROFIT_PCT: '3.5'           # TAKE_PROFIT threshold (+%)
-      STOP_LOSS_PCT:   '2.0'           # STOP_LOSS threshold (−%)
-      TRAIL_ARM_PCT:   '1.0'           # Arm trailing after +1.0% gain
-      TRAIL_PCT:       '1.5'           # TRAIL distance (%) from high watermark
-
-      # -------- Universe --------
-      SYMBOL_WHITELIST: 'BTC/USD,ETH/USD,SOL/USD,DOGE/USD,ZEC/USD,ENA/USD'
+    timeout-minutes: 20
 
     steps:
+      - name: Set up job
+        run: echo "Starting…"
+
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install ccxt
 
+      # ✅ New: fail early with a clear error if secrets aren’t present.
+      - name: Check Kraken secrets
+        shell: bash
+        run: |
+          if [[ -z "${{ secrets.KRAKEN_API_KEY }}" || -z "${{ secrets.KRAKEN_API_SECRET }}" ]]; then
+            echo "::error title=Missing Kraken Secrets::KRAKEN_API_KEY and/or KRAKEN_API_SECRET are not available to this workflow run."
+            echo "Go to: Repository → Settings → Secrets and variables → Actions → New repository secret"
+            echo "Add KRAKEN_API_KEY and KRAKEN_API_SECRET (values from Kraken)."
+            exit 1
+          fi
+          echo "Secrets are present (values are hidden)."
+
       - name: Echo config (non-secret)
         run: |
-          echo "DRY_RUN=${DRY_RUN}"
-          echo "USD_PER_TRADE=${USD_PER_TRADE}"
-          echo "RESERVE_USD=${RESERVE_USD}"
-          echo "MAX_POSITIONS=${MAX_POSITIONS}"
-          echo "ROTATE_WHEN_CASH_SHORT=${ROTATE_WHEN_CASH_SHORT}"
-          echo "ROTATE_MIN_EDGE_PCT=${ROTATE_MIN_EDGE_PCT}"
-          echo "COOLDOWN_RUNS=${COOLDOWN_RUNS}"
-          echo "TAKE_PROFIT_PCT=${TAKE_PROFIT_PCT}"
-          echo "STOP_LOSS_PCT=${STOP_LOSS_PCT}"
-          echo "TRAIL_ARM_PCT=${TRAIL_ARM_PCT}"
-          echo "TRAIL_PCT=${TRAIL_PCT}"
-          echo "SYMBOL_WHITELIST=${SYMBOL_WHITELIST}"
+          echo "DRY_RUN=${{ inputs.DRY_RUN || 'true' }}"
+          echo "TOP_K=${{ inputs.TOP_K || '6' }}"
+          echo "EDGE_THRESHOLD=${{ inputs.EDGE_THRESHOLD || '0.004' }}"
+          echo "RESERVE_CASH_USD=${{ inputs.RESERVE_CASH_USD || '25' }}"
+          echo "USD_PER_TRADE=${{ inputs.USD_PER_TRADE || '10' }}"
+          echo "MIN_COST_PER_ORDER=${{ inputs.MIN_COST_PER_ORDER || '5.0' }}"
+          echo "MAX_SPREAD_BPS=${{ inputs.MAX_SPREAD_BPS || '75' }}"
+          echo "COOLDOWN_MINUTES=${{ inputs.COOLDOWN_MINUTES || '10' }}"
+          echo "ROTATE_WEAKEST_STRICT=${{ inputs.ROTATE_WEAKEST_STRICT || 'false' }}"
+          echo "PARTIAL_ASSIST=${{ inputs.PARTIAL_ASSIST || 'true' }}"
+          echo "WHY_NOT_LOGS=${{ inputs.WHY_NOT_LOGS || 'true' }}"
+          echo "TAKE_PROFIT_PCT=${{ inputs.TAKE_PROFIT_PCT || '0.05' }}"
+          echo "STOP_LOSS_PCT=${{ inputs.STOP_LOSS_PCT || '0.03' }}"
+          echo "TRAILING_STOP_PCT=${{ inputs.TRAILING_STOP_PCT || '0.02' }}"
+          echo "UNIVERSE='${{ inputs.UNIVERSE }}'"
+          echo "IGNORE_TICKERS='${{ inputs.IGNORE_TICKERS || 'USDT,USDC,USD,EUR,GBP,XRP' }}'"
 
       - name: Run bot
-        run: python main.py
+        env:
+          # Exchange & secrets
+          EXCHANGE: kraken
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
+          # Behavior (dispatch inputs override sensible defaults)
+          DRY_RUN: ${{ inputs.DRY_RUN || 'true' }}
+          TOP_K: ${{ inputs.TOP_K || '6' }}
+          EDGE_THRESHOLD: ${{ inputs.EDGE_THRESHOLD || '0.004' }}
+          RESERVE_CASH_USD: ${{ inputs.RESERVE_CASH_USD || '25' }}
+          USD_PER_TRADE: ${{ inputs.USD_PER_TRADE || '10' }}
+          MIN_COST_PER_ORDER: ${{ inputs.MIN_COST_PER_ORDER || '5.0' }}
+          MAX_SPREAD_BPS: ${{ inputs.MAX_SPREAD_BPS || '75' }}
+          COOLDOWN_MINUTES: ${{ inputs.COOLDOWN_MINUTES || '10' }}
+          ROTATE_WEAKEST_STRICT: ${{ inputs.ROTATE_WEAKEST_STRICT || 'false' }}
+          PARTIAL_ASSIST: ${{ inputs.PARTIAL_ASSIST || 'true' }}
+          WHY_NOT_LOGS: ${{ inputs.WHY_NOT_LOGS || 'true' }}
+          TAKE_PROFIT_PCT: ${{ inputs.TAKE_PROFIT_PCT || '0.05' }}
+          STOP_LOSS_PCT: ${{ inputs.STOP_LOSS_PCT || '0.03' }}
+          TRAILING_STOP_PCT: ${{ inputs.TRAILING_STOP_PCT || '0.02' }}
+          UNIVERSE: ${{ inputs.UNIVERSE }}
+          IGNORE_TICKERS: ${{ inputs.IGNORE_TICKERS || 'USDT,USDC,USD,EUR,GBP,XRP' }}
+        run: |
+          python main.py
