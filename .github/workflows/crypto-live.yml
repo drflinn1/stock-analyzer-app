@@ -2,13 +2,13 @@ name: Crypto Live (Every 15 min — Rotation + Exits)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/15 * * * *"   # run every 15 minutes
   workflow_dispatch:
     inputs:
       DRY_RUN:
         description: "Dry run (no real orders)"
         required: true
-        default: "false"   # ⬅⬅ LIVE by default
+        default: "false"
         type: choice
         options: ["true","false"]
       TOP_K:
@@ -63,6 +63,11 @@ on:
 permissions:
   contents: read
 
+# Prevent overlapping runs of this workflow
+concurrency:
+  group: crypto-live
+  cancel-in-progress: false
+
 jobs:
   run:
     name: Run Crypto Bot
@@ -86,11 +91,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt
 
+      # Fail early if secrets are missing
       - name: Check Kraken secrets
         shell: bash
         run: |
           if [[ -z "${{ secrets.KRAKEN_API_KEY }}" || -z "${{ secrets.KRAKEN_API_SECRET }}" ]]; then
             echo "::error title=Missing Kraken Secrets::KRAKEN_API_KEY and/or KRAKEN_API_SECRET are not available to this workflow run."
+            echo "Add them under: Repository → Settings → Secrets and variables → Actions."
             exit 1
           fi
           echo "Kraken secrets detected."
@@ -110,11 +117,12 @@ jobs:
 
       - name: Run bot
         env:
+          # Exchange & secrets
           EXCHANGE: kraken
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-          # Dispatch-controlled knobs
+          # Dispatch-controlled knobs (10 inputs max)
           DRY_RUN: ${{ inputs.DRY_RUN || 'false' }}
           TOP_K: ${{ inputs.TOP_K || '6' }}
           EDGE_THRESHOLD: ${{ inputs.EDGE_THRESHOLD || '0.004' }}
@@ -126,12 +134,28 @@ jobs:
           PARTIAL_ASSIST: ${{ inputs.PARTIAL_ASSIST || 'true' }}
           WHY_NOT_LOGS: ${{ inputs.WHY_NOT_LOGS || 'true' }}
 
-          # Fixed defaults
+          # --- Fixed env defaults (edit here if you want) ---
+          # Rotation safety & universe quality
+          ATOMIC_ROTATION: "true"        # sell only if a buy is also eligible
+          MIN_QUOTE_VOL_USD: "50000"     # filter thin markets from Top-K
+          EXIT_SCOPE: "weakest"          # weakest | bottom | all
+          EXIT_BEFORE_ROTATE: "false"    # keep rotation first
+
+          # Sizing safety margins
+          SELL_EPS: "0.995"              # sell <= 99.5% to avoid fee/precision rejects
+          BUY_EPS: "0.995"               # spend <= 99.5% of budget
+
+          # Trade hygiene
           COOLDOWN_MINUTES: "10"
+
+          # Exit thresholds (labels present for CI guards)
           TAKE_PROFIT_PCT: "0.05"
           STOP_LOSS_PCT: "0.03"
           TRAILING_STOP_PCT: "0.02"
-          UNIVERSE: ""
+
+          # Universe filters
+          UNIVERSE: ""                   # empty = autodetect USD spot markets
           IGNORE_TICKERS: "USDT,USDC,USD,EUR,GBP,XRP"
+
         run: |
           python main.py
