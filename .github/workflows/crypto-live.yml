@@ -1,8 +1,8 @@
-name: Crypto Live (Every 15 min — Rotation + Exits)
+name: Crypto Live (Every 15 min — Rotation Day-Trade)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # run every 15 minutes
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       DRY_RUN:
@@ -12,12 +12,12 @@ on:
         type: choice
         options: ["true","false"]
       TOP_K:
-        description: "Hold up to this many symbols"
+        description: "Rank/scan top K coins"
         required: true
         default: "6"
         type: string
-      EDGE_THRESHOLD:
-        description: "Min edge (e.g., 0.004 = 0.4%)"
+      ROTATE_MIN_EDGE_PCT:
+        description: "Min edge to rotate (e.g., 0.004 = 0.4%)"
         required: true
         default: "0.004"
         type: string
@@ -27,12 +27,12 @@ on:
         default: "25"
         type: string
       USD_PER_TRADE:
-        description: "USD per buy"
+        description: "USD budget per BUY"
         required: true
         default: "10"
         type: string
       MIN_COST_PER_ORDER:
-        description: "USD min notional per order"
+        description: "Exchange min notional per order"
         required: true
         default: "5.0"
         type: string
@@ -41,20 +41,19 @@ on:
         required: true
         default: "75"
         type: string
-      ROTATE_WEAKEST_STRICT:
-        description: "If weakest cannot be sold, skip rotation"
+      MIN_QUOTE_VOL_USD:
+        description: "Filter out thin markets under this 24h vol"
         required: true
-        default: "false"
-        type: choice
-        options: ["true","false"]
+        default: "50000"
+        type: string
       PARTIAL_ASSIST:
-        description: "Sell tiny slice of next-weakest to free cash if needed"
+        description: "Allow small helper sells if needed (not used when atomic)"
         required: true
         default: "true"
         type: choice
         options: ["true","false"]
       WHY_NOT_LOGS:
-        description: "Verbose reasons for rejections"
+        description: "Verbose reasons for accept/reject"
         required: true
         default: "true"
         type: choice
@@ -63,7 +62,7 @@ on:
 permissions:
   contents: read
 
-# Prevent overlapping runs of this workflow
+# Avoid overlapping live runs
 concurrency:
   group: crypto-live
   cancel-in-progress: false
@@ -91,12 +90,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt
 
-      # Fail early if secrets are missing
       - name: Check Kraken secrets
         shell: bash
         run: |
           if [[ -z "${{ secrets.KRAKEN_API_KEY }}" || -z "${{ secrets.KRAKEN_API_SECRET }}" ]]; then
-            echo "::error title=Missing Kraken Secrets::KRAKEN_API_KEY and/or KRAKEN_API_SECRET are not available to this workflow run."
+            echo "::error title=Missing Kraken Secrets::KRAKEN_API_KEY and/or KRAKEN_API_SECRET are not set."
             echo "Add them under: Repository → Settings → Secrets and variables → Actions."
             exit 1
           fi
@@ -104,57 +102,67 @@ jobs:
 
       - name: Echo config (non-secret)
         run: |
+          echo "--- Inputs ---"
           echo "DRY_RUN=${{ inputs.DRY_RUN || 'false' }}"
           echo "TOP_K=${{ inputs.TOP_K || '6' }}"
-          echo "EDGE_THRESHOLD=${{ inputs.EDGE_THRESHOLD || '0.004' }}"
+          echo "ROTATE_MIN_EDGE_PCT=${{ inputs.ROTATE_MIN_EDGE_PCT || '0.004' }}"
           echo "RESERVE_CASH_USD=${{ inputs.RESERVE_CASH_USD || '25' }}"
           echo "USD_PER_TRADE=${{ inputs.USD_PER_TRADE || '10' }}"
           echo "MIN_COST_PER_ORDER=${{ inputs.MIN_COST_PER_ORDER || '5.0' }}"
           echo "MAX_SPREAD_BPS=${{ inputs.MAX_SPREAD_BPS || '75' }}"
-          echo "ROTATE_WEAKEST_STRICT=${{ inputs.ROTATE_WEAKEST_STRICT || 'false' }}"
+          echo "MIN_QUOTE_VOL_USD=${{ inputs.MIN_QUOTE_VOL_USD || '50000' }}"
           echo "PARTIAL_ASSIST=${{ inputs.PARTIAL_ASSIST || 'true' }}"
           echo "WHY_NOT_LOGS=${{ inputs.WHY_NOT_LOGS || 'true' }}"
+          echo "--- Fixed env (edit in YAML) ---"
+          echo "ROTATE_MAX_SWITCHES_PER_RUN=1"
+          echo "ROTATE_COOLDOWN_MIN=30"
+          echo "ATOMIC_ROTATION=true"
+          echo "DUST_IGNORE_BELOW_USD=1.00"
+          echo "SELL_EPS=0.995 BUY_EPS=0.995"
+          echo "COOLDOWN_MINUTES=10"
+          echo "TP=0.05 SL=0.03 TRAIL=0.02"
+          echo "UNIVERSE='' IGNORE_TICKERS='USDT,USDC,USD,EUR,GBP,XRP'"
 
       - name: Run bot
         env:
-          # Exchange & secrets
+          # Exchange + secrets
           EXCHANGE: kraken
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-          # Dispatch-controlled knobs (10 inputs max)
+          # ---- Dispatch-controlled knobs (≤10 inputs) ----
           DRY_RUN: ${{ inputs.DRY_RUN || 'false' }}
           TOP_K: ${{ inputs.TOP_K || '6' }}
-          EDGE_THRESHOLD: ${{ inputs.EDGE_THRESHOLD || '0.004' }}
+          ROTATE_MIN_EDGE_PCT: ${{ inputs.ROTATE_MIN_EDGE_PCT || '0.004' }}
           RESERVE_CASH_USD: ${{ inputs.RESERVE_CASH_USD || '25' }}
           USD_PER_TRADE: ${{ inputs.USD_PER_TRADE || '10' }}
           MIN_COST_PER_ORDER: ${{ inputs.MIN_COST_PER_ORDER || '5.0' }}
           MAX_SPREAD_BPS: ${{ inputs.MAX_SPREAD_BPS || '75' }}
-          ROTATE_WEAKEST_STRICT: ${{ inputs.ROTATE_WEAKEST_STRICT || 'false' }}
+          MIN_QUOTE_VOL_USD: ${{ inputs.MIN_QUOTE_VOL_USD || '50000' }}
           PARTIAL_ASSIST: ${{ inputs.PARTIAL_ASSIST || 'true' }}
           WHY_NOT_LOGS: ${{ inputs.WHY_NOT_LOGS || 'true' }}
 
-          # --- Fixed env defaults (edit here if you want) ---
-          # Rotation safety & universe quality
-          ATOMIC_ROTATION: "true"        # sell only if a buy is also eligible
-          MIN_QUOTE_VOL_USD: "50000"     # filter thin markets from Top-K
-          EXIT_SCOPE: "weakest"          # weakest | bottom | all
-          EXIT_BEFORE_ROTATE: "false"    # keep rotation first
+          # ---- Fixed env defaults (edit here to tune behavior) ----
+          # Rotation rule & safety
+          ROTATE_MAX_SWITCHES_PER_RUN: "1"
+          ROTATE_COOLDOWN_MIN: "30"
+          ATOMIC_ROTATION: "true"           # sell only if a buy is eligible
+          DUST_IGNORE_BELOW_USD: "1.00"     # ignore tiny leftovers when picking weakest
 
           # Sizing safety margins
-          SELL_EPS: "0.995"              # sell <= 99.5% to avoid fee/precision rejects
-          BUY_EPS: "0.995"               # spend <= 99.5% of budget
+          SELL_EPS: "0.995"
+          BUY_EPS: "0.995"
 
-          # Trade hygiene
+          # General trade hygiene
           COOLDOWN_MINUTES: "10"
 
-          # Exit thresholds (labels present for CI guards)
+          # Exit thresholds (kept for CI/safety; exits scoped in code)
           TAKE_PROFIT_PCT: "0.05"
           STOP_LOSS_PCT: "0.03"
           TRAILING_STOP_PCT: "0.02"
 
           # Universe filters
-          UNIVERSE: ""                   # empty = autodetect USD spot markets
+          UNIVERSE: ""
           IGNORE_TICKERS: "USDT,USDC,USD,EUR,GBP,XRP"
 
         run: |
