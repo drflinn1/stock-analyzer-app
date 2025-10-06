@@ -30,8 +30,9 @@ jobs:
       ROTATE_WHEN_CASH_SHORT: "true"
 
       MIN_NOTIONAL_USD: "5"
-      DUST_MIN_USD: "2"
+      DUST_MIN_USD: "5"
       RESERVE_CASH_PCT: "5"
+      UNIVERSE_WHITELIST: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
 
       TP_PCT: "2.0"
       SL_PCT: "3.5"
