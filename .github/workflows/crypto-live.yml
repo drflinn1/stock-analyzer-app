@@ -1,4 +1,4 @@
-name: Crypto Live — Every 15m (ENV secrets + Dust Sweep)
+name: Crypto Live — Every 15m (Repo secrets + Dust Sweep)
 
 on:
   workflow_dispatch:
@@ -14,50 +14,41 @@ concurrency:
 
 jobs:
   run:
-    # ⬇️ Use the SAME Environment name where your Kraken secrets already work
-    environment: production   # <- if your env is called "live", change to live
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
     env:
-      # ====== EXECUTION TOGGLES ======
-      DRY_RUN: "false"            # LIVE (set "true" to simulate only)
-      RUN_SWITCH: "on"            # off = skip trading loop but still boot/log
+      DRY_RUN: "false"
+      RUN_SWITCH: "on"
 
-      # ====== EXCHANGE / ROUTING ======
       EXCHANGE: "kraken"
       BASE_QUOTE: "USD"
 
-      # ====== POSITION SIZING / ROTATION ======
       MAX_POSITIONS: "12"
       MAX_BUYS_PER_RUN: "1"
       ROTATE_WHEN_FULL: "true"
       ROTATE_WHEN_CASH_SHORT: "true"
 
-      # ====== ORDER GUARDS ======
       MIN_NOTIONAL_USD: "5"
-      DUST_MIN_USD: "2"           # sweep anything <= $2 to USD
+      DUST_MIN_USD: "2"
       RESERVE_CASH_PCT: "5"
 
-      # ====== RISK CONTROLS ======
       TP_PCT: "2.0"
       SL_PCT: "3.5"
       TRAIL_PCT: "1.2"
       DAILY_LOSS_CAP: "3"
       AUTO_PAUSE_ON_ERROR: "true"
 
-      # ====== LOGGING / OUTPUT ======
       LOG_LEVEL: "INFO"
       KPI_CSV_PATH: ".state/kpi_history.csv"
       STATE_DIR: ".state"
 
-      # ====== STRATEGY MISC ======
       TIMEFRAME: "15m"
       TOPK: "6"
       COOL_DOWN_MINUTES: "30"
       SHOW_BANNER: "true"
 
-      # ====== SECRETS (from the Environment above) ======
+      # Repo-level secrets
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
       KRAKEN_API_OTP: ${{ secrets.KRAKEN_API_OTP }}
@@ -81,13 +72,18 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
-            python -m pip install --upgrade pip
             pip install -r requirements.txt
           else
-            python -m pip install --upgrade pip
             pip install ccxt pandas numpy requests python-dateutil
           fi
+
+      - name: Preflight — check secrets (length only)
+        run: |
+          [ -z "${KRAKEN_API_KEY}" ] && echo "❌ KRAKEN_API_KEY is missing" && exit 1 || echo "KRAKEN_API_KEY len: ${#KRAKEN_API_KEY}"
+          [ -z "${KRAKEN_API_SECRET}" ] && echo "❌ KRAKEN_API_SECRET is missing" && exit 1 || echo "KRAKEN_API_SECRET len: ${#KRAKEN_API_SECRET}"
+          echo "✅ Secrets present"
 
       - name: Print mode & guards
         run: |
@@ -111,7 +107,7 @@ jobs:
           if [ -f "${STATE_DIR}/summary.txt" ]; then
             cat "${STATE_DIR}/summary.txt" || true
           else
-            echo "No summary.txt found (ok if your script logs to stdout only)."
+            echo "No summary.txt found (ok)."
           fi
 
       - name: Upload state & logs
