@@ -52,28 +52,8 @@ on:
         default: 'true'
         type: choice
         options: ['true','false']
-      TP_PCT:
-        description: 'TAKE_PROFIT percent (0 disables)'
-        required: true
-        default: '5'
-        type: string
-      SL_PCT:
-        description: 'STOP_LOSS percent (0 disables)'
-        required: true
-        default: '3'
-        type: string
-      TSL_PCT:
-        description: 'TRAIL (trailing stop) percent (0 disables)'
-        required: true
-        default: '4'
-        type: string
       SYMBOLS_WHITELIST:
         description: 'Optional hard whitelist (comma-separated, e.g., BTC/USD,ETH/USD)'
-        required: false
-        default: ''
-        type: string
-      SYMBOLS_EXCLUDE:
-        description: 'Optional exclusions (comma-separated)'
         required: false
         default: ''
         type: string
@@ -89,14 +69,17 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # ----- Exchange auth -----
   EXCHANGE_ID: "kraken"
   API_KEY: ${{ secrets.KRAKEN_API_KEY }}
   API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
   API_PASSWORD: ""
 
+  # ----- Quote & state -----
   QUOTE: "USD"
   STATE_DIR: ".state"
 
+  # ----- Runtime knobs (inputs <= 10) -----
   DRY_RUN: ${{ inputs.DRY_RUN || 'true' }}
   RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'true' }}
   TOP_K: ${{ inputs.TOP_K || '6' }}
@@ -106,11 +89,13 @@ env:
   ROTATE_WHEN_FULL: ${{ inputs.ROTATE_WHEN_FULL || 'false' }}
   MAX_BUYS_PER_RUN: ${{ inputs.MAX_BUYS_PER_RUN || '1' }}
   ROTATE_WHEN_CASH_SHORT: ${{ inputs.ROTATE_WHEN_CASH_SHORT || 'true' }}
-  TP_PCT: ${{ inputs.TP_PCT || '5' }}
-  SL_PCT: ${{ inputs.SL_PCT || '3' }}
-  TSL_PCT: ${{ inputs.TSL_PCT || '4' }}
   SYMBOLS_WHITELIST: ${{ inputs.SYMBOLS_WHITELIST }}
-  SYMBOLS_EXCLUDE: ${{ inputs.SYMBOLS_EXCLUDE }}
+
+  # ----- Extra knobs (not in inputs; edit here or set as repository variables) -----
+  SYMBOLS_EXCLUDE: ""
+  TP_PCT: "5"   # TAKE_PROFIT percent; set here if you want different default
+  SL_PCT: "3"   # STOP_LOSS percent
+  TSL_PCT: "4"  # TRAIL (trailing) percent
 
 jobs:
   live:
@@ -138,6 +123,7 @@ jobs:
           echo "QUOTE=$QUOTE"
           echo "DRY_RUN=$DRY_RUN RUN_SWITCH=$RUN_SWITCH"
           echo "TOP_K=$TOP_K MAX_POSITIONS=$MAX_POSITIONS MIN_NOTIONAL=$MIN_NOTIONAL"
+          echo "RESERVE_CASH_PCT=$RESERVE_CASH_PCT"
           echo "ROTATE_WHEN_FULL=$ROTATE_WHEN_FULL MAX_BUYS_PER_RUN=$MAX_BUYS_PER_RUN ROTATE_WHEN_CASH_SHORT=$ROTATE_WHEN_CASH_SHORT"
           echo "TP_PCT=$TP_PCT SL_PCT=$SL_PCT TSL_PCT=$TSL_PCT"
           echo "WHITELIST=$SYMBOLS_WHITELIST"
