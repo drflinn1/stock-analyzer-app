@@ -1,5 +1,8 @@
-# main.py — Rotation-first "day-trade" with fixed direction (worst -> best),
-# atomic buy/sell, cooldown, dust ignore, and WHY-NOT logs.
+# main.py — Mean-revert day-trader (buy dips, quick TP/SL/trail)
+# - Entries: ranks coins by 15m RSI (low) and % below VWAP (low) -> buys most oversold eligible
+# - Exits (uniform): TAKE_PROFIT, STOP_LOSS, TRAILING stop, tracked vs our entry price
+# - Atomic: won't sell to rotate unless a buy is eligible (and only when fully allocated)
+# - Dust ignored; min-cost respected; WHY-NOT logs everywhere
 
 from __future__ import annotations
 import os, json, math, csv
@@ -7,7 +10,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
-# ---------- small utils ----------
+# ---------- env helpers ----------
 def as_bool(v: Optional[str], default=False) -> bool:
     if v is None: return default
     return str(v).strip().lower() in {"1","true","y","yes","on"}
@@ -23,52 +26,56 @@ def env_csv(name: str) -> List[str]:
 def now_utc() -> datetime: return datetime.now(timezone.utc)
 def ts() -> str: return now_utc().strftime("%Y-%m-%d %H:%M:%S %Z")
 
-# ---------- ENV ----------
-EXCHANGE_NAME   = (os.getenv("EXCHANGE") or "kraken").lower()
-DRY_RUN         = as_bool(os.getenv("DRY_RUN"), True)
+# ---------- CONFIG (env) ----------
+EXCHANGE         = (os.getenv("EXCHANGE") or "kraken").lower()
+DRY_RUN          = as_bool(os.getenv("DRY_RUN"), True)
 
-# Universe & filters
-UNIVERSE        = env_csv("UNIVERSE")
-IGNORE_TICKERS  = set(env_csv("IGNORE_TICKERS") or ["USDT","USDC","USD","EUR","GBP","XRP"])
-MIN_QUOTE_VOL_USD = as_float(os.getenv("MIN_QUOTE_VOL_USD"), 50_000.0)
-MAX_SPREAD_BPS  = as_float(os.getenv("MAX_SPREAD_BPS"), 75.0)
+# Universe / filters
+UNIVERSE         = env_csv("UNIVERSE")
+IGNORE_TICKERS   = set(env_csv("IGNORE_TICKERS") or ["USDT","USDC","USD","EUR","GBP"])
+MIN_QUOTE_VOL_USD= as_float(os.getenv("MIN_QUOTE_VOL_USD"), 10000.0)
+MAX_SPREAD_BPS   = as_float(os.getenv("MAX_SPREAD_BPS"), 150.0)
 
-# Sizing, costs & reserves
-TOP_K           = int(os.getenv("TOP_K") or "6")
-USD_PER_TRADE   = as_float(os.getenv("USD_PER_TRADE"), 10.0)
+# Sizing, reserves
+TOP_K            = int(os.getenv("TOP_K") or "6")
+USD_PER_TRADE    = as_float(os.getenv("USD_PER_TRADE"), 15.0)
 MIN_COST_PER_ORDER = as_float(os.getenv("MIN_COST_PER_ORDER"), 5.0)
 RESERVE_CASH_USD = as_float(os.getenv("RESERVE_CASH_USD"), 25.0)
 
-# Rotation rule (this is the "go back but fix the backwards logic" part)
-ROTATE_MIN_EDGE_PCT        = as_float(os.getenv("ROTATE_MIN_EDGE_PCT"), 0.004)  # 0.4%
-ROTATE_MAX_SWITCHES_PER_RUN= int(os.getenv("ROTATE_MAX_SWITCHES_PER_RUN") or "1")
-ROTATE_COOLDOWN_MIN        = int(os.getenv("ROTATE_COOLDOWN_MIN") or "30")
-ATOMIC_ROTATION            = as_bool(os.getenv("ATOMIC_ROTATION"), True)         # sell only if buy passes
+# Mean-revert signal params
+TIMEFRAME        = os.getenv("TIMEFRAME") or "15m"
+RSI_LEN          = int(os.getenv("RSI_LEN") or "14")
+VWAP_BARS        = int(os.getenv("VWAP_BARS") or "20")  # ~5 hours on 15m
+OVERSOLD_RSI     = as_float(os.getenv("OVERSOLD_RSI"), 35.0)
+
+# Exits (uniform for all positions)
+TAKE_PROFIT_PCT  = as_float(os.getenv("TAKE_PROFIT_PCT"), 0.02)   # +2.0%
+STOP_LOSS_PCT    = as_float(os.getenv("STOP_LOSS_PCT"),   0.01)   # -1.0%
+TRAILING_STOP_PCT= as_float(os.getenv("TRAILING_STOP_PCT"),0.007) # 0.7%
+
+# Rotation behavior when fully allocated
+ATOMIC_ROTATION  = as_bool(os.getenv("ATOMIC_ROTATION"), True)
+ROTATE_WHEN_FULL = as_bool(os.getenv("ROTATE_WHEN_FULL"), True)   # can swap worst->best when no USD
 
 # Hygiene
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES") or "10")  # trade-level (exit & rotation)
-SELL_EPS         = as_float(os.getenv("SELL_EPS"), 0.995)       # sell 99.5% to avoid fee/precision rejects
-BUY_EPS          = as_float(os.getenv("BUY_EPS"),  0.995)
-DUST_IGNORE_BELOW_USD = as_float(os.getenv("DUST_IGNORE_BELOW_USD"), 1.00)
-WHY_NOT_LOGS     = as_bool(os.getenv("WHY_NOT_LOGS"), True)
-
-# Exit guards (kept for CI / safety; scoped to weakest so we don't dump winners first)
-TAKE_PROFIT_PCT  = as_float(os.getenv("TAKE_PROFIT_PCT"), 0.05)  # TAKE_PROFIT
-STOP_LOSS_PCT    = as_float(os.getenv("STOP_LOSS_PCT"), 0.03)    # STOP_LOSS
-TRAILING_STOP_PCT= as_float(os.getenv("TRAILING_STOP_PCT"), 0.02)# TRAIL
-EXIT_SCOPE       = (os.getenv("EXIT_SCOPE") or "weakest").strip().lower()
+COOLDOWN_MINUTES         = int(os.getenv("COOLDOWN_MINUTES") or "10")
+SELL_EPS                 = as_float(os.getenv("SELL_EPS"), 0.995)
+BUY_EPS                  = as_float(os.getenv("BUY_EPS"),  0.995)
+DUST_IGNORE_BELOW_USD    = as_float(os.getenv("DUST_IGNORE_BELOW_USD"), 1.00)
+WHY_NOT_LOGS             = as_bool(os.getenv("WHY_NOT_LOGS"), True)
 
 STATE_DIR = Path(".state"); STATE_DIR.mkdir(exist_ok=True)
-LAST_TRADES_FILE = STATE_DIR / "last_trades.json"          # per-symbol trade cooldown
-ROTATE_CD_FILE   = STATE_DIR / "rotate_cooldown.json"      # ping-pong guard
-KPI_CSV          = STATE_DIR / "kpi_history.csv"
+TRADES_FILE   = STATE_DIR / "last_trades.json"     # per-symbol cooldown
+POSITIONS_FILE= STATE_DIR / "positions.json"       # our entries/peaks for exits
+KPI_CSV       = STATE_DIR / "kpi_history.csv"
 
 print(
-  f"[BOOT] {ts()} EXCHANGE={EXCHANGE_NAME} DRY_RUN={DRY_RUN} TOP_K={TOP_K} "
-  f"EDGE(min)={ROTATE_MIN_EDGE_PCT} USD_PER_TRADE=${USD_PER_TRADE} MIN_COST=${MIN_COST_PER_ORDER} "
-  f"RESERVE=${RESERVE_CASH_USD} VOL_USD>={MIN_QUOTE_VOL_USD} SPREAD_BPS<={MAX_SPREAD_BPS} "
-  f"ROTATE_MAX={ROTATE_MAX_SWITCHES_PER_RUN} ROTATE_CD_MIN={ROTATE_COOLDOWN_MIN} ATOMIC={ATOMIC_ROTATION} "
-  f"SELL_EPS={SELL_EPS} BUY_EPS={BUY_EPS} DUST_IGNORE<${DUST_IGNORE_BELOW_USD}"
+  f"[BOOT] {ts()} EXCHANGE={EXCHANGE} DRY_RUN={DRY_RUN} TOP_K={TOP_K} TF={TIMEFRAME} "
+  f"USD_PER_TRADE=${USD_PER_TRADE} MIN_COST=${MIN_COST_PER_ORDER} RESERVE=${RESERVE_CASH_USD} "
+  f"RSI_LEN={RSI_LEN} VWAP_BARS={VWAP_BARS} OVERSOLD_RSI={OVERSOLD_RSI} "
+  f"TP={TAKE_PROFIT_PCT:.3f} SL={STOP_LOSS_PCT:.3f} TRAIL={TRAILING_STOP_PCT:.3f} "
+  f"VOL_USD>={MIN_QUOTE_VOL_USD} SPREAD_BPS<={MAX_SPREAD_BPS} ATOMIC={ATOMIC_ROTATION} "
+  f"DUST_IGNORE<${DUST_IGNORE_BELOW_USD}"
 )
 
 # ---------- ccxt ----------
@@ -78,16 +85,16 @@ except Exception as e:
     raise SystemExit(f"[ERROR] ccxt import failed: {e}")
 
 def build_exchange():
-    if EXCHANGE_NAME != "kraken":
-        raise SystemExit("[ERROR] Only 'kraken' is implemented.")
+    if EXCHANGE != "kraken":
+        raise SystemExit("[ERROR] Only Kraken wired for now.")
     return ccxt.kraken({
-        "apiKey": os.getenv("KRAKEN_API_KEY", ""),
-        "secret": os.getenv("KRAKEN_API_SECRET", ""),
+        "apiKey": os.getenv("KRAKEN_API_KEY",""),
+        "secret": os.getenv("KRAKEN_API_SECRET",""),
         "enableRateLimit": True,
         "options": {"adjustForTimeDifference": True},
     })
 
-# ---------- helpers ----------
+# ---------- state ----------
 def load_json(p: Path) -> dict:
     if p.exists():
         try: return json.loads(p.read_text())
@@ -97,32 +104,37 @@ def load_json(p: Path) -> dict:
 def save_json(p: Path, obj: dict):
     p.write_text(json.dumps(obj, indent=2))
 
-def load_last_trades() -> Dict[str, str]:
-    return load_json(LAST_TRADES_FILE)
-
-def save_last_trade(sym: str):
-    d = load_last_trades(); d[sym.upper()] = now_utc().isoformat(); save_json(LAST_TRADES_FILE, d)
-
-def cooldown_active(sym: str, minutes: int) -> bool:
-    d = load_last_trades(); s = sym.upper()
+def load_trades(): return load_json(TRADES_FILE)
+def save_trade(sym: str):
+    d = load_trades(); d[sym.upper()] = now_utc().isoformat(); save_json(TRADES_FILE, d)
+def cooldown_active(sym: str) -> bool:
+    d = load_trades(); s=sym.upper()
     if s not in d: return False
-    return (now_utc() - datetime.fromisoformat(d[s])) < timedelta(minutes=minutes)
+    return (now_utc() - datetime.fromisoformat(d[s])) < timedelta(minutes=COOLDOWN_MINUTES)
 
-def rotate_cooldown_active(sym: str) -> bool:
-    d = load_json(ROTATE_CD_FILE); s = sym.upper()
-    if s not in d: return False
-    return (now_utc() - datetime.fromisoformat(d[s])) < timedelta(minutes=ROTATE_COOLDOWN_MIN)
+def load_positions(): return load_json(POSITIONS_FILE)
+def set_position(sym: str, entry_price: float):
+    d = load_positions()
+    d[sym] = {"entry": entry_price, "peak": entry_price, "ts": now_utc().isoformat()}
+    save_json(POSITIONS_FILE, d)
+def clear_position(sym: str):
+    d = load_positions()
+    if sym in d: del d[sym]
+    save_json(POSITIONS_FILE, d)
+def update_peak(sym: str, price: float):
+    d = load_positions()
+    if sym in d:
+        d[sym]["peak"] = max(d[sym].get("peak", price), price)
+        save_json(POSITIONS_FILE, d)
 
-def mark_rotate_sell(sym: str):
-    d = load_json(ROTATE_CD_FILE); d[sym.upper()] = now_utc().isoformat(); save_json(ROTATE_CD_FILE, d)
-
+# ---------- utils ----------
 def direct_market(ex, base: str, quote="USD") -> Optional[str]:
-    s = f"{base}/{quote}"; return s if s in ex.markets else None
+    s = f"{base}/USD"; return s if s in ex.markets else None
 
 def spread_bps(t: dict) -> float:
     bid = t.get("bid") or 0.0; ask = t.get("ask") or 0.0
     if bid <= 0 or ask <= 0: return 1e9
-    return (ask - bid) / ((bid + ask) / 2.0) * 1e4
+    return (ask - bid) / ((ask + bid)/2.0) * 1e4
 
 def price_bid_or_last(t: dict) -> float:
     return t.get("bid") or t.get("last") or t.get("close") or 0.0
@@ -133,7 +145,7 @@ def amount_precision(ex, symbol: str) -> int:
     return p if isinstance(p, int) and p >= 0 else 8
 
 def clamp(amount: float, decimals: int) -> float:
-    q = 10 ** decimals; return math.floor(max(amount, 0.0) * q) / q
+    q = 10 ** decimals; return math.floor(max(amount, 0.0)*q)/q
 
 def record_kpi(summary: str):
     exists = KPI_CSV.exists()
@@ -142,89 +154,160 @@ def record_kpi(summary: str):
         if not exists: w.writerow(["ts","summary"])
         w.writerow([now_utc().isoformat(), summary])
 
-def score_from_ticker(t: dict) -> float:
-    """24h return proxy: prefer 'percentage' else compute (last-open)/open."""
-    ch = t.get("percentage")
-    if ch is not None:
-        try: return float(ch)/100.0
-        except Exception: pass
-    last = t.get("last") or t.get("close"); opn = t.get("open")
-    try:
-        if last and opn and float(opn) > 0:
-            return (float(last) - float(opn)) / float(opn)
-    except Exception: pass
-    return 0.0
+# ---------- indicators ----------
+def rsi(values: List[float], period: int=14) -> Optional[float]:
+    if len(values) < period+1: return None
+    gains, losses = 0.0, 0.0
+    for i in range(1, period+1):
+        ch = values[-i] - values[-i-1]
+        gains += max(ch, 0.0); losses += max(-ch, 0.0)
+    if (gains + losses) == 0: return 50.0
+    avg_gain = gains / period; avg_loss = losses / period
+    if avg_loss == 0: return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def vwap_from_bars(bars: List[list], last_n: int=20) -> Optional[float]:
+    if len(bars) < max(1, last_n): return None
+    sub = bars[-last_n:]
+    num = sum((b[4]) * (b[5] or 0.0) for b in sub)  # close * volume
+    den = sum((b[5] or 0.0) for b in sub)
+    if den <= 0: return None
+    return num / den
 
 # ---------- eligibility ----------
 def exit_eligible(ex, sym: str, amt: float, t: dict, why: List[str]) -> bool:
     mkt = direct_market(ex, sym, "USD")
     if not mkt: why.append("no USD market"); return False
-    if cooldown_active(sym, COOLDOWN_MINUTES): why.append("cooldown active"); return False
-    if rotate_cooldown_active(sym): why.append("rotate cooldown"); return False
+    if cooldown_active(sym): why.append("cooldown active"); return False
     bps = spread_bps(t)
     if bps > MAX_SPREAD_BPS: why.append(f"spread {bps:.0f} bps > {MAX_SPREAD_BPS}"); return False
-    px = price_bid_or_last(t); 
+    px = price_bid_or_last(t)
     if px <= 0: why.append("no price"); return False
     m = ex.market(mkt)
-    min_cost = float((m.get("limits") or {}).get("cost", {}).get("min") or 0.0)
+    min_cost = float((m.get("limits") or {}).get("cost", {}).get("min") or 0)
     floor = max(MIN_COST_PER_ORDER, min_cost)
     if amt * px < floor: why.append(f"notional ${amt*px:.2f} < min_cost ${floor:.2f}"); return False
     return True
 
 def buy_eligible(ex, base: str, budget_usd: float, t: dict, why: List[str]) -> bool:
     if base.upper() in IGNORE_TICKERS: why.append("ignored"); return False
-    sym = direct_market(ex, base, "USD")
-    if not sym: why.append("no USD market"); return False
+    mkt = direct_market(ex, base, "USD")
+    if not mkt: why.append("no USD market"); return False
     bps = spread_bps(t)
     if bps > MAX_SPREAD_BPS: why.append(f"spread {bps:.0f} bps > {MAX_SPREAD_BPS}"); return False
-    m = ex.market(sym)
-    min_cost = float((m.get("limits") or {}).get("cost", {}).get("min") or 0.0)
+    m = ex.market(mkt)
+    min_cost = float((m.get("limits") or {}).get("cost", {}).get("min") or 0)
     floor = max(MIN_COST_PER_ORDER, min_cost)
     if budget_usd < floor: why.append(f"budget ${budget_usd:.2f} < min_cost ${floor:.2f}"); return False
     return True
 
-# ---------- exit checks (labels kept for CI) ----------
-def take_profit_check(sym: str, t: dict) -> bool:
-    s = score_from_ticker(t)
-    if s >= TAKE_PROFIT_PCT:
-        print(f"[TAKE_PROFIT] {sym} 24h +{s:.3%} >= {TAKE_PROFIT_PCT:.3%}")
+# ---------- order ops ----------
+def do_sell(ex, sym: str, amt: float) -> bool:
+    mkt = f"{sym}/USD"; dec = amount_precision(ex, mkt)
+    amt = clamp(amt, dec)
+    print(f"[SELL] {sym} amount={amt}")
+    if DRY_RUN:
+        print(f"[DRY-RUN] create_order SELL {mkt} amount={amt}")
         return True
-    return False
-
-def stop_loss_check(sym: str, t: dict) -> bool:
-    s = score_from_ticker(t)
-    if s <= -STOP_LOSS_PCT:
-        print(f"[STOP_LOSS] {sym} 24h {s:.3%} <= -{STOP_LOSS_PCT:.3%}")
+    try:
+        ex.create_order(symbol=mkt, type="market", side="sell", amount=amt)
+        save_trade(sym); clear_position(sym)
         return True
-    return False
+    except Exception as e:
+        print(f"[ERROR] sell failed ({sym}): {e}")
+        retry = clamp(amt*0.97, dec)
+        if retry > 0 and retry != amt:
+            print(f"[RETRY] SELL {sym} amount={retry}")
+            try:
+                ex.create_order(symbol=mkt, type="market", side="sell", amount=retry)
+                save_trade(sym); clear_position(sym)
+                return True
+            except Exception as e2:
+                print(f"[ERROR] retry sell failed: {e2}")
+        return False
 
-def trailing_stop_check(sym: str, t: dict) -> bool:
-    hi = t.get("high"); last = t.get("last") or t.get("close") or 0.0
-    if not hi or not last or hi <= 0: return False
-    dd = 1.0 - (last/hi)
-    if dd >= TRAILING_STOP_PCT:
-        print(f"[TRAIL] {sym} intraday drawdown {dd:.3%} >= {TRAILING_STOP_PCT:.3%}")
+def do_buy(ex, base: str, tkr: dict, budget: float) -> bool:
+    px = price_bid_or_last(tkr)
+    if px <= 0: 
+        print(f"[WHY-NOT][BUY {base}] no price")
+        return False
+    amt = (budget * BUY_EPS) / px
+    mkt = f"{base}/USD"; dec = amount_precision(ex, mkt)
+    amt = clamp(amt, dec)
+    print(f"[BUY ] {base} budget~${budget:.2f} → amount={amt}")
+    if DRY_RUN:
+        print(f"[DRY-RUN] create_order BUY {mkt} amount={amt}")
+        set_position(base, px)
         return True
-    return False
+    try:
+        ex.create_order(symbol=mkt, type="market", side="buy", amount=amt)
+        save_trade(base); set_position(base, px)
+        return True
+    except Exception as e:
+        print(f"[ERROR] buy failed ({base}): {e}")
+        return False
 
-# ---------- main ----------
+# ---------- strategy core ----------
+def mean_revert_score(ex, symbol: str, bars: List[list]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Return (rsi15m, pct_to_vwap, last_price). Lower RSI and more negative pct_to_vwap => more oversold."""
+    closes = [b[4] for b in bars]
+    r = rsi(closes, RSI_LEN)
+    v = vwap_from_bars(bars, VWAP_BARS)
+    last = closes[-1] if closes else None
+    pct_to_vwap = None
+    if v and last:
+        pct_to_vwap = (last / v) - 1.0
+    return r, pct_to_vwap, last
+
+def pick_best_buy_mean_revert(ex, top: List[str], tickers: dict) -> Tuple[Optional[str], Optional[dict], dict]:
+    """Scan Top-K; compute RSI/VWAP; log; return best eligible by (RSI asc, pct_to_vwap asc)."""
+    budget = max(USD_PER_TRADE, MIN_COST_PER_ORDER) * BUY_EPS
+    rankings = []
+    print("[SCAN_MEAN_REVERT] candidates (RSI, %toVWAP, spread, OK?)")
+    for base in top:
+        sym = f"{base}/USD"
+        try:
+            bars = ex.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=max(RSI_LEN+VWAP_BARS+5, 60))
+        except Exception as e:
+            print(f"  - {base:<8} fetch_ohlcv error: {e}")
+            continue
+        r, pct_v, last = mean_revert_score(ex, sym, bars)
+        t = tickers.get(sym) or ex.fetch_ticker(sym)
+        why=[]; ok = buy_eligible(ex, base, budget, t, why)
+        bps = spread_bps(t)
+        r_s = f"{r:5.1f}" if r is not None else " None"
+        pv_s= f"{(pct_v or 0.0)*100:6.2f}%" if pct_v is not None else "  None "
+        flag = "OK" if ok else "NO"
+        print(f"  - {base:<8} rsi={r_s}  %vwap={pv_s}  spread={bps:>4.0f}bps  {flag} {'; '.join(why)}")
+        if ok and r is not None and pct_v is not None:
+            rankings.append((r, pct_v, base, t))
+    if not rankings: 
+        return None, None, {}
+    # Lower RSI first, then more negative pct_to_vwap
+    rankings.sort(key=lambda x: (x[0], x[1]))
+    rsi_val, pv, best, tkr = rankings[0]
+    meta = {"rsi": rsi_val, "pct_to_vwap": pv}
+    return best, tkr, meta
+
+def fully_allocated(usd: float) -> bool:
+    return (usd - RESERVE_CASH_USD) < max(USD_PER_TRADE, MIN_COST_PER_ORDER)
+
 def main() -> int:
     print(f"[START] {ts()} — run")
     ex = build_exchange(); ex.load_markets()
     balances = ex.fetch_balance()
     total: Dict[str, float] = (balances.get("total") or {})
     free:  Dict[str, float] = (balances.get("free")  or {})
-
     usd = float(total.get("USD", 0.0))
     holdings = {a.upper(): amt for a, amt in total.items()
                 if amt and a.upper() not in {"USD","USDT","USDC","EUR","GBP"}}
-
     print(f"[BAL] USD: ${usd:.2f}")
     print(f"[HOLD] {[(k, round(v,8)) for k,v in holdings.items() if v>0]}")
 
     tickers = ex.fetch_tickers()
 
-    # ---- universe (USD spot, active, liquid, tight spread)
+    # Universe: USD spot, active, vol/spread filters
     def market_ok(base: str) -> bool:
         if base in IGNORE_TICKERS: return False
         sym = direct_market(ex, base, "USD")
@@ -244,180 +327,121 @@ def main() -> int:
     if UNIVERSE:
         universe = [s for s in UNIVERSE if market_ok(s)]
     else:
-        universe = sorted({ (m.get("base") or "").upper()
-                            for _, m in ex.markets.items()
-                            if m.get("quote")=="USD" and (m.get("spot", True) or m.get("type")=="spot") })
+        universe = sorted({
+            (m.get("base") or "").upper()
+            for _, m in ex.markets.items()
+            if m.get("quote")=="USD" and (m.get("spot", True) or m.get("type")=="spot")
+        })
         universe = [s for s in universe if market_ok(s)]
 
-    # ---- score & rank
-    scores: Dict[str, float] = {}
+    # Rank top-K by "oversold": RSI asc then % to VWAP asc
+    ranked = []
     for b in universe:
-        scores[b] = score_from_ticker(tickers.get(f"{b}/USD") or {})
-    ranked = sorted(universe, key=lambda s: scores.get(s, -1e9), reverse=True)
-    top = ranked[:max(TOP_K,1)]
-
-    print("[RANK] Top candidates (24h%):")
-    for c in top: print(f"  - {c:<8} {scores.get(c,0.0):+6.2%}")
-
-    # ---- BUY CANDIDATE: pick the BEST eligible in Top-K
-    budget = max(USD_PER_TRADE, MIN_COST_PER_ORDER) * BUY_EPS
-    best_buy: Optional[str] = None; btkr = None; best_score = -1e9
-    print("[SCAN] Top-K buy candidates:")
-    for c in top:
-        t = tickers.get(f"{c}/USD") or ex.fetch_ticker(f"{c}/USD")
-        s = score_from_ticker(t); bps = spread_bps(t)
-        vol_q = t.get("quoteVolume") or 0
-        why=[]; ok = buy_eligible(ex, c, budget, t, why)
-        flag = "OK" if ok else "NO"
-        print(f"  - {c:<8} 24h={s:+6.2%} spread={bps:>4.0f}bps volUSD≈{vol_q:,.0f} {flag} {'; '.join(why)}")
-        if ok and s > best_score:
-            best_score, best_buy, btkr = s, c, t
-
-    # ---- Are we fully allocated?
-    usd_free_for_buy = usd - RESERVE_CASH_USD
-    fully_allocated = usd_free_for_buy < max(USD_PER_TRADE, MIN_COST_PER_ORDER)
-    print(f"[ALLOC] fully_allocated={fully_allocated} usd_free_for_buy=${usd_free_for_buy:.2f}")
-
-    did_anything = False
-
-    # ---- If NOT fully allocated and we have an eligible buy → just buy
-    if not fully_allocated and best_buy:
-        did_anything |= do_buy(ex, best_buy, btkr, budget)
-        return finish(usd, None, best_buy, 0.0, did_anything)
-
-    # ---- Else we need to ROTATE from worst -> best (fixed direction)
-    # pick weakest among *sell-eligible* holdings, skipping dust & cooldown
-    holding_list = [h for h in holdings.keys() if h not in IGNORE_TICKERS]
-    # compute each holding's 24h% score
-    hold_scores = {h: score_from_ticker(tickers.get(f"{h}/USD") or {}) for h in holding_list}
-    # sort weakest first
-    ordered = sorted(holding_list, key=lambda s: hold_scores.get(s, 0.0))
-
-    weakest = None; w_amt = 0.0; wtkr=None
-    for cand in ordered:
-        sym = direct_market(ex, cand, "USD")
-        if not sym: 
-            if WHY_NOT_LOGS: print(f"[WHY-NOT][WEAKEST {cand}] no USD market"); 
+        sym = f"{b}/USD"
+        try:
+            bars = ex.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=max(RSI_LEN+VWAP_BARS+5, 60))
+            r, pv, _ = mean_revert_score(ex, sym, bars)
+            if r is None or pv is None: continue
+            ranked.append((r, pv, b))
+        except Exception:
             continue
-        wtkr = tickers.get(sym) or ex.fetch_ticker(sym)
-        px = price_bid_or_last(wtkr); val_usd = float(holdings[cand]) * (px or 0.0)
-        if val_usd < DUST_IGNORE_BELOW_USD:
-            if WHY_NOT_LOGS: print(f"[DUST] ignore {cand} value≈${val_usd:.2f} < ${DUST_IGNORE_BELOW_USD:.2f}")
-            continue
-        total_amt = float(holdings[cand]); free_amt = (balances.get("free") or {}).get(cand, None)
-        amt = (float(free_amt) if free_amt is not None else total_amt) * SELL_EPS
-        why=[]
-        if exit_eligible(ex, cand, amt, wtkr, why):
-            weakest, w_amt = cand, amt
-            break
-        elif WHY_NOT_LOGS:
-            for r in why: print(f"[WHY-NOT][WEAKEST {cand}] {r}")
+    ranked.sort(key=lambda x: (x[0], x[1]))
+    top = [b for _,__,b in ranked[:max(1, TOP_K)]]
+    print("[RANK] Top oversold (RSI, %vwap):")
+    for r, pv, b in ranked[:max(1, TOP_K)]:
+        print(f"  - {b:<8} rsi={r:5.1f}  %vwap={(pv*100):6.2f}%")
+    print(f"[RANK] Top {TOP_K}: {top}")
 
-    if not weakest:
-        print("[ROTATE] No sell-eligible holding found. Skipping rotation.")
-        return finish(usd, None, best_buy, 0.0, did_anything)
+    # Pick the best buy candidate
+    best_buy, btkr, meta = pick_best_buy_mean_revert(ex, top, tickers)
 
-    if not best_buy:
-        if ATOMIC_ROTATION:
-            print("[ROTATE] No eligible buy in Top-K → not selling weakest (atomic).")
-            return finish(usd, weakest, None, 0.0, did_anything)
-        else:
-            print("[ROTATE] No eligible buy but ATOMIC_ROTATION=false → may still sell.")
-
-    edge = (scores.get(best_buy,0.0) - hold_scores.get(weakest,0.0)) if best_buy else 0.0
-    print(f"[EDGE] weakest={weakest}({hold_scores.get(weakest,0.0):+6.2%}) best={best_buy}({scores.get(best_buy,0.0):+6.2%}) edge={edge:.4f} thr={ROTATE_MIN_EDGE_PCT:.4f}")
-
-    switches = 0
-    while switches < max(1, ROTATE_MAX_SWITCHES_PER_RUN):
-        if best_buy is None or edge < ROTATE_MIN_EDGE_PCT: 
-            print("[ROTATE] Edge below threshold or no buy; stop.")
-            break
-        ok_sell = do_sell(ex, weakest, wtkr, w_amt)
-        if not ok_sell:
-            print("[ROTATE] Sell failed; stop.")
-            break
-        mark_rotate_sell(weakest)
-        ok_buy = do_buy(ex, best_buy, btkr, budget)
-        did_anything = did_anything or ok_sell or ok_buy
-        switches += 1
-        break  # single-step rotation is usually enough per run
-
-    # ---- Exits scoped to weakest AFTER rotation (keeps CI tokens, avoids dumping winners)
-    do_exits(ex, {weakest: holdings.get(weakest, 0.0)}, tickers)
-
-    return finish(usd, weakest, best_buy, edge, did_anything)
-
-# ---------- order helpers ----------
-def do_sell(ex, sym: str, tkr: dict, amt: float) -> bool:
-    mkt = f"{sym}/USD"; dec = amount_precision(ex, mkt)
-    amt = clamp(amt, dec)
-    print(f"[SELL] {sym} amount={amt}")
-    if DRY_RUN:
-        print(f"[DRY-RUN] create_order SELL {mkt} amount={amt}")
-        return True
-    try:
-        ex.create_order(symbol=mkt, type="market", side="sell", amount=amt)
-        save_last_trade(sym); 
-        return True
-    except Exception as e:
-        print(f"[ERROR] sell failed ({sym}): {e}")
-        retry = clamp(amt * 0.97, dec)
-        if retry > 0 and retry != amt:
-            print(f"[RETRY] SELL {sym} amount={retry}")
-            try:
-                ex.create_order(symbol=mkt, type="market", side="sell", amount=retry)
-                save_last_trade(sym); 
-                return True
-            except Exception as e2:
-                print(f"[ERROR] retry sell failed: {e2}")
-        return False
-
-def do_buy(ex, base: str, tkr: dict, budget: float) -> bool:
-    mkt = f"{base}/USD"; px = price_bid_or_last(tkr)
-    if px <= 0:
-        print(f"[WHY-NOT][BUY {base}] no price")
-        return False
-    amt = (budget * BUY_EPS) / px
-    dec = amount_precision(ex, mkt); amt = clamp(amt, dec)
-    print(f"[BUY ] {base} budget~${budget:.2f} → amount={amt}")
-    if DRY_RUN:
-        print(f"[DRY-RUN] create_order BUY {mkt} amount={amt}")
-        return True
-    try:
-        ex.create_order(symbol=mkt, type="market", side="buy", amount=amt)
-        save_last_trade(base)
-        return True
-    except Exception as e:
-        print(f"[ERROR] buy failed ({base}): {e}")
-        return False
-
-# ---------- exits (scoped to weakest by default) ----------
-def do_exits(ex, subset_holdings: Dict[str,float], tickers: dict) -> bool:
+    # Uniform exits on all positions
     did = False
-    for sym in sorted(subset_holdings.keys()):
+    pos = load_positions()
+    for sym, amt in holdings.items():
+        if sym in IGNORE_TICKERS: continue
         mkt = direct_market(ex, sym, "USD")
         if not mkt: continue
         t = tickers.get(mkt) or ex.fetch_ticker(mkt)
-        # CI tokens
-        tp = take_profit_check(sym, t)
-        sl = stop_loss_check(sym, t)
-        tr = trailing_stop_check(sym, t)
-        if not (tp or sl or tr): 
+        px = price_bid_or_last(t)
+        if px <= 0: continue
+        info = pos.get(sym)
+        if not info: 
+            # If we inherited a position w/o state, initialize and skip exits this run
+            set_position(sym, px)
+            print(f"[STATE] init position for {sym} @ {px}")
             continue
-        # Eligibility w/ min-cost
-        px = price_bid_or_last(t); total_amt = subset_holdings.get(sym, 0.0)
-        amt = total_amt * SELL_EPS
+        entry = float(info.get("entry", px))
+        peak  = float(info.get("peak", entry))
+        update_peak(sym, px)
+        pnl = (px / entry) - 1.0
+        drawdown = 1.0 - (px / max(peak, 1e-9))
+        do_tp = pnl >= TAKE_PROFIT_PCT
+        do_sl = pnl <= -STOP_LOSS_PCT
+        do_tr = (drawdown >= TRAILING_STOP_PCT) and (px > entry)  # trail only if in profit
+        if not (do_tp or do_sl or do_tr):
+            continue
+        # sell eligibility (dust/min-cost guard)
+        total_amt = float(amt)
+        free_amt  = (free.get(sym) if free is not None else None)
+        sell_amt  = (float(free_amt) if (free_amt is not None and free_amt > 0) else total_amt) * SELL_EPS
         why=[]
-        if not exit_eligible(ex, sym, amt, t, why):
-            print(f"[WHY-NOT][EXIT {sym}] " + "; ".join(why))
+        if not exit_eligible(ex, sym, sell_amt, t, why):
+            if WHY_NOT_LOGS: print(f"[WHY-NOT][EXIT {sym}] {'; '.join(why)}")
             continue
-        # sell it
-        did |= do_sell(ex, sym, t, amt)
-    return did
+        label = "TP" if do_tp else ("SL" if do_sl else "TRAIL")
+        print(f"[EXIT] {label} {sym}: pnl={pnl:+.2%} dd={drawdown:.2%} → sell")
+        did |= do_sell(ex, sym, sell_amt)
 
-# ---------- finish ----------
-def finish(usd, weakest, best, edge, did=False):
-    summary = f"did_anything={did} usd=${usd:.2f} weakest={weakest} best={best} edge={edge:.4f}"
+    # Decide to buy and/or rotate
+    usd_buyable = usd - RESERVE_CASH_USD
+    can_buy = (best_buy is not None) and (usd_buyable >= max(USD_PER_TRADE, MIN_COST_PER_ORDER))
+    if can_buy:
+        print(f"[ENTRY] BUY {best_buy} (rsi={meta.get('rsi'):.1f}, %vwap={(meta.get('pct_to_vwap')*100):.2f}%)")
+        did |= do_buy(ex, best_buy, btkr, max(USD_PER_TRADE, MIN_COST_PER_ORDER))
+        return finish(usd, did, best_buy)
+
+    if not can_buy and ROTATE_WHEN_FULL and best_buy:
+        # Try to free USD by selling the MOST overbought eligible holding: highest RSI, above VWAP
+        if not holdings:
+            return finish(usd, did, None)
+        candidates = []
+        for h in holdings.keys():
+            if h in IGNORE_TICKERS: continue
+            sym = f"{h}/USD"
+            try:
+                bars = ex.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=max(RSI_LEN+VWAP_BARS+5, 60))
+            except Exception:
+                continue
+            r, pv, _ = mean_revert_score(ex, sym, bars)
+            if r is None or pv is None: continue
+            # Prefer overbought (RSI high, price above VWAP)
+            candidates.append((-(pv), r, h))  # pv negative is below VWAP; we want ABOVE, so use -pv
+        if candidates:
+            candidates.sort(reverse=True)  # highest -pv (i.e., most above vwap), then higher RSI
+            _,__,weakest = candidates[0]
+            mkt = direct_market(ex, weakest, "USD")
+            if mkt:
+                t = tickers.get(mkt) or ex.fetch_ticker(mkt)
+                total_amt = float(holdings.get(weakest, 0.0))
+                free_amt  = (free.get(weakest) if free is not None else None)
+                sell_amt  = (float(free_amt) if (free_amt is not None and free_amt > 0) else total_amt) * SELL_EPS
+                why=[]
+                if ATOMIC_ROTATION and not buy_eligible(ex, best_buy, max(USD_PER_TRADE, MIN_COST_PER_ORDER)*BUY_EPS, btkr, why):
+                    print(f"[ROTATE] skip — buy not eligible: {'; '.join(why)}")
+                else:
+                    why=[] 
+                    if exit_eligible(ex, weakest, sell_amt, t, why):
+                        print(f"[ROTATE] SELL {weakest} → BUY {best_buy}")
+                        did |= do_sell(ex, weakest, sell_amt)
+                        did |= do_buy(ex, best_buy, btkr, max(USD_PER_TRADE, MIN_COST_PER_ORDER))
+                    elif WHY_NOT_LOGS:
+                        print(f"[WHY-NOT][ROTATE sell {weakest}] {'; '.join(why)}")
+
+    return finish(usd, did, best_buy)
+
+def finish(usd, did, best):
+    summary = f"did_anything={did} usd=${usd:.2f} best={best}"
     print(f"[SUMMARY] {summary}")
     record_kpi(summary)
     print(f"[END] {ts()}")
