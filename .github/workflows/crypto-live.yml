@@ -52,7 +52,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: crypto-live-meanrevert
+  group: crypto-live-meanrevert-v2
   cancel-in-progress: false
 
 jobs:
