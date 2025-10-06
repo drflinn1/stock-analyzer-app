@@ -1,4 +1,4 @@
-name: Crypto Live — Every 15m (Repo secrets + Dust Sweep)
+name: Crypto Live — Every 15m (Repo secrets + Preflight)
 
 on:
   workflow_dispatch:
@@ -48,7 +48,7 @@ jobs:
       COOL_DOWN_MINUTES: "30"
       SHOW_BANNER: "true"
 
-      # Repo-level secrets
+      # Repo-level secrets (from Settings → Secrets and variables → Actions)
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
       KRAKEN_API_OTP: ${{ secrets.KRAKEN_API_OTP }}
@@ -79,10 +79,10 @@ jobs:
             pip install ccxt pandas numpy requests python-dateutil
           fi
 
-      - name: Preflight — check secrets (length only)
+      - name: Preflight — check secrets present (length only)
         run: |
-          [ -z "${KRAKEN_API_KEY}" ] && echo "❌ KRAKEN_API_KEY is missing" && exit 1 || echo "KRAKEN_API_KEY len: ${#KRAKEN_API_KEY}"
-          [ -z "${KRAKEN_API_SECRET}" ] && echo "❌ KRAKEN_API_SECRET is missing" && exit 1 || echo "KRAKEN_API_SECRET len: ${#KRAKEN_API_SECRET}"
+          [ -z "${KRAKEN_API_KEY}" ] && echo "❌ KRAKEN_API_KEY missing" && exit 1 || echo "KRAKEN_API_KEY len: ${#KRAKEN_API_KEY}"
+          [ -z "${KRAKEN_API_SECRET}" ] && echo "❌ KRAKEN_API_SECRET missing" && exit 1 || echo "KRAKEN_API_SECRET len: ${#KRAKEN_API_SECRET}"
           echo "✅ Secrets present"
 
       - name: Print mode & guards
