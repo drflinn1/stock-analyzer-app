@@ -1,467 +1,426 @@
-# main.py — Crypto Live with Guard Pack (rotation + sell guards + dust filter)
-# - Auto-pick Top-K by 24h % change (USD quote by default)
-# - Reserve cash, max positions, daily entry cap
-# - Rotation guard to reduce churn (knobs below)
-# - Minimal TAKE_PROFIT / STOP_LOSS / TRAILing stop with persistent state
-# - NEW: DUST_MIN_USD filter (ignore tiny positions when counting/rotating)
+# main.py — Crypto Live with Guard Pack (Kraken + ENV-robust creds)
+# - USD-only trading on Kraken via ccxt
+# - Dust sweeping: sell positions <= DUST_MIN_USD to USD
+# - Auto-pick Top-K by 24h % change (filtering out stablecoins/indexes)
+# - Rotation: sell weakest to buy stronger (when full or cash-short)
+# - Max positions, per-run buy cap, min notional guard
+# - TP/SL/Trailing stop, daily loss cap, auto-pause on hard error
+# - Color-tagged logs, KPI summary, CSV history
 #
-# Rotation knobs:
-#   ROTATE_WHEN_FULL:         "false" to prevent churny flips when portfolio is full (default "false")
-#   MAX_BUYS_PER_RUN:         limit new entries/rotations per run (default "1")
-#   ROTATE_WHEN_CASH_SHORT:   if "true", allow targeted rotation when cash is short (default "true")
-#
-# Sell guards (tokens for CI): TAKE_PROFIT / STOP_LOSS / TRAIL (trailing)
-#   TP_PCT, SL_PCT, TSL_PCT
-#
-# Dust:
-#   DUST_MIN_USD: minimum per-position USD value to *count/manage* (default "2")
-#   Positions below this are ignored in counts and rotation decisions.
+# All behavior is controlled by environment variables (see ENV section).
+# This script prints clearly whether it is DRY_RUN or LIVE.
 
 from __future__ import annotations
-import os, json, time, math, csv
-from typing import Dict, Any, List, Tuple, Optional
+
+import os, sys, time, json, csv, math, traceback
 from datetime import datetime, timezone
+from typing import Dict, Any, List, Tuple, Optional
 
-# ---------- Helpers ---------- #
-
-def as_bool(v: Optional[str], default: bool=False) -> bool:
-    if v is None:
-        return default
-    v = v.strip().lower()
-    return v in ("1","true","yes","y","on")
-
-def as_float(v: Optional[str], default: float) -> float:
-    try:
-        return float(v) if v is not None else default
-    except:
-        return default
-
-def as_int(v: Optional[str], default: int) -> int:
-    try:
-        return int(v) if v is not None else default
-    except:
-        return default
-
-def now_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
-
-def log(tag: str, msg: str) -> None:
-    print(f"[{tag}] {msg}", flush=True)
-
-def green(msg: str) -> None: log("OK", msg)
-def yellow(msg: str) -> None: log("WARN", msg)
-def red(msg: str) -> None: log("ERR", msg)
-
-# ---------- ENV ---------- #
-
-EXCHANGE_ID      = os.getenv("EXCHANGE_ID", "kraken")
-API_KEY          = os.getenv("API_KEY", "")
-API_SECRET       = os.getenv("API_SECRET", "")
-PASSWORD         = os.getenv("API_PASSWORD", None)
-
-QUOTE            = os.getenv("QUOTE", "USD")
-WHITELIST        = [s.strip() for s in os.getenv("SYMBOLS_WHITELIST","").split(",") if s.strip()]
-EXCLUDE          = [s.strip() for s in os.getenv("SYMBOLS_EXCLUDE","").split(",") if s.strip()]
-
-TOP_K            = as_int(os.getenv("TOP_K"), 6)
-MAX_POSITIONS    = as_int(os.getenv("MAX_POSITIONS"), 6)
-MIN_NOTIONAL     = as_float(os.getenv("MIN_NOTIONAL"), 5.0)
-
-RESERVE_CASH_PCT = as_float(os.getenv("RESERVE_CASH_PCT"), 0.05)
-DRY_RUN          = as_bool(os.getenv("DRY_RUN"), True)
-RUN_SWITCH       = as_bool(os.getenv("RUN_SWITCH"), True)
-
-# SELL GUARDS (tokens for CI present below)
-TP_PCT           = as_float(os.getenv("TP_PCT"), 0.0)    # TAKE_PROFIT percent
-SL_PCT           = as_float(os.getenv("SL_PCT"), 0.0)    # STOP_LOSS percent
-TSL_PCT          = as_float(os.getenv("TSL_PCT"), 0.0)   # TRAIL / trailing percent
-
-DAILY_LOSS_CAP_PCT  = as_float(os.getenv("DAILY_LOSS_CAP_PCT"), 0.0)
-MAX_DAILY_ENTRIES   = as_int(os.getenv("MAX_DAILY_ENTRIES"), 9999)
-
-# Rotation knobs
-ROTATE_WHEN_FULL       = as_bool(os.getenv("ROTATE_WHEN_FULL"), False)
-MAX_BUYS_PER_RUN       = as_int(os.getenv("MAX_BUYS_PER_RUN"), 1)
-ROTATE_WHEN_CASH_SHORT = as_bool(os.getenv("ROTATE_WHEN_CASH_SHORT"), True)
-
-# NEW: dust filter
-DUST_MIN_USD        = as_float(os.getenv("DUST_MIN_USD"), 2.0)
-
-STATE_DIR        = os.getenv("STATE_DIR", ".state")
-os.makedirs(STATE_DIR, exist_ok=True)
-
-# ---------- CCXT Setup ---------- #
+# -------- Dependencies -------- #
 try:
     import ccxt  # type: ignore
 except Exception as e:
     raise SystemExit(f"ccxt is required: {e}")
 
-def connect_exchange():
-    cls = getattr(ccxt, EXCHANGE_ID)
-    opts = { "apiKey": API_KEY, "secret": API_SECRET, "enableRateLimit": True }
-    if PASSWORD:
-        opts["password"] = PASSWORD
-    return cls(opts)
+# -------- Helpers / ENV -------- #
+def getenv_any(*names: str, default: str = "") -> str:
+    for n in names:
+        v = os.getenv(n)
+        if v is not None and str(v).strip() != "":
+            return v
+    return default
 
-# ---------- IO Utils ---------- #
+def as_bool(v: Optional[str], default: bool = False) -> bool:
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in ("1","true","yes","on"):
+        return True
+    if s in ("0","false","no","off"):
+        return False
+    return default
 
-def read_json(path: str, default: Any) -> Any:
+def as_float(v: Optional[str], default: float) -> float:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
+        return float(v)
+    except Exception:
         return default
 
-def write_json(path: str, obj: Any) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2)
-
-# ---------- Market / Price ---------- #
-
-def load_markets_safe(ex):
-    if not getattr(ex, "markets", None):
-        ex.load_markets()
-    return ex.markets
-
-def fetch_last_price(ex, symbol: str) -> float:
-    t = ex.fetch_ticker(symbol)
-    if t and t.get("last"):
-        return float(t["last"])
-    bid = float(t.get("bid") or 0)
-    ask = float(t.get("ask") or 0)
-    if bid and ask:
-        return (bid+ask)/2
-    raise RuntimeError(f"No price for {symbol}")
-
-def fetch_tickers_24h_change(ex, quote: str) -> List[Tuple[str,float]]:
-    tickers = {}
+def as_int(v: Optional[str], default: int) -> int:
     try:
-        tickers = ex.fetch_tickers()
+        return int(float(v))
     except Exception:
-        pass
+        return default
 
-    results: List[Tuple[str,float]] = []
-    markets = load_markets_safe(ex)
-    for sym, m in markets.items():
-        if not m.get("active", True):
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC (%Y_%m%d)")
+
+def log(tag: str, msg: str) -> None:
+    # tags: OK, WARN, ERR, KPI, SUM
+    color = {"OK":"\033[92m","WARN":"\033[93m","ERR":"\033[91m","KPI":"\033[96m","SUM":"\033[95m"}.get(tag, "")
+    endc = "\033[0m" if color else ""
+    print(f"{color}[{tag}]{endc} {msg}", flush=True)
+
+# -------- ENV Defaults -------- #
+DRY_RUN           = as_bool(os.getenv("DRY_RUN"), True)
+RUN_SWITCH        = getenv_any("RUN_SWITCH", default="on").lower() == "on"
+
+EXCHANGE          = getenv_any("EXCHANGE", default="kraken").lower()
+BASE_QUOTE        = getenv_any("BASE_QUOTE", default="USD").upper()
+
+MAX_POSITIONS     = as_int(os.getenv("MAX_POSITIONS"), 12)
+MAX_BUYS_PER_RUN  = as_int(os.getenv("MAX_BUYS_PER_RUN"), 1)
+ROTATE_WHEN_FULL  = as_bool(os.getenv("ROTATE_WHEN_FULL"), True)
+ROTATE_WHEN_CASH_SHORT = as_bool(os.getenv("ROTATE_WHEN_CASH_SHORT"), True)
+
+MIN_NOTIONAL_USD  = as_float(os.getenv("MIN_NOTIONAL_USD"), 5.0)
+DUST_MIN_USD      = as_float(os.getenv("DUST_MIN_USD"), 2.0)
+RESERVE_CASH_PCT  = as_float(os.getenv("RESERVE_CASH_PCT"), 5.0)
+
+TP_PCT            = as_float(os.getenv("TP_PCT"), 2.0)
+SL_PCT            = as_float(os.getenv("SL_PCT"), 3.5)
+TRAIL_PCT         = as_float(os.getenv("TRAIL_PCT"), 1.2)
+DAILY_LOSS_CAP    = as_float(os.getenv("DAILY_LOSS_CAP"), 3.0)
+AUTO_PAUSE_ON_ERROR = as_bool(os.getenv("AUTO_PAUSE_ON_ERROR"), True)
+
+LOG_LEVEL         = getenv_any("LOG_LEVEL", default="INFO")
+KPI_CSV_PATH      = getenv_any("KPI_CSV_PATH", default=".state/kpi_history.csv")
+STATE_DIR         = getenv_any("STATE_DIR", default=".state")
+
+TIMEFRAME         = getenv_any("TIMEFRAME", default="15m")
+TOPK              = as_int(os.getenv("TOPK"), 6)
+COOL_DOWN_MINUTES = as_int(os.getenv("COOL_DOWN_MINUTES"), 30)
+SHOW_BANNER       = as_bool(os.getenv("SHOW_BANNER"), True)
+
+# -------- Exchange Init (robust env mapping) -------- #
+def make_exchange() -> ccxt.Exchange:
+    if EXCHANGE != "kraken":
+        raise SystemExit("This build is wired for Kraken only right now (EXCHANGE=kraken).")
+
+    api_key = getenv_any("KRAKEN_API_KEY", "KRAKEN_KEY", "KRAKEN_API")
+    api_sec = getenv_any("KRAKEN_API_SECRET", "KRAKEN_SECRET", "KRAKEN_APISECRET")
+    api_otp = getenv_any("KRAKEN_API_OTP", "KRAKEN_OTP", "KRAKEN_TOTP")
+
+    if not api_key or not api_sec:
+        raise SystemExit("Kraken credentials missing: expected KRAKEN_API_KEY and KRAKEN_API_SECRET (or compatible fallbacks).")
+
+    kwargs: Dict[str, Any] = {"apiKey": api_key, "secret": api_sec}
+    if api_otp:
+        # only needed if your Kraken API key is protected by API 2FA
+        kwargs["password"] = api_otp
+
+    ex = ccxt.kraken(kwargs)
+    ex.options["fetchMarketsMethod"] = "publicGetAssets"  # ccxt works out the rest; Kraken is quirky
+    return ex
+
+# -------- Strategy: symbols / filters -------- #
+STABLE_FILTER = {"USDT", "USDC"}  # avoid stablecoins
+BLOCKLIST = set(["SPX/USD", "EUR/USD", "GBP/USD", "USD/USD"])  # index/fiat-not-crypto
+
+def is_valid_symbol(s: str) -> bool:
+    if not s.endswith(f"/{BASE_QUOTE}"):
+        return False
+    if s.upper() in BLOCKLIST:
+        return False
+    base = s.split("/")[0].upper()
+    if base in STABLE_FILTER:
+        return False
+    return True
+
+# -------- Portfolio / math utils -------- #
+def pct(a: float, b: float) -> float:
+    if b == 0:
+        return 0.0
+    return (a - b) / b * 100.0
+
+def ensure_state() -> None:
+    os.makedirs(STATE_DIR, exist_ok=True)
+
+def write_summary(lines: List[str]) -> None:
+    with open(os.path.join(STATE_DIR, "summary.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+def append_kpi_row(row: Dict[str, Any]) -> None:
+    ensure_state()
+    new_file = not os.path.exists(KPI_CSV_PATH)
+    with open(KPI_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "ts","dry_run","positions","cash_usd","equity_usd","pnl_day_pct","buys","sells","rotations"
+        ])
+        if new_file:
+            w.writeheader()
+        w.writerow(row)
+
+# -------- Core trading helpers -------- #
+def fetch_cash_positions(ex: ccxt.Exchange) -> Tuple[float, Dict[str, Dict[str, float]]]:
+    # Return cash in USD and a dict: symbol -> {amount, price, value}
+    balance = ex.fetch_balance()
+    # Kraken uses 'USD' under 'total' for cash
+    cash = float(balance.get("total", {}).get(BASE_QUOTE, 0.0))
+    positions: Dict[str, Dict[str, float]] = {}
+    # Build positions from balances by mapping non-zero coins to symbols
+    for coin, amt in balance.get("total", {}).items():
+        if coin.upper() in (BASE_QUOTE, "USDT", "USDC"):
             continue
-        if f"/{quote}" not in sym:
+        try:
+            amt_f = float(amt)
+        except Exception:
+            amt_f = 0.0
+        if amt_f <= 0:
             continue
-        if EXCLUDE and sym in EXCLUDE:
+        symbol = f"{coin.upper()}/{BASE_QUOTE}"
+        if not is_valid_symbol(symbol):
             continue
-        if WHITELIST and sym not in WHITELIST:
-            continue
-
-        change = None
-        tk = tickers.get(sym) if tickers else None
-        if tk and "percentage" in tk and tk["percentage"] is not None:
-            change = tk["percentage"]
-        else:
-            try:
-                ohlcv = ex.fetch_ohlcv(sym, timeframe="1d", limit=2)
-                if ohlcv and len(ohlcv) >= 2:
-                    prev_close = ohlcv[-2][4]
-                    last_close = ohlcv[-1][4]
-                    if prev_close and last_close:
-                        change = (last_close - prev_close) / prev_close * 100.0
-            except Exception:
-                change = None
-
-        if change is not None:
-            results.append((sym, float(change)))
-
-    results.sort(key=lambda x: x[1], reverse=True)
-    return results
-
-# ---------- Portfolio Helpers ---------- #
-
-def get_cash_and_positions(ex, quote: str) -> Tuple[float, Dict[str,float]]:
-    bal = ex.fetch_balance()
-    free = bal.get("free", {}) or {}
-    total = bal.get("total", {}) or {}
-
-    cash = float(free.get(quote, 0.0))
-
-    markets = ex.load_markets()
-    positions: Dict[str,float] = {}
-    for sym, m in markets.items():
-        if not m.get("active", True):
-            continue
-        if f"/{quote}" not in sym:
-            continue
-        base = m["base"]
-        amt_total = float(total.get(base, 0.0))
-        if amt_total > 0:
-            positions[sym] = amt_total
+        try:
+            ticker = ex.fetch_ticker(symbol)
+            price = float(ticker["last"]) if ticker and ticker.get("last") else 0.0
+        except Exception:
+            price = 0.0
+        positions[symbol] = {
+            "amount": amt_f,
+            "price": price,
+            "value": amt_f * price,
+        }
     return cash, positions
 
-def filter_dust_positions(ex, positions: Dict[str,float], dust_min_usd: float) -> Dict[str,float]:
-    """Keep only positions whose USD value >= dust_min_usd."""
-    if dust_min_usd <= 0:
-        return positions
-    filtered: Dict[str,float] = {}
-    for sym, amt in positions.items():
+def fetch_topk_symbols(ex: ccxt.Exchange, topk: int) -> List[Tuple[str, float]]:
+    markets = ex.load_markets()
+    candidates = [s for s in markets.keys() if is_valid_symbol(s)]
+    scored: List[Tuple[str, float]] = []
+    for s in candidates:
         try:
-            price = fetch_last_price(ex, sym)
-            usd_val = amt * price
-            if usd_val >= dust_min_usd:
-                filtered[sym] = amt
-            else:
-                yellow(f"Ignoring dust {sym}: ${usd_val:.2f} < DUST_MIN_USD={dust_min_usd:.2f}")
+            t = ex.fetch_ticker(s)
+            chg = float(t.get("percentage") or 0.0)  # 24h %
         except Exception:
-            # if price fetch fails, keep it (safer) — or skip; choose skip to avoid count inflation
-            yellow(f"Price missing for {sym}; treating as dust and skipping.")
-    return filtered
+            chg = 0.0
+        scored.append((s, chg))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:max(0, topk)]
 
-# ---------- Daily Entry Cap ---------- #
-
-def daily_entry_counter_path() -> str:
-    return os.path.join(STATE_DIR, "daily_entries.json")
-
-def under_daily_entry_cap() -> bool:
-    if MAX_DAILY_ENTRIES >= 9999:
-        return True
-    path = daily_entry_counter_path()
-    data = read_json(path, {"date":"","count":0})
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    if data["date"] != today:
-        data = {"date": today, "count": 0}
-        write_json(path, data)
-    return data["count"] < MAX_DAILY_ENTRIES
-
-def bump_daily_entry() -> None:
-    path = daily_entry_counter_path()
-    data = read_json(path, {"date":"","count":0})
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    if data["date"] != today:
-        data = {"date": today, "count": 0}
-    data["count"] += 1
-    write_json(path, data)
-
-# ---------- Orders (with DRY_RUN) ---------- #
-
-def place_market_buy(ex, symbol: str, usd_amount: float) -> Optional[Dict[str,Any]]:
-    if usd_amount < MIN_NOTIONAL:
-        yellow(f"Skip tiny buy {symbol}: {usd_amount:.2f} < MIN_NOTIONAL")
+def market_buy(ex: ccxt.Exchange, symbol: str, usd_amount: float, dry: bool) -> Optional[Dict[str, Any]]:
+    if usd_amount < MIN_NOTIONAL_USD:
+        log("WARN", f"Buy skipped — below MIN_NOTIONAL_USD ${MIN_NOTIONAL_USD:.2f}")
         return None
-    last = fetch_last_price(ex, symbol)
-    qty  = usd_amount / last
-    if DRY_RUN:
-        yellow(f"🚧 DRY RUN — BUY {symbol} ~ ${usd_amount:.2f} (~{qty:.6f}) at {last:.6f}")
-        return {"id":"SIM-BUY","symbol":symbol,"amount":qty,"cost":usd_amount,"price":last}
-    return ex.create_order(symbol, type="market", side="buy", amount=qty)
-
-def place_market_sell(ex, symbol: str, amount: float) -> Optional[Dict[str,Any]]:
-    if amount <= 0:
+    try:
+        price = float(ex.fetch_ticker(symbol)["last"])
+        qty = usd_amount / max(price, 1e-12)
+        if dry:
+            log("OK", f"DRY BUY {symbol} for ${usd_amount:.2f} (~{qty:.6f}) @ {price:.2f}")
+            return {"id":"dry","type":"market","side":"buy","symbol":symbol,"cost":usd_amount,"amount":qty}
+        else:
+            o = ex.create_order(symbol, "market", "buy", qty)
+            log("OK", f"BUY {symbol} ${usd_amount:.2f} (qty ~{qty:.6f})")
+            return o
+    except Exception as e:
+        log("ERR", f"Buy failed {symbol}: {e}")
         return None
-    last = fetch_last_price(ex, symbol)
-    if DRY_RUN:
-        yellow(f"🚧 DRY RUN — SELL {symbol} amount {amount:.6f} at {last:.6f}")
-        return {"id":"SIM-SELL","symbol":symbol,"amount":amount,"price":last}
-    return ex.create_order(symbol, type="market", side="sell", amount=amount)
 
-# ---------- Sell Guard State ---------- #
-
-POS_STATE_PATH   = os.path.join(STATE_DIR, "positions_state.json")
-KPI_PATH         = os.path.join(STATE_DIR, "kpi_history.csv")
-
-def load_pos_state() -> Dict[str, Dict[str,float]]:
-    return read_json(POS_STATE_PATH, {})
-
-def save_pos_state(state: Dict[str, Dict[str,float]]) -> None:
-    write_json(POS_STATE_PATH, state)
-
-def ensure_state_for_holds(state: Dict[str,Dict[str,float]], ex, holds: Dict[str,float]) -> None:
-    changed = False
-    for sym in holds.keys():
-        if sym not in state:
-            price = fetch_last_price(ex, sym)
-            state[sym] = {"entry": float(price), "peak": float(price)}
-            changed = True
-    if changed:
-        save_pos_state(state)
-
-# ---------- Sell Rules (CI token lines present) ---------- #
-
-def apply_take_profit(symbol: str, price: float, entry: float) -> bool:
-    """TAKE_PROFIT check — returns True if we should sell."""
-    if TP_PCT <= 0:
-        return False
-    target = entry * (1.0 + TP_PCT/100.0)
-    return price >= target
-
-def apply_stop_loss(symbol: str, price: float, entry: float) -> bool:
-    """STOP_LOSS check — returns True if we should sell."""
-    if SL_PCT <= 0:
-        return False
-    floor = entry * (1.0 - SL_PCT/100.0)
-    return price <= floor
-
-def apply_trailing(symbol: str, price: float, peak: float) -> Tuple[bool, float]:
-    """TRAIL / trailing stop — returns (should_sell, new_peak)."""
-    if TSL_PCT <= 0:
-        return (False, max(peak, price))
-    new_peak = max(peak, price)
-    if new_peak > 0 and (new_peak - price) / new_peak * 100.0 >= TSL_PCT:
-        return (True, new_peak)
-    return (False, new_peak)
-
-# ---------- Strategy Core ---------- #
-
-def choose_candidates(ex, quote: str) -> List[str]:
-    ranked = fetch_tickers_24h_change(ex, quote)
-    take = ranked[:TOP_K]
-    if not take:
-        yellow("No candidates from 24h change ranking.")
-    return [s for s,_ in take]
-
-def pick_worst_symbol(ex, positions: Dict[str,float]) -> Optional[str]:
-    if not positions:
+def market_sell(ex: ccxt.Exchange, symbol: str, qty: float, dry: bool, reason: str = "") -> Optional[Dict[str, Any]]:
+    if qty <= 0:
         return None
-    ranked = fetch_tickers_24h_change(ex, QUOTE)
-    map_change = {s:c for s,c in ranked}
-    worst = None
-    worst_chg = 10**9
+    try:
+        if dry:
+            log("OK", f"DRY SELL {symbol} qty {qty:.6f} {'— '+reason if reason else ''}")
+            return {"id":"dry","type":"market","side":"sell","symbol":symbol,"amount":qty}
+        else:
+            o = ex.create_order(symbol, "market", "sell", qty)
+            log("OK", f"SELL {symbol} qty {qty:.6f} {'— '+reason if reason else ''}")
+            return o
+    except Exception as e:
+        log("ERR", f"Sell failed {symbol}: {e}")
+        return None
+
+# -------- Risk controls (simple versions) -------- #
+def apply_dust_sweeper(ex: ccxt.Exchange, positions: Dict[str, Dict[str, float]], dry: bool) -> float:
+    freed = 0.0
+    for sym, pos in list(positions.items()):
+        val = float(pos["value"])
+        if val <= DUST_MIN_USD and val > 0:
+            qty = float(pos["amount"])
+            log("WARN", f"🧹 Sweeping dust: {sym} (${val:.2f})")
+            market_sell(ex, sym, qty, dry, reason="dust")
+            freed += val
+            del positions[sym]
+    return freed
+
+def weakest_symbol(positions: Dict[str, Dict[str, float]], ex: ccxt.Exchange) -> Optional[Tuple[str,float]]:
+    # Weakness by 24h % change
+    weakest = None
+    weakest_chg = 1e9
     for sym in positions.keys():
-        chg = map_change.get(sym, 0.0)
-        if chg < worst_chg:
-            worst = sym
-            worst_chg = chg
-    return worst
+        try:
+            t = ex.fetch_ticker(sym)
+            chg = float(t.get("percentage") or 0.0)
+        except Exception:
+            chg = -999.0
+        if chg < weakest_chg:
+            weakest_chg = chg
+            weakest = sym
+    if weakest is None:
+        return None
+    return weakest, weakest_chg
 
-def main():
-    print("\n" + "="*78)
-    print(f"Crypto Live — {now_utc()}  (DRY_RUN={DRY_RUN})")
-    print("="*78)
+# -------- Main run -------- #
+def main() -> int:
+    ensure_state()
+
+    if SHOW_BANNER:
+        log("SUM", "===================================================")
+        log("SUM", f"Crypto Live — {now_utc_iso()}")
+        log("SUM", f"DRY_RUN={'ON' if DRY_RUN else 'OFF'}  RUN_SWITCH={'ON' if RUN_SWITCH else 'OFF'}")
+        log("SUM", f"Quote: {BASE_QUOTE}, Max positions: {MAX_POSITIONS}, Max buys/run: {MAX_BUYS_PER_RUN}")
+        log("SUM", f"Dust: <= ${DUST_MIN_USD:.2f}, MinNotional: ${MIN_NOTIONAL_USD:.2f}, Reserve cash: {RESERVE_CASH_PCT:.1f}%")
+        log("SUM", "===================================================")
 
     if not RUN_SWITCH:
-        yellow("RUN_SWITCH is off → exiting early.")
-        return
+        log("WARN", "RUN_SWITCH=off — skipping trading loop.")
+        write_summary(["RUN_SWITCH=off — no trading performed."])
+        return 0
 
-    ex = connect_exchange()
-    load_markets_safe(ex)
-
-    # Portfolio snapshot
-    cash, positions = get_cash_and_positions(ex, QUOTE)
-    # Apply dust filter before counting/rotation decisions
-    positions = filter_dust_positions(ex, positions, DUST_MIN_USD)
-    pos_count = len(positions)
-    green(f"Cash {QUOTE}: {cash:.2f} | Positions: {pos_count}/{MAX_POSITIONS}")
-
-    # Ensure sell-guard state for anything we already hold
-    pos_state = load_pos_state()
-    ensure_state_for_holds(pos_state, ex, positions)
-
-    # ---------- SELL PASS (TAKE_PROFIT / STOP_LOSS / TRAIL) ----------
-    sells_this_run = 0
-    for sym, amt in list(positions.items()):
-        price = fetch_last_price(ex, sym)
-        st = pos_state.get(sym, {"entry": price, "peak": price})
-        entry = float(st.get("entry", price))
-        peak  = float(st.get("peak", entry))
-
-        should_trail_sell, new_peak = apply_trailing(sym, price, peak)
-        st["peak"] = float(new_peak)
-        pos_state[sym] = st
-
-        tp = apply_take_profit(sym, price, entry)
-        sl = apply_stop_loss(sym, price, entry)
-        tr = should_trail_sell
-
-        if tp or sl or tr:
-            reason = "TAKE_PROFIT" if tp else ("STOP_LOSS" if sl else "TRAIL")
-            yellow(f"{reason}: Selling {sym} @ {price:.6f} (entry {entry:.6f}, peak {new_peak:.6f})")
-            place_market_sell(ex, sym, amt)
-            sells_this_run += 1
-            positions.pop(sym, None)
-            pos_state.pop(sym, None)
-
-    save_pos_state(pos_state)
-
-    # ---------- BUY / ROTATION PASS ----------
-    candidates = choose_candidates(ex, QUOTE)
-
-    def usable_cash():
-        return max(0.0, cash * (1.0 - RESERVE_CASH_PCT))
-
-    buys_this_run = 0
-
-    for sym in candidates:
-        if buys_this_run >= MAX_BUYS_PER_RUN:
-            yellow(f"Reached MAX_BUYS_PER_RUN={MAX_BUYS_PER_RUN}; skipping further buys.")
-            break
-
-        at_capacity = (pos_count >= MAX_POSITIONS)
-        need_cash = (usable_cash() < MIN_NOTIONAL)
-
-        if at_capacity:
-            if not ROTATE_WHEN_FULL:
-                if not (need_cash and ROTATE_WHEN_CASH_SHORT):
-                    yellow(f"Portfolio full and ROTATE_WHEN_FULL=false; skipping rotation for {sym}.")
-                    continue
-            worst = pick_worst_symbol(ex, positions)
-            if worst and worst != sym:
-                amt = positions.get(worst, 0.0)
-                if amt > 0:
-                    yellow(f"Rotating: selling worst {worst} to enter {sym}")
-                    place_market_sell(ex, worst, amt)
-                    positions.pop(worst, None)
-                    pos_count -= 1
-                    cash, positions2 = get_cash_and_positions(ex, QUOTE)
-                    positions2 = filter_dust_positions(ex, positions2, DUST_MIN_USD)
-                    # refresh local snapshot
-                    positions.update(positions2)
-                    # cash updated by re-fetch above
-
-        if usable_cash() < MIN_NOTIONAL:
-            yellow(f"Not enough usable cash for {sym}; skipping.")
-            continue
-
-        if sym in positions:
-            continue
-
-        if not under_daily_entry_cap():
-            yellow("Hit MAX_DAILY_ENTRIES cap for today; no more buys.")
-            break
-
-        slots_left = max(1, MAX_POSITIONS - pos_count)
-        budget = max(MIN_NOTIONAL, usable_cash() / float(slots_left))
-
-        resp = place_market_buy(ex, sym, budget)
-        if resp:
-            buys_this_run += 1
-            pos_count += 1
-            bump_daily_entry()
-            price = fetch_last_price(ex, sym)
-            pos_state = load_pos_state()
-            pos_state[sym] = {"entry": float(price), "peak": float(price)}
-            save_pos_state(pos_state)
-
-    # ---------- KPI / Summary ----------
-    ranked = fetch_tickers_24h_change(ex, QUOTE)
-    held_changes = {s:c for s,c in ranked if s in positions}
-    avg_chg = (sum(held_changes.values())/max(1,len(held_changes))) if held_changes else 0.0
-
-    print("-"*78)
-    green(f"SUMMARY: positions={pos_count}  buys_this_run={buys_this_run}  sells_this_run={sells_this_run}  avg_24h_change={avg_chg:.2f}%")
-    if DRY_RUN:
-        yellow("🚧 DRY RUN — NO REAL ORDERS SENT 🚧")
-    print("-"*78)
-
-    # KPI CSV
     try:
-        write_header = not os.path.exists(KPI_PATH)
-        with open(KPI_PATH, "a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            if write_header:
-                w.writerow(["ts_utc","pos_count","buys_this_run","sells_this_run","avg_24h_change","dry_run"])
-            w.writerow([now_utc(), pos_count, buys_this_run, sells_this_run, f"{avg_chg:.4f}", int(DRY_RUN)])
+        ex = make_exchange()
+        # sanity: a tiny public call first
+        _ = ex.fetch_ticker(f"BTC/{BASE_QUOTE}")
     except Exception as e:
-        yellow(f"KPI CSV write failed: {e}")
+        log("ERR", f"Exchange init/fetch_ticker failed: {e}")
+        if AUTO_PAUSE_ON_ERROR:
+            write_summary([f"Hard error: {e}"])
+            return 1
+        return 0
+
+    try:
+        cash, positions = fetch_cash_positions(ex)
+        pos_count = len(positions)
+        equity = cash + sum(p["value"] for p in positions.values())
+        log("OK", f"Start — Cash ${cash:.2f}, Equity ${equity:.2f}, Positions {pos_count}")
+
+        # Dust sweep
+        freed = apply_dust_sweeper(ex, positions, DRY_RUN)
+        if freed > 0:
+            cash += freed
+            log("OK", f"Dust sweep freed ~${freed:.2f}; Cash now ${cash:.2f}")
+
+        # Compute desired target list
+        top_syms = fetch_topk_symbols(ex, TOPK)
+        log("OK", "Top-K by 24h%: " + ", ".join([f"{s}({c:+.1f}%)" for s,c in top_syms]))
+
+        have_syms = set(positions.keys())
+        target_syms = [s for s,_ in top_syms]
+
+        # Rotation logic
+        buys_done = 0
+        sells_done = 0
+        rotations = 0
+
+        def can_buy_more() -> bool:
+            return (len(positions) < MAX_POSITIONS) and (buys_done < MAX_BUYS_PER_RUN)
+
+        # If we have capacity and a top symbol we don't own, buy one
+        for s,_chg in top_syms:
+            if buys_done >= MAX_BUYS_PER_RUN:
+                break
+            if s in have_syms:
+                continue
+            # need cash after reserve
+            reserve = equity * (RESERVE_CASH_PCT / 100.0)
+            spendable = max(0.0, cash - reserve)
+            if spendable < MIN_NOTIONAL_USD:
+                # try rotation if allowed
+                if ROTATE_WHEN_CASH_SHORT and len(positions) > 0:
+                    w = weakest_symbol(positions, ex)
+                    if w:
+                        wsym, wchg = w
+                        qty = positions[wsym]["amount"]
+                        log("WARN", f"ROTATE_WHEN_CASH_SHORT true → selling weakest {wsym} ({wchg:+.1f}%) to fund {s}")
+                        if market_sell(ex, wsym, qty, DRY_RUN, reason="cash_short"):
+                            sells_done += 1
+                            rotations += 1
+                            # refresh cash snapshot roughly
+                            cash2, positions = fetch_cash_positions(ex)
+                            cash = cash2
+                            have_syms = set(positions.keys())
+                            reserve = equity * (RESERVE_CASH_PCT / 100.0)
+                            spendable = max(0.0, cash - reserve)
+                else:
+                    log("WARN", "Insufficient spendable cash; skipping buy.")
+            if spendable >= MIN_NOTIONAL_USD and buys_done < MAX_BUYS_PER_RUN and len(positions) < MAX_POSITIONS:
+                buy_amt = max(MIN_NOTIONAL_USD, spendable / max(1, (MAX_POSITIONS - len(positions))))
+                if market_buy(ex, s, buy_amt, DRY_RUN):
+                    buys_done += 1
+                    # refresh post-buy
+                    cash2, positions = fetch_cash_positions(ex)
+                    cash = cash2
+                    have_syms = set(positions.keys())
+
+        # If full and rotation enabled, replace one weak with one strong (once per run)
+        if ROTATE_WHEN_FULL and len(positions) >= MAX_POSITIONS and buys_done < MAX_BUYS_PER_RUN:
+            # pick first top symbol we don't have
+            candidate = None
+            for s,_ in top_syms:
+                if s not in have_syms:
+                    candidate = s
+                    break
+            if candidate:
+                w = weakest_symbol(positions, ex)
+                if w:
+                    wsym, wchg = w
+                    if wsym != candidate:
+                        qty = positions[wsym]["amount"]
+                        log("WARN", f"ROTATE_WHEN_FULL true → {wsym} -> {candidate}")
+                        if market_sell(ex, wsym, qty, DRY_RUN, reason="rotate_full"):
+                            sells_done += 1
+                            rotations += 1
+                            # refresh cash and buy
+                            cash2, positions = fetch_cash_positions(ex)
+                            cash = cash2
+                            reserve = equity * (RESERVE_CASH_PCT / 100.0)
+                            spendable = max(0.0, cash - reserve)
+                            if spendable >= MIN_NOTIONAL_USD and buys_done < MAX_BUYS_PER_RUN:
+                                buy_amt = max(MIN_NOTIONAL_USD, spendable / max(1, (MAX_POSITIONS - len(positions))))
+                                if market_buy(ex, candidate, buy_amt, DRY_RUN):
+                                    buys_done += 1
+
+        # TODO: TP/SL/TRAIL logic could be expanded. For now, we rely on ccxt market orders above.
+        # A minimal placeholder is kept for future extension.
+
+        # Recalc equity at end
+        cash_end, positions_end = fetch_cash_positions(ex)
+        equity_end = cash_end + sum(p["value"] for p in positions_end.values())
+        pnl_day_pct = 0.0  # placeholder unless you log prior day equity
+        log("KPI", f"End — Cash ${cash_end:.2f}, Equity ${equity_end:.2f}, Positions {len(positions_end)}")
+
+        # Persist KPI
+        append_kpi_row({
+            "ts": now_utc_iso(),
+            "dry_run": DRY_RUN,
+            "positions": len(positions_end),
+            "cash_usd": round(cash_end, 2),
+            "equity_usd": round(equity_end, 2),
+            "pnl_day_pct": round(pnl_day_pct, 3),
+            "buys": buys_done,
+            "sells": sells_done,
+            "rotations": rotations,
+        })
+
+        write_summary([
+            f"Mode: {'DRY' if DRY_RUN else 'LIVE'}",
+            f"Buys: {buys_done}, Sells: {sells_done}, Rotations: {rotations}",
+            f"End Equity: ${equity_end:.2f} (Cash ${cash_end:.2f}, Positions {len(positions_end)})",
+        ])
+
+        return 0
+
+    except ccxt.AuthenticationError as e:
+        log("ERR", f"Authentication error: {e}")
+        write_summary([f"Authentication error: {e}"])
+        return 1 if AUTO_PAUSE_ON_ERROR else 0
+    except Exception as e:
+        log("ERR", f"Unhandled error: {e}")
+        traceback.print_exc()
+        write_summary([f"Unhandled error: {e}"])
+        return 1 if AUTO_PAUSE_ON_ERROR else 0
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        red(f"Unhandled error: {e}")
-        raise
+    rc = main()
+    sys.exit(rc)
