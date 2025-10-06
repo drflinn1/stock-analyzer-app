@@ -24,42 +24,42 @@ jobs:
 
       # ====== EXCHANGE / ROUTING ======
       EXCHANGE: "kraken"
-      BASE_QUOTE: "USD"           # trade against USD on Kraken
+      BASE_QUOTE: "USD"
 
       # ====== POSITION SIZING / ROTATION ======
-      MAX_POSITIONS: "12"         # aligns with what you’re seeing on Kraken
-      MAX_BUYS_PER_RUN: "1"       # keep 1 to limit churn per 15m tick
-      ROTATE_WHEN_FULL: "true"    # replace weakest to enter a stronger one
-      ROTATE_WHEN_CASH_SHORT: "true"  # sell a laggard if a better pick needs cash
+      MAX_POSITIONS: "12"
+      MAX_BUYS_PER_RUN: "1"
+      ROTATE_WHEN_FULL: "true"
+      ROTATE_WHEN_CASH_SHORT: "true"
 
       # ====== ORDER GUARDS ======
-      MIN_NOTIONAL_USD: "5"       # ignore tiny orders below this
-      DUST_MIN_USD: "2"           # << new: sweep anything <= $2 to USD >>
-      RESERVE_CASH_PCT: "5"       # keep a little dry powder (set 0 to disable)
+      MIN_NOTIONAL_USD: "5"
+      DUST_MIN_USD: "2"           # sweep anything <= $2 to USD
+      RESERVE_CASH_PCT: "5"
 
       # ====== RISK CONTROLS ======
-      TP_PCT: "2.0"               # take-profit target (percent)
-      SL_PCT: "3.5"               # stop-loss (percent)
-      TRAIL_PCT: "1.2"            # trailing take-profit (percent)
-      DAILY_LOSS_CAP: "3"         # auto-stop for the day if P/L <= -3%
-      AUTO_PAUSE_ON_ERROR: "true" # fail-safe pause on unrecoverable errors
+      TP_PCT: "2.0"
+      SL_PCT: "3.5"
+      TRAIL_PCT: "1.2"
+      DAILY_LOSS_CAP: "3"
+      AUTO_PAUSE_ON_ERROR: "true"
 
       # ====== LOGGING / OUTPUT ======
       LOG_LEVEL: "INFO"
       KPI_CSV_PATH: ".state/kpi_history.csv"
       STATE_DIR: ".state"
 
-      # ====== MISC (safe defaults in code if unset) ======
+      # ====== STRATEGY MISC ======
       TIMEFRAME: "15m"
-      TOPK: "6"                   # if your code uses Top-K autopick
+      TOPK: "6"
       COOL_DOWN_MINUTES: "30"
-
-      # ====== DRY RUN BANNER / COMPLIANCE ======
       SHOW_BANNER: "true"
 
-      # ====== SECRETS INJECTED AT RUNTIME ======
+      # ====== SECRETS (repo-level) ======
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+      # Optional if your Kraken API uses OTP/2FA for API:
+      KRAKEN_API_OTP: ${{ secrets.KRAKEN_API_OTP }}
 
     steps:
       - name: Checkout repo
