@@ -79,7 +79,6 @@ on:
         type: string
 
   schedule:
-    # every 5 minutes
     - cron: '*/5 * * * *'
 
 permissions:
@@ -90,38 +89,26 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # ----- Exchange wiring (FIXED) -----
   EXCHANGE_ID: "kraken"
   API_KEY: ${{ secrets.KRAKEN_API_KEY }}
   API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-  # If your Kraken key requires a password/OTP, put it in a secret and reference here.
-  # Otherwise leave empty string:
   API_PASSWORD: ""
 
-  # ----- Quote & state -----
   QUOTE: "USD"
   STATE_DIR: ".state"
 
-  # ----- Defaults (can be overridden by workflow_dispatch inputs) -----
   DRY_RUN: ${{ inputs.DRY_RUN || 'true' }}
   RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'true' }}
-
   TOP_K: ${{ inputs.TOP_K || '6' }}
   MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || '6' }}
   MIN_NOTIONAL: ${{ inputs.MIN_NOTIONAL || '5.0' }}
   RESERVE_CASH_PCT: ${{ inputs.RESERVE_CASH_PCT || '0.05' }}
-
-  # Rotation knobs
   ROTATE_WHEN_FULL: ${{ inputs.ROTATE_WHEN_FULL || 'false' }}
   MAX_BUYS_PER_RUN: ${{ inputs.MAX_BUYS_PER_RUN || '1' }}
   ROTATE_WHEN_CASH_SHORT: ${{ inputs.ROTATE_WHEN_CASH_SHORT || 'true' }}
-
-  # Sell guards (tokens in main.py: TAKE_PROFIT, STOP_LOSS, TRAIL/trailing)
   TP_PCT: ${{ inputs.TP_PCT || '5' }}
   SL_PCT: ${{ inputs.SL_PCT || '3' }}
   TSL_PCT: ${{ inputs.TSL_PCT || '4' }}
-
-  # Optional symbol filters (comma-separated; empty = unused)
   SYMBOLS_WHITELIST: ${{ inputs.SYMBOLS_WHITELIST }}
   SYMBOLS_EXCLUDE: ${{ inputs.SYMBOLS_EXCLUDE }}
 
@@ -131,7 +118,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
-      - uses: actions/checkout@v4
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -142,15 +129,15 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install ccxt==4.*  # lock to v4 major for stability
+          pip install ccxt==4.*
 
-      - name: Show kraken secrets (masked) & params
+      - name: Show run parameters
         run: |
           echo "RUN @ $(date -u) UTC"
           echo "EXCHANGE_ID=$EXCHANGE_ID"
           echo "QUOTE=$QUOTE"
           echo "DRY_RUN=$DRY_RUN RUN_SWITCH=$RUN_SWITCH"
-          echo "TOP_K=$TOP_K MAX_POSITIONS=$MAX_POSITIONS MIN_NOTIONAL=$MIN_NOTIONAL RESERVE_CASH_PCT=$RESERVE_CASH_PCT"
+          echo "TOP_K=$TOP_K MAX_POSITIONS=$MAX_POSITIONS MIN_NOTIONAL=$MIN_NOTIONAL"
           echo "ROTATE_WHEN_FULL=$ROTATE_WHEN_FULL MAX_BUYS_PER_RUN=$MAX_BUYS_PER_RUN ROTATE_WHEN_CASH_SHORT=$ROTATE_WHEN_CASH_SHORT"
           echo "TP_PCT=$TP_PCT SL_PCT=$SL_PCT TSL_PCT=$TSL_PCT"
           echo "WHITELIST=$SYMBOLS_WHITELIST"
@@ -158,14 +145,12 @@ jobs:
           echo "STATE_DIR=$STATE_DIR"
 
       - name: Run bot
-        run: |
-          python main.py
+        run: python main.py
 
-      - name: Upload .state (artifacts)
+      - name: Upload .state artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
-          path: |
-            .state/**
+          path: .state/**
           if-no-files-found: ignore
