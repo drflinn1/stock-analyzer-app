@@ -37,7 +37,7 @@ on:
         default: "150"
         type: string
       MIN_QUOTE_VOL_USD:
-        description: "Filter out thin markets (24h quote vol)"
+        description: "Filter out thin markets (24h quote vol, USD)"
         required: true
         default: "10000"
         type: string
@@ -51,6 +51,7 @@ on:
 permissions:
   contents: read
 
+# Prevent overlapping runs, but don't cancel in-progress ones
 concurrency:
   group: crypto-live-meanrevert-v2
   cancel-in-progress: false
@@ -86,7 +87,9 @@ jobs:
 
       - name: Echo config (non-secret)
         run: |
-          echo "DRY_RUN=${{ inputs.DRY_RUN || 'true' }}"
+          echo "EVENT_NAME=${{ github.event_name }}"
+          # Scheduled runs go LIVE; manual runs use the input (default true)
+          echo "DRY_RUN=${{ github.event_name == 'schedule' && 'false' || (inputs.DRY_RUN || 'true') }}"
           echo "TOP_K=${{ inputs.TOP_K || '6' }}"
           echo "USD_PER_TRADE=${{ inputs.USD_PER_TRADE || '15' }}"
           echo "MIN_COST_PER_ORDER=${{ inputs.MIN_COST_PER_ORDER || '5.0' }}"
@@ -107,8 +110,9 @@ jobs:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-          # dispatch-controlled
-          DRY_RUN: ${{ inputs.DRY_RUN || 'true' }}
+          # ⬇️ Scheduled = LIVE, Manual = input
+          DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || (inputs.DRY_RUN || 'true') }}
+
           TOP_K: ${{ inputs.TOP_K || '6' }}
           USD_PER_TRADE: ${{ inputs.USD_PER_TRADE || '15' }}
           MIN_COST_PER_ORDER: ${{ inputs.MIN_COST_PER_ORDER || '5.0' }}
@@ -117,7 +121,7 @@ jobs:
           MIN_QUOTE_VOL_USD: ${{ inputs.MIN_QUOTE_VOL_USD || '10000' }}
           WHY_NOT_LOGS: ${{ inputs.WHY_NOT_LOGS || 'true' }}
 
-          # fixed defaults (tune here)
+          # Mean-revert fixed defaults (tune here if needed)
           TIMEFRAME: "15m"
           RSI_LEN: "14"
           VWAP_BARS: "20"
