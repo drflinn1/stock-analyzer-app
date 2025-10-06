@@ -51,7 +51,7 @@ on:
 permissions:
   contents: read
 
-# Prevent overlapping runs, but don't cancel in-progress ones
+# One run at a time. (Rename group if you need to “nudge” the scheduler.)
 concurrency:
   group: crypto-live-meanrevert-v2
   cancel-in-progress: false
@@ -121,7 +121,7 @@ jobs:
           MIN_QUOTE_VOL_USD: ${{ inputs.MIN_QUOTE_VOL_USD || '10000' }}
           WHY_NOT_LOGS: ${{ inputs.WHY_NOT_LOGS || 'true' }}
 
-          # Mean-revert fixed defaults (tune here if needed)
+          # Mean-revert defaults (tune here)
           TIMEFRAME: "15m"
           RSI_LEN: "14"
           VWAP_BARS: "20"
