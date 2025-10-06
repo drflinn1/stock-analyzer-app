@@ -1,59 +1,48 @@
-name: Crypto Live (Every 15 min — Rotation Day-Trade)
+name: Crypto Live — Mean Revert (every 5m)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: "Dry run (no real orders)"
+        description: "Dry run (no orders)"
         required: true
-        default: "false"
+        default: "true"
         type: choice
         options: ["true","false"]
       TOP_K:
-        description: "Rank/scan top K coins"
+        description: "Scan top-K oversold"
         required: true
         default: "6"
-        type: string
-      ROTATE_MIN_EDGE_PCT:
-        description: "Min edge to rotate (e.g., 0.004 = 0.4%)"
-        required: true
-        default: "0.004"
-        type: string
-      RESERVE_CASH_USD:
-        description: "Keep at least this much USD"
-        required: true
-        default: "25"
         type: string
       USD_PER_TRADE:
         description: "USD budget per BUY"
         required: true
-        default: "10"
+        default: "15"
         type: string
       MIN_COST_PER_ORDER:
         description: "Exchange min notional per order"
         required: true
         default: "5.0"
         type: string
+      RESERVE_CASH_USD:
+        description: "Keep at least this USD"
+        required: true
+        default: "25"
+        type: string
       MAX_SPREAD_BPS:
         description: "Skip markets wider than this (bps)"
         required: true
-        default: "75"
+        default: "150"
         type: string
       MIN_QUOTE_VOL_USD:
-        description: "Filter out thin markets under this 24h vol"
+        description: "Filter out thin markets (24h quote vol)"
         required: true
-        default: "50000"
+        default: "10000"
         type: string
-      PARTIAL_ASSIST:
-        description: "Allow small helper sells if needed (not used when atomic)"
-        required: true
-        default: "true"
-        type: choice
-        options: ["true","false"]
       WHY_NOT_LOGS:
-        description: "Verbose reasons for accept/reject"
+        description: "Verbose reject reasons"
         required: true
         default: "true"
         type: choice
@@ -62,21 +51,17 @@ on:
 permissions:
   contents: read
 
-# Avoid overlapping live runs
 concurrency:
-  group: crypto-live
+  group: crypto-live-meanrevert
   cancel-in-progress: false
 
 jobs:
   run:
-    name: Run Crypto Bot
+    name: Run Crypto Bot (mean-revert)
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
-      - name: Set up job
-        run: echo "Starting…"
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -94,76 +79,62 @@ jobs:
         shell: bash
         run: |
           if [[ -z "${{ secrets.KRAKEN_API_KEY }}" || -z "${{ secrets.KRAKEN_API_SECRET }}" ]]; then
-            echo "::error title=Missing Kraken Secrets::KRAKEN_API_KEY and/or KRAKEN_API_SECRET are not set."
-            echo "Add them under: Repository → Settings → Secrets and variables → Actions."
+            echo "::error title=Missing Kraken Secrets::Add KRAKEN_API_KEY and KRAKEN_API_SECRET in repo settings."
             exit 1
           fi
           echo "Kraken secrets detected."
 
       - name: Echo config (non-secret)
         run: |
-          echo "--- Inputs ---"
-          echo "DRY_RUN=${{ inputs.DRY_RUN || 'false' }}"
+          echo "DRY_RUN=${{ inputs.DRY_RUN || 'true' }}"
           echo "TOP_K=${{ inputs.TOP_K || '6' }}"
-          echo "ROTATE_MIN_EDGE_PCT=${{ inputs.ROTATE_MIN_EDGE_PCT || '0.004' }}"
-          echo "RESERVE_CASH_USD=${{ inputs.RESERVE_CASH_USD || '25' }}"
-          echo "USD_PER_TRADE=${{ inputs.USD_PER_TRADE || '10' }}"
+          echo "USD_PER_TRADE=${{ inputs.USD_PER_TRADE || '15' }}"
           echo "MIN_COST_PER_ORDER=${{ inputs.MIN_COST_PER_ORDER || '5.0' }}"
-          echo "MAX_SPREAD_BPS=${{ inputs.MAX_SPREAD_BPS || '75' }}"
-          echo "MIN_QUOTE_VOL_USD=${{ inputs.MIN_QUOTE_VOL_USD || '50000' }}"
-          echo "PARTIAL_ASSIST=${{ inputs.PARTIAL_ASSIST || 'true' }}"
+          echo "RESERVE_CASH_USD=${{ inputs.RESERVE_CASH_USD || '25' }}"
+          echo "MAX_SPREAD_BPS=${{ inputs.MAX_SPREAD_BPS || '150' }}"
+          echo "MIN_QUOTE_VOL_USD=${{ inputs.MIN_QUOTE_VOL_USD || '10000' }}"
           echo "WHY_NOT_LOGS=${{ inputs.WHY_NOT_LOGS || 'true' }}"
-          echo "--- Fixed env (edit in YAML) ---"
-          echo "ROTATE_MAX_SWITCHES_PER_RUN=1"
-          echo "ROTATE_COOLDOWN_MIN=30"
-          echo "ATOMIC_ROTATION=true"
-          echo "DUST_IGNORE_BELOW_USD=1.00"
-          echo "SELL_EPS=0.995 BUY_EPS=0.995"
-          echo "COOLDOWN_MINUTES=10"
-          echo "TP=0.05 SL=0.03 TRAIL=0.02"
-          echo "UNIVERSE='' IGNORE_TICKERS='USDT,USDC,USD,EUR,GBP,XRP'"
+          echo "--- Fixed params ---"
+          echo "TIMEFRAME=15m RSI_LEN=14 VWAP_BARS=20 OVERSOLD_RSI=35"
+          echo "TP=0.02 SL=0.01 TRAIL=0.007"
+          echo "ATOMIC_ROTATION=true ROTATE_WHEN_FULL=true"
+          echo "SELL_EPS=0.995 BUY_EPS=0.995 DUST_IGNORE_BELOW_USD=1.00"
+          echo "UNIVERSE='' IGNORE_TICKERS='USDT,USDC,USD,EUR,GBP'"
 
       - name: Run bot
         env:
-          # Exchange + secrets
           EXCHANGE: kraken
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-          # ---- Dispatch-controlled knobs (≤10 inputs) ----
-          DRY_RUN: ${{ inputs.DRY_RUN || 'false' }}
+          # dispatch-controlled
+          DRY_RUN: ${{ inputs.DRY_RUN || 'true' }}
           TOP_K: ${{ inputs.TOP_K || '6' }}
-          ROTATE_MIN_EDGE_PCT: ${{ inputs.ROTATE_MIN_EDGE_PCT || '0.004' }}
-          RESERVE_CASH_USD: ${{ inputs.RESERVE_CASH_USD || '25' }}
-          USD_PER_TRADE: ${{ inputs.USD_PER_TRADE || '10' }}
+          USD_PER_TRADE: ${{ inputs.USD_PER_TRADE || '15' }}
           MIN_COST_PER_ORDER: ${{ inputs.MIN_COST_PER_ORDER || '5.0' }}
-          MAX_SPREAD_BPS: ${{ inputs.MAX_SPREAD_BPS || '75' }}
-          MIN_QUOTE_VOL_USD: ${{ inputs.MIN_QUOTE_VOL_USD || '50000' }}
-          PARTIAL_ASSIST: ${{ inputs.PARTIAL_ASSIST || 'true' }}
+          RESERVE_CASH_USD: ${{ inputs.RESERVE_CASH_USD || '25' }}
+          MAX_SPREAD_BPS: ${{ inputs.MAX_SPREAD_BPS || '150' }}
+          MIN_QUOTE_VOL_USD: ${{ inputs.MIN_QUOTE_VOL_USD || '10000' }}
           WHY_NOT_LOGS: ${{ inputs.WHY_NOT_LOGS || 'true' }}
 
-          # ---- Fixed env defaults (edit here to tune behavior) ----
-          # Rotation rule & safety
-          ROTATE_MAX_SWITCHES_PER_RUN: "1"
-          ROTATE_COOLDOWN_MIN: "30"
-          ATOMIC_ROTATION: "true"           # sell only if a buy is eligible
-          DUST_IGNORE_BELOW_USD: "1.00"     # ignore tiny leftovers when picking weakest
+          # fixed defaults (tune here)
+          TIMEFRAME: "15m"
+          RSI_LEN: "14"
+          VWAP_BARS: "20"
+          OVERSOLD_RSI: "35"
 
-          # Sizing safety margins
+          TAKE_PROFIT_PCT: "0.02"
+          STOP_LOSS_PCT: "0.01"
+          TRAILING_STOP_PCT: "0.007"
+
+          ATOMIC_ROTATION: "true"
+          ROTATE_WHEN_FULL: "true"
+
           SELL_EPS: "0.995"
           BUY_EPS: "0.995"
+          DUST_IGNORE_BELOW_USD: "1.00"
 
-          # General trade hygiene
-          COOLDOWN_MINUTES: "10"
-
-          # Exit thresholds (kept for CI/safety; exits scoped in code)
-          TAKE_PROFIT_PCT: "0.05"
-          STOP_LOSS_PCT: "0.03"
-          TRAILING_STOP_PCT: "0.02"
-
-          # Universe filters
           UNIVERSE: ""
-          IGNORE_TICKERS: "USDT,USDC,USD,EUR,GBP,XRP"
-
+          IGNORE_TICKERS: "USDT,USDC,USD,EUR,GBP"
         run: |
           python main.py
