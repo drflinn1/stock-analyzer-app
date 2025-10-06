@@ -1,9 +1,9 @@
-name: Crypto Live — Every 15m (Live + Dust Sweep)
+name: Crypto Live — Every 15m (ENV secrets + Dust Sweep)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"  # every 15 minutes
+    - cron: "*/15 * * * *"
 
 permissions:
   contents: read
@@ -14,12 +14,14 @@ concurrency:
 
 jobs:
   run:
+    # ⬇️ Use the SAME Environment name where your Kraken secrets already work
+    environment: production   # <- if your env is called "live", change to live
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
     env:
       # ====== EXECUTION TOGGLES ======
-      DRY_RUN: "false"            # << LIVE MODE (real orders) >>
+      DRY_RUN: "false"            # LIVE (set "true" to simulate only)
       RUN_SWITCH: "on"            # off = skip trading loop but still boot/log
 
       # ====== EXCHANGE / ROUTING ======
@@ -55,10 +57,9 @@ jobs:
       COOL_DOWN_MINUTES: "30"
       SHOW_BANNER: "true"
 
-      # ====== SECRETS (repo-level) ======
+      # ====== SECRETS (from the Environment above) ======
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-      # Optional if your Kraken API uses OTP/2FA for API:
       KRAKEN_API_OTP: ${{ secrets.KRAKEN_API_OTP }}
 
     steps:
