@@ -1,145 +1,171 @@
 name: Crypto Live — Mean Revert (every 5m)
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: "Dry run (no orders)"
+        description: 'Dry run (no orders)'
         required: true
-        default: "true"
+        default: 'true'
         type: choice
-        options: ["true","false"]
+        options: ['true','false']
+      RUN_SWITCH:
+        description: 'Master ON/OFF switch'
+        required: true
+        default: 'true'
+        type: choice
+        options: ['true','false']
       TOP_K:
-        description: "Scan top-K oversold"
+        description: 'Auto-pick Top-K by 24h % change'
         required: true
-        default: "10"
+        default: '6'
         type: string
-      USD_PER_TRADE:
-        description: "USD budget per BUY"
+      MAX_POSITIONS:
+        description: 'Max concurrent positions'
         required: true
-        default: "20"
+        default: '6'
         type: string
-      MIN_COST_PER_ORDER:
-        description: "Exchange min notional per order"
+      MIN_NOTIONAL:
+        description: 'Exchange min notional per order (USD)'
         required: true
-        default: "5.0"
+        default: '5.0'
         type: string
-      RESERVE_CASH_USD:
-        description: "Keep at least this USD"
+      RESERVE_CASH_PCT:
+        description: 'Keep this % in cash'
         required: true
-        default: "25"
+        default: '0.05'
         type: string
-      MAX_SPREAD_BPS:
-        description: "Skip markets wider than this (bps)"
+      ROTATE_WHEN_FULL:
+        description: 'Allow rotation when already at MAX_POSITIONS'
         required: true
-        default: "200"
-        type: string
-      MIN_QUOTE_VOL_USD:
-        description: "Filter out thin markets (24h quote vol, USD)"
-        required: true
-        default: "5000"
-        type: string
-      WHY_NOT_LOGS:
-        description: "Verbose reject reasons"
-        required: true
-        default: "true"
+        default: 'false'
         type: choice
-        options: ["true","false"]
+        options: ['true','false']
+      MAX_BUYS_PER_RUN:
+        description: 'Max new buys/rotations per run'
+        required: true
+        default: '1'
+        type: string
+      ROTATE_WHEN_CASH_SHORT:
+        description: 'Allow targeted rotation only when cash is short'
+        required: true
+        default: 'true'
+        type: choice
+        options: ['true','false']
+      TP_PCT:
+        description: 'TAKE_PROFIT percent (0 disables)'
+        required: true
+        default: '5'
+        type: string
+      SL_PCT:
+        description: 'STOP_LOSS percent (0 disables)'
+        required: true
+        default: '3'
+        type: string
+      TSL_PCT:
+        description: 'TRAIL (trailing stop) percent (0 disables)'
+        required: true
+        default: '4'
+        type: string
+      SYMBOLS_WHITELIST:
+        description: 'Optional hard whitelist (comma-separated, e.g., BTC/USD,ETH/USD)'
+        required: false
+        default: ''
+        type: string
+      SYMBOLS_EXCLUDE:
+        description: 'Optional exclusions (comma-separated)'
+        required: false
+        default: ''
+        type: string
+
+  schedule:
+    # every 5 minutes
+    - cron: '*/5 * * * *'
 
 permissions:
   contents: read
 
-# One run at a time; changing the group string “nudges” the scheduler if needed
 concurrency:
-  group: crypto-live-meanrevert-v3
+  group: crypto-live
   cancel-in-progress: false
 
+env:
+  # ----- Exchange wiring (FIXED) -----
+  EXCHANGE_ID: "kraken"
+  API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+  API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+  # If your Kraken key requires a password/OTP, put it in a secret and reference here.
+  # Otherwise leave empty string:
+  API_PASSWORD: ""
+
+  # ----- Quote & state -----
+  QUOTE: "USD"
+  STATE_DIR: ".state"
+
+  # ----- Defaults (can be overridden by workflow_dispatch inputs) -----
+  DRY_RUN: ${{ inputs.DRY_RUN || 'true' }}
+  RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'true' }}
+
+  TOP_K: ${{ inputs.TOP_K || '6' }}
+  MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || '6' }}
+  MIN_NOTIONAL: ${{ inputs.MIN_NOTIONAL || '5.0' }}
+  RESERVE_CASH_PCT: ${{ inputs.RESERVE_CASH_PCT || '0.05' }}
+
+  # Rotation knobs
+  ROTATE_WHEN_FULL: ${{ inputs.ROTATE_WHEN_FULL || 'false' }}
+  MAX_BUYS_PER_RUN: ${{ inputs.MAX_BUYS_PER_RUN || '1' }}
+  ROTATE_WHEN_CASH_SHORT: ${{ inputs.ROTATE_WHEN_CASH_SHORT || 'true' }}
+
+  # Sell guards (tokens in main.py: TAKE_PROFIT, STOP_LOSS, TRAIL/trailing)
+  TP_PCT: ${{ inputs.TP_PCT || '5' }}
+  SL_PCT: ${{ inputs.SL_PCT || '3' }}
+  TSL_PCT: ${{ inputs.TSL_PCT || '4' }}
+
+  # Optional symbol filters (comma-separated; empty = unused)
+  SYMBOLS_WHITELIST: ${{ inputs.SYMBOLS_WHITELIST }}
+  SYMBOLS_EXCLUDE: ${{ inputs.SYMBOLS_EXCLUDE }}
+
 jobs:
-  run:
-    name: Run Crypto Bot (mean-revert)
+  live:
+    name: Run Crypto bot (mean-revert)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout repo
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install ccxt
+          pip install ccxt==4.*  # lock to v4 major for stability
 
-      - name: Check Kraken secrets
-        shell: bash
+      - name: Show kraken secrets (masked) & params
         run: |
-          if [[ -z "${{ secrets.KRAKEN_API_KEY }}" || -z "${{ secrets.KRAKEN_API_SECRET }}" ]]; then
-            echo "::error title=Missing Kraken Secrets::Add KRAKEN_API_KEY and KRAKEN_API_SECRET in repo settings."
-            exit 1
-          fi
-          echo "Kraken secrets detected."
-
-      - name: Echo config (non-secret)
-        run: |
-          echo "EVENT_NAME=${{ github.event_name }}"
-          # Scheduled runs go LIVE; manual runs use the input (default true)
-          echo "DRY_RUN=${{ github.event_name == 'schedule' && 'false' || (inputs.DRY_RUN || 'true') }}"
-          echo "TOP_K=${{ inputs.TOP_K || '10' }}"
-          echo "USD_PER_TRADE=${{ inputs.USD_PER_TRADE || '20' }}"
-          echo "MIN_COST_PER_ORDER=${{ inputs.MIN_COST_PER_ORDER || '5.0' }}"
-          echo "RESERVE_CASH_USD=${{ inputs.RESERVE_CASH_USD || '25' }}"
-          echo "MAX_SPREAD_BPS=${{ inputs.MAX_SPREAD_BPS || '200' }}"
-          echo "MIN_QUOTE_VOL_USD=${{ inputs.MIN_QUOTE_VOL_USD || '5000' }}"
-          echo "WHY_NOT_LOGS=${{ inputs.WHY_NOT_LOGS || 'true' }}"
-          echo "--- Mean-revert scalper params ---"
-          echo "TIMEFRAME=15m RSI_LEN=14 VWAP_BARS=20 OVERSOLD_RSI=34"
-          echo "TP=0.012 SL=0.009 TRAIL=0.005"
-          echo "MAX_BUYS_PER_RUN=2 ROTATE_WHEN_FULL=false"
-          echo "SELL_EPS=0.995 BUY_EPS=0.995 DUST_IGNORE_BELOW_USD=1.00"
-          echo "UNIVERSE='' IGNORE_TICKERS='USDT,USDC,USD,EUR,GBP'"
+          echo "RUN @ $(date -u) UTC"
+          echo "EXCHANGE_ID=$EXCHANGE_ID"
+          echo "QUOTE=$QUOTE"
+          echo "DRY_RUN=$DRY_RUN RUN_SWITCH=$RUN_SWITCH"
+          echo "TOP_K=$TOP_K MAX_POSITIONS=$MAX_POSITIONS MIN_NOTIONAL=$MIN_NOTIONAL RESERVE_CASH_PCT=$RESERVE_CASH_PCT"
+          echo "ROTATE_WHEN_FULL=$ROTATE_WHEN_FULL MAX_BUYS_PER_RUN=$MAX_BUYS_PER_RUN ROTATE_WHEN_CASH_SHORT=$ROTATE_WHEN_CASH_SHORT"
+          echo "TP_PCT=$TP_PCT SL_PCT=$SL_PCT TSL_PCT=$TSL_PCT"
+          echo "WHITELIST=$SYMBOLS_WHITELIST"
+          echo "EXCLUDE=$SYMBOLS_EXCLUDE"
+          echo "STATE_DIR=$STATE_DIR"
 
       - name: Run bot
-        env:
-          EXCHANGE: kraken
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-
-          # ⬇️ Scheduled = LIVE, Manual = input
-          DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || (inputs.DRY_RUN || 'true') }}
-
-          TOP_K: ${{ inputs.TOP_K || '10' }}
-          USD_PER_TRADE: ${{ inputs.USD_PER_TRADE || '20' }}
-          MIN_COST_PER_ORDER: ${{ inputs.MIN_COST_PER_ORDER || '5.0' }}
-          RESERVE_CASH_USD: ${{ inputs.RESERVE_CASH_USD || '25' }}
-          MAX_SPREAD_BPS: ${{ inputs.MAX_SPREAD_BPS || '200' }}
-          MIN_QUOTE_VOL_USD: ${{ inputs.MIN_QUOTE_VOL_USD || '5000' }}
-          WHY_NOT_LOGS: ${{ inputs.WHY_NOT_LOGS || 'true' }}
-
-          # Mean-revert defaults (tuned for fast scalps)
-          TIMEFRAME: "15m"
-          RSI_LEN: "14"
-          VWAP_BARS: "20"
-          OVERSOLD_RSI: "34"
-
-          TAKE_PROFIT_PCT: "0.012"
-          STOP_LOSS_PCT: "0.009"
-          TRAILING_STOP_PCT: "0.005"
-
-          # Throughput & rotation
-          MAX_BUYS_PER_RUN: "2"
-          ROTATE_WHEN_FULL: "false"
-
-          SELL_EPS: "0.995"
-          BUY_EPS: "0.995"
-          DUST_IGNORE_BELOW_USD: "1.00"
-
-          UNIVERSE: ""
-          IGNORE_TICKERS: "USDT,USDC,USD,EUR,GBP"
         run: |
           python main.py
+
+      - name: Upload .state (artifacts)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-${{ github.run_id }}
+          path: |
+            .state/**
+          if-no-files-found: ignore
