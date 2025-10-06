@@ -1,65 +1,9 @@
-name: Crypto Live — Mean Revert (every 5m)
+name: Crypto Live — Every 15m (Live + Dust Sweep)
 
 on:
   workflow_dispatch:
-    inputs:
-      DRY_RUN:
-        description: 'Dry run (no orders)'
-        required: true
-        default: 'true'
-        type: choice
-        options: ['true','false']
-      RUN_SWITCH:
-        description: 'Master ON/OFF switch'
-        required: true
-        default: 'true'
-        type: choice
-        options: ['true','false']
-      TOP_K:
-        description: 'Auto-pick Top-K by 24h % change'
-        required: true
-        default: '6'
-        type: string
-      MAX_POSITIONS:
-        description: 'Max concurrent positions'
-        required: true
-        default: '6'
-        type: string
-      MIN_NOTIONAL:
-        description: 'Exchange min notional per order (USD)'
-        required: true
-        default: '5.0'
-        type: string
-      RESERVE_CASH_PCT:
-        description: 'Keep this % in cash'
-        required: true
-        default: '0.05'
-        type: string
-      ROTATE_WHEN_FULL:
-        description: 'Allow rotation when already at MAX_POSITIONS'
-        required: true
-        default: 'false'
-        type: choice
-        options: ['true','false']
-      MAX_BUYS_PER_RUN:
-        description: 'Max new buys/rotations per run'
-        required: true
-        default: '1'
-        type: string
-      ROTATE_WHEN_CASH_SHORT:
-        description: 'Allow targeted rotation only when cash is short'
-        required: true
-        default: 'true'
-        type: choice
-        options: ['true','false']
-      SYMBOLS_WHITELIST:
-        description: 'Optional hard whitelist (comma-separated, e.g., BTC/USD,ETH/USD)'
-        required: false
-        default: ''
-        type: string
-
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: "*/15 * * * *"  # every 15 minutes
 
 permissions:
   contents: read
@@ -68,40 +12,55 @@ concurrency:
   group: crypto-live
   cancel-in-progress: false
 
-env:
-  # ----- Exchange auth -----
-  EXCHANGE_ID: "kraken"
-  API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-  API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-  API_PASSWORD: ""
-  DUST_MIN_USD: "2"
-
-  # ----- Quote & state -----
-  QUOTE: "USD"
-  STATE_DIR: ".state"
-
-  # ----- Runtime knobs (inputs <= 10) -----
-  DRY_RUN: ${{ inputs.DRY_RUN || 'true' }}
-  RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'true' }}
-  TOP_K: ${{ inputs.TOP_K || '6' }}
-  MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || '6' }}
-  MIN_NOTIONAL: ${{ inputs.MIN_NOTIONAL || '5.0' }}
-  RESERVE_CASH_PCT: ${{ inputs.RESERVE_CASH_PCT || '0.05' }}
-  ROTATE_WHEN_FULL: ${{ inputs.ROTATE_WHEN_FULL || 'false' }}
-  MAX_BUYS_PER_RUN: ${{ inputs.MAX_BUYS_PER_RUN || '1' }}
-  ROTATE_WHEN_CASH_SHORT: ${{ inputs.ROTATE_WHEN_CASH_SHORT || 'true' }}
-  SYMBOLS_WHITELIST: ${{ inputs.SYMBOLS_WHITELIST }}
-
-  # ----- Extra knobs (not in inputs; edit here or set as repository variables) -----
-  SYMBOLS_EXCLUDE: ""
-  TP_PCT: "5"   # TAKE_PROFIT percent; set here if you want different default
-  SL_PCT: "3"   # STOP_LOSS percent
-  TSL_PCT: "4"  # TRAIL (trailing) percent
-
 jobs:
-  live:
-    name: Run Crypto bot (mean-revert)
+  run:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      # ====== EXECUTION TOGGLES ======
+      DRY_RUN: "false"            # << LIVE MODE (real orders) >>
+      RUN_SWITCH: "on"            # off = skip trading loop but still boot/log
+
+      # ====== EXCHANGE / ROUTING ======
+      EXCHANGE: "kraken"
+      BASE_QUOTE: "USD"           # trade against USD on Kraken
+
+      # ====== POSITION SIZING / ROTATION ======
+      MAX_POSITIONS: "12"         # aligns with what you’re seeing on Kraken
+      MAX_BUYS_PER_RUN: "1"       # keep 1 to limit churn per 15m tick
+      ROTATE_WHEN_FULL: "true"    # replace weakest to enter a stronger one
+      ROTATE_WHEN_CASH_SHORT: "true"  # sell a laggard if a better pick needs cash
+
+      # ====== ORDER GUARDS ======
+      MIN_NOTIONAL_USD: "5"       # ignore tiny orders below this
+      DUST_MIN_USD: "2"           # << new: sweep anything <= $2 to USD >>
+      RESERVE_CASH_PCT: "5"       # keep a little dry powder (set 0 to disable)
+
+      # ====== RISK CONTROLS ======
+      TP_PCT: "2.0"               # take-profit target (percent)
+      SL_PCT: "3.5"               # stop-loss (percent)
+      TRAIL_PCT: "1.2"            # trailing take-profit (percent)
+      DAILY_LOSS_CAP: "3"         # auto-stop for the day if P/L <= -3%
+      AUTO_PAUSE_ON_ERROR: "true" # fail-safe pause on unrecoverable errors
+
+      # ====== LOGGING / OUTPUT ======
+      LOG_LEVEL: "INFO"
+      KPI_CSV_PATH: ".state/kpi_history.csv"
+      STATE_DIR: ".state"
+
+      # ====== MISC (safe defaults in code if unset) ======
+      TIMEFRAME: "15m"
+      TOPK: "6"                   # if your code uses Top-K autopick
+      COOL_DOWN_MINUTES: "30"
+
+      # ====== DRY RUN BANNER / COMPLIANCE ======
+      SHOW_BANNER: "true"
+
+      # ====== SECRETS INJECTED AT RUNTIME ======
+      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -109,35 +68,58 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
 
-      - name: Install deps
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install ccxt==4.*
+          if [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+          else
+            python -m pip install --upgrade pip
+            pip install ccxt pandas numpy requests python-dateutil
+          fi
 
-      - name: Show run parameters
+      - name: Print mode & guards
         run: |
-          echo "RUN @ $(date -u) UTC"
-          echo "EXCHANGE_ID=$EXCHANGE_ID"
-          echo "QUOTE=$QUOTE"
-          echo "DRY_RUN=$DRY_RUN RUN_SWITCH=$RUN_SWITCH"
-          echo "TOP_K=$TOP_K MAX_POSITIONS=$MAX_POSITIONS MIN_NOTIONAL=$MIN_NOTIONAL"
-          echo "RESERVE_CASH_PCT=$RESERVE_CASH_PCT"
-          echo "ROTATE_WHEN_FULL=$ROTATE_WHEN_FULL MAX_BUYS_PER_RUN=$MAX_BUYS_PER_RUN ROTATE_WHEN_CASH_SHORT=$ROTATE_WHEN_CASH_SHORT"
-          echo "TP_PCT=$TP_PCT SL_PCT=$SL_PCT TSL_PCT=$TSL_PCT"
-          echo "WHITELIST=$SYMBOLS_WHITELIST"
-          echo "EXCLUDE=$SYMBOLS_EXCLUDE"
-          echo "STATE_DIR=$STATE_DIR"
+          echo "Mode: DRY_RUN=${DRY_RUN}, RUN_SWITCH=${RUN_SWITCH}"
+          echo "Dust threshold: DUST_MIN_USD=${DUST_MIN_USD}"
+          echo "Max positions: ${MAX_POSITIONS}, Max buys per run: ${MAX_BUYS_PER_RUN}"
+          echo "Rotate when full: ${ROTATE_WHEN_FULL}, Rotate when cash short: ${ROTATE_WHEN_CASH_SHORT}"
+          echo "Daily loss cap: ${DAILY_LOSS_CAP}%"
+          echo "State dir: ${STATE_DIR}"
 
-      - name: Run bot
-        run: python main.py
+      - name: Run Crypto Live
+        id: runbot
+        run: |
+          mkdir -p "${STATE_DIR}"
+          python -u main.py
 
-      - name: Upload .state artifacts
+      - name: Summarize run
+        if: always()
+        run: |
+          echo "----- SUMMARY -----"
+          if [ -f "${STATE_DIR}/summary.txt" ]; then
+            cat "${STATE_DIR}/summary.txt" || true
+          else
+            echo "No summary.txt found (ok if your script logs to stdout only)."
+          fi
+
+      - name: Upload state & logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: state-${{ github.run_id }}
-          path: .state/**
+          name: crypto-live-state-${{ github.run_id }}
+          path: |
+            .state/**
+            **/run.log
+            **/summary.txt
           if-no-files-found: ignore
