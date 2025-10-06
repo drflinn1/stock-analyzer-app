@@ -1,21 +1,21 @@
-# main.py — Crypto Live with Guard Pack (rotation + sell guards)
+# main.py — Crypto Live with Guard Pack (rotation + sell guards + dust filter)
 # - Auto-pick Top-K by 24h % change (USD quote by default)
 # - Reserve cash, max positions, daily entry cap
-# - Rotation guard to reduce churn (new knobs below)
+# - Rotation guard to reduce churn (knobs below)
 # - Minimal TAKE_PROFIT / STOP_LOSS / TRAILing stop with persistent state
+# - NEW: DUST_MIN_USD filter (ignore tiny positions when counting/rotating)
 #
-# NEW KNOBS (rotation patch):
+# Rotation knobs:
 #   ROTATE_WHEN_FULL:         "false" to prevent churny flips when portfolio is full (default "false")
 #   MAX_BUYS_PER_RUN:         limit new entries/rotations per run (default "1")
 #   ROTATE_WHEN_CASH_SHORT:   if "true", allow targeted rotation when cash is short (default "true")
 #
-# SELL GUARDS (CI looks for tokens: TAKE_PROFIT / STOP_LOSS / TRAIL[ing]):
-#   TP_PCT:   take profit percent (e.g., 5.0). 0 disables TAKE_PROFIT.
-#   SL_PCT:   stop loss percent (e.g., 3.0).    0 disables STOP_LOSS.
-#   TSL_PCT:  trailing stop percent (e.g., 4.0). 0 disables TRAIL / trailing.
+# Sell guards (tokens for CI): TAKE_PROFIT / STOP_LOSS / TRAIL (trailing)
+#   TP_PCT, SL_PCT, TSL_PCT
 #
-# State persisted in .state/positions_state.json:
-#   { "<symbol>": { "entry": float, "peak": float } }
+# Dust:
+#   DUST_MIN_USD: minimum per-position USD value to *count/manage* (default "2")
+#   Positions below this are ignored in counts and rotation decisions.
 
 from __future__ import annotations
 import os, json, time, math, csv
@@ -71,25 +71,24 @@ RESERVE_CASH_PCT = as_float(os.getenv("RESERVE_CASH_PCT"), 0.05)
 DRY_RUN          = as_bool(os.getenv("DRY_RUN"), True)
 RUN_SWITCH       = as_bool(os.getenv("RUN_SWITCH"), True)
 
-# --- SELL GUARDS (these names and comments include CI tokens) ---
-TP_PCT           = as_float(os.getenv("TP_PCT"), 0.0)    # TAKE_PROFIT percent; 0 disables
-SL_PCT           = as_float(os.getenv("SL_PCT"), 0.0)    # STOP_LOSS percent; 0 disables
-TSL_PCT          = as_float(os.getenv("TSL_PCT"), 0.0)   # TRAIL / trailing percent; 0 disables
+# SELL GUARDS (tokens for CI present below)
+TP_PCT           = as_float(os.getenv("TP_PCT"), 0.0)    # TAKE_PROFIT percent
+SL_PCT           = as_float(os.getenv("SL_PCT"), 0.0)    # STOP_LOSS percent
+TSL_PCT          = as_float(os.getenv("TSL_PCT"), 0.0)   # TRAIL / trailing percent
 
 DAILY_LOSS_CAP_PCT  = as_float(os.getenv("DAILY_LOSS_CAP_PCT"), 0.0)
 MAX_DAILY_ENTRIES   = as_int(os.getenv("MAX_DAILY_ENTRIES"), 9999)
 
-# --- NEW (Edit #1): rotation knobs & loop limit ---
+# Rotation knobs
 ROTATE_WHEN_FULL       = as_bool(os.getenv("ROTATE_WHEN_FULL"), False)
 MAX_BUYS_PER_RUN       = as_int(os.getenv("MAX_BUYS_PER_RUN"), 1)
 ROTATE_WHEN_CASH_SHORT = as_bool(os.getenv("ROTATE_WHEN_CASH_SHORT"), True)
 
+# NEW: dust filter
+DUST_MIN_USD        = as_float(os.getenv("DUST_MIN_USD"), 2.0)
+
 STATE_DIR        = os.getenv("STATE_DIR", ".state")
 os.makedirs(STATE_DIR, exist_ok=True)
-
-# Files
-POS_STATE_PATH   = os.path.join(STATE_DIR, "positions_state.json")  # entry/peak per symbol
-KPI_PATH         = os.path.join(STATE_DIR, "kpi_history.csv")
 
 # ---------- CCXT Setup ---------- #
 try:
@@ -117,12 +116,22 @@ def write_json(path: str, obj: Any) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2)
 
-# ---------- Data Fetch ---------- #
+# ---------- Market / Price ---------- #
 
 def load_markets_safe(ex):
     if not getattr(ex, "markets", None):
         ex.load_markets()
     return ex.markets
+
+def fetch_last_price(ex, symbol: str) -> float:
+    t = ex.fetch_ticker(symbol)
+    if t and t.get("last"):
+        return float(t["last"])
+    bid = float(t.get("bid") or 0)
+    ask = float(t.get("ask") or 0)
+    if bid and ask:
+        return (bid+ask)/2
+    raise RuntimeError(f"No price for {symbol}")
 
 def fetch_tickers_24h_change(ex, quote: str) -> List[Tuple[str,float]]:
     tickers = {}
@@ -186,15 +195,23 @@ def get_cash_and_positions(ex, quote: str) -> Tuple[float, Dict[str,float]]:
             positions[sym] = amt_total
     return cash, positions
 
-def fetch_last_price(ex, symbol: str) -> float:
-    t = ex.fetch_ticker(symbol)
-    if t and t.get("last"):
-        return float(t["last"])
-    bid = float(t.get("bid") or 0)
-    ask = float(t.get("ask") or 0)
-    if bid and ask:
-        return (bid+ask)/2
-    raise RuntimeError(f"No price for {symbol}")
+def filter_dust_positions(ex, positions: Dict[str,float], dust_min_usd: float) -> Dict[str,float]:
+    """Keep only positions whose USD value >= dust_min_usd."""
+    if dust_min_usd <= 0:
+        return positions
+    filtered: Dict[str,float] = {}
+    for sym, amt in positions.items():
+        try:
+            price = fetch_last_price(ex, sym)
+            usd_val = amt * price
+            if usd_val >= dust_min_usd:
+                filtered[sym] = amt
+            else:
+                yellow(f"Ignoring dust {sym}: ${usd_val:.2f} < DUST_MIN_USD={dust_min_usd:.2f}")
+        except Exception:
+            # if price fetch fails, keep it (safer) — or skip; choose skip to avoid count inflation
+            yellow(f"Price missing for {sym}; treating as dust and skipping.")
+    return filtered
 
 # ---------- Daily Entry Cap ---------- #
 
@@ -245,6 +262,9 @@ def place_market_sell(ex, symbol: str, amount: float) -> Optional[Dict[str,Any]]
 
 # ---------- Sell Guard State ---------- #
 
+POS_STATE_PATH   = os.path.join(STATE_DIR, "positions_state.json")
+KPI_PATH         = os.path.join(STATE_DIR, "kpi_history.csv")
+
 def load_pos_state() -> Dict[str, Dict[str,float]]:
     return read_json(POS_STATE_PATH, {})
 
@@ -252,7 +272,6 @@ def save_pos_state(state: Dict[str, Dict[str,float]]) -> None:
     write_json(POS_STATE_PATH, state)
 
 def ensure_state_for_holds(state: Dict[str,Dict[str,float]], ex, holds: Dict[str,float]) -> None:
-    """Initialize missing symbols with current price as entry & peak."""
     changed = False
     for sym in holds.keys():
         if sym not in state:
@@ -262,7 +281,7 @@ def ensure_state_for_holds(state: Dict[str,Dict[str,float]], ex, holds: Dict[str
     if changed:
         save_pos_state(state)
 
-# ---------- Sell Rules (contain CI-friendly tokens) ---------- #
+# ---------- Sell Rules (CI token lines present) ---------- #
 
 def apply_take_profit(symbol: str, price: float, entry: float) -> bool:
     """TAKE_PROFIT check — returns True if we should sell."""
@@ -283,7 +302,6 @@ def apply_trailing(symbol: str, price: float, peak: float) -> Tuple[bool, float]
     if TSL_PCT <= 0:
         return (False, max(peak, price))
     new_peak = max(peak, price)
-    # sell if drawdown from peak exceeds TSL_PCT
     if new_peak > 0 and (new_peak - price) / new_peak * 100.0 >= TSL_PCT:
         return (True, new_peak)
     return (False, new_peak)
@@ -325,6 +343,8 @@ def main():
 
     # Portfolio snapshot
     cash, positions = get_cash_and_positions(ex, QUOTE)
+    # Apply dust filter before counting/rotation decisions
+    positions = filter_dust_positions(ex, positions, DUST_MIN_USD)
     pos_count = len(positions)
     green(f"Cash {QUOTE}: {cash:.2f} | Positions: {pos_count}/{MAX_POSITIONS}")
 
@@ -333,7 +353,6 @@ def main():
     ensure_state_for_holds(pos_state, ex, positions)
 
     # ---------- SELL PASS (TAKE_PROFIT / STOP_LOSS / TRAIL) ----------
-    # Evaluate each holding and sell if any guard triggers.
     sells_this_run = 0
     for sym, amt in list(positions.items()):
         price = fetch_last_price(ex, sym)
@@ -341,10 +360,9 @@ def main():
         entry = float(st.get("entry", price))
         peak  = float(st.get("peak", entry))
 
-        # Update peak before checks
         should_trail_sell, new_peak = apply_trailing(sym, price, peak)
         st["peak"] = float(new_peak)
-        pos_state[sym] = st  # write-back; we'll persist later
+        pos_state[sym] = st
 
         tp = apply_take_profit(sym, price, entry)
         sl = apply_stop_loss(sym, price, entry)
@@ -355,7 +373,6 @@ def main():
             yellow(f"{reason}: Selling {sym} @ {price:.6f} (entry {entry:.6f}, peak {new_peak:.6f})")
             place_market_sell(ex, sym, amt)
             sells_this_run += 1
-            # Remove from local views/state
             positions.pop(sym, None)
             pos_state.pop(sym, None)
 
@@ -377,7 +394,6 @@ def main():
         at_capacity = (pos_count >= MAX_POSITIONS)
         need_cash = (usable_cash() < MIN_NOTIONAL)
 
-        # Rotation gating (Edit #3)
         if at_capacity:
             if not ROTATE_WHEN_FULL:
                 if not (need_cash and ROTATE_WHEN_CASH_SHORT):
@@ -392,8 +408,10 @@ def main():
                     positions.pop(worst, None)
                     pos_count -= 1
                     cash, positions2 = get_cash_and_positions(ex, QUOTE)
-                    cash = cash
+                    positions2 = filter_dust_positions(ex, positions2, DUST_MIN_USD)
+                    # refresh local snapshot
                     positions.update(positions2)
+                    # cash updated by re-fetch above
 
         if usable_cash() < MIN_NOTIONAL:
             yellow(f"Not enough usable cash for {sym}; skipping.")
@@ -402,7 +420,6 @@ def main():
         if sym in positions:
             continue
 
-        # Daily entry cap
         if not under_daily_entry_cap():
             yellow("Hit MAX_DAILY_ENTRIES cap for today; no more buys.")
             break
@@ -415,7 +432,6 @@ def main():
             buys_this_run += 1
             pos_count += 1
             bump_daily_entry()
-            # Initialize sell-guard state for new position
             price = fetch_last_price(ex, sym)
             pos_state = load_pos_state()
             pos_state[sym] = {"entry": float(price), "peak": float(price)}
