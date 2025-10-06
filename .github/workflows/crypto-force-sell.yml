@@ -1,0 +1,146 @@
+name: Crypto Force Sell (One-Time)
+
+on:
+  workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: "Preview only (no orders)"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true","false"]
+      MIN_COST_PER_ORDER:
+        description: "Min notional per order (USD)"
+        required: true
+        default: "5.0"
+        type: string
+      MAX_SPREAD_BPS:
+        description: "Skip markets wider than this (bps)"
+        required: true
+        default: "200"
+        type: string
+      SELL_EPS:
+        description: "Sell ≤ this fraction of free balance"
+        required: true
+        default: "0.995"
+        type: string
+      DUST_IGNORE_BELOW_USD:
+        description: "Ignore tiny positions below this USD value"
+        required: true
+        default: "1.00"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crypto-force-sell
+  cancel-in-progress: false
+
+jobs:
+  liquidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check Kraken secrets
+        shell: bash
+        run: |
+          if [[ -z "${{ secrets.KRAKEN_API_KEY }}" || -z "${{ secrets.KRAKEN_API_SECRET }}" ]]; then
+            echo "::error title=Missing secrets::Add KRAKEN_API_KEY and KRAKEN_API_SECRET in repo settings."
+            exit 1
+          fi
+          echo "Kraken secrets detected."
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt
+
+      - name: Force sell all non-USD
+        env:
+          EXCHANGE: kraken
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          DRY_RUN: ${{ inputs.DRY_RUN }}
+          MIN_COST_PER_ORDER: ${{ inputs.MIN_COST_PER_ORDER }}
+          MAX_SPREAD_BPS: ${{ inputs.MAX_SPREAD_BPS }}
+          SELL_EPS: ${{ inputs.SELL_EPS }}
+          DUST_IGNORE_BELOW_USD: ${{ inputs.DUST_IGNORE_BELOW_USD }}
+          IGNORE_TICKERS: "USDT,USDC,USD,EUR,GBP"
+        run: |
+          python - <<'PY'
+          import os, math
+          import ccxt
+
+          EX = os.getenv("EXCHANGE","kraken")
+          DRY = (os.getenv("DRY_RUN","true").lower()=="true")
+          MIN_COST = float(os.getenv("MIN_COST_PER_ORDER","5.0"))
+          MAX_SPREAD = float(os.getenv("MAX_SPREAD_BPS","200"))
+          SELL_EPS = float(os.getenv("SELL_EPS","0.995"))
+          DUST = float(os.getenv("DUST_IGNORE_BELOW_USD","1.0"))
+          IGNORE = set(s.strip().upper() for s in (os.getenv("IGNORE_TICKERS") or "").split(",") if s.strip())
+
+          ex = ccxt.kraken({
+              "apiKey": os.getenv("KRAKEN_API_KEY",""),
+              "secret": os.getenv("KRAKEN_API_SECRET",""),
+              "enableRateLimit": True,
+              "options": {"adjustForTimeDifference": True},
+          })
+          ex.load_markets()
+
+          bal = ex.fetch_balance()
+          total = bal.get("total") or {}
+          free  = bal.get("free") or {}
+
+          plan = []
+          for a, amt in total.items():
+              a = a.upper()
+              if not amt or a in IGNORE: 
+                  continue
+              sym = f"{a}/USD"
+              if sym not in ex.markets:
+                  print(f"[SKIP] {a}: no USD market")
+                  continue
+              t = ex.fetch_ticker(sym)
+              bid = t.get("bid") or t.get("last") or 0.0
+              ask = t.get("ask") or 0.0
+              if bid and ask:
+                  bps = (ask - bid) / ((ask + bid)/2.0) * 1e4
+                  if bps > MAX_SPREAD:
+                      print(f"[SKIP] {a}: spread {bps:.0f} bps > {MAX_SPREAD}")
+                      continue
+              px = bid or 0.0
+              notional = float(amt) * px
+              m = ex.market(sym)
+              min_cost = float(((m.get("limits") or {}).get("cost") or {}).get("min") or 0.0)
+              floor = max(MIN_COST, min_cost)
+              if notional < max(floor, DUST):
+                  print(f"[SKIP] {a}: notional ${notional:.2f} < floor ${floor:.2f} or dust < ${DUST:.2f}")
+                  continue
+              prec = (m.get("precision") or {}).get("amount", 8)
+              sell_amt = (free.get(a, amt) or 0.0) * SELL_EPS
+              sell_amt = math.floor(sell_amt * (10**prec)) / (10**prec)
+              if sell_amt <= 0:
+                  print(f"[SKIP] {a}: zero sellable amount")
+                  continue
+              plan.append((sym, sell_amt))
+
+          print(f"[PLAN] {len(plan)} sells:")
+          for sym, amt in plan:
+              print(f"  SELL {sym} amount={amt}")
+
+          if DRY:
+              print("[DRY-RUN] No orders sent.")
+          else:
+              for sym, amt in plan:
+                  try:
+                      print(f"[EXEC] SELL {sym} amount={amt}")
+                      ex.create_order(symbol=sym, type="market", side="sell", amount=amt)
+                  except Exception as e:
+                      print(f"[ERROR] {sym}: {e}")
+          PY
