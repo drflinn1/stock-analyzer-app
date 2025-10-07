@@ -5,6 +5,7 @@ on:
     - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
+      # --- master gates ---
       RUN_SWITCH:
         description: "Set to ON to allow live trading (otherwise skip)"
         default: "ON"
@@ -14,12 +15,50 @@ on:
       RISK_OVERRIDE:
         description: "Force risk gate: ON or OFF (leave blank to auto-compute)"
         default: ""
+
+      # --- portfolio sizing ---
       MAX_POSITIONS:
         description: "Max concurrent positions"
         default: "6"
+      MAX_BUYS_PER_RUN:
+        description: "Max new buys per run"
+        default: "1"
+      ALLOC_USD_PER_TRADE:
+        description: "Fixed USD per buy (blank = auto split)"
+        default: ""
+      MIN_TRADE_USD:
+        description: "Minimum USD per order"
+        default: "8"
       DUST_MIN_USD:
-        description: "Treat balances under this USD as dust"
+        description: "Treat positions under this USD as dust"
         default: "2"
+
+      # --- rotation behavior ---
+      EDGE_DELTA_PCT:
+        description: "Rotate if candidate beats worst hold by this %"
+        default: "5"
+      ROTATE_WHEN_FULL:
+        description: "When at MAX_POSITIONS, allow rotation"
+        default: "true"
+      ROTATE_WHEN_CASH_SHORT:
+        description: "Rotate when cash < MIN_TRADE_USD"
+        default: "true"
+
+      # --- protection knobs (SELL LOGIC) ---
+      SL_PCT:
+        description: "STOP_LOSS percent (e.g., 0.04 = 4%)"
+        default: "0.04"
+      TRAIL_PCT:
+        description: "TRAILING percent from high (e.g., 0.035 = 3.5%)"
+        default: "0.035"
+      TP1_PCT:
+        description: "TAKE_PROFIT #1 trigger (e.g., 0.05 = +5%)"
+        default: "0.05"
+      TP1_SIZE:
+        description: "Fraction to sell on TP1 (0..1)"
+        default: "0.25"
+
+      # --- screener filters (Kraken/USD) ---
       SCREENER_TOP_N:
         description: "How many top-strength coins to show"
         default: "12"
@@ -27,21 +66,44 @@ on:
         description: "Minimum 24h quote volume (USD) for screener"
         default: "50000"
       SPREAD_MAX_PCT:
-        description: "Max allowed spread % for screener"
+        description: "Max allowed spread % for screener & trading"
         default: "0.60"
+      MIN_NOTIONAL_USD:
+        description: "Skip pairs whose min cost > this USD"
+        default: "5"
 
 env:
+  # gates
   RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
   DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
   RISK_OVERRIDE: ${{ inputs.RISK_OVERRIDE || '' }}
+
+  # sizing
   MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || '6' }}
+  MAX_BUYS_PER_RUN: ${{ inputs.MAX_BUYS_PER_RUN || '1' }}
+  ALLOC_USD_PER_TRADE: ${{ inputs.ALLOC_USD_PER_TRADE || '' }}
+  MIN_TRADE_USD: ${{ inputs.MIN_TRADE_USD || '8' }}
   DUST_MIN_USD: ${{ inputs.DUST_MIN_USD || '2' }}
-  RESERVE_CASH_USD: "0"
-  MAX_BUYS_PER_RUN: "1"
-  ROTATE_WHEN_CASH_SHORT: "true"
+
+  # rotation
+  EDGE_DELTA_PCT: ${{ inputs.EDGE_DELTA_PCT || '5' }}
+  ROTATE_WHEN_FULL: ${{ inputs.ROTATE_WHEN_FULL || 'true' }}
+  ROTATE_WHEN_CASH_SHORT: ${{ inputs.ROTATE_WHEN_CASH_SHORT || 'true' }}
+
+  # protection (sell logic)
+  SL_PCT: ${{ inputs.SL_PCT || '0.04' }}
+  TRAIL_PCT: ${{ inputs.TRAIL_PCT || '0.035' }}
+  TP1_PCT: ${{ inputs.TP1_PCT || '0.05' }}
+  TP1_SIZE: ${{ inputs.TP1_SIZE || '0.25' }}
+
+  # screener filters
   SCREENER_TOP_N: ${{ inputs.SCREENER_TOP_N || '12' }}
   MIN_QVOL_USD: ${{ inputs.MIN_QVOL_USD || '50000' }}
   SPREAD_MAX_PCT: ${{ inputs.SPREAD_MAX_PCT || '0.60' }}
+  MIN_NOTIONAL_USD: ${{ inputs.MIN_NOTIONAL_USD || '5' }}
+
+  # misc
+  RESERVE_CASH_USD: "0"
   PYTHONUNBUFFERED: "1"
 
 jobs:
@@ -76,7 +138,7 @@ jobs:
             pip install ccxt numpy pandas
           fi
 
-      # ---- Compute risk signal -----------------------------------------------
+      # ---- Compute risk signal (breadth-based) -------------------------------
       - name: Compute Risk Signal
         id: risk
         env:
@@ -110,15 +172,13 @@ jobs:
                   for sym in basket:
                       try:
                           t = ex.fetch_ticker(sym)
-                          pct = None
-                          if isinstance(t.get("percentage"), (int,float)):
-                              pct = float(t["percentage"])
-                          else:
+                          pct = t.get("percentage")
+                          if pct is None:
                               last, open_ = t.get("last"), t.get("open")
                               if isinstance(last,(int,float)) and isinstance(open_,(int,float)) and open_:
                                   pct = (last/open_ - 1.0)*100.0
                           detail[sym] = pct
-                          if pct is not None and pct > 0: positives += 1
+                          if isinstance(pct,(int,float)) and pct > 0: positives += 1
                       except Exception:
                           detail[sym] = None
                   result["risk"] = "ON" if positives >= 3 else "OFF"
@@ -151,79 +211,60 @@ jobs:
             echo "- **DRY_RUN**: ${DRY_RUN}"
             echo "- **MAX_POSITIONS**: ${MAX_POSITIONS}"
             echo "- **DUST_MIN_USD**: ${DUST_MIN_USD}"
+            echo "- **SL_PCT**: ${SL_PCT}  **TRAIL_PCT**: ${TRAIL_PCT}  **TP1_PCT**: ${TP1_PCT}  **TP1_SIZE**: ${TP1_SIZE}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---- Market Strength Screener (always runs) ----------------------------
+      # ---- Market Strength Screener (always) ---------------------------------
       - name: Market Strength Screener (Kraken USD)
         env:
           TOP_N: ${{ env.SCREENER_TOP_N }}
           MIN_QVOL_USD: ${{ env.MIN_QVOL_USD }}
           SPREAD_MAX_PCT: ${{ env.SPREAD_MAX_PCT }}
+          MIN_NOTIONAL_USD: ${{ env.MIN_NOTIONAL_USD }}
         run: |
           python - <<'PY'
-          import os, json, math
-          TOP_N = int(os.getenv("TOP_N","12"))
-          MIN_QVOL = float(os.getenv("MIN_QVOL_USD","50000"))
-          MAX_SPREAD = float(os.getenv("SPREAD_MAX_PCT","0.60"))
-          import ccxt, pathlib
-          ex = ccxt.kraken()
-          markets = ex.load_markets()
-          # USD spot only; skip stables/fiat bases
-          skip_bases = {"USDT","USDC","EUR","GBP","USD"}
-          symbols = []
+          import os, json, math, pathlib
+          TOP_N=int(os.getenv("TOP_N","12")); MIN_QVOL=float(os.getenv("MIN_QVOL_USD","50000"))
+          MAX_SPREAD=float(os.getenv("SPREAD_MAX_PCT","0.60")); MIN_COST=float(os.getenv("MIN_NOTIONAL_USD","5"))
+          import ccxt
+          ex=ccxt.kraken(); markets=ex.load_markets()
+          skip_bases={"USDT","USDC","EUR","GBP","USD"}
+          syms=[]
           for m in markets.values():
-              if not m.get("active", True): 
-                  continue
-              if m.get("spot") and m.get("quote") == "USD":
-                  base = m.get("base","")
-                  if base not in skip_bases:
-                      symbols.append(m["symbol"])
-          rows = []
-          for sym in symbols:
+              if m.get("spot") and m.get("quote")=="USD":
+                  if m.get("base") not in skip_bases:
+                      # respect min cost
+                      min_cost=((m.get("limits") or {}).get("cost") or {}).get("min")
+                      if isinstance(min_cost,(int,float)) and min_cost and min_cost>MIN_COST: 
+                          continue
+                      syms.append(m["symbol"])
+          rows=[]
+          for s in syms:
               try:
-                  t = ex.fetch_ticker(sym)
-                  last = t.get("last")
-                  open_ = t.get("open")
-                  pct = t.get("percentage")
+                  t=ex.fetch_ticker(s)
+                  last=t.get("last"); open_=t.get("open")
+                  pct=t.get("percentage")
                   if pct is None and isinstance(last,(int,float)) and isinstance(open_,(int,float)) and open_:
-                      pct = (last/open_ - 1.0)*100.0
-                  bid, ask = t.get("bid"), t.get("ask")
-                  spread = None
-                  if isinstance(bid,(int,float)) and isinstance(ask,(int,float)) and (bid>0 and ask>0):
-                      mid = (bid+ask)/2.0
-                      if mid>0:
-                          spread = (ask-bid)/mid*100.0
-                  qvol = t.get("quoteVolume")
-                  if qvol is None:
-                      bv = t.get("baseVolume")
-                      if isinstance(bv,(int,float)) and isinstance(last,(int,float)):
-                          qvol = bv*last
-                  if qvol is None:
-                      qvol = 0.0
-                  # filters
-                  if spread is not None and spread > MAX_SPREAD: 
+                      pct=(last/open_-1)*100.0
+                  bid,ask=t.get("bid"),t.get("ask"); spread=None
+                  if isinstance(bid,(int,float)) and isinstance(ask,(int,float)) and bid>0 and ask>0:
+                      mid=(bid+ask)/2; 
+                      if mid>0: spread=(ask-bid)/mid*100.0
+                  qvol=t.get("quoteVolume") or 0.0
+                  if spread is not None and spread>MAX_SPREAD: 
                       continue
-                  if qvol < MIN_QVOL: 
+                  if qvol<MIN_QVOL: 
                       continue
-                  rows.append({
-                      "symbol": sym,
-                      "pct": pct if pct is not None else -9999,
-                      "last": last,
-                      "spread": spread,
-                      "qvol": qvol
-                  })
+                  rows.append({"symbol":s,"pct":pct if pct is not None else -9999,"last":last,"spread":spread,"qvol":qvol})
               except Exception:
                   pass
-          rows.sort(key=lambda r: (r["pct"] if r["pct"] is not None else -9999), reverse=True)
-          top = rows[:TOP_N]
+          rows.sort(key=lambda r: r["pct"], reverse=True)
+          top=rows[:TOP_N]
           pathlib.Path(".state").mkdir(exist_ok=True)
           (pathlib.Path(".state")/"top_candidates.json").write_text(json.dumps(top, indent=2))
-          # Write table to job summary
-          def fmt(v, nd=2):
-              return "-" if v is None or (isinstance(v,float) and math.isnan(v)) else (f"{v:.{nd}f}" if isinstance(v,(int,float)) else str(v))
-          lines = ["## Screener — Top Strength (Kraken USD)","",
-                   f"Filters: MIN_QVOL_USD≥{MIN_QVOL:.0f}, SPREAD≤{MAX_SPREAD:.2f}%","","| # | Symbol | 24h % | Last | Spread % | 24h $Vol |",
-                   "|---:|:------|------:|-----:|--------:|--------:|"]
+          lines=["## Screener — Top Strength (Kraken USD)","","| # | Symbol | 24h % | Last | Spread % | 24h $Vol |","|---:|:------|------:|-----:|--------:|--------:|"]
+          def fmt(v,nd=2):
+              return "-" if v is None else (f"{v:.{nd}f}" if isinstance(v,(int,float)) else str(v))
           for i,r in enumerate(top,1):
               lines.append(f"| {i} | {r['symbol']} | {fmt(r['pct'])} | {fmt(r['last'])} | {fmt(r['spread'])} | {fmt(r['qvol'],0)} |")
           with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as fh:
@@ -239,11 +280,33 @@ jobs:
       - name: Run bot (main.py)
         if: ${{ env.RUN_SWITCH == 'ON' && steps.risk.outputs.risk == 'ON' }}
         env:
+          # gates
           DRY_RUN: ${{ env.DRY_RUN }}
+
+          # sizing
           MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
+          MAX_BUYS_PER_RUN: ${{ env.MAX_BUYS_PER_RUN }}
+          ALLOC_USD_PER_TRADE: ${{ env.ALLOC_USD_PER_TRADE }}
+          MIN_TRADE_USD: ${{ env.MIN_TRADE_USD }}
           DUST_MIN_USD: ${{ env.DUST_MIN_USD }}
+
+          # rotation
+          EDGE_DELTA_PCT: ${{ env.EDGE_DELTA_PCT }}
+          ROTATE_WHEN_FULL: ${{ env.ROTATE_WHEN_FULL }}
+          ROTATE_WHEN_CASH_SHORT: ${{ env.ROTATE_WHEN_CASH_SHORT }}
+
+          # protection
+          SL_PCT: ${{ env.SL_PCT }}
+          TRAIL_PCT: ${{ env.TRAIL_PCT }}
+          TP1_PCT: ${{ env.TP1_PCT }}
+          TP1_SIZE: ${{ env.TP1_SIZE }}
+
+          # filters shared with screener
+          SPREAD_MAX_PCT: ${{ env.SPREAD_MAX_PCT }}
+          MIN_NOTIONAL_USD: ${{ env.MIN_NOTIONAL_USD }}
         run: |
-          echo "🚧 DRY_RUN=${DRY_RUN} — MAX_POSITIONS=${MAX_POSITIONS} — DUST_MIN_USD=${DUST_MIN_USD}"
+          echo "🚧 DRY_RUN=${DRY_RUN} — MAX_POSITIONS=${MAX_POSITIONS} — MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}"
+          echo "SL=${SL_PCT} TRAIL=${TRAIL_PCT} TP1=${TP1_PCT} x ${TP1_SIZE}"
           if [ -f ./main.py ]; then
             python ./main.py
           elif [ -f trader/main.py ]; then
