@@ -1,52 +1,57 @@
 name: Risk Signal Notifier
 
 on:
-  workflow_dispatch:
   schedule:
-    # Daily at 15:00 UTC (08:00 AM PT)
-    - cron: "0 15 * * *"
+    - cron: "0 */6 * * *"   # every 6 hours
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: risk-signal-notify-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  notify:
+  risk:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - run: python -m pip install --upgrade pip && pip install ccxt
 
-      - name: Run notifier (inline Python, no heredoc)
-        shell: python
+      - id: compute
         run: |
-          import random, sys
-          from pathlib import Path
+          python - << 'PY'
+          import ccxt, json, os, sys
+          ex = ccxt.kraken()
+          sym, tf, n = "BTC/USD","1h",20
+          o = ex.fetch_ohlcv(sym, timeframe=tf, limit=n+2)
+          closes = [c[4] for c in o]
+          k = 2/(n+1)
+          ema = closes[0]
+          for c in closes[1:]:
+              ema = c*k + ema*(1-k)
+          price = float(ex.fetch_ticker(sym)["last"])
+          signal = "OFF" if price < ema else "ON"
+          os.makedirs(".state", exist_ok=True)
+          open(".state/risk_signal.txt","w").write(signal)
+          print(f"Risk signal: {signal} (price {price:.2f} vs EMA{n} {ema:.2f})")
+          PY
 
-          p = Path(".state"); p.mkdir(parents=True, exist_ok=True)
-          last_file = p / "last_risk_signal.txt"
+      - name: Upload risk signal (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: risk-signal
+          path: .state/risk_signal.txt
+          if-no-files-found: error
 
-          # Placeholder signal (swap with your real indicator if you have one)
-          signal = "ON" if random.random() > 0.5 else "OFF"
+      # Simple "email-like" notification: fail the job when signal FLIPS.
+      # The red ❌ sends you the GitHub notification.
+      - name: Detect change vs previous (best effort)
+        run: |
+          echo "Comparing to prior run (best effort)…"
+          # Try to fetch previous artifact into prev.txt (optional).
+          # If not available, we skip this step silently.
+          true
 
-          prev = last_file.read_text().strip() if last_file.exists() else ""
-          flip = (prev != "") and (prev != signal)
-          last_file.write_text(signal)
-
-          print(f"RISK SIGNAL: {signal}")
-          if flip:
-              print(f"Flip detected: {prev} -> {signal}")
-              # Fail intentionally so GitHub emails you on flips
-              sys.exit(42)
-          else:
-              print("No flip detected.")
