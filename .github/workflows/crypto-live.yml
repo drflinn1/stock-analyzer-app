@@ -27,21 +27,14 @@ on:
         default: "2"
 
 env:
-  # --- Global toggles (safe defaults) ---
   RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
   DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
   RISK_OVERRIDE: ${{ inputs.RISK_OVERRIDE || '' }}
-
-  # --- Trading knobs (your bot reads these) ---
   MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || '6' }}
   DUST_MIN_USD: ${{ inputs.DUST_MIN_USD || '2' }}
-
-  # --- Optional: reserve cash, etc. (your bot can read these if present) ---
   RESERVE_CASH_USD: "0"
   MAX_BUYS_PER_RUN: "1"
   ROTATE_WHEN_CASH_SHORT: "true"
-
-  # Make logs clearer
   PYTHONUNBUFFERED: "1"
 
 jobs:
@@ -73,126 +66,92 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            # minimal deps for risk compute + ccxt access
             pip install ccxt numpy pandas
           fi
 
-      # ------------------------------------------------------------------
-      # RISK: compute ON/OFF inside this job (no artifacts needed)
-      # Simple, robust rule:
-      #   - Pull 24h change for a small breadth basket (BTC, ETH, SOL, DOGE)
-      #   - Count how many are positive; if >= 3 → RISK=ON else OFF
-      #   - If the exchange symbol differs (XBT/USD vs BTC/USD), we map it.
-      #   - If anything fails, default to OFF (safe).
-      # You can refine this anytime; your trading code doesn't change.
-      # ------------------------------------------------------------------
       - name: Compute Risk Signal
         id: risk
         env:
           RISK_OVERRIDE: ${{ env.RISK_OVERRIDE }}
         run: |
           python - <<'PY'
-          import os, json, sys
-          result = {"risk":"OFF", "reason":"default"}
-          override = os.getenv("RISK_OVERRIDE","").strip().upper()
-          if override in ("ON","OFF"):
+          import os, json
+          result = {"risk": "OFF", "reason": "default"}
+          override = os.getenv("RISK_OVERRIDE", "").strip().upper()
+          if override in ("ON", "OFF"):
               result["risk"] = override
               result["reason"] = "override"
           else:
               try:
                   import ccxt
                   ex = ccxt.kraken()
-                  # Map to Kraken symbol conventions when needed
-                  candidates = ["BTC/USD","XBT/USD","ETH/USD","SOL/USD","DOGE/USD"]
-                  wanted     = {"BTC":"", "ETH":"", "SOL":"", "DOGE":""}
-                  # Probe which symbols exist
                   markets = ex.load_markets()
+                  candidates = ["BTC/USD", "XBT/USD", "ETH/USD", "SOL/USD", "DOGE/USD"]
+                  wanted = {"BTC":"", "ETH":"", "SOL":"", "DOGE":""}
                   for s in candidates:
                       base = s.split("/")[0].replace("XBT","BTC")
                       if s in markets and base in wanted and not wanted[base]:
                           wanted[base] = s
-                  # Fallbacks if some not found
                   if not wanted["BTC"]:
                       wanted["BTC"] = "XBT/USD" if "XBT/USD" in markets else "BTC/USD"
                   for k in ("ETH","SOL","DOGE"):
                       if not wanted[k]:
                           wanted[k] = f"{k}/USD"
-
                   basket = [wanted["BTC"], wanted["ETH"], wanted["SOL"], wanted["DOGE"]]
                   positives = 0
                   detail = {}
                   for sym in basket:
                       try:
                           t = ex.fetch_ticker(sym)
-                          # CCXT typical: t['percentage'] is 24h % change if available
                           pct = None
                           if isinstance(t.get("percentage"), (int,float)):
                               pct = float(t["percentage"])
                           else:
-                              # derive from last/close values if needed
                               last, open_ = t.get("last"), t.get("open")
                               if isinstance(last,(int,float)) and isinstance(open_,(int,float)) and open_:
                                   pct = (last/open_ - 1.0)*100.0
                           detail[sym] = pct
-                          if pct is not None and pct > 0.0:
+                          if pct and pct > 0:
                               positives += 1
-                      except Exception as e:
+                      except Exception:
                           detail[sym] = None
-
-                  # Risk ON if >=3 of 4 basket coins green on 24h
                   result["risk"] = "ON" if positives >= 3 else "OFF"
                   result["reason"] = f"{positives}/4 green"
                   result["detail"] = detail
               except Exception as e:
                   result["risk"] = "OFF"
                   result["reason"] = f"error:{type(e).__name__}"
-
-          # Emit summary + output
           print("RISK_SIGNAL_COMPUTE =>", json.dumps(result, indent=2))
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write(f"risk={result['risk']}\n")
               fh.write(f"reason={result['reason']}\n")
-          # Also write to workspace for your bot, if it wants to read it
-          try:
-              import pathlib, json
-              pathlib.Path(".state").mkdir(exist_ok=True)
-              pathlib.Path(".state/last_risk_signal.txt").write_text(result["risk"])
-              pathlib.Path(".state/last_risk_detail.json").write_text(json.dumps(result, indent=2))
-          except Exception:
-              pass
+          os.makedirs(".state", exist_ok=True)
+          open(".state/last_risk_signal.txt","w").write(result["risk"])
+          open(".state/last_risk_detail.json","w").write(json.dumps(result, indent=2))
           PY
 
       - name: Show computed risk
         run: |
           echo "Computed risk: ${{ steps.risk.outputs.risk }} (reason: ${{ steps.risk.outputs.reason }})"
 
-      # Guard 1: Master switch to quickly pause everything
       - name: Guard — RUN_SWITCH must be ON
         if: env.RUN_SWITCH != 'ON'
         run: |
           echo "RUN_SWITCH is ${RUN_SWITCH}; exiting (no trading)."
           exit 0
 
-      # Guard 2: Risk gate (skip trading when risk is OFF)
       - name: Guard — Risk must be ON
         if: steps.risk.outputs.risk != 'ON'
         run: |
-          echo "Risk is ${ { steps.risk.outputs.risk } }; skipping trading run."
+          echo "Risk is ${{ steps.risk.outputs.risk }}; skipping trading run."
           exit 0
 
-      # Optional: sweep dust before trading
       - name: Sweep Dust (optional)
         run: |
           echo "Sweeping dust < ${DUST_MIN_USD} USD (if your bot implements it)..."
-          # Your bot can read DUST_MIN_USD and perform the sweep
 
-      # ---- Run your trading bot ------------------------------------------------
-      # If your entrypoint is repo-root main.py, this just works.
-      # It will see DRY_RUN, MAX_POSITIONS, etc. from env.
       - name: Run bot (main.py)
         env:
-          # Exchange/Broker creds should come from GitHub Secrets/Env
-          # e.g., KRAKEN_API_KEY, KRAKEN_API_SECRET, etc.
           DRY_RUN: ${{ env.DRY_RUN }}
           MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
           DUST_MIN_USD: ${{ env.DUST_MIN_USD }}
@@ -207,7 +166,6 @@ jobs:
             exit 1
           fi
 
-      # Save outputs/logs your bot may have written
       - name: Upload .state artifacts
         if: always()
         uses: actions/upload-artifact@v4
