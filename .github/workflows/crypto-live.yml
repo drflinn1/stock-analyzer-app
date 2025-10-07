@@ -183,7 +183,10 @@ jobs:
         with:
           name: state-${{ github.run_id }}
           path: |
+            .state/last_risk_signal.txt
+            .state/last_risk_reason.txt
+            .state/last_risk_detail.json
             .state/**
             **/kpi_history.csv
             **/spec_gate_report.txt
-          if-no-files-found: ignore
+          if-no-files-found: warn
