@@ -27,18 +27,14 @@ on:
         default: "2"
 
 env:
-  # Global toggles (safe defaults)
   RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
   DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
   RISK_OVERRIDE: ${{ inputs.RISK_OVERRIDE || '' }}
-
-  # Trading knobs your bot reads
   MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || '6' }}
   DUST_MIN_USD: ${{ inputs.DUST_MIN_USD || '2' }}
   RESERVE_CASH_USD: "0"
   MAX_BUYS_PER_RUN: "1"
   ROTATE_WHEN_CASH_SHORT: "true"
-
   PYTHONUNBUFFERED: "1"
 
 jobs:
@@ -73,7 +69,7 @@ jobs:
             pip install ccxt numpy pandas
           fi
 
-      # ---- Compute risk inside the job (no artifacts needed) -----------------
+      # ---- Compute risk signal -----------------------------------------------
       - name: Compute Risk Signal
         id: risk
         env:
@@ -129,9 +125,10 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write(f"risk={result['risk']}\n")
               fh.write(f"reason={result['reason']}\n")
-          # Persist to workspace for your bot or later inspection
+          # Always create .state for artifacts
           os.makedirs(".state", exist_ok=True)
           open(".state/last_risk_signal.txt","w").write(result["risk"])
+          open(".state/last_risk_reason.txt","w").write(result["reason"])
           open(".state/last_risk_detail.json","w").write(json.dumps(result, indent=2))
           PY
 
@@ -152,7 +149,12 @@ jobs:
             echo "- **DUST_MIN_USD**: ${DUST_MIN_USD}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---- Everything below only runs when BOTH switches are ON --------------
+      - name: List workspace for debugging
+        run: |
+          echo "Current workspace structure:"
+          ls -R . || true
+
+      # ---- Run bot only when allowed ----------------------------------------
       - name: Sweep Dust (optional)
         if: ${{ env.RUN_SWITCH == 'ON' && steps.risk.outputs.risk == 'ON' }}
         run: |
@@ -182,8 +184,6 @@ jobs:
           name: state-${{ github.run_id }}
           path: |
             .state/**
-            .state/*.txt
-            .state/*.json
             **/kpi_history.csv
             **/spec_gate_report.txt
           if-no-files-found: ignore
