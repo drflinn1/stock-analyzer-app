@@ -5,7 +5,6 @@ on:
     - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
-      # --- master gates ---
       RUN_SWITCH:
         description: "Set to ON to allow live trading (otherwise skip)"
         default: "ON"
@@ -15,95 +14,53 @@ on:
       RISK_OVERRIDE:
         description: "Force risk gate: ON or OFF (leave blank to auto-compute)"
         default: ""
-
-      # --- portfolio sizing ---
       MAX_POSITIONS:
         description: "Max concurrent positions"
         default: "6"
       MAX_BUYS_PER_RUN:
         description: "Max new buys per run"
         default: "1"
-      ALLOC_USD_PER_TRADE:
-        description: "Fixed USD per buy (blank = auto split)"
-        default: ""
-      MIN_TRADE_USD:
-        description: "Minimum USD per order"
-        default: "8"
       DUST_MIN_USD:
         description: "Treat positions under this USD as dust"
         default: "2"
-
-      # --- rotation behavior ---
       EDGE_DELTA_PCT:
         description: "Rotate if candidate beats worst hold by this %"
         default: "5"
-      ROTATE_WHEN_FULL:
-        description: "When at MAX_POSITIONS, allow rotation"
-        default: "true"
-      ROTATE_WHEN_CASH_SHORT:
-        description: "Rotate when cash < MIN_TRADE_USD"
-        default: "true"
-
-      # --- protection knobs (SELL LOGIC) ---
-      SL_PCT:
-        description: "STOP_LOSS percent (e.g., 0.04 = 4%)"
-        default: "0.04"
-      TRAIL_PCT:
-        description: "TRAILING percent from high (e.g., 0.035 = 3.5%)"
-        default: "0.035"
-      TP1_PCT:
-        description: "TAKE_PROFIT #1 trigger (e.g., 0.05 = +5%)"
-        default: "0.05"
-      TP1_SIZE:
-        description: "Fraction to sell on TP1 (0..1)"
-        default: "0.25"
-
-      # --- screener filters (Kraken/USD) ---
-      SCREENER_TOP_N:
-        description: "How many top-strength coins to show"
-        default: "12"
-      MIN_QVOL_USD:
-        description: "Minimum 24h quote volume (USD) for screener"
-        default: "50000"
-      SPREAD_MAX_PCT:
-        description: "Max allowed spread % for screener & trading"
-        default: "0.60"
-      MIN_NOTIONAL_USD:
-        description: "Skip pairs whose min cost > this USD"
-        default: "5"
+      PROTECT_JSON:
+        description: 'Sell logic JSON. Ex: {"SL_PCT":0.04,"TRAIL_PCT":0.035,"TP1_PCT":0.05,"TP1_SIZE":0.25}'
+        default: '{"SL_PCT":0.04,"TRAIL_PCT":0.035,"TP1_PCT":0.05,"TP1_SIZE":0.25}'
+      ADVANCED_JSON:
+        description: 'Advanced JSON. Ex: {"MIN_TRADE_USD":8,"ALLOC_USD_PER_TRADE":"","SCREENER_TOP_N":12,"MIN_QVOL_USD":50000,"SPREAD_MAX_PCT":0.60,"MIN_NOTIONAL_USD":5,"ROTATE_WHEN_FULL":true,"ROTATE_WHEN_CASH_SHORT":true}'
+        default: '{"MIN_TRADE_USD":8,"ALLOC_USD_PER_TRADE":"","SCREENER_TOP_N":12,"MIN_QVOL_USD":50000,"SPREAD_MAX_PCT":0.60,"MIN_NOTIONAL_USD":5,"ROTATE_WHEN_FULL":true,"ROTATE_WHEN_CASH_SHORT":true}'
 
 env:
-  # gates
+  # core gates
   RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
   DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
   RISK_OVERRIDE: ${{ inputs.RISK_OVERRIDE || '' }}
 
-  # sizing
+  # sizing/rotation essentials
   MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || '6' }}
   MAX_BUYS_PER_RUN: ${{ inputs.MAX_BUYS_PER_RUN || '1' }}
-  ALLOC_USD_PER_TRADE: ${{ inputs.ALLOC_USD_PER_TRADE || '' }}
-  MIN_TRADE_USD: ${{ inputs.MIN_TRADE_USD || '8' }}
   DUST_MIN_USD: ${{ inputs.DUST_MIN_USD || '2' }}
-
-  # rotation
   EDGE_DELTA_PCT: ${{ inputs.EDGE_DELTA_PCT || '5' }}
-  ROTATE_WHEN_FULL: ${{ inputs.ROTATE_WHEN_FULL || 'true' }}
-  ROTATE_WHEN_CASH_SHORT: ${{ inputs.ROTATE_WHEN_CASH_SHORT || 'true' }}
 
-  # protection (sell logic)
-  SL_PCT: ${{ inputs.SL_PCT || '0.04' }}
-  TRAIL_PCT: ${{ inputs.TRAIL_PCT || '0.035' }}
-  TP1_PCT: ${{ inputs.TP1_PCT || '0.05' }}
-  TP1_SIZE: ${{ inputs.TP1_SIZE || '0.25' }}
+  # defaults (may be overridden by JSON step below)
+  MIN_TRADE_USD: "8"
+  ALLOC_USD_PER_TRADE: ""
+  SCREENER_TOP_N: "12"
+  MIN_QVOL_USD: "50000"
+  SPREAD_MAX_PCT: "0.60"
+  MIN_NOTIONAL_USD: "5"
+  ROTATE_WHEN_FULL: "true"
+  ROTATE_WHEN_CASH_SHORT: "true"
 
-  # screener filters
-  SCREENER_TOP_N: ${{ inputs.SCREENER_TOP_N || '12' }}
-  MIN_QVOL_USD: ${{ inputs.MIN_QVOL_USD || '50000' }}
-  SPREAD_MAX_PCT: ${{ inputs.SPREAD_MAX_PCT || '0.60' }}
-  MIN_NOTIONAL_USD: ${{ inputs.MIN_NOTIONAL_USD || '5' }}
+  # sell logic defaults (may be overridden)
+  SL_PCT: "0.04"
+  TRAIL_PCT: "0.035"
+  TP1_PCT: "0.05"
+  TP1_SIZE: "0.25"
 
-  # misc
-  RESERVE_CASH_USD: "0"
   PYTHONUNBUFFERED: "1"
 
 jobs:
@@ -138,7 +95,33 @@ jobs:
             pip install ccxt numpy pandas
           fi
 
-      # ---- Compute risk signal (breadth-based) -------------------------------
+      # Parse JSON inputs and export to env
+      - name: Apply JSON inputs → env
+        env:
+          PROTECT_JSON_RAW: ${{ inputs.PROTECT_JSON }}
+          ADVANCED_JSON_RAW: ${{ inputs.ADVANCED_JSON }}
+        run: |
+          python - <<'PY'
+          import os, json, sys
+          out = {}
+          def merge(js):
+              if not js: return
+              try:
+                  d = json.loads(js)
+                  if isinstance(d, dict):
+                      for k,v in d.items():
+                          out[str(k)] = v
+              except Exception:
+                  pass
+          merge(os.getenv("PROTECT_JSON_RAW",""))
+          merge(os.getenv("ADVANCED_JSON_RAW",""))
+          with open(os.environ["GITHUB_ENV"], "a") as fh:
+              for k,v in out.items():
+                  fh.write(f"{k}={v}\n")
+          print("Applied overrides:", out)
+          PY
+
+      # ---- Compute risk (breadth) --------------------------------------------
       - name: Compute Risk Signal
         id: risk
         env:
@@ -146,52 +129,44 @@ jobs:
         run: |
           python - <<'PY'
           import os, json
-          result = {"risk": "OFF", "reason": "default"}
-          override = os.getenv("RISK_OVERRIDE","").strip().upper()
-          if override in ("ON","OFF"):
-              result["risk"] = override
-              result["reason"] = "override"
+          result = {"risk":"OFF","reason":"default"}
+          ov=os.getenv("RISK_OVERRIDE","").strip().upper()
+          if ov in ("ON","OFF"):
+              result.update(risk=ov, reason="override")
           else:
               try:
                   import ccxt
-                  ex = ccxt.kraken()
-                  markets = ex.load_markets()
-                  candidates = ["BTC/USD","XBT/USD","ETH/USD","SOL/USD","DOGE/USD"]
-                  wanted = {"BTC":"", "ETH":"", "SOL":"", "DOGE":""}
-                  for s in candidates:
-                      base = s.split("/")[0].replace("XBT","BTC")
-                      if s in markets and base in wanted and not wanted[base]:
-                          wanted[base] = s
-                  if not wanted["BTC"]:
-                      wanted["BTC"] = "XBT/USD" if "XBT/USD" in markets else "BTC/USD"
+                  ex=ccxt.kraken(); mk=ex.load_markets()
+                  cands=["BTC/USD","XBT/USD","ETH/USD","SOL/USD","DOGE/USD"]
+                  wanted={"BTC":"","ETH":"","SOL":"","DOGE":""}
+                  for s in cands:
+                      b=s.split("/")[0].replace("XBT","BTC")
+                      if s in mk and b in wanted and not wanted[b]: wanted[b]=s
+                  if not wanted["BTC"]: wanted["BTC"]="XBT/USD" if "XBT/USD" in mk else "BTC/USD"
                   for k in ("ETH","SOL","DOGE"):
-                      if not wanted[k]:
-                          wanted[k] = f"{k}/USD"
-                  basket = [wanted["BTC"], wanted["ETH"], wanted["SOL"], wanted["DOGE"]]
-                  positives, detail = 0, {}
+                      if not wanted[k]: wanted[k]=f"{k}/USD"
+                  basket=[wanted["BTC"],wanted["ETH"],wanted["SOL"],wanted["DOGE"]]
+                  pos=0; det={}
                   for sym in basket:
                       try:
-                          t = ex.fetch_ticker(sym)
-                          pct = t.get("percentage")
+                          t=ex.fetch_ticker(sym)
+                          pct=t.get("percentage")
                           if pct is None:
-                              last, open_ = t.get("last"), t.get("open")
+                              last,open_=t.get("last"),t.get("open")
                               if isinstance(last,(int,float)) and isinstance(open_,(int,float)) and open_:
-                                  pct = (last/open_ - 1.0)*100.0
-                          detail[sym] = pct
-                          if isinstance(pct,(int,float)) and pct > 0: positives += 1
-                      except Exception:
-                          detail[sym] = None
-                  result["risk"] = "ON" if positives >= 3 else "OFF"
-                  result["reason"] = f"{positives}/4 green"
-                  result["detail"] = detail
+                                  pct=(last/open_-1)*100.0
+                          det[sym]=pct
+                          if isinstance(pct,(int,float)) and pct>0: pos+=1
+                      except Exception: det[sym]=None
+                  result["risk"]="ON" if pos>=3 else "OFF"
+                  result["reason"]=f"{pos}/4 green"
+                  result["detail"]=det
               except Exception as e:
-                  result["risk"] = "OFF"
-                  result["reason"] = f"error:{type(e).__name__}"
+                  result.update(risk="OFF", reason=f"error:{type(e).__name__}")
           print("RISK_SIGNAL_COMPUTE =>", json.dumps(result, indent=2))
-          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-              fh.write(f"risk={result['risk']}\n")
-              fh.write(f"reason={result['reason']}\n")
-          os.makedirs(".state", exist_ok=True)
+          with open(os.environ["GITHUB_OUTPUT"],"a") as fh:
+              fh.write(f"risk={result['risk']}\nreason={result['reason']}\n")
+          os.makedirs(".state",exist_ok=True)
           open(".state/last_risk_signal.txt","w").write(result["risk"])
           open(".state/last_risk_reason.txt","w").write(result["reason"])
           open(".state/last_risk_detail.json","w").write(json.dumps(result, indent=2))
@@ -209,12 +184,12 @@ jobs:
             echo "- **RUN_SWITCH**: ${RUN_SWITCH}"
             echo "- **Risk**: ${{ steps.risk.outputs.risk }} (_${{ steps.risk.outputs.reason }}_)"
             echo "- **DRY_RUN**: ${DRY_RUN}"
-            echo "- **MAX_POSITIONS**: ${MAX_POSITIONS}"
+            echo "- **MAX_POSITIONS**: ${MAX_POSITIONS} / **MAX_BUYS_PER_RUN**: ${MAX_BUYS_PER_RUN}"
             echo "- **DUST_MIN_USD**: ${DUST_MIN_USD}"
             echo "- **SL_PCT**: ${SL_PCT}  **TRAIL_PCT**: ${TRAIL_PCT}  **TP1_PCT**: ${TP1_PCT}  **TP1_SIZE**: ${TP1_SIZE}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---- Market Strength Screener (always) ---------------------------------
+      # Screener (always) ------------------------------------------------------
       - name: Market Strength Screener (Kraken USD)
         env:
           TOP_N: ${{ env.SCREENER_TOP_N }}
@@ -223,21 +198,19 @@ jobs:
           MIN_NOTIONAL_USD: ${{ env.MIN_NOTIONAL_USD }}
         run: |
           python - <<'PY'
-          import os, json, math, pathlib
-          TOP_N=int(os.getenv("TOP_N","12")); MIN_QVOL=float(os.getenv("MIN_QVOL_USD","50000"))
-          MAX_SPREAD=float(os.getenv("SPREAD_MAX_PCT","0.60")); MIN_COST=float(os.getenv("MIN_NOTIONAL_USD","5"))
-          import ccxt
-          ex=ccxt.kraken(); markets=ex.load_markets()
-          skip_bases={"USDT","USDC","EUR","GBP","USD"}
+          import os, json, math, pathlib, ccxt
+          TOP_N=int(os.getenv("TOP_N","12"))
+          MIN_Q=float(os.getenv("MIN_QVOL_USD","50000"))
+          MAX_S=float(os.getenv("SPREAD_MAX_PCT","0.60"))
+          MINC=float(os.getenv("MIN_NOTIONAL_USD","5"))
+          ex=ccxt.kraken(); mk=ex.load_markets()
+          skip={"USDT","USDC","EUR","GBP","USD"}
           syms=[]
-          for m in markets.values():
-              if m.get("spot") and m.get("quote")=="USD":
-                  if m.get("base") not in skip_bases:
-                      # respect min cost
-                      min_cost=((m.get("limits") or {}).get("cost") or {}).get("min")
-                      if isinstance(min_cost,(int,float)) and min_cost and min_cost>MIN_COST: 
-                          continue
-                      syms.append(m["symbol"])
+          for m in mk.values():
+              if m.get("spot") and m.get("quote")=="USD" and m.get("base") not in skip:
+                  mc=((m.get("limits") or {}).get("cost") or {}).get("min")
+                  if isinstance(mc,(int,float)) and mc and mc>MINC: continue
+                  syms.append(m["symbol"])
           rows=[]
           for s in syms:
               try:
@@ -250,73 +223,48 @@ jobs:
                   if isinstance(bid,(int,float)) and isinstance(ask,(int,float)) and bid>0 and ask>0:
                       mid=(bid+ask)/2; 
                       if mid>0: spread=(ask-bid)/mid*100.0
-                  qvol=t.get("quoteVolume") or 0.0
-                  if spread is not None and spread>MAX_SPREAD: 
-                      continue
-                  if qvol<MIN_QVOL: 
-                      continue
-                  rows.append({"symbol":s,"pct":pct if pct is not None else -9999,"last":last,"spread":spread,"qvol":qvol})
-              except Exception:
-                  pass
-          rows.sort(key=lambda r: r["pct"], reverse=True)
+                  qv=t.get("quoteVolume") or 0.0
+                  if spread is not None and spread>MAX_S: continue
+                  if qv<MIN_Q: continue
+                  rows.append({"symbol":s,"pct":pct if pct is not None else -9999,"last":last,"spread":spread,"qvol":qv})
+              except Exception: pass
+          rows.sort(key=lambda r:r["pct"], reverse=True)
           top=rows[:TOP_N]
           pathlib.Path(".state").mkdir(exist_ok=True)
           (pathlib.Path(".state")/"top_candidates.json").write_text(json.dumps(top, indent=2))
-          lines=["## Screener — Top Strength (Kraken USD)","","| # | Symbol | 24h % | Last | Spread % | 24h $Vol |","|---:|:------|------:|-----:|--------:|--------:|"]
-          def fmt(v,nd=2):
+          def fmt(v,nd=2): 
               return "-" if v is None else (f"{v:.{nd}f}" if isinstance(v,(int,float)) else str(v))
+          lines=["## Screener — Top Strength (Kraken USD)","","| # | Symbol | 24h % | Last | Spread % | 24h $Vol |","|---:|:------|------:|-----:|--------:|--------:|"]
           for i,r in enumerate(top,1):
               lines.append(f"| {i} | {r['symbol']} | {fmt(r['pct'])} | {fmt(r['last'])} | {fmt(r['spread'])} | {fmt(r['qvol'],0)} |")
           with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as fh:
               fh.write("\n".join(lines)+"\n")
           PY
 
-      # ---- Only run when BOTH gates are ON -----------------------------------
-      - name: Sweep Dust (optional)
-        if: ${{ env.RUN_SWITCH == 'ON' && steps.risk.outputs.risk == 'ON' }}
-        run: |
-          echo "Sweeping dust < ${DUST_MIN_USD} USD (if your bot implements it)..."
-
+      # Only run bot when BOTH gates are ON ------------------------------------
       - name: Run bot (main.py)
         if: ${{ env.RUN_SWITCH == 'ON' && steps.risk.outputs.risk == 'ON' }}
         env:
-          # gates
           DRY_RUN: ${{ env.DRY_RUN }}
-
-          # sizing
           MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
           MAX_BUYS_PER_RUN: ${{ env.MAX_BUYS_PER_RUN }}
-          ALLOC_USD_PER_TRADE: ${{ env.ALLOC_USD_PER_TRADE }}
-          MIN_TRADE_USD: ${{ env.MIN_TRADE_USD }}
           DUST_MIN_USD: ${{ env.DUST_MIN_USD }}
-
-          # rotation
           EDGE_DELTA_PCT: ${{ env.EDGE_DELTA_PCT }}
           ROTATE_WHEN_FULL: ${{ env.ROTATE_WHEN_FULL }}
           ROTATE_WHEN_CASH_SHORT: ${{ env.ROTATE_WHEN_CASH_SHORT }}
-
-          # protection
           SL_PCT: ${{ env.SL_PCT }}
           TRAIL_PCT: ${{ env.TRAIL_PCT }}
           TP1_PCT: ${{ env.TP1_PCT }}
           TP1_SIZE: ${{ env.TP1_SIZE }}
-
-          # filters shared with screener
+          MIN_TRADE_USD: ${{ env.MIN_TRADE_USD }}
+          ALLOC_USD_PER_TRADE: ${{ env.ALLOC_USD_PER_TRADE }}
           SPREAD_MAX_PCT: ${{ env.SPREAD_MAX_PCT }}
           MIN_NOTIONAL_USD: ${{ env.MIN_NOTIONAL_USD }}
         run: |
           echo "🚧 DRY_RUN=${DRY_RUN} — MAX_POSITIONS=${MAX_POSITIONS} — MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}"
           echo "SL=${SL_PCT} TRAIL=${TRAIL_PCT} TP1=${TP1_PCT} x ${TP1_SIZE}"
-          if [ -f ./main.py ]; then
-            python ./main.py
-          elif [ -f trader/main.py ]; then
-            python trader/main.py
-          else
-            echo "::error::Could not find main.py (root or trader/)."
-            exit 1
-          fi
+          python ./main.py
 
-      # ---- Artifacts (always) -------------------------------------------------
       - name: Upload .state artifacts
         if: always()
         uses: actions/upload-artifact@v4
