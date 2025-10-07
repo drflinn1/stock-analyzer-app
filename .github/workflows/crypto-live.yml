@@ -27,14 +27,18 @@ on:
         default: "2"
 
 env:
+  # Global toggles (safe defaults)
   RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
   DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
   RISK_OVERRIDE: ${{ inputs.RISK_OVERRIDE || '' }}
+
+  # Trading knobs your bot reads
   MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || '6' }}
   DUST_MIN_USD: ${{ inputs.DUST_MIN_USD || '2' }}
   RESERVE_CASH_USD: "0"
   MAX_BUYS_PER_RUN: "1"
   ROTATE_WHEN_CASH_SHORT: "true"
+
   PYTHONUNBUFFERED: "1"
 
 jobs:
@@ -121,9 +125,11 @@ jobs:
                   result["risk"] = "OFF"
                   result["reason"] = f"error:{type(e).__name__}"
           print("RISK_SIGNAL_COMPUTE =>", json.dumps(result, indent=2))
+          # Step outputs for gating
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write(f"risk={result['risk']}\n")
               fh.write(f"reason={result['reason']}\n")
+          # Persist to workspace for your bot or later inspection
           os.makedirs(".state", exist_ok=True)
           open(".state/last_risk_signal.txt","w").write(result["risk"])
           open(".state/last_risk_detail.json","w").write(json.dumps(result, indent=2))
@@ -133,6 +139,18 @@ jobs:
         run: |
           echo "Computed risk: ${{ steps.risk.outputs.risk }} (reason: ${{ steps.risk.outputs.reason }})"
           echo "RUN_SWITCH=${RUN_SWITCH}"
+
+      - name: Add job summary
+        run: |
+          {
+            echo "## Crypto Live — Gate Summary"
+            echo ""
+            echo "- **RUN_SWITCH**: ${RUN_SWITCH}"
+            echo "- **Risk**: ${{ steps.risk.outputs.risk }}  (_${{ steps.risk.outputs.reason }}_)"
+            echo "- **DRY_RUN**: ${DRY_RUN}"
+            echo "- **MAX_POSITIONS**: ${MAX_POSITIONS}"
+            echo "- **DUST_MIN_USD**: ${DUST_MIN_USD}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # ---- Everything below only runs when BOTH switches are ON --------------
       - name: Sweep Dust (optional)
@@ -164,6 +182,8 @@ jobs:
           name: state-${{ github.run_id }}
           path: |
             .state/**
+            .state/*.txt
+            .state/*.json
             **/kpi_history.csv
             **/spec_gate_report.txt
           if-no-files-found: ignore
