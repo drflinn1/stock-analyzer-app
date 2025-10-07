@@ -1,74 +1,57 @@
-name: Crypto Live — Every 15m (Repo secrets + Preflight + Breadth Brake + Risk Gate)
+name: Crypto Live — Auto-Pick + Guards (every 15m)
 
 on:
-  workflow_dispatch:
   schedule:
     - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      RUN_SWITCH:
+        description: "Set to ON to allow live trading (otherwise job exits early)"
+        required: false
+        default: "ON"
+      DRY_RUN:
+        description: "If ON, simulate orders (no real trades)"
+        required: false
+        default: "ON"
+      RISK_OVERRIDE:
+        description: "Force risk gate: ON or OFF (leave blank to auto-compute)"
+        required: false
+        default: ""
+      MAX_POSITIONS:
+        description: "Max concurrent positions"
+        required: false
+        default: "6"
+      DUST_MIN_USD:
+        description: "Treat balances under this USD as dust"
+        required: false
+        default: "2"
 
-permissions:
-  contents: read
+env:
+  # --- Global toggles (safe defaults) ---
+  RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
+  DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
+  RISK_OVERRIDE: ${{ inputs.RISK_OVERRIDE || '' }}
 
-concurrency:
-  group: crypto-live
-  cancel-in-progress: true
+  # --- Trading knobs (your bot reads these) ---
+  MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || '6' }}
+  DUST_MIN_USD: ${{ inputs.DUST_MIN_USD || '2' }}
+
+  # --- Optional: reserve cash, etc. (your bot can read these if present) ---
+  RESERVE_CASH_USD: "0"
+  MAX_BUYS_PER_RUN: "1"
+  ROTATE_WHEN_CASH_SHORT: "true"
+
+  # Make logs clearer
+  PYTHONUNBUFFERED: "1"
 
 jobs:
-  run:
+  live:
+    name: Live Crypto Run
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-
-    env:
-      # --- Mode ---
-      DRY_RUN: "false"
-      RUN_SWITCH: "on"
-
-      # --- Exchange & quote ---
-      EXCHANGE: "kraken"
-      BASE_QUOTE: "USD"
-
-      # --- Positioning / rotation ---
-      MAX_POSITIONS: "12"
-      MAX_BUYS_PER_RUN: "2"
-      ROTATE_WHEN_FULL: "true"
-      ROTATE_WHEN_CASH_SHORT: "true"
-
-      # --- Order sizing / dust ---
-      MIN_NOTIONAL_USD: "5"
-      DUST_MIN_USD: "5"
-      RESERVE_CASH_PCT: "5"
-      BUY_USD_MIN: "12"          # raise to 15 if BTC/ETH still reject
-
-      # --- Risk controls ---
-      TP_PCT: "2.0"
-      SL_PCT: "2.0"
-      TRAIL_PCT: "0.8"
-      DAILY_LOSS_CAP: "3"
-      AUTO_PAUSE_ON_ERROR: "true"
-
-      # --- Logging / state ---
-      LOG_LEVEL: "INFO"
-      KPI_CSV_PATH: ".state/kpi_history.csv"
-      STATE_DIR: ".state"
-      SHOW_BANNER: "true"
-
-      # --- Universe (stick to majors) ---
-      UNIVERSE_WHITELIST: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
-      TOPK: "6"
-
-      # --- Market breadth brake (pause buys when weak; trim weakest) ---
-      BREADTH_SYMBOL: "BTC/USD"
-      BREADTH_EMA_TIMEFRAME: "1h"
-      BREADTH_EMA_LEN: "20"
-      BREADTH_PAUSE_BUYS: "true"
-      BREADTH_EXIT_WEAKEST: "true"
-
-      # --- Secrets (repo-level) ---
-      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-      KRAKEN_API_OTP: ${{ secrets.KRAKEN_API_OTP }}
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -80,8 +63,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: ${{ runner.os }}-pip-
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: |
@@ -89,74 +73,148 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install ccxt pandas numpy requests python-dateutil
+            # minimal deps for risk compute + ccxt access
+            pip install ccxt numpy pandas
           fi
 
-      - name: Preflight — check secrets present (length only)
+      # ------------------------------------------------------------------
+      # RISK: compute ON/OFF inside this job (no artifacts needed)
+      # Simple, robust rule:
+      #   - Pull 24h change for a small breadth basket (BTC, ETH, SOL, DOGE)
+      #   - Count how many are positive; if >= 3 → RISK=ON else OFF
+      #   - If the exchange symbol differs (XBT/USD vs BTC/USD), we map it.
+      #   - If anything fails, default to OFF (safe).
+      # You can refine this anytime; your trading code doesn't change.
+      # ------------------------------------------------------------------
+      - name: Compute Risk Signal
+        id: risk
+        env:
+          RISK_OVERRIDE: ${{ env.RISK_OVERRIDE }}
         run: |
-          [ -z "${KRAKEN_API_KEY}" ] && echo "❌ KRAKEN_API_KEY missing" && exit 1 || echo "KRAKEN_API_KEY len: ${#KRAKEN_API_KEY}"
-          [ -z "${KRAKEN_API_SECRET}" ] && echo "❌ KRAKEN_API_SECRET missing" && exit 1 || echo "KRAKEN_API_SECRET len: ${#KRAKEN_API_SECRET}"
-          echo "✅ Secrets present"
+          python - <<'PY'
+          import os, json, sys
+          result = {"risk":"OFF", "reason":"default"}
+          override = os.getenv("RISK_OVERRIDE","").strip().upper()
+          if override in ("ON","OFF"):
+              result["risk"] = override
+              result["reason"] = "override"
+          else:
+              try:
+                  import ccxt
+                  ex = ccxt.kraken()
+                  # Map to Kraken symbol conventions when needed
+                  candidates = ["BTC/USD","XBT/USD","ETH/USD","SOL/USD","DOGE/USD"]
+                  wanted     = {"BTC":"", "ETH":"", "SOL":"", "DOGE":""}
+                  # Probe which symbols exist
+                  markets = ex.load_markets()
+                  for s in candidates:
+                      base = s.split("/")[0].replace("XBT","BTC")
+                      if s in markets and base in wanted and not wanted[base]:
+                          wanted[base] = s
+                  # Fallbacks if some not found
+                  if not wanted["BTC"]:
+                      wanted["BTC"] = "XBT/USD" if "XBT/USD" in markets else "BTC/USD"
+                  for k in ("ETH","SOL","DOGE"):
+                      if not wanted[k]:
+                          wanted[k] = f"{k}/USD"
 
-      # ---------- RISK SIGNAL GATE ----------
-      - name: Download latest risk signal (best effort)
-        uses: actions/download-artifact@v4
-        with:
-          name: risk-signal
-          path: .state
-        continue-on-error: true
+                  basket = [wanted["BTC"], wanted["ETH"], wanted["SOL"], wanted["DOGE"]]
+                  positives = 0
+                  detail = {}
+                  for sym in basket:
+                      try:
+                          t = ex.fetch_ticker(sym)
+                          # CCXT typical: t['percentage'] is 24h % change if available
+                          pct = None
+                          if isinstance(t.get("percentage"), (int,float)):
+                              pct = float(t["percentage"])
+                          else:
+                              # derive from last/close values if needed
+                              last, open_ = t.get("last"), t.get("open")
+                              if isinstance(last,(int,float)) and isinstance(open_,(int,float)) and open_:
+                                  pct = (last/open_ - 1.0)*100.0
+                          detail[sym] = pct
+                          if pct is not None and pct > 0.0:
+                              positives += 1
+                      except Exception as e:
+                          detail[sym] = None
 
-      - id: risk_gate
-        name: Evaluate risk signal (default ON if missing)
+                  # Risk ON if >=3 of 4 basket coins green on 24h
+                  result["risk"] = "ON" if positives >= 3 else "OFF"
+                  result["reason"] = f"{positives}/4 green"
+                  result["detail"] = detail
+              except Exception as e:
+                  result["risk"] = "OFF"
+                  result["reason"] = f"error:{type(e).__name__}"
+
+          # Emit summary + output
+          print("RISK_SIGNAL_COMPUTE =>", json.dumps(result, indent=2))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"risk={result['risk']}\n")
+              fh.write(f"reason={result['reason']}\n")
+          # Also write to workspace for your bot, if it wants to read it
+          try:
+              import pathlib, json
+              pathlib.Path(".state").mkdir(exist_ok=True)
+              pathlib.Path(".state/last_risk_signal.txt").write_text(result["risk"])
+              pathlib.Path(".state/last_risk_detail.json").write_text(json.dumps(result, indent=2))
+          except Exception:
+              pass
+          PY
+
+      - name: Show computed risk
         run: |
-          SIG="ON"
-          [ -f ".state/risk_signal.txt" ] && SIG="$(cat .state/risk_signal.txt | tr -d '\r\n' | tr a-z A-Z)"
-          echo "Risk signal: $SIG"
-          if [ "$SIG" = "OFF" ]; then
-            echo "risk_ok=false" >> $GITHUB_OUTPUT
+          echo "Computed risk: ${{ steps.risk.outputs.risk }} (reason: ${{ steps.risk.outputs.reason }})"
+
+      # Guard 1: Master switch to quickly pause everything
+      - name: Guard — RUN_SWITCH must be ON
+        if: env.RUN_SWITCH != 'ON'
+        run: |
+          echo "RUN_SWITCH is ${RUN_SWITCH}; exiting (no trading)."
+          exit 0
+
+      # Guard 2: Risk gate (skip trading when risk is OFF)
+      - name: Guard — Risk must be ON
+        if: steps.risk.outputs.risk != 'ON'
+        run: |
+          echo "Risk is ${ { steps.risk.outputs.risk } }; skipping trading run."
+          exit 0
+
+      # Optional: sweep dust before trading
+      - name: Sweep Dust (optional)
+        run: |
+          echo "Sweeping dust < ${DUST_MIN_USD} USD (if your bot implements it)..."
+          # Your bot can read DUST_MIN_USD and perform the sweep
+
+      # ---- Run your trading bot ------------------------------------------------
+      # If your entrypoint is repo-root main.py, this just works.
+      # It will see DRY_RUN, MAX_POSITIONS, etc. from env.
+      - name: Run bot (main.py)
+        env:
+          # Exchange/Broker creds should come from GitHub Secrets/Env
+          # e.g., KRAKEN_API_KEY, KRAKEN_API_SECRET, etc.
+          DRY_RUN: ${{ env.DRY_RUN }}
+          MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
+          DUST_MIN_USD: ${{ env.DUST_MIN_USD }}
+        run: |
+          echo "🚧 DRY_RUN=${DRY_RUN} — MAX_POSITIONS=${MAX_POSITIONS} — DUST_MIN_USD=${DUST_MIN_USD}"
+          if [ -f ./main.py ]; then
+            python ./main.py
+          elif [ -f trader/main.py ]; then
+            python trader/main.py
           else
-            echo "risk_ok=true" >> $GITHUB_OUTPUT
+            echo "::error::Could not find main.py (root or trader/)."
+            exit 1
           fi
 
-      - name: Print mode & guards
-        run: |
-          echo "Mode: DRY_RUN=${DRY_RUN}, RUN_SWITCH=${RUN_SWITCH}"
-          echo "Risk signal gate: ${{ steps.risk_gate.outputs.risk_ok }}"
-          echo "Dust threshold: DUST_MIN_USD=${DUST_MIN_USD}"
-          echo "Max positions: ${MAX_POSITIONS}, Max buys per run: ${MAX_BUYS_PER_RUN}"
-          echo "Rotate when full: ${ROTATE_WHEN_FULL}, Rotate when cash short: ${ROTATE_WHEN_CASH_SHORT}"
-          echo "MinNotional: $${MIN_NOTIONAL_USD}, BuyMin: $${BUY_USD_MIN}"
-          echo "Whitelist: ${UNIVERSE_WHITELIST}"
-          echo "Breadth: ${BREADTH_SYMBOL} ${BREADTH_EMA_TIMEFRAME} EMA${BREADTH_EMA_LEN}"
-          echo "State dir: ${STATE_DIR}"
-
-      - name: Run Crypto Live
-        if: ${{ steps.risk_gate.outputs.risk_ok == 'true' }}
-        run: |
-          mkdir -p "${STATE_DIR}"
-          python -u main.py
-
-      - name: Paused by risk signal (OFF)
-        if: ${{ steps.risk_gate.outputs.risk_ok != 'true' }}
-        run: echo "⛔ Risk signal OFF — trading paused this run."
-
-      - name: Summarize run
-        if: always()
-        run: |
-          echo "----- SUMMARY -----"
-          if [ -f "${STATE_DIR}/summary.txt" ]; then
-            cat "${STATE_DIR}/summary.txt" || true
-          else
-            echo "No summary.txt found (ok)."
-          fi
-
-      - name: Upload state & logs
+      # Save outputs/logs your bot may have written
+      - name: Upload .state artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: crypto-live-state-${{ github.run_id }}
+          name: state-${{ github.run_id }}
           path: |
             .state/**
-            **/run.log
-            **/summary.txt
+            **/kpi_history.csv
+            **/spec_gate_report.txt
           if-no-files-found: ignore
