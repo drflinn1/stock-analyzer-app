@@ -7,23 +7,18 @@ on:
     inputs:
       RUN_SWITCH:
         description: "Set to ON to allow live trading (otherwise skip)"
-        required: false
         default: "ON"
       DRY_RUN:
         description: "If ON, simulate orders (no real trades)"
-        required: false
         default: "ON"
       RISK_OVERRIDE:
         description: "Force risk gate: ON or OFF (leave blank to auto-compute)"
-        required: false
         default: ""
       MAX_POSITIONS:
         description: "Max concurrent positions"
-        required: false
         default: "6"
       DUST_MIN_USD:
         description: "Treat balances under this USD as dust"
-        required: false
         default: "2"
 
 env:
@@ -121,11 +116,10 @@ jobs:
                   result["risk"] = "OFF"
                   result["reason"] = f"error:{type(e).__name__}"
           print("RISK_SIGNAL_COMPUTE =>", json.dumps(result, indent=2))
-          # Step outputs for gating
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write(f"risk={result['risk']}\n")
               fh.write(f"reason={result['reason']}\n")
-          # Always create .state for artifacts
+          # Persist to .state
           os.makedirs(".state", exist_ok=True)
           open(".state/last_risk_signal.txt","w").write(result["risk"])
           open(".state/last_risk_reason.txt","w").write(result["reason"])
@@ -141,7 +135,6 @@ jobs:
         run: |
           {
             echo "## Crypto Live — Gate Summary"
-            echo ""
             echo "- **RUN_SWITCH**: ${RUN_SWITCH}"
             echo "- **Risk**: ${{ steps.risk.outputs.risk }}  (_${{ steps.risk.outputs.reason }}_)"
             echo "- **DRY_RUN**: ${DRY_RUN}"
@@ -149,12 +142,7 @@ jobs:
             echo "- **DUST_MIN_USD**: ${DUST_MIN_USD}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: List workspace for debugging
-        run: |
-          echo "Current workspace structure:"
-          ls -R . || true
-
-      # ---- Run bot only when allowed ----------------------------------------
+      # ---- Only run when BOTH gates are ON -----------------------------------
       - name: Sweep Dust (optional)
         if: ${{ env.RUN_SWITCH == 'ON' && steps.risk.outputs.risk == 'ON' }}
         run: |
@@ -177,16 +165,14 @@ jobs:
             exit 1
           fi
 
+      # ---- Artifacts (always) -------------------------------------------------
       - name: Upload .state artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
           path: |
-            .state/last_risk_signal.txt
-            .state/last_risk_reason.txt
-            .state/last_risk_detail.json
             .state/**
             **/kpi_history.csv
             **/spec_gate_report.txt
-          if-no-files-found: warn
+          if-no-files-found: ignore
