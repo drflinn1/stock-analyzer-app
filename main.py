@@ -1,7 +1,7 @@
-# main.py — Kraken Live Bot (Min-lot dust sweep + Restricted auto-blacklist + TP/SL/Trail)
+# main.py — Kraken Live Bot (tight stops + market breadth brake + min-lot dust)
 from __future__ import annotations
-import os, sys, json, csv, math, time, traceback
-from datetime import datetime, timezone, timedelta
+import os, sys, json, csv, time, traceback
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Tuple, Optional
 
 try:
@@ -9,7 +9,7 @@ try:
 except Exception as e:
     raise SystemExit(f"ccxt is required: {e}")
 
-# ---------- small utils ----------
+# ---------- helpers ----------
 def getenv_any(*names: str, default: str = "") -> str:
     for n in names:
         v = os.getenv(n)
@@ -40,46 +40,53 @@ def log(tag: str, msg: str) -> None:
     end = "\033[0m" if color else ""
     print(f"{color}[{tag}]{end} {msg}", flush=True)
 
-# ---------- ENV ----------
+# ---------- env ----------
 DRY_RUN  = as_bool(os.getenv("DRY_RUN"), True)
-RUN_SWITCH = getenv_any("RUN_SWITCH", default="on").lower()=="on"
+RUN_SWITCH = getenv_any("RUN_SWITCH","on").lower()=="on"
 
 EXCHANGE   = getenv_any("EXCHANGE","kraken").lower()
 BASE_QUOTE = getenv_any("BASE_QUOTE","USD").upper()
 
-MAX_POSITIONS = as_int(os.getenv("MAX_POSITIONS"), 12)
-MAX_BUYS_PER_RUN = as_int(os.getenv("MAX_BUYS_PER_RUN"), 1)
-ROTATE_WHEN_FULL = as_bool(os.getenv("ROTATE_WHEN_FULL"), True)
+MAX_POSITIONS     = as_int(os.getenv("MAX_POSITIONS"), 12)
+MAX_BUYS_PER_RUN  = as_int(os.getenv("MAX_BUYS_PER_RUN"), 2)            # tighter churn, but more responsive
+ROTATE_WHEN_FULL  = as_bool(os.getenv("ROTATE_WHEN_FULL"), True)
 ROTATE_WHEN_CASH_SHORT = as_bool(os.getenv("ROTATE_WHEN_CASH_SHORT"), True)
 
-MIN_NOTIONAL_USD = as_float(os.getenv("MIN_NOTIONAL_USD"), 5.0)
-DUST_MIN_USD     = as_float(os.getenv("DUST_MIN_USD"), 2.0)
-RESERVE_CASH_PCT = as_float(os.getenv("RESERVE_CASH_PCT"), 5.0)
+MIN_NOTIONAL_USD  = as_float(os.getenv("MIN_NOTIONAL_USD"), 5.0)
+DUST_MIN_USD      = as_float(os.getenv("DUST_MIN_USD"), 5.0)
+RESERVE_CASH_PCT  = as_float(os.getenv("RESERVE_CASH_PCT"), 5.0)
+
+# NEW: enforce a minimum dollar size for buys so BTC/ETH orders clear Kraken's min cost
+BUY_USD_MIN       = as_float(os.getenv("BUY_USD_MIN"), 12.0)
 
 TP_PCT     = as_float(os.getenv("TP_PCT"), 2.0)
-SL_PCT     = as_float(os.getenv("SL_PCT"), 3.5)
-TRAIL_PCT  = as_float(os.getenv("TRAIL_PCT"), 1.2)
+SL_PCT     = as_float(os.getenv("SL_PCT"), 2.0)      # tighter stop
+TRAIL_PCT  = as_float(os.getenv("TRAIL_PCT"), 0.8)   # faster trailing stop
 
 DAILY_LOSS_CAP = as_float(os.getenv("DAILY_LOSS_CAP"), 3.0)
 AUTO_PAUSE_ON_ERROR = as_bool(os.getenv("AUTO_PAUSE_ON_ERROR"), True)
 
-LOG_LEVEL    = getenv_any("LOG_LEVEL","INFO")
 STATE_DIR    = getenv_any("STATE_DIR",".state")
 KPI_CSV_PATH = getenv_any("KPI_CSV_PATH",".state/kpi_history.csv")
 POS_STATE    = os.path.join(STATE_DIR,"pos_state.json")
-REJECT_LIST  = os.path.join(STATE_DIR,"reject_list.json")  # for restricted symbols
+REJECT_LIST  = os.path.join(STATE_DIR,"reject_list.json")
 REJECT_TTL_DAYS = as_int(os.getenv("REJECT_TTL_DAYS"), 14)
 
-# optional tight universe: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
+# universe controls
 UNIVERSE_WHITELIST = [s.strip().upper() for s in getenv_any("UNIVERSE_WHITELIST","").split(",") if s.strip()]
+SHOW_BANNER = as_bool(os.getenv("SHOW_BANNER"), True)
+TOPK = as_int(os.getenv("TOPK"), 6)
 
-SHOW_BANNER  = as_bool(os.getenv("SHOW_BANNER"), True)
-TOPK         = as_int(os.getenv("TOPK"), 6)
+# market breadth brake
+BREADTH_SYMBOL     = getenv_any("BREADTH_SYMBOL","BTC/USD")
+BREADTH_TF         = getenv_any("BREADTH_EMA_TIMEFRAME","1h")
+BREADTH_EMA_LEN    = as_int(os.getenv("BREADTH_EMA_LEN"), 20)
+BREADTH_PAUSE_BUYS = as_bool(os.getenv("BREADTH_PAUSE_BUYS"), True)      # default: pause fresh buys below EMA
+BREADTH_EXIT_WEAKEST = as_bool(os.getenv("BREADTH_EXIT_WEAKEST"), True)  # default: also trim weakest once/run
 
-# ---------- exchange init ----------
+# ---------- exchange ----------
 def make_exchange() -> ccxt.Exchange:
-    if EXCHANGE!="kraken":
-        raise SystemExit("Only Kraken supported in this build.")
+    if EXCHANGE!="kraken": raise SystemExit("Only Kraken supported in this build.")
     api_key = getenv_any("KRAKEN_API_KEY","KRAKEN_KEY","KRAKEN_API")
     api_sec = getenv_any("KRAKEN_API_SECRET","KRAKEN_SECRET","KRAKEN_APISECRET")
     api_otp = getenv_any("KRAKEN_API_OTP","KRAKEN_OTP","KRAKEN_TOTP")
@@ -89,20 +96,17 @@ def make_exchange() -> ccxt.Exchange:
     if api_otp: kwargs["password"] = api_otp
     return ccxt.kraken(kwargs)
 
-# ---------- files ----------
+# ---------- file helpers ----------
 def ensure_state(): os.makedirs(STATE_DIR, exist_ok=True)
-
 def load_json(path: str, default: Any) -> Any:
     ensure_state()
     if not os.path.exists(path): return default
     try:
         with open(path,"r",encoding="utf-8") as f: return json.load(f)
     except: return default
-
 def save_json(path: str, data: Any) -> None:
     ensure_state()
     with open(path,"w",encoding="utf-8") as f: json.dump(data,f,indent=2)
-
 def append_kpi(row: Dict[str,Any]) -> None:
     ensure_state()
     new = not os.path.exists(KPI_CSV_PATH)
@@ -110,7 +114,6 @@ def append_kpi(row: Dict[str,Any]) -> None:
         w = csv.DictWriter(f, fieldnames=["ts","dry_run","positions","cash_usd","equity_usd","pnl_day_pct","buys","sells","rotations"])
         if new: w.writeheader()
         w.writerow(row)
-
 def write_summary(lines: List[str]) -> None:
     ensure_state()
     with open(os.path.join(STATE_DIR,"summary.txt"),"w",encoding="utf-8") as f:
@@ -118,8 +121,7 @@ def write_summary(lines: List[str]) -> None:
 
 # ---------- universe filters ----------
 STABLES = {"USDT","USDC"}
-BLOCKLIST = set(["SPX/USD","EUR/USD","GBP/USD","USD/USD"])
-
+BLOCKLIST = {"SPX/USD","EUR/USD","GBP/USD","USD/USD"}
 def is_valid_symbol(s: str) -> bool:
     s = s.upper()
     if not s.endswith(f"/{BASE_QUOTE}"): return False
@@ -135,26 +137,24 @@ def fetch_cash_positions(ex: ccxt.Exchange) -> Tuple[float, Dict[str,Dict[str,fl
     cash = float(bal.get("total",{}).get(BASE_QUOTE,0.0))
     pos: Dict[str,Dict[str,float]] = {}
     for coin, amt in bal.get("total",{}).items():
-        u = coin.upper()
-        if u in (BASE_QUOTE, "USDT","USDC"): continue
+        u = str(coin).upper()
+        if u in (BASE_QUOTE,"USDT","USDC"): continue
         try: qty = float(amt)
         except: qty = 0.0
         if qty <= 0: continue
         sym = f"{u}/{BASE_QUOTE}"
         if not is_valid_symbol(sym): continue
-        try:
-            price = float(ex.fetch_ticker(sym).get("last") or 0.0)
+        try: price = float(ex.fetch_ticker(sym).get("last") or 0.0)
         except: price = 0.0
         pos[sym] = {"amount": qty, "price": price, "value": qty*price}
     return cash, pos
 
 def fetch_topk(ex: ccxt.Exchange, k: int) -> List[Tuple[str,float]]:
     markets = ex.load_markets()
-    cands = [s for s in markets.keys() if is_valid_symbol(s)]
+    cands = [s for s in markets if is_valid_symbol(s)]
     scored: List[Tuple[str,float]] = []
     for s in cands:
-        try:
-            chg = float(ex.fetch_ticker(s).get("percentage") or 0.0)
+        try: chg = float(ex.fetch_ticker(s).get("percentage") or 0.0)
         except: chg = 0.0
         scored.append((s, chg))
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -176,18 +176,16 @@ def seed_or_update(st: Dict[str,Dict[str,float]], sym: str, price: float, qty: f
 
 def tp_hit(price: float, avg: float) -> bool:
     return avg>0 and (price-avg)/avg*100.0 >= TP_PCT
-
 def sl_hit(price: float, avg: float) -> bool:
     return avg>0 and (price-avg)/avg*100.0 <= -SL_PCT
-
-def trail_hit(price: float, trail_max: float, avg: float) -> bool:
-    if trail_max<=0 or price<=0 or price<=avg: return False
-    return (trail_max-price)/trail_max*100.0 >= TRAIL_PCT
+def trail_hit(price: float, tmax: float, avg: float) -> bool:
+    if tmax<=0 or price<=0 or price<=avg: return False
+    return (tmax-price)/tmax*100.0 >= TRAIL_PCT
 
 # ---------- orders ----------
 def market_buy(ex: ccxt.Exchange, sym: str, usd_amount: float, dry: bool, reject: Dict[str,float]) -> Optional[Dict[str,Any]]:
-    if usd_amount < MIN_NOTIONAL_USD:
-        log("WARN", f"Buy skipped < MIN_NOTIONAL_USD ${MIN_NOTIONAL_USD:.2f}")
+    if usd_amount < max(MIN_NOTIONAL_USD, BUY_USD_MIN):
+        log("WARN", f"Buy skipped — need ≥ max(MIN_NOTIONAL_USD ${MIN_NOTIONAL_USD:.2f}, BUY_USD_MIN ${BUY_USD_MIN:.2f})")
         return None
     try:
         price = float(ex.fetch_ticker(sym)["last"])
@@ -198,15 +196,12 @@ def market_buy(ex: ccxt.Exchange, sym: str, usd_amount: float, dry: bool, reject
         o = ex.create_order(sym,"market","buy",qty)
         log("OK", f"BUY {sym} ${usd_amount:.2f}")
         return o
-    except ccxt.AuthenticationError as e:
-        raise
     except Exception as e:
         msg = str(e)
-        if "Invalid permissions" in msg or "trading restricted" in msg:
-            # auto-blacklist this symbol for TTL
-            until = time.time() + REJECT_TTL_DAYS*86400
+        if "Invalid permissions" in msg or "restricted" in msg:
+            until = time.time() + 86400*REJECT_TTL_DAYS
             reject[sym] = until
-            log("WARN", f"Auto-blacklist {sym} for {REJECT_TTL_DAYS}d (exchange says restricted)")
+            log("WARN", f"Auto-blacklist {sym} for {REJECT_TTL_DAYS}d (restricted)")
         else:
             log("ERR", f"Buy failed {sym}: {e}")
         return None
@@ -232,10 +227,10 @@ def apply_dust_sweeper(ex: ccxt.Exchange, positions: Dict[str,Dict[str,float]], 
         val = float(pos["value"])
         if val <= 0 or val > DUST_MIN_USD: continue
         qty = float(pos["amount"])
-        # check Kraken min lot
+        # min lot
         amt_min = 0.0
         try:
-            limits = markets.get(sym,{}).get("limits",{}) or {}
+            limits = (markets.get(sym,{}).get("limits",{}) or {})
             amt_min = float((limits.get("amount",{}) or {}).get("min") or 0.0)
         except: pass
         if amt_min and qty < amt_min:
@@ -255,31 +250,26 @@ def apply_sell_rules(ex: ccxt.Exchange, positions: Dict[str,Dict[str,float]], st
         if qty <= 0: continue
         try: price = float(ex.fetch_ticker(sym)["last"])
         except: price = float(pos.get("price",0.0))
-        ps = st.get(sym)
-        if not ps:
-            st[sym] = {"avg_price": price, "trail_max": price, "last_qty": qty}
-            ps = st[sym]
+        ps = st.get(sym) or {"avg_price": price, "trail_max": price, "last_qty": qty}
+        st[sym] = ps
         avg = float(ps.get("avg_price", price))
         tmax = float(ps.get("trail_max", price))
-        if price > tmax:
-            ps["trail_max"] = price; tmax = price
+        if price > tmax: ps["trail_max"] = price; tmax = price
 
         if tp_hit(price, avg):
             log("OK", f"TAKE_PROFIT {sym} price {price:.6f} ≥ avg {avg:.6f} + {TP_PCT:.2f}%")
-            market_sell(ex, sym, qty, dry, reason="TAKE_PROFIT")
-            sells += 1; del positions[sym]; st.pop(sym, None); continue
-
+            market_sell(ex, sym, qty, dry, reason="TAKE_PROFIT"); sells += 1
+            del positions[sym]; st.pop(sym, None); continue
         if sl_hit(price, avg):
             log("WARN", f"STOP_LOSS {sym} price {price:.6f} ≤ avg {avg:.6f} - {SL_PCT:.2f}%")
-            market_sell(ex, sym, qty, dry, reason="STOP_LOSS")
-            sells += 1; del positions[sym]; st.pop(sym, None); continue
-
+            market_sell(ex, sym, qty, dry, reason="STOP_LOSS"); sells += 1
+            del positions[sym]; st.pop(sym, None); continue
         if trail_hit(price, tmax, avg):
             log("WARN", f"TRAILING_STOP {sym} drawdown from {tmax:.6f} ≥ {TRAIL_PCT:.2f}% (price {price:.6f})")
-            market_sell(ex, sym, qty, dry, reason="TRAILING_STOP")
-            sells += 1; del positions[sym]; st.pop(sym, None); continue
+            market_sell(ex, sym, qty, dry, reason="TRAILING_STOP"); sells += 1
+            del positions[sym]; st.pop(sym, None); continue
 
-        # hold → keep state fresh
+        # hold
         seed_or_update(st, sym, price, qty)
     return sells
 
@@ -293,13 +283,31 @@ def weakest_symbol(positions: Dict[str,Dict[str,float]], ex: ccxt.Exchange) -> O
     if weakest is None: return None
     return weakest, wchg
 
+# ---------- breadth (EMA) ----------
+def is_breadth_bearish(ex: ccxt.Exchange) -> bool:
+    try:
+        ohlcv = ex.fetch_ohlcv(BREADTH_SYMBOL, timeframe=BREADTH_TF, limit=BREADTH_EMA_LEN+2)
+        if not ohlcv or len(ohlcv) < BREADTH_EMA_LEN: return False
+        closes = [c[4] for c in ohlcv]
+        k = 2/(BREADTH_EMA_LEN+1)
+        ema = closes[0]
+        for c in closes[1:]:
+            ema = c*k + ema*(1-k)
+        price = float(ex.fetch_ticker(BREADTH_SYMBOL)["last"])
+        bear = price < ema
+        log("OK", f"Breadth {BREADTH_SYMBOL} {BREADTH_TF}: price {price:.2f} vs EMA{BREADTH_EMA_LEN} {ema:.2f} → {'BEAR' if bear else 'BULL'}")
+        return bear
+    except Exception as e:
+        log("WARN", f"Breadth check failed ({BREADTH_SYMBOL} {BREADTH_TF}): {e}")
+        return False
+
 # ---------- main ----------
 def main() -> int:
     ensure_state()
     if SHOW_BANNER:
         log("SUM","===================================================")
         log("SUM", f"{now_iso()}  DRY_RUN={'ON' if DRY_RUN else 'OFF'}  RUN_SWITCH={'ON' if RUN_SWITCH else 'OFF'}")
-        log("SUM", f"MaxPos {MAX_POSITIONS}, MaxBuys/run {MAX_BUYS_PER_RUN}, Dust <= ${DUST_MIN_USD:.2f}, MinNotional ${MIN_NOTIONAL_USD:.2f}")
+        log("SUM", f"MaxPos {MAX_POSITIONS}, MaxBuys/run {MAX_BUYS_PER_RUN}, Dust <= ${DUST_MIN_USD:.2f}, MinNotional ${MIN_NOTIONAL_USD:.2f}, BuyMin ${BUY_USD_MIN:.2f}")
         log("SUM","===================================================")
 
     if not RUN_SWITCH:
@@ -315,73 +323,81 @@ def main() -> int:
         write_summary([f"Hard error: {e}"]);  return 1 if AUTO_PAUSE_ON_ERROR else 0
 
     try:
-        # load state
         pos_state: Dict[str,Dict[str,float]] = load_json(POS_STATE, {})
-        reject_map: Dict[str,float] = load_json(REJECT_LIST, {})  # sym -> unix expiry
-        # purge expired rejects
-        now = time.time()
-        reject_map = {s:exp for s,exp in reject_map.items() if exp>now}
+        reject_map: Dict[str,float] = load_json(REJECT_LIST, {})
+        now_ts = time.time()
+        reject_map = {s:exp for s,exp in reject_map.items() if exp>now_ts}
 
         cash, positions = fetch_cash_positions(ex)
         equity = cash + sum(p["value"] for p in positions.values())
         log("OK", f"Start — Cash ${cash:.2f}, Equity ${equity:.2f}, Positions {len(positions)}")
 
-        # sells first
+        # rule-based sells first
         sells1 = apply_sell_rules(ex, positions, pos_state, DRY_RUN)
 
-        # dust sweep
+        # dust
         freed = apply_dust_sweeper(ex, positions, DRY_RUN)
-        if freed>0:
-            cash += freed
-            log("OK", f"Dust sweep freed ~${freed:.2f}; Cash now ${cash:.2f}")
+        if freed>0: cash += freed; log("OK", f"Dust sweep freed ~${freed:.2f}; Cash now ${cash:.2f}")
 
-        # targets
+        # breadth brake
+        bear = is_breadth_bearish(ex)
+        if bear and BREADTH_EXIT_WEAKEST and positions:
+            wk = weakest_symbol(positions, ex)
+            if wk:
+                wsym, wchg = wk
+                qty = positions[wsym]["amount"]
+                log("WARN", f"Market BEAR → trimming weakest {wsym} ({wchg:+.1f}%)")
+                market_sell(ex, wsym, qty, DRY_RUN, reason="breadth_trim")
+                cash, positions = fetch_cash_positions(ex)
+
         top = fetch_topk(ex, TOPK)
-        top = [(s,c) for (s,c) in top if s not in reject_map or reject_map[s] < now]
-        if UNIVERSE_WHITELIST:
-            log("OK", "Whitelist active → " + ", ".join(UNIVERSE_WHITELIST))
+        # skip rejected
+        top = [(s,c) for (s,c) in top if s not in reject_map or reject_map[s] < now_ts]
+        if UNIVERSE_WHITELIST: log("OK", "Whitelist active → " + ", ".join(UNIVERSE_WHITELIST))
         log("OK", "Top-K by 24h%: " + ", ".join([f"{s}({c:+.1f}%)" for s,c in top]))
 
         have = set(positions.keys())
-        buys_done = 0; rotations = 0; sells_rot = 0
+        buys_done = 0
+        rotations = 0
+        sells_rot = 0
 
-        # buy loop
-        for s,_chg in top:
-            if buys_done >= MAX_BUYS_PER_RUN: break
-            if s in have: continue
-            reserve = equity*(RESERVE_CASH_PCT/100.0)
-            spendable = max(0.0, cash - reserve)
+        if bear and BREADTH_PAUSE_BUYS:
+            log("WARN", "Breadth BEAR → PAUSING new buys this run.")
+        else:
+            # buy loop
+            for s,_chg in top:
+                if buys_done >= MAX_BUYS_PER_RUN: break
+                if s in have: continue
+                reserve = equity*(RESERVE_CASH_PCT/100.0)
+                spendable = max(0.0, cash - reserve)
 
-            if spendable < MIN_NOTIONAL_USD and ROTATE_WHEN_CASH_SHORT and len(positions)>0:
-                w = weakest_symbol(positions, ex)
-                if w:
-                    wsym, wchg = w
-                    qty = positions[wsym]["amount"]
-                    log("WARN", f"ROTATE_WHEN_CASH_SHORT → selling weakest {wsym} ({wchg:+.1f}%) to fund {s}")
-                    if market_sell(ex, wsym, qty, DRY_RUN, reason="cash_short"):
-                        sells_rot += 1; rotations += 1
-                        cash, positions = fetch_cash_positions(ex); have = set(positions.keys())
-                        reserve = equity*(RESERVE_CASH_PCT/100.0)
-                        spendable = max(0.0, cash - reserve)
+                if spendable < max(MIN_NOTIONAL_USD, BUY_USD_MIN) and ROTATE_WHEN_CASH_SHORT and len(positions)>0:
+                    w = weakest_symbol(positions, ex)
+                    if w:
+                        wsym, wchg = w
+                        qty = positions[wsym]["amount"]
+                        log("WARN", f"ROTATE_WHEN_CASH_SHORT → selling weakest {wsym} ({wchg:+.1f}%) to fund {s}")
+                        if market_sell(ex, wsym, qty, DRY_RUN, reason="cash_short"):
+                            sells_rot += 1; rotations += 1
+                            cash, positions = fetch_cash_positions(ex); have = set(positions.keys())
+                            reserve = equity*(RESERVE_CASH_PCT/100.0)
+                            spendable = max(0.0, cash - reserve)
 
-            if spendable >= MIN_NOTIONAL_USD and buys_done < MAX_BUYS_PER_RUN and len(positions) < MAX_POSITIONS:
-                buy_amt = max(MIN_NOTIONAL_USD, spendable / max(1,(MAX_POSITIONS-len(positions))))
-                before_rejects = dict(reject_map)
-                o = market_buy(ex, s, buy_amt, DRY_RUN, reject_map)
-                if o:
-                    buys_done += 1
-                    cash, positions = fetch_cash_positions(ex); have = set(positions.keys())
-                    try: price = float(ex.fetch_ticker(s)["last"])
-                    except: price = 0.0
-                    qty = positions.get(s,{}).get("amount",0.0)
-                    seed_or_update(pos_state, s, price, float(qty))
-                else:
-                    # if restricted we already updated reject_map; persist shortly
-                    if reject_map != before_rejects:
+                if spendable >= max(MIN_NOTIONAL_USD, BUY_USD_MIN) and buys_done < MAX_BUYS_PER_RUN and len(positions) < MAX_POSITIONS:
+                    buy_amt = max(BUY_USD_MIN, spendable / max(1,(MAX_POSITIONS-len(positions))))
+                    before = dict(reject_map)
+                    if market_buy(ex, s, buy_amt, DRY_RUN, reject_map):
+                        buys_done += 1
+                        cash, positions = fetch_cash_positions(ex); have=set(positions.keys())
+                        try: price = float(ex.fetch_ticker(s)["last"])
+                        except: price = 0.0
+                        qty = positions.get(s,{}).get("amount",0.0)
+                        seed_or_update(pos_state, s, price, float(qty))
+                    elif reject_map != before:
                         save_json(REJECT_LIST, reject_map)
 
-        # if full → one swap
-        if ROTATE_WHEN_FULL and len(positions)>=MAX_POSITIONS and buys_done<MAX_BUYS_PER_RUN:
+        # if full, swap once/run
+        if not (bear and BREADTH_PAUSE_BUYS) and ROTATE_WHEN_FULL and len(positions)>=MAX_POSITIONS and buys_done<MAX_BUYS_PER_RUN:
             candidate = next((sym for sym,_ in top if sym not in have), None)
             if candidate and candidate not in reject_map:
                 w = weakest_symbol(positions, ex)
@@ -395,25 +411,22 @@ def main() -> int:
                             cash, positions = fetch_cash_positions(ex); have=set(positions.keys())
                             reserve = equity*(RESERVE_CASH_PCT/100.0)
                             spendable = max(0.0, cash - reserve)
-                            if spendable >= MIN_NOTIONAL_USD and buys_done<MAX_BUYS_PER_RUN:
-                                buy_amt = max(MIN_NOTIONAL_USD, spendable / max(1,(MAX_POSITIONS-len(positions))))
-                                before_rejects = dict(reject_map)
-                                o = market_buy(ex, candidate, buy_amt, DRY_RUN, reject_map)
-                                if o:
+                            if spendable >= max(MIN_NOTIONAL_USD, BUY_USD_MIN) and buys_done<MAX_BUYS_PER_RUN:
+                                buy_amt = max(BUY_USD_MIN, spendable / max(1,(MAX_POSITIONS-len(positions))))
+                                before = dict(reject_map)
+                                if market_buy(ex, candidate, buy_amt, DRY_RUN, reject_map):
                                     buys_done += 1
                                     cash, positions = fetch_cash_positions(ex); have=set(positions.keys())
                                     try: price = float(ex.fetch_ticker(candidate)["last"])
                                     except: price = 0.0
                                     qty2 = positions.get(candidate,{}).get("amount",0.0)
                                     seed_or_update(pos_state, candidate, price, float(qty2))
-                                else:
-                                    if reject_map != before_rejects:
-                                        save_json(REJECT_LIST, reject_map)
+                                elif reject_map != before:
+                                    save_json(REJECT_LIST, reject_map)
 
-        # end state
+        # persist & kpi
         save_json(POS_STATE, pos_state)
         save_json(REJECT_LIST, reject_map)
-
         cash_end, positions_end = fetch_cash_positions(ex)
         equity_end = cash_end + sum(p["value"] for p in positions_end.values())
         log("KPI", f"End — Cash ${cash_end:.2f}, Equity ${equity_end:.2f}, Positions {len(positions_end)}")
