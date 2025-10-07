@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       RUN_SWITCH:
-        description: "Set to ON to allow live trading (otherwise job exits early)"
+        description: "Set to ON to allow live trading (otherwise skip)"
         required: false
         default: "ON"
       DRY_RUN:
@@ -69,6 +69,7 @@ jobs:
             pip install ccxt numpy pandas
           fi
 
+      # ---- Compute risk inside the job (no artifacts needed) -----------------
       - name: Compute Risk Signal
         id: risk
         env:
@@ -77,8 +78,8 @@ jobs:
           python - <<'PY'
           import os, json
           result = {"risk": "OFF", "reason": "default"}
-          override = os.getenv("RISK_OVERRIDE", "").strip().upper()
-          if override in ("ON", "OFF"):
+          override = os.getenv("RISK_OVERRIDE","").strip().upper()
+          if override in ("ON","OFF"):
               result["risk"] = override
               result["reason"] = "override"
           else:
@@ -86,7 +87,7 @@ jobs:
                   import ccxt
                   ex = ccxt.kraken()
                   markets = ex.load_markets()
-                  candidates = ["BTC/USD", "XBT/USD", "ETH/USD", "SOL/USD", "DOGE/USD"]
+                  candidates = ["BTC/USD","XBT/USD","ETH/USD","SOL/USD","DOGE/USD"]
                   wanted = {"BTC":"", "ETH":"", "SOL":"", "DOGE":""}
                   for s in candidates:
                       base = s.split("/")[0].replace("XBT","BTC")
@@ -98,8 +99,7 @@ jobs:
                       if not wanted[k]:
                           wanted[k] = f"{k}/USD"
                   basket = [wanted["BTC"], wanted["ETH"], wanted["SOL"], wanted["DOGE"]]
-                  positives = 0
-                  detail = {}
+                  positives, detail = 0, {}
                   for sym in basket:
                       try:
                           t = ex.fetch_ticker(sym)
@@ -111,8 +111,7 @@ jobs:
                               if isinstance(last,(int,float)) and isinstance(open_,(int,float)) and open_:
                                   pct = (last/open_ - 1.0)*100.0
                           detail[sym] = pct
-                          if pct and pct > 0:
-                              positives += 1
+                          if pct is not None and pct > 0: positives += 1
                       except Exception:
                           detail[sym] = None
                   result["risk"] = "ON" if positives >= 3 else "OFF"
@@ -133,24 +132,16 @@ jobs:
       - name: Show computed risk
         run: |
           echo "Computed risk: ${{ steps.risk.outputs.risk }} (reason: ${{ steps.risk.outputs.reason }})"
+          echo "RUN_SWITCH=${RUN_SWITCH}"
 
-      - name: Guard — RUN_SWITCH must be ON
-        if: env.RUN_SWITCH != 'ON'
-        run: |
-          echo "RUN_SWITCH is ${RUN_SWITCH}; exiting (no trading)."
-          exit 0
-
-      - name: Guard — Risk must be ON
-        if: steps.risk.outputs.risk != 'ON'
-        run: |
-          echo "Risk is ${{ steps.risk.outputs.risk }}; skipping trading run."
-          exit 0
-
+      # ---- Everything below only runs when BOTH switches are ON --------------
       - name: Sweep Dust (optional)
+        if: ${{ env.RUN_SWITCH == 'ON' && steps.risk.outputs.risk == 'ON' }}
         run: |
           echo "Sweeping dust < ${DUST_MIN_USD} USD (if your bot implements it)..."
 
       - name: Run bot (main.py)
+        if: ${{ env.RUN_SWITCH == 'ON' && steps.risk.outputs.risk == 'ON' }}
         env:
           DRY_RUN: ${{ env.DRY_RUN }}
           MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
