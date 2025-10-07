@@ -1,4 +1,4 @@
-name: Crypto Live — Every 15m (Repo secrets + Preflight)
+name: Crypto Live — Every 15m (Repo secrets + Preflight + Breadth Brake)
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: crypto-live
-  cancel-in-progress: false
+  cancel-in-progress: true    # auto-cancel older runs when a new one starts
 
 jobs:
   run:
@@ -18,38 +18,51 @@ jobs:
     timeout-minutes: 25
 
     env:
+      # --- Mode ---
       DRY_RUN: "false"
       RUN_SWITCH: "on"
 
+      # --- Exchange & quote ---
       EXCHANGE: "kraken"
       BASE_QUOTE: "USD"
 
+      # --- Positioning / rotation ---
       MAX_POSITIONS: "12"
-      MAX_BUYS_PER_RUN: "1"
+      MAX_BUYS_PER_RUN: "2"        # more responsive
       ROTATE_WHEN_FULL: "true"
       ROTATE_WHEN_CASH_SHORT: "true"
 
+      # --- Order sizing / dust ---
       MIN_NOTIONAL_USD: "5"
       DUST_MIN_USD: "5"
       RESERVE_CASH_PCT: "5"
-      UNIVERSE_WHITELIST: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
+      BUY_USD_MIN: "12"            # ensure BTC/ETH orders meet Kraken min cost
 
+      # --- Risk controls ---
       TP_PCT: "2.0"
-      SL_PCT: "3.5"
-      TRAIL_PCT: "1.2"
+      SL_PCT: "2.0"                # tighter stop
+      TRAIL_PCT: "0.8"             # faster trailing stop
       DAILY_LOSS_CAP: "3"
       AUTO_PAUSE_ON_ERROR: "true"
 
+      # --- Logging / state ---
       LOG_LEVEL: "INFO"
       KPI_CSV_PATH: ".state/kpi_history.csv"
       STATE_DIR: ".state"
-
-      TIMEFRAME: "15m"
-      TOPK: "6"
-      COOL_DOWN_MINUTES: "30"
       SHOW_BANNER: "true"
 
-      # Repo-level secrets (from Settings → Secrets and variables → Actions)
+      # --- Universe (stick to majors) ---
+      UNIVERSE_WHITELIST: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
+      TOPK: "6"
+
+      # --- Market breadth brake (pause buys when weak; trim weakest) ---
+      BREADTH_SYMBOL: "BTC/USD"
+      BREADTH_EMA_TIMEFRAME: "1h"
+      BREADTH_EMA_LEN: "20"
+      BREADTH_PAUSE_BUYS: "true"
+      BREADTH_EXIT_WEAKEST: "true"
+
+      # --- Secrets (repo-level) ---
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
       KRAKEN_API_OTP: ${{ secrets.KRAKEN_API_OTP }}
@@ -93,10 +106,12 @@ jobs:
           echo "Max positions: ${MAX_POSITIONS}, Max buys per run: ${MAX_BUYS_PER_RUN}"
           echo "Rotate when full: ${ROTATE_WHEN_FULL}, Rotate when cash short: ${ROTATE_WHEN_CASH_SHORT}"
           echo "Daily loss cap: ${DAILY_LOSS_CAP}%"
+          echo "MinNotional: $${MIN_NOTIONAL_USD}, BuyMin: $${BUY_USD_MIN}"
+          echo "Whitelist: ${UNIVERSE_WHITELIST}"
+          echo "Breadth: ${BREADTH_SYMBOL} ${BREADTH_EMA_TIMEFRAME} EMA${BREADTH_EMA_LEN} (pause buys=${BREADTH_PAUSE_BUYS}, trim weakest=${BREADTH_EXIT_WEAKEST})"
           echo "State dir: ${STATE_DIR}"
 
       - name: Run Crypto Live
-        id: runbot
         run: |
           mkdir -p "${STATE_DIR}"
           python -u main.py
