@@ -1,4 +1,4 @@
-name: Crypto Live — Every 15m (Repo secrets + Preflight + Breadth Brake)
+name: Crypto Live — Every 15m (Repo secrets + Preflight + Breadth Brake + Risk Gate)
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: crypto-live
-  cancel-in-progress: true    # auto-cancel older runs when a new one starts
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -28,7 +28,7 @@ jobs:
 
       # --- Positioning / rotation ---
       MAX_POSITIONS: "12"
-      MAX_BUYS_PER_RUN: "2"        # more responsive
+      MAX_BUYS_PER_RUN: "2"
       ROTATE_WHEN_FULL: "true"
       ROTATE_WHEN_CASH_SHORT: "true"
 
@@ -36,12 +36,12 @@ jobs:
       MIN_NOTIONAL_USD: "5"
       DUST_MIN_USD: "5"
       RESERVE_CASH_PCT: "5"
-      BUY_USD_MIN: "12"            # ensure BTC/ETH orders meet Kraken min cost
+      BUY_USD_MIN: "12"          # raise to 15 if BTC/ETH still reject
 
       # --- Risk controls ---
       TP_PCT: "2.0"
-      SL_PCT: "2.0"                # tighter stop
-      TRAIL_PCT: "0.8"             # faster trailing stop
+      SL_PCT: "2.0"
+      TRAIL_PCT: "0.8"
       DAILY_LOSS_CAP: "3"
       AUTO_PAUSE_ON_ERROR: "true"
 
@@ -81,8 +81,7 @@ jobs:
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          restore-keys: ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: |
@@ -99,22 +98,47 @@ jobs:
           [ -z "${KRAKEN_API_SECRET}" ] && echo "❌ KRAKEN_API_SECRET missing" && exit 1 || echo "KRAKEN_API_SECRET len: ${#KRAKEN_API_SECRET}"
           echo "✅ Secrets present"
 
+      # ---------- RISK SIGNAL GATE ----------
+      - name: Download latest risk signal (best effort)
+        uses: actions/download-artifact@v4
+        with:
+          name: risk-signal
+          path: .state
+        continue-on-error: true
+
+      - id: risk_gate
+        name: Evaluate risk signal (default ON if missing)
+        run: |
+          SIG="ON"
+          [ -f ".state/risk_signal.txt" ] && SIG="$(cat .state/risk_signal.txt | tr -d '\r\n' | tr a-z A-Z)"
+          echo "Risk signal: $SIG"
+          if [ "$SIG" = "OFF" ]; then
+            echo "risk_ok=false" >> $GITHUB_OUTPUT
+          else
+            echo "risk_ok=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Print mode & guards
         run: |
           echo "Mode: DRY_RUN=${DRY_RUN}, RUN_SWITCH=${RUN_SWITCH}"
+          echo "Risk signal gate: ${{ steps.risk_gate.outputs.risk_ok }}"
           echo "Dust threshold: DUST_MIN_USD=${DUST_MIN_USD}"
           echo "Max positions: ${MAX_POSITIONS}, Max buys per run: ${MAX_BUYS_PER_RUN}"
           echo "Rotate when full: ${ROTATE_WHEN_FULL}, Rotate when cash short: ${ROTATE_WHEN_CASH_SHORT}"
-          echo "Daily loss cap: ${DAILY_LOSS_CAP}%"
           echo "MinNotional: $${MIN_NOTIONAL_USD}, BuyMin: $${BUY_USD_MIN}"
           echo "Whitelist: ${UNIVERSE_WHITELIST}"
-          echo "Breadth: ${BREADTH_SYMBOL} ${BREADTH_EMA_TIMEFRAME} EMA${BREADTH_EMA_LEN} (pause buys=${BREADTH_PAUSE_BUYS}, trim weakest=${BREADTH_EXIT_WEAKEST})"
+          echo "Breadth: ${BREADTH_SYMBOL} ${BREADTH_EMA_TIMEFRAME} EMA${BREADTH_EMA_LEN}"
           echo "State dir: ${STATE_DIR}"
 
       - name: Run Crypto Live
+        if: ${{ steps.risk_gate.outputs.risk_ok == 'true' }}
         run: |
           mkdir -p "${STATE_DIR}"
           python -u main.py
+
+      - name: Paused by risk signal (OFF)
+        if: ${{ steps.risk_gate.outputs.risk_ok != 'true' }}
+        run: echo "⛔ Risk signal OFF — trading paused this run."
 
       - name: Summarize run
         if: always()
