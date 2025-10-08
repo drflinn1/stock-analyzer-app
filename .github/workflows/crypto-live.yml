@@ -1,61 +1,76 @@
-name: Crypto Live — Every 15 min (Guarded)
+name: Crypto Live — Kraken (every 15m)
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: "Override dry-run (ON/OFF). Leave blank to use default below."
+        description: "ON = simulate (no orders). OFF = live orders."
+        type: choice
         required: false
-        default: ""
+        default: "OFF"
+        options: ["ON", "OFF"]
       RUN_SWITCH:
-        description: "Master switch (ON/OFF). Leave blank to use default below."
+        description: "Master on/off switch for the bot"
+        type: choice
         required: false
-        default: ""
+        default: "ON"
+        options: ["ON", "OFF"]
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes
+
+permissions:
+  contents: read
 
 concurrency:
   group: crypto-live-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
+
+env:
+  # ---- Core toggles (safe defaults can be overridden via workflow_dispatch inputs) ----
+  DRY_RUN: ${{ inputs.DRY_RUN || 'OFF' }}
+  RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
+
+  # ---- Exchange / universe / sizing ----
+  EXCHANGE: "kraken"
+  QUOTE: "USD"
+  UNIVERSE: "BTC,ETH,SOL,DOGE,ADA,ZEC"
+  MAX_POSITIONS: "6"
+  USD_PER_TRADE: "20"             # adjust to taste
+  RESERVE_CASH_PCT: "10"          # keep some cash back
+
+  # ---- Rotation & dust ----
+  ROTATE_WHEN_CASH_SHORT: "true"  # sell laggards to fund a better buy
+  ROTATE_WHEN_FULL: "false"       # avoid over-churn in scalping mode
+  DUST_MIN_USD: "2"
+
+  # ---- Guards (take-profit / stop-loss / daily caps) ----
+  TAKE_PROFIT_PCT: "3.0"
+  STOP_LOSS_PCT: "2.0"
+  TRAIL_STOP_PCT: "1.0"
+  MAX_DAILY_LOSS_PCT: "5.0"
+  MAX_DAILY_ENTRIES: "6"
+  EMERGENCY_SL_PCT: "8.0"
+
+  # ---- Files & artifacts ----
+  STATE_DIR: ".state"
+  POSITIONS_JSON: ".state/positions.json"
+  KPI_CSV: ".state/kpi_history.csv"
+  SPEC_GATE_REPORT: ".state/spec_gate_report.txt"
+
+  # ---- Slack (set this secret in repo settings → Secrets and variables → Actions) ----
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
 jobs:
   live:
+    name: Run bot
     runs-on: ubuntu-latest
-
-    env:
-      # ===== Master switches =====
-      RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
-      DRY_RUN:    ${{ inputs.DRY_RUN    || 'OFF' }}   # live by default for scheduled runs
-
-      # ===== Night-mode sizing / risk knobs =====
-      MAX_POSITIONS: "6"
-      MAX_BUYS_PER_RUN: "1"
-      SL_PCT: "0.04"
-      TRAIL_PCT: "0.035"
-      TP1_PCT: "0.05"
-      TP1_SIZE: "0.25"
-      RESERVE_CASH_PCT: "0.10"
-      DAILY_NOTIONAL_CAP_USD: "0"
-
-      # ===== Universe / rotation =====
-      USD_ONLY: "true"
-      WHITELIST: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
-      ROTATE_WHEN_CASH_SHORT: "true"
-      ROTATE_WHEN_FULL: "false"
-      DUST_MIN_USD: "2"
-
-      # ===== Logging / misc =====
-      BOT_NAME: "crypto-live"
-      PYTHONUNBUFFERED: "1"
-
-      # ===== Slack (optional, safe to leave empty) =====
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -64,75 +79,97 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: ${{ runner.os }}-pip-
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}-${{ env.DRY_RUN }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-      - name: Install deps
+      - name: Install minimal deps (fast)
         run: |
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install ccxt pandas requests matplotlib
-          fi
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir ccxt pandas numpy requests
 
-      - name: Compute risk
-        id: risk
-        shell: bash
+      # ---------- Heartbeat (Slack) ----------
+      - name: Heartbeat — Slack "bot starting"
+        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
         run: |
-          SIGNAL="OFF"
-          if [ -f ".state/risk_signal.txt" ]; then
-            RAW=$(cat .state/risk_signal.txt | tr -d '\r' | tr '[:lower:]' '[:upper:]')
-            if [ "$RAW" = "ON" ] || [ "$RAW" = "OFF" ]; then
-              SIGNAL="$RAW"
-            fi
-          fi
-          echo "risk=$SIGNAL" >> "$GITHUB_OUTPUT"
-          echo "Gate Summary → Risk: $SIGNAL | RUN_SWITCH: ${RUN_SWITCH} | DRY_RUN: ${DRY_RUN}"
-
-      - name: Daily cap info (noop)
-        if: ${{ always() }}
-        run: |
-          echo "DAILY_NOTIONAL_CAP_USD=${DAILY_NOTIONAL_CAP_USD} (0 means disabled; enforce inside main.py as well)"
-
-      - name: Run bot (main.py)
-        if: ${{ env.RUN_SWITCH == 'ON' && steps.risk.outputs.risk == 'ON' }}
+          RUN_MODE="${{ env.DRY_RUN }}"
+          NOW="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          MSG="🫀 *Crypto Live Heartbeat* — ${NOW}\nRepo: ${{ github.repository }}\nRef: ${{ github.ref_name }}\nRun: ${{ github.run_id }}\nMode: *${RUN_MODE}*\nSwitch: ${{ env.RUN_SWITCH }}"
+          payload=$(jq -n --arg text "$MSG" '{text: $text}')
+          curl -sS -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL" >/dev/null
         env:
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          # pass-through
-          RUN_SWITCH: ${{ env.RUN_SWITCH }}
-          DRY_RUN: ${{ env.DRY_RUN }}
+          SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+
+      - name: Heartbeat — echo fallback
+        if: ${{ env.SLACK_WEBHOOK_URL == '' }}
+        run: |
+          echo "Heartbeat OK — $(date -u) — DRY_RUN=${{ env.DRY_RUN }} RUN_SWITCH=${{ env.RUN_SWITCH }}"
+
+      # ---------- Run bot ----------
+      - name: Prepare state dir
+        run: |
+          mkdir -p "${STATE_DIR}"
+          : > "${SPEC_GATE_REPORT}" || true
+
+      - name: Print mode banner
+        run: |
+          if [ "${DRY_RUN}" = "ON" ]; then
+            echo "🚧 DRY RUN — NO REAL ORDERS SENT 🚧"
+          else
+            echo "✅ LIVE MODE — REAL ORDERS ENABLED"
+          fi
+
+      - name: Run main.py
+        env:
+          # Pass through envs for your bot
+          EXCHANGE: ${{ env.EXCHANGE }}
+          QUOTE: ${{ env.QUOTE }}
+          UNIVERSE: ${{ env.UNIVERSE }}
           MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
-          MAX_BUYS_PER_RUN: ${{ env.MAX_BUYS_PER_RUN }}
-          SL_PCT: ${{ env.SL_PCT }}
-          TRAIL_PCT: ${{ env.TRAIL_PCT }}
-          TP1_PCT: ${{ env.TP1_PCT }}
-          TP1_SIZE: ${{ env.TP1_SIZE }}
+          USD_PER_TRADE: ${{ env.USD_PER_TRADE }}
           RESERVE_CASH_PCT: ${{ env.RESERVE_CASH_PCT }}
-          DAILY_NOTIONAL_CAP_USD: ${{ env.DAILY_NOTIONAL_CAP_USD }}
-          USD_ONLY: ${{ env.USD_ONLY }}
-          WHITELIST: ${{ env.WHITELIST }}
           ROTATE_WHEN_CASH_SHORT: ${{ env.ROTATE_WHEN_CASH_SHORT }}
           ROTATE_WHEN_FULL: ${{ env.ROTATE_WHEN_FULL }}
           DUST_MIN_USD: ${{ env.DUST_MIN_USD }}
-          BOT_NAME: ${{ env.BOT_NAME }}
-          PYTHONUNBUFFERED: ${{ env.PYTHONUNBUFFERED }}
-          SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+          TAKE_PROFIT_PCT: ${{ env.TAKE_PROFIT_PCT }}
+          STOP_LOSS_PCT: ${{ env.STOP_LOSS_PCT }}
+          TRAIL_STOP_PCT: ${{ env.TRAIL_STOP_PCT }}
+          MAX_DAILY_LOSS_PCT: ${{ env.MAX_DAILY_LOSS_PCT }}
+          MAX_DAILY_ENTRIES: ${{ env.MAX_DAILY_ENTRIES }}
+          EMERGENCY_SL_PCT: ${{ env.EMERGENCY_SL_PCT }}
+          RUN_SWITCH: ${{ env.RUN_SWITCH }}
+          DRY_RUN: ${{ env.DRY_RUN }}
+          STATE_DIR: ${{ env.STATE_DIR }}
+          POSITIONS_JSON: ${{ env.POSITIONS_JSON }}
+          KPI_CSV: ${{ env.KPI_CSV }}
+          SPEC_GATE_REPORT: ${{ env.SPEC_GATE_REPORT }}
+          # Exchange creds via secrets (set these in your repo)
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
-          echo "========== RUN CONFIG =========="
-          echo "🚧 DRY_RUN=${DRY_RUN} — RUN_SWITCH=${RUN_SWITCH}"
-          echo "MAX_POSITIONS=${MAX_POSITIONS} — MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}"
-          echo "SL=${SL_PCT} TRAIL=${TRAIL_PCT} TP1=${TP1_PCT} x ${TP1_SIZE}"
-          echo "RESERVE_CASH_PCT=${RESERVE_CASH_PCT} — DUST_MIN_USD=${DUST_MIN_USD}"
-          echo "WHITELIST=${WHITELIST} — USD_ONLY=${USD_ONLY}"
-          echo "================================"
-          python ./main.py
+          set -e
+          python -u main.py
 
-      - name: Skipped (risk OFF or switch OFF)
-        if: ${{ !(env.RUN_SWITCH == 'ON' && steps.risk.outputs.risk == 'ON') }}
+      # ---------- Slack completion ping (optional but handy) ----------
+      - name: Slack — run completed
+        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
         run: |
-          echo "Skipped bot run → Reason:"
-          echo "  RUN_SWITCH=${RUN_SWITCH}"
-          echo "  Risk=${{ steps.risk.outputs.risk || 'UNKNOWN' }}"
-          echo "  DRY_RUN=${DRY_RUN}"
-          echo "This is expected when Risk=OFF. The moment Risk=ON, this job will execute."
+          STATUS="${{ job.status }}"
+          NOW="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          MSG="✅ *Crypto Live completed* — ${NOW}\nStatus: *${STATUS}*\nMode: *${{ env.DRY_RUN }}*\nArtifacts: positions.json / kpi_history.csv / spec_gate_report.txt"
+          payload=$(jq -n --arg text "$MSG" '{text: $text}')
+          curl -sS -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL" >/dev/null
+        env:
+          SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+
+      # ---------- Artifacts ----------
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-live-state-${{ github.run_id }}
+          path: |
+            .state/positions.json
+            .state/kpi_history.csv
+            .state/spec_gate_report.txt
+          if-no-files-found: warn
