@@ -11,37 +11,65 @@ jobs:
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
       WHITELIST: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-      - run: pip install ccxt
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install ccxt requests
+
       - name: Post snapshot
         run: |
           python - <<'PY'
-import os, time, json
-import ccxt, requests
-wl=[s.strip() for s in os.getenv("WHITELIST").split(",") if s.strip()]
-ex=ccxt.kraken({"apiKey":os.getenv("KRAKEN_API_KEY"),"secret":os.getenv("KRAKEN_API_SECRET"),"enableRateLimit":True})
-ex.load_markets()
-bal=ex.fetch_free_balance()
-tick=ex.fetch_tickers(wl)
-rows=[]
-pv=0.0
-for s in wl:
-  base=s.split("/")[0]
-  q=float(bal.get(base,0.0))
-  px=float(tick.get(s,{}).get("last") or 0.0)
-  val=q*px
-  if q>0:
-    pv+=val
-    rows.append(f"{s}: {q:.6f} (~${val:.2f})")
-usd=float(bal.get("USD",0.0))+float(bal.get("ZUSD",0.0))
-pv+=usd
-fields=[{"title":"USD Free","value":f"${usd:.2f}","short":True},
-        {"title":"PV (est)","value":f"${pv:.2f}","short":True},
-        {"title":"Holdings","value":("\n".join(rows) if rows else "None"),"short":False}]
-payload={"attachments":[{"color":"#2eb886","title":"📊 Positions Snapshot","fields":fields,"ts":int(time.time())}]}
-requests.post(os.getenv("SLACK_WEBHOOK_URL"), json=payload, timeout=8)
-print("Posted positions snapshot.")
-PY
+          import os, time
+          import ccxt, requests
+
+          wl = [s.strip() for s in os.getenv("WHITELIST","").split(",") if s.strip()]
+          ex = ccxt.kraken({
+              "apiKey": os.getenv("KRAKEN_API_KEY",""),
+              "secret": os.getenv("KRAKEN_API_SECRET",""),
+              "enableRateLimit": True
+          })
+          ex.load_markets()
+          bal = ex.fetch_free_balance()
+          tick = ex.fetch_tickers(wl)
+
+          rows = []
+          pv = 0.0
+
+          for s in wl:
+              base = s.split("/")[0]
+              q = float(bal.get(base, 0.0))
+              px = float(tick.get(s, {}).get("last") or 0.0)
+              val = q * px
+              if q > 0:
+                  pv += val
+                  rows.append(f"{s}: {q:.6f} (~${val:.2f})")
+
+          usd = float(bal.get("USD", 0.0)) + float(bal.get("ZUSD", 0.0))
+          pv += usd
+
+          payload = {
+              "attachments": [{
+                  "color": "#2eb886",
+                  "title": "📊 Positions Snapshot",
+                  "fields": [
+                      {"title": "USD Free", "value": f"${usd:.2f}", "short": True},
+                      {"title": "PV (est)", "value": f"${pv:.2f}", "short": True},
+                      {"title": "Holdings", "value": "\n".join(rows) if rows else "None", "short": False}
+                  ],
+                  "ts": int(time.time())
+              }]
+          }
+
+          url = os.getenv("SLACK_WEBHOOK_URL","").strip()
+          if url:
+              requests.post(url, json=payload, timeout=8)
+              print("Posted positions snapshot.")
+          else:
+              print("No SLACK_WEBHOOK_URL set; skipping Slack post.")
+          PY
