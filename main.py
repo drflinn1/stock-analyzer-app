@@ -1,472 +1,581 @@
-#!/usr/bin/env python3
-"""
-Crypto Live Bot — Guarded + Slack + KPI
-- Exchange: Kraken via CCXT
-- Exits: STOP_LOSS / TAKE_PROFIT (TP1) / Trailing
-- Entries: Momentum, rotation when cash short, rebuy cooldown
-- Controls: Daily notional cap, reserve cash, dust sweep
-- DRY_RUN simulation with verbose logs
-"""
-# Guard tokens (do not remove): STOP_LOSS, stop_loss, TAKE_PROFIT, take_profit
+# main.py — Crypto Live with Guard Pack (Kraken, USD)
+# - Auto-pick Top-K from UNIVERSE using 24h momentum
+# - DRY_RUN banner and safe execution
+# - Rotation when cash short (optional) and when full (optional)
+# - Take-profit / Stop-loss / Trailing stop
+# - Daily caps (max loss, max entries)
+# - Slack pings for trades and risk flips (no line continuations)
+# - Artifacts: .state/positions.json, .state/kpi_history.csv, .state/spec_gate_report.txt
+#
+# Env keys expected (all have sane defaults):
+# EXCHANGE, QUOTE, UNIVERSE, MAX_POSITIONS, USD_PER_TRADE, RESERVE_CASH_PCT,
+# ROTATE_WHEN_CASH_SHORT, ROTATE_WHEN_FULL, DUST_MIN_USD,
+# TAKE_PROFIT_PCT, STOP_LOSS_PCT, TRAIL_STOP_PCT,
+# MAX_DAILY_LOSS_PCT, MAX_DAILY_ENTRIES, EMERGENCY_SL_PCT,
+# RUN_SWITCH, DRY_RUN,
+# STATE_DIR, POSITIONS_JSON, KPI_CSV, SPEC_GATE_REPORT,
+# KRAKEN_API_KEY, KRAKEN_API_SECRET, SLACK_WEBHOOK_URL
 
 from __future__ import annotations
-import os, json, math, time, csv, pathlib
+import os, sys, json, time, csv, math, traceback
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 
-# ---------- Slack (color cards) ----------
-SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
-
-def _ts() -> int:
-    # Slack expects seconds (not ms)
-    return int(time.time())
-
-def slack_card(title: str, text: str = "", color: str = "#aaaaaa", fields: List[Dict[str,str]] | None = None):
-    """Post a colored attachment to Slack (safe no-op if webhook not set)."""
-    if not SLACK_WEBHOOK_URL:
-        return
-    payload = {
-        "attachments": [
-            {
-                "color": color,
-                "fallback": title,
-                "title": title,
-                "text": text,
-                "fields": fields or [],
-                "ts": _ts(),
-            }
-        ]
-    }
-    try:
-        import requests
-        requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=6)
-    except Exception:
-        # never break trading on Slack errors
-        pass
-
-def slack_ok(title: str, text: str = "", fields: List[Dict[str,str]] | None = None):
-    slack_card(title, text, color="#2eb886", fields=fields)  # green
-
-def slack_warn(title: str, text: str = "", fields: List[Dict[str,str]] | None = None):
-    slack_card(title, text, color="#daa038", fields=fields)  # amber
-
-def slack_err(title: str, text: str = "", fields: List[Dict[str,str]] | None = None):
-    slack_card(title, text, color="#e01e5a", fields=fields)  # red
-
-# ---------- FS / utils ----------
-ROOT = pathlib.Path(".")
-STATE_DIR = ROOT / ".state"
-STATE_DIR.mkdir(exist_ok=True)
-
-def env_str(k, d): return os.environ.get(k, d)
-def env_bool(k, d):
-    v = os.environ.get(k); 
-    return d if v is None else str(v).strip().lower() in ("1","true","yes","on")
-def env_float(k, d):
-    try: return float(os.environ.get(k, str(d)))
-    except: return d
-def env_int(k, d):
-    try: return int(float(os.environ.get(k, str(d))))
-    except: return d
-
-def now_iso(): return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-def today_key(): return datetime.now(timezone.utc).strftime("%Y%m%d")
-
-def load_json(p: pathlib.Path, default):
-    try:
-        if p.exists(): return json.loads(p.read_text())
-    except: pass
-    return default
-
-def save_json(p: pathlib.Path, data):
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-    tmp.replace(p)
-
-def append_csv(p: pathlib.Path, row: List[Any]):
-    new = not p.exists()
-    with p.open("a", newline="") as f:
-        w = csv.writer(f)
-        if new: w.writerow(["ts","event","symbol","side","qty","price","notional","note"])
-        w.writerow(row)
-
-# ---------- Config ----------
-RUN_SWITCH          = env_str("RUN_SWITCH", "ON")
-DRY_RUN             = env_str("DRY_RUN", "ON").upper()
-USD_ONLY            = env_bool("USD_ONLY", True)
-WHITELIST           = [s.strip() for s in env_str("WHITELIST","BTC/USD,ETH/USD,SOL/USD,DOGE/USD").split(",") if s.strip()]
-
-MAX_POSITIONS       = env_int("MAX_POSITIONS", 6)
-MAX_BUYS_PER_RUN    = env_int("MAX_BUYS_PER_RUN", 1)
-
-# Sell guards — keep names for the repo's Sell Logic Guard
-SL_PCT              = env_float("SL_PCT", 0.04)     # STOP_LOSS = 4%
-TRAIL_PCT           = env_float("TRAIL_PCT", 0.035) # trailing 3.5%
-TP1_PCT             = env_float("TP1_PCT", 0.05)    # TAKE_PROFIT (leg 1) = 5%
-TP1_SIZE            = env_float("TP1_SIZE", 0.25)   # portion to sell at TP1
-
-RESERVE_CASH_PCT    = env_float("RESERVE_CASH_PCT", 0.10)
-DAILY_CAP_USD       = env_float("DAILY_NOTIONAL_CAP_USD", 0.0)   # 0 disables
-REBUY_COOLDOWN_MIN  = env_int("REBUY_COOLDOWN_MIN", 30)
-
-ROTATE_WHEN_CASH_SHORT = env_bool("ROTATE_WHEN_CASH_SHORT", True)
-ROTATE_WHEN_FULL       = env_bool("ROTATE_WHEN_FULL", False)
-
-DUST_MIN_USD        = env_float("DUST_MIN_USD", 2.0)
-BOT_NAME            = env_str("BOT_NAME", "crypto-live")
-
-KRAKEN_API_KEY      = env_str("KRAKEN_API_KEY", "")
-KRAKEN_API_SECRET   = env_str("KRAKEN_API_SECRET", "")
-HAS_KEYS            = bool(KRAKEN_API_KEY and KRAKEN_API_SECRET)
-
-# ---------- Exchange ----------
 try:
     import ccxt  # type: ignore
 except Exception as e:
-    raise SystemExit(f"[FATAL] ccxt is required: {e}")
+    raise SystemExit(f"ccxt is required: {e}")
 
-def make_exchange(dry: bool):
-    params = {"enableRateLimit": True}
-    if HAS_KEYS and not dry:
-        params.update({"apiKey": KRAKEN_API_KEY, "secret": KRAKEN_API_SECRET})
-    return ccxt.kraken(params)
+# ---------- Tiny utils ----------
+
+def utcnow() -> str:
+    return datetime.utcnow().replace(tzinfo=timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+def as_bool(val: Optional[str], default: bool) -> bool:
+    if val is None or val == "":
+        return default
+    s = str(val).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
+
+def as_float(val: Optional[str], default: float) -> float:
+    try:
+        return float(val) if val is not None else default
+    except Exception:
+        return default
+
+def as_int(val: Optional[str], default: int) -> int:
+    try:
+        return int(val) if val is not None else default
+    except Exception:
+        return default
+
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+def load_json(path: str, default: Any) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def save_json(path: str, obj: Any) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+def append_csv(path: str, row: List[Any]) -> None:
+    exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if not exists:
+            w.writerow(["ts_utc","event","symbol","side","qty","price","notional","pnl","note"])
+        w.writerow(row)
+
+# ---------- Slack helpers (safe, no backslashes) ----------
+
+import requests
+
+def slack_post(webhook: str, payload: Dict[str, Any]) -> None:
+    try:
+        r = requests.post(
+            webhook,
+            data=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[warn] Slack post failed: {e}")
+
+def slack_trade_ping(
+    webhook: str,
+    *,
+    text: str,
+    symbol: str,
+    side: str,
+    qty: float,
+    price: float,
+    color: str = "#36a64f",
+) -> None:
+    fields: List[Dict[str, Any]] = [
+        {"title": "Symbol",   "value": symbol,               "short": True},
+        {"title": "Side",     "value": side.upper(),         "short": True},
+        {"title": "Qty",      "value": f"{qty:.6f}",         "short": True},
+        {"title": "Price",    "value": f"${price:.2f}",      "short": True},
+        {"title": "Notional", "value": f"${qty*price:.2f}",  "short": True},
+    ]
+    payload = {
+        "text": text,
+        "attachments": [
+            {
+                "color": color,
+                "fields": fields,
+            }
+        ],
+    }
+    slack_post(webhook, payload)
+
+def slack_info(webhook: str, text: str) -> None:
+    slack_post(webhook, {"text": text})
+
+def slack_risk_flip(webhook: str, *, new_state: str, reason: str) -> None:
+    payload = {
+        "text": f"⚠️ Risk signal changed → *{new_state.upper()}*",
+        "attachments": [
+            {
+                "color": "#e01e5a" if new_state.lower() == "off" else "#2eb886",
+                "fields": [
+                    {"title": "Reason", "value": reason or "n/a", "short": False}
+                ],
+            }
+        ],
+    }
+    slack_post(webhook, payload)
+
+# ---------- ENV ----------
+
+EXCHANGE           = os.getenv("EXCHANGE", "kraken")
+QUOTE              = os.getenv("QUOTE", "USD").upper()
+UNIVERSE           = [s.strip().upper() for s in os.getenv("UNIVERSE", "BTC,ETH,SOL,DOGE,ADA,ZEC").split(",") if s.strip()]
+MAX_POSITIONS      = as_int(os.getenv("MAX_POSITIONS"), 6)
+USD_PER_TRADE      = as_float(os.getenv("USD_PER_TRADE"), 20.0)
+RESERVE_CASH_PCT   = as_float(os.getenv("RESERVE_CASH_PCT"), 10.0)
+
+ROTATE_WHEN_CASH_SHORT = as_bool(os.getenv("ROTATE_WHEN_CASH_SHORT"), True)
+ROTATE_WHEN_FULL       = as_bool(os.getenv("ROTATE_WHEN_FULL"), False)
+DUST_MIN_USD       = as_float(os.getenv("DUST_MIN_USD"), 2.0)
+
+TAKE_PROFIT_PCT    = as_float(os.getenv("TAKE_PROFIT_PCT"), 3.0)
+STOP_LOSS_PCT      = as_float(os.getenv("STOP_LOSS_PCT"), 2.0)
+TRAIL_STOP_PCT     = as_float(os.getenv("TRAIL_STOP_PCT"), 1.0)
+MAX_DAILY_LOSS_PCT = as_float(os.getenv("MAX_DAILY_LOSS_PCT"), 5.0)
+MAX_DAILY_ENTRIES  = as_int(os.getenv("MAX_DAILY_ENTRIES"), 6)
+EMERGENCY_SL_PCT   = as_float(os.getenv("EMERGENCY_SL_PCT"), 8.0)
+
+RUN_SWITCH         = os.getenv("RUN_SWITCH","ON").upper()
+DRY_RUN            = os.getenv("DRY_RUN","ON").upper()
+
+STATE_DIR          = os.getenv("STATE_DIR",".state")
+POSITIONS_JSON     = os.getenv("POSITIONS_JSON", f"{STATE_DIR}/positions.json")
+KPI_CSV            = os.getenv("KPI_CSV", f"{STATE_DIR}/kpi_history.csv")
+SPEC_GATE_REPORT   = os.getenv("SPEC_GATE_REPORT", f"{STATE_DIR}/spec_gate_report.txt")
+
+SLACK_WEBHOOK      = os.getenv("SLACK_WEBHOOK_URL","").strip()
+
+API_KEY            = os.getenv("KRAKEN_API_KEY","")
+API_SECRET         = os.getenv("KRAKEN_API_SECRET","")
+
+# ---------- Exchange wiring ----------
+
+def make_exchange() -> ccxt.Exchange:
+    if EXCHANGE.lower() != "kraken":
+        raise SystemExit("Only kraken is supported in this file (set EXCHANGE=kraken).")
+    cfg = {
+        "enableRateLimit": True,
+        "options": {"adjustForTimeDifference": True},
+    }
+    if DRY_RUN != "ON":
+        cfg.update({"apiKey": API_KEY, "secret": API_SECRET})
+    ex = ccxt.kraken(cfg)
+    ex.load_markets()
+    return ex
+
+def pair(base: str) -> str:
+    return f"{base}/{QUOTE}"
+
+# Kraken returns balances sometimes as 'USD' or 'ZUSD'
+def pick_usd_key(bal: Dict[str, float]) -> str:
+    for k in ("USD","ZUSD","XUSD"):
+        if k in bal:
+            return k
+    # fall back to QUOTE key if present
+    return QUOTE if QUOTE in bal else "USD"
 
 # ---------- State ----------
-POS_STATE_FILE = STATE_DIR / "positions.json"     # avg_cost, qty, peak, last_buy_ts
-COOLDOWN_FILE  = STATE_DIR / "cooldown.json"      # symbol -> ts
-KPI_FILE       = STATE_DIR / "kpi_history.csv"
-DAILY_FILE     = STATE_DIR / f"notional_{today_key()}.json"  # {"spent": float}
 
-positions: Dict[str, Dict[str, float]] = load_json(POS_STATE_FILE, {})
-cooldown: Dict[str, float]             = load_json(COOLDOWN_FILE, {})
-daily: Dict[str, float]                 = load_json(DAILY_FILE, {"spent": 0.0})
+def default_state() -> Dict[str, Any]:
+    return {
+        "positions": {},  # symbol -> {"qty":float, "entry_price":float, "trail":float}
+        "last_risk": "ON",
+        "today": datetime.utcnow().strftime("%Y-%m-%d"),
+        "daily_pnl": 0.0,
+        "daily_entries": 0,
+    }
 
-def bump_daily_spent(amount: float) -> None:
-    daily["spent"] = round(float(daily.get("spent", 0.0)) + max(amount, 0.0), 2)
-    save_json(DAILY_FILE, daily)
+def load_state() -> Dict[str, Any]:
+    s = load_json(POSITIONS_JSON, default_state())
+    # migrate keys
+    if "positions" not in s:
+        s = default_state()
+    # reset day counters if date changed
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    if s.get("today") != today:
+        s["today"] = today
+        s["daily_pnl"] = 0.0
+        s["daily_entries"] = 0
+    return s
 
-def record_trade(event: str, symbol: str, side: str, qty: float, price: float, note: str="") -> None:
-    append_csv(STATE_DIR / "trades.csv", [now_iso(), event, symbol, side, f"{qty:.8f}", f"{price:.8f}", f"{qty*price:.2f}", note])
+def save_state(s: Dict[str, Any]) -> None:
+    ensure_dir(STATE_DIR)
+    save_json(POSITIONS_JSON, s)
 
-def kpi(note: str) -> None:
-    append_csv(KPI_FILE, [now_iso(), "kpi", note, "", "", "", "", ""])
+# ---------- Risk Signal (simple momentum breadth) ----------
 
-# ---------- Guarded sell helpers (explicit tokens) ----------
-def stop_loss_triggered(avg_price: float, last_price: float) -> bool:
-    """Return True if STOP_LOSS should fire (guard token present)."""
-    return last_price <= avg_price * (1.0 - SL_PCT)
+def compute_risk_signal(ex: ccxt.Exchange, bases: List[str]) -> Tuple[str, str]:
+    # Simple: ON if average 24h change of universe >= -2%; else OFF
+    changes: List[float] = []
+    for b in bases:
+        sym = pair(b)
+        try:
+            t = ex.fetch_ticker(sym)
+            pct = t.get("percentage", 0.0) or 0.0
+            changes.append(float(pct))
+        except Exception:
+            pass
+    if not changes:
+        return "ON", "No data; default ON"
+    avg = sum(changes)/len(changes)
+    if avg < -2.0:
+        return "OFF", f"Avg 24h% {avg:.2f} < -2%"
+    return "ON", f"Avg 24h% {avg:.2f} >= -2%"
 
-def take_profit_qty(qty: float, avg_price: float, last_price: float) -> float:
-    """Return portion to sell for TAKE_PROFIT leg 1 (guard token present)."""
-    if last_price >= avg_price * (1.0 + TP1_PCT) and TP1_SIZE > 0:
-        return round(qty * TP1_SIZE, 8)
-    return 0.0
+# ---------- Guards ----------
 
-# ---------- Market / balances ----------
-def fetch_market_snapshot(ex):
-    ex.load_markets()
-    try:
-        tickers = ex.fetch_tickers(WHITELIST)
-    except Exception:
-        time.sleep(1.0)
-        tickers = ex.fetch_tickers(WHITELIST)
-    data = {}
-    for s in WHITELIST:
-        t = tickers.get(s, {})
-        last = float(t.get("last") or t.get("close") or 0.0)
-        pct  = float(t.get("percentage") or 0.0)
-        ask  = float(t.get("ask") or last or 0.0)
-        bid  = float(t.get("bid") or last or 0.0)
-        spread = (ask - bid) / ask if ask else 0.0
-        data[s] = {"last": last, "pct": pct, "ask": ask, "bid": bid, "spread": spread}
-    return data
+def violated_daily_caps(state: Dict[str, Any], equity_usd: float) -> Optional[str]:
+    # MAX_DAILY_LOSS_PCT: compare daily_pnl vs equity
+    if MAX_DAILY_LOSS_PCT > 0 and equity_usd > 0:
+        if (state.get("daily_pnl", 0.0) / equity_usd) * 100 <= -MAX_DAILY_LOSS_PCT:
+            return f"Daily loss cap hit ({state.get('daily_pnl',0.0):.2f} vs equity {equity_usd:.2f})"
+    if MAX_DAILY_ENTRIES > 0 and state.get("daily_entries",0) >= MAX_DAILY_ENTRIES:
+        return f"Max daily entries reached ({state['daily_entries']})"
+    return None
 
-def fetch_balances(ex) -> Tuple[float, Dict[str, float]]:
+# ---------- Sizing / balances ----------
+
+def fetch_cash_and_equity(ex: ccxt.Exchange) -> Tuple[float, float, Dict[str,float]]:
     bal = ex.fetch_free_balance()
-    usd = float(bal.get("USD", 0.0)) + float(bal.get("ZUSD", 0.0))
-    coins = {}
-    for s in WHITELIST:
-        base = s.split("/")[0]
-        coins[base] = float(bal.get(base, 0.0))
-    return usd, coins
+    usd_key = pick_usd_key(bal)
+    cash = float(bal.get(usd_key, 0.0))
+    equity = cash
+    # rough equity: add positions using last price
+    try:
+        for b in UNIVERSE:
+            qty = float(bal.get(b, 0.0))
+            if qty > 0:
+                t = ex.fetch_ticker(pair(b))
+                px = float(t.get("last") or t.get("close") or t.get("ask") or 0.0)
+                equity += qty * px
+    except Exception:
+        pass
+    return cash, equity, bal
 
-# ---------- Logging ----------
-def log_header():
-    print("========== CONFIG ==========")
-    print(f"BOT={BOT_NAME}  RUN_SWITCH={RUN_SWITCH}  DRY_RUN={DRY_RUN}  HAS_KEYS={HAS_KEYS}")
-    # include tokens in the line below for the guard:
-    print(f"STOP_LOSS={SL_PCT}  TRAIL={TRAIL_PCT}  TAKE_PROFIT={TP1_PCT} x {TP1_SIZE}")
-    print(f"MAX_POS={MAX_POSITIONS}  MAX_BUYS_PER_RUN={MAX_BUYS_PER_RUN}")
-    print(f"RESERVE_CASH_PCT={RESERVE_CASH_PCT}  DUST_MIN_USD={DUST_MIN_USD}")
-    print(f"DAILY_CAP_USD={DAILY_CAP_USD} (spent_today={daily.get('spent',0.0)})  REBUY_COOLDOWN_MIN={REBUY_COOLDOWN_MIN}")
-    print(f"WHITELIST={','.join(WHITELIST)}  USD_ONLY={USD_ONLY}")
-    print(f"ROTATE_WHEN_CASH_SHORT={ROTATE_WHEN_CASH_SHORT}  ROTATE_WHEN_FULL={ROTATE_WHEN_FULL}")
-    print("============================")
+def min_cash_reserved(cash: float) -> float:
+    reserve = max(0.0, cash * (RESERVE_CASH_PCT/100.0))
+    return reserve
 
-# ---------- Orders ----------
-def place_market_buy(ex, symbol: str, usd_alloc: float, price_hint: float) -> Tuple[float,float]:
-    price = price_hint if price_hint > 0 else ex.fetch_ticker(symbol)["last"]
-    qty = round(max(0.0, usd_alloc) / max(price, 1e-12), 8)
-    if qty <= 0: return 0.0, price
+# ---------- Order exec ----------
+
+def place_order(
+    ex: ccxt.Exchange, base: str, side: str, usd_notional: float, price_hint: Optional[float]=None
+) -> Tuple[float,float]:
+    # returns (qty, price)
+    sym = pair(base)
+    t = ex.fetch_ticker(sym)
+    price = float(t.get("last") or t.get("close") or t.get("ask") or t.get("bid") or 0.0)
+    if price <= 0:
+        raise RuntimeError(f"Bad price for {sym}")
+    qty = usd_notional / price
     if DRY_RUN == "ON":
-        print(f"[SIM BUY] {symbol} qty={qty:.8f} @ ~{price:.4f}  notional=${usd_alloc:.2f}")
-        record_trade("sim", symbol, "buy", qty, price, "dry_run")
-        slack_warn(
-            f"🧪 DRY BUY {symbol}",
-            fields=[
-                {"title":"Notional","value":f"${usd_alloc:.2f}","short":True},
-                {"title":"Price","value":f"{price:.4f}","short":True},
-            ],
-        )
+        print(f"[DRY] {side.upper()} {sym} qty={qty:.8f} px={price:.2f} notional=${usd_notional:.2f}")
         return qty, price
-    if not HAS_KEYS: raise RuntimeError("Live BUY requested but API keys not present")
-    order = ex.create_market_buy_order(symbol, qty)
-    fill = float(order.get("average") or order.get("price") or price) if isinstance(order, dict) else price
-    print(f"[LIVE BUY] {symbol} qty={qty:.8f} @ ~{fill:.4f}  notional≈${qty*fill:.2f}")
-    record_trade("live", symbol, "buy", qty, fill, "market")
-    slack_ok(
-        f"🟢 BUY {symbol}",
-        fields=[
-            {"title":"Qty","value":f"{qty:.6f}","short":True},
-            {"title":"Fill","value":f"{fill:.4f}","short":True},
-            {"title":"Notional","value":f"${qty*fill:.2f}","short":True},
-            {"title":"Stops/TP","value":f"SL {SL_PCT*100:.1f}% · TR {TRAIL_PCT*100:.1f}% · TP {TP1_PCT*100:.1f}% x {int(TP1_SIZE*100)}%","short":False},
-        ],
-    )
-    return qty, fill
-
-def place_market_sell(ex, symbol: str, qty: float, price_hint: float) -> Tuple[float,float]:
-    price = price_hint if price_hint > 0 else ex.fetch_ticker(symbol)["last"]
-    qty = round(qty, 8)
-    if qty <= 0: return 0.0, price
-    if DRY_RUN == "ON":
-        print(f"[SIM SELL] {symbol} qty={qty:.8f} @ ~{price:.4f}  notional≈${qty*price:.2f}")
-        record_trade("sim", symbol, "sell", qty, price, "dry_run")
-        slack_warn(
-            f"🧪 DRY SELL {symbol}",
-            fields=[
-                {"title":"Qty","value":f"{qty:.6f}","short":True},
-                {"title":"Px","value":f"{price:.4f}","short":True},
-                {"title":"Notional","value":f\"${qty*price:.2f}\",\"short\":True},
-            ],
-        )
-        return qty, price
-    if not HAS_KEYS: raise RuntimeError("Live SELL requested but API keys not present")
-    order = ex.create_market_sell_order(symbol, qty)
-    fill = float(order.get("average") or order.get("price") or price) if isinstance(order, dict) else price
-    print(f"[LIVE SELL] {symbol} qty={qty:.8f} @ ~{fill:.4f}  notional≈${qty*fill:.2f}")
-    record_trade("live", symbol, "sell", qty, fill, "market")
-    slack_err(
-        f"🔴 SELL {symbol}",
-        fields=[
-            {"title":"Qty","value":f"{qty:.6f}","short":True},
-            {"title":"Fill","value":f"{fill:.4f}","short":True},
-            {"title":"Notional","value":f\"${qty*fill:.2f}\",\"short\":True},
-        ],
-    )
-    return qty, fill
-
-# ---------- Exits (SL / TP / Trail / Dust) ----------
-def value_usd(qty: float, price: float) -> float:
-    return float(qty) * float(price)
-
-def update_after_buy(sym: str, qty: float, price: float):
-    p = positions.get(sym, {"avg_cost": 0.0, "qty": 0.0, "peak": 0.0, "last_buy_ts": 0.0})
-    new_qty = p["qty"] + qty
-    new_cost = (p["avg_cost"]*p["qty"] + qty*price) / new_qty if new_qty > 0 else price
-    p["qty"], p["avg_cost"], p["peak"] = new_qty, new_cost, max(p.get("peak", 0.0), price)
-    p["last_buy_ts"] = time.time()
-    positions[sym] = p
-    cooldown[sym] = p["last_buy_ts"]
-    save_json(POS_STATE_FILE, positions); save_json(COOLDOWN_FILE, cooldown)
-
-def update_after_sell(sym: str, sell_qty: float, price: float):
-    p = positions.get(sym, {"avg_cost": 0.0, "qty": 0.0, "peak": 0.0, "last_buy_ts": 0.0})
-    p["qty"] = max(0.0, p["qty"] - sell_qty)
-    p["peak"] = max(p.get("peak", 0.0), price)
-    if p["qty"] <= 1e-9:
-        positions.pop(sym, None); cooldown.pop(sym, None)
+    # LIVE
+    typ = "market"
+    if side.lower() == "buy":
+        o = ex.create_order(sym, typ, "buy", qty, None, {"cost": usd_notional})
     else:
-        positions[sym] = p
-    save_json(POS_STATE_FILE, positions); save_json(COOLDOWN_FILE, cooldown)
+        o = ex.create_order(sym, typ, "sell", qty, None, {})
+    # best-effort fill price
+    filled = float(o.get("filled") or qty)
+    avg = float(o.get("average") or price)
+    return filled, avg
 
-def evaluate_exits(ex, snapshot, coin_balances) -> Tuple[float, float]:
-    usd_realized = 0.0; usd_dusted = 0.0
-    for symbol in WHITELIST:
-        base = symbol.split("/")[0]
-        qty = float(coin_balances.get(base, 0.0))
-        if qty <= 0: 
-            continue
-        price = snapshot[symbol]["bid"] or snapshot[symbol]["last"]
-        p = positions.get(symbol, {"avg_cost": price, "qty": qty, "peak": price})
-        avg, peak = float(p.get("avg_cost", price)), float(p.get("peak", price))
+# ---------- Core strategy ----------
 
-        # keep peak for trailing
-        if price > peak:
-            p["peak"] = price; positions[symbol] = p; save_json(POS_STATE_FILE, positions)
+def rank_universe_by_momentum(ex: ccxt.Exchange, bases: List[str]) -> List[Tuple[str, float]]:
+    ranks: List[Tuple[str, float]] = []
+    for b in bases:
+        sym = pair(b)
+        try:
+            t = ex.fetch_ticker(sym)
+            pct = float(t.get("percentage") or 0.0)
+            ranks.append((b, pct))
+        except Exception:
+            pass
+    ranks.sort(key=lambda x: x[1], reverse=True)
+    return ranks
 
-        value = value_usd(qty, price)
+def trailing_update(trail: float, price: float, trail_pct: float, is_long: bool=True) -> float:
+    if is_long:
+        # ratchet up only
+        new_trail = price * (1.0 - trail_pct/100.0)
+        return max(trail, new_trail) if trail > 0 else new_trail
+    return trail
 
-        # Dust
-        if value < DUST_MIN_USD:
-            print(f"[DUST] {symbol} value=${value:.2f} < {DUST_MIN_USD} → sweeping")
-            sqty, spx = place_market_sell(ex, symbol, qty, price)
-            update_after_sell(symbol, sqty, spx); usd_dusted += sqty * spx; continue
+# ---------- Spec gate report ----------
 
-        # STOP_LOSS
-        if stop_loss_triggered(avg, price):
-            print(f"[SL] {symbol} price {price:.4f} <= avg {avg:.4f} * (1-SL) → exit ALL")
-            sqty, spx = place_market_sell(ex, symbol, qty, price)
-            update_after_sell(symbol, sqty, spx); usd_realized += sqty * spx; continue
+def append_spec(msg: str) -> None:
+    ensure_dir(STATE_DIR)
+    with open(SPEC_GATE_REPORT, "a", encoding="utf-8") as f:
+        f.write(f"[{utcnow()}] {msg}\n")
 
-        # Trailing (only if in profit)
-        if peak > avg and price <= peak * (1.0 - TRAIL_PCT):
-            print(f"[TRAIL] {symbol} price {price:.4f} <= peak {peak:.4f} * (1-TRAIL) → exit ALL")
-            sqty, spx = place_market_sell(ex, symbol, qty, price)
-            update_after_sell(symbol, sqty, spx); usd_realized += sqty * spx; continue
+# ---------- Main run ----------
 
-        # TAKE_PROFIT partial
-        tp_qty = take_profit_qty(qty, avg, price)
-        if tp_qty > 0:
-            print(f"[TP1] {symbol} price {price:.4f} >= avg {avg:.4f} * (1+TP1) → sell {TP1_SIZE*100:.0f}%")
-            sqty, spx = place_market_sell(ex, symbol, tp_qty, price)
-            update_after_sell(symbol, sqty, spx); usd_realized += sqty * spx
-    return usd_realized, usd_dusted
+def run() -> None:
+    print(f"=== Crypto Live — {EXCHANGE.upper()} — {utcnow()} ===")
+    print(f"Mode: {DRY_RUN} | RUN_SWITCH: {RUN_SWITCH} | UNIVERSE: {','.join(UNIVERSE)}")
+    ensure_dir(STATE_DIR)
+    # clear spec report for this run
+    with open(SPEC_GATE_REPORT, "w", encoding="utf-8") as f:
+        f.write(f"Run started {utcnow()}\n")
 
-# ---------- Entries ----------
-def want_slots(current_positions: int) -> int:
-    return max(0, MAX_POSITIONS - current_positions)
-
-def can_buy_symbol(sym: str, nowt: float) -> bool:
-    last = cooldown.get(sym, 0.0)
-    return not (last and (nowt - last) < (REBUY_COOLDOWN_MIN * 60))
-
-def pick_candidates(snapshot, held_symbols: List[str]) -> List[str]:
-    scored = []
-    for s, d in snapshot.items():
-        if d["last"] <= 0 or d["ask"] <= 0 or d["bid"] <= 0: continue
-        if d["spread"] > 0.004: continue
-        scored.append((s, d["pct"]))
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return [s for (s,_) in scored if s not in held_symbols] + [s for (s,_) in scored if s in held_symbols]
-
-def maybe_rotate_to_free_cash(ex, snapshot, usd_free: float, need_usd: float) -> float:
-    if usd_free >= need_usd or not ROTATE_WHEN_CASH_SHORT: return usd_free
-    held = [(s, snapshot[s]["pct"]) for s in WHITELIST if positions.get(s,{}).get("qty",0) > 0]
-    if not held: return usd_free
-    weakest = sorted(held, key=lambda x: x[1])[0][0]
-    qty = positions.get(weakest, {}).get("qty", 0.0)
-    if qty <= 0: return usd_free
-    price = snapshot[weakest]["bid"] or snapshot[weakest]["last"]
-    print(f"[ROTATE] Selling weakest {weakest} to free cash")
-    sqty, spx = place_market_sell(ex, weakest, qty, price)
-    update_after_sell(weakest, sqty, spx)
-    return usd_free + sqty * spx
-
-def place_entries(ex, snapshot, usd_free: float, held_count: int) -> float:
-    if MAX_BUYS_PER_RUN <= 0: return 0.0
-    slots = want_slots(held_count)
-    buys_allowed = min(MAX_BUYS_PER_RUN, max(0, slots))
-    if buys_allowed <= 0:
-        if ROTATE_WHEN_FULL:
-            print("[INFO] At max positions; rotation-when-full intentionally disabled to reduce churn.")
-        return 0.0
-
-    spendable = max(0.0, usd_free * (1.0 - RESERVE_CASH_PCT))
-    if spendable <= 10.0:
-        print("[INFO] Not enough spendable USD after reserve buffer."); return 0.0
-
-    cap_left = max(0.0, DAILY_CAP_USD - daily.get("spent", 0.0)) if DAILY_CAP_USD > 0 else float("inf")
-    if cap_left <= 5.0:
-        print(f"[DAILYCAP] Reached cap: spent={daily.get('spent',0.0)} / cap={DAILY_CAP_USD}. No new buys.")
-        return 0.0
-
-    per_buy = spendable / buys_allowed
-    ordered = pick_candidates(snapshot, held_symbols=[s for s in WHITELIST if positions.get(s,{}).get("qty",0)>0])
-    buys_done = 0; usd_spent_total = 0.0; nowt = time.time()
-
-    for sym in ordered:
-        if buys_done >= buys_allowed: break
-        if not can_buy_symbol(sym, nowt): continue
-        price = snapshot[sym]["ask"] or snapshot[sym]["last"]
-        if price <= 0: continue
-
-        allowed = min(per_buy, cap_left - usd_spent_total) if DAILY_CAP_USD > 0 else per_buy
-        if allowed <= 5.0: break
-
-        if allowed > usd_free:
-            usd_free = maybe_rotate_to_free_cash(ex, snapshot, usd_free, allowed)
-        if usd_free < allowed: continue
-
-        qty, fill = place_market_buy(ex, sym, allowed, price)
-        update_after_buy(sym, qty, fill)
-        usd_free -= qty * fill; usd_spent_total += qty * fill; buys_done += 1
-
-    if usd_spent_total > 0:
-        bump_daily_spent(usd_spent_total)
-        print(f"[BUY] Placed {buys_done} buy(s), spent ≈ ${usd_spent_total:.2f} (daily spent now ${daily.get('spent',0.0):.2f})")
-    else:
-        print("[BUY] No entries this run.")
-    return usd_spent_total
-
-# ---------- Main ----------
-def main():
     if RUN_SWITCH != "ON":
-        print(f"[SKIP] RUN_SWITCH={RUN_SWITCH} → exiting."); return
+        append_spec("RUN_SWITCH is OFF — exiting.")
+        print("RUN_SWITCH is OFF — exiting.")
+        return
 
-    print("========== RUN =========="); log_header()
-    ex = make_exchange(dry=(DRY_RUN=="ON"))
+    ex = make_exchange()
+    state = load_state()
 
-    snapshot = fetch_market_snapshot(ex)
-    usd_free, base_balances = fetch_balances(ex)
+    # risk
+    risk, reason = compute_risk_signal(ex, UNIVERSE)
+    append_spec(f"Risk={risk} ({reason})")
 
-    # sync positions with live balances
-    for s in WHITELIST:
-        base = s.split("/")[0]
-        live_qty = float(base_balances.get(base, 0.0))
-        p = positions.get(s, {"avg_cost": snapshot[s]["last"], "qty": 0.0, "peak": snapshot[s]["last"]})
-        if abs(p.get("qty", 0.0) - live_qty) > 1e-9:
-            p["qty"] = live_qty; positions[s] = p
-    save_json(POS_STATE_FILE, positions)
+    if risk != state.get("last_risk","ON"):
+        if SLACK_WEBHOOK:
+            slack_risk_flip(SLACK_WEBHOOK, new_state=risk, reason=reason)
+        state["last_risk"] = risk
+        save_state(state)
 
-    held = [s for s in WHITELIST if positions.get(s,{}).get("qty",0) > 0]
-    held_str = ", ".join([f"{s}:{positions[s]['qty']:.6f}" for s in held]) if held else "None"
-    print(f"[BAL] USD free ≈ ${usd_free:.2f} | Held: {held_str}")
+    # balances
+    cash, equity, raw_bal = fetch_cash_and_equity(ex)
+    append_spec(f"Cash={cash:.2f} Equity~={equity:.2f}")
 
-    # 1) exits
-    usd_from_sells, usd_dusted = evaluate_exits(ex, snapshot, base_balances)
-    if usd_from_sells or usd_dusted:
-        usd_free, base_balances = fetch_balances(ex)
+    # daily caps
+    cap_msg = violated_daily_caps(state, equity)
+    if cap_msg:
+        append_spec(f"Daily cap active: {cap_msg}")
+        print(cap_msg)
+        save_state(state)
+        save_json(POSITIONS_JSON, state)  # ensure file
+        return
 
-    # 2) entries
-    held_count = sum(1 for s in WHITELIST if positions.get(s,{}).get("qty",0) > 0)
-    spent = place_entries(ex, snapshot, usd_free, held_count)
+    # build current holdings qty (exchange balances)
+    holdings: Dict[str,float] = {}
+    usd_key = pick_usd_key(raw_bal)
+    for b in UNIVERSE:
+        q = float(raw_bal.get(b, 0.0))
+        if q > 0:
+            holdings[b] = q
 
-    # 3) KPIs / summary
-    portfolio_value = float(usd_free)
-    for s in WHITELIST:
-        qty = positions.get(s,{}).get("qty",0.0)
-        if qty > 0: portfolio_value += qty * snapshot[s]["last"]
-    msg_txt = f"PV≈${portfolio_value:.2f} | USD≈${usd_free:.2f} | spent_today=${daily.get('spent',0.0):.2f}"
-    print(f"[SUMMARY] {('🧪' if DRY_RUN=='ON' else '✅')} {BOT_NAME} summary: {msg_txt}")
-    slack_card(
-        title=("🧪 DRY RUN" if DRY_RUN=="ON" else "✅ LIVE SUMMARY"),
-        text="",
-        color="#777777" if DRY_RUN=="ON" else "#4caf50",
-        fields=[
-            {"title":"Bot","value":BOT_NAME,"short":True},
-            {"title":"Positions","value":str(len([1 for s in WHITELIST if positions.get(s,{}).get('qty',0)>0])),"short":True},
-            {"title":"PV","value":f"${portfolio_value:.2f}","short":True},
-            {"title":"USD Free","value":f"${usd_free:.2f}","short":True},
-            {"title":"Spent Today","value":f"${daily.get('spent',0.0):.2f}","short":True},
-        ],
-    )
-    kpi(f"pv=${portfolio_value:.2f}; usd_free=${usd_free:.2f}; spent_today=${daily.get('spent',0.0):.2f}; buys_this_run=${spent:.2f}")
+    # mark dust for sell
+    to_sell_dust: List[str] = []
+    for b, q in list(holdings.items()):
+        try:
+            px = float(ex.fetch_ticker(pair(b)).get("last") or 0.0)
+            notional = q * px
+            if notional < DUST_MIN_USD:
+                to_sell_dust.append(b)
+        except Exception:
+            pass
+
+    ranks = rank_universe_by_momentum(ex, UNIVERSE)
+    append_spec(f"Top ranks: {ranks[:5]}")
+
+    # desired set = top MAX_POSITIONS
+    desired = [b for (b,_) in ranks[:MAX_POSITIONS]]
+
+    actions: List[Tuple[str,str,float]] = []  # (side, base, usd_notional)
+
+    # SELL rules first: TP/SL/Trail, Dust, Rotation
+    for b, q in list(holdings.items()):
+        sym = pair(b)
+        try:
+            t = ex.fetch_ticker(sym)
+            px = float(t.get("last") or 0.0)
+        except Exception:
+            px = 0.0
+
+        # trailing stop tracking in state
+        pos = state["positions"].get(b, {"qty": q, "entry_price": px, "trail": 0.0})
+        if pos.get("qty",0) <= 0:
+            pos["qty"] = q
+            pos["entry_price"] = px if px > 0 else pos.get("entry_price", 0.0)
+            pos["trail"] = pos.get("trail", 0.0)
+
+        entry = float(pos.get("entry_price", px))
+        if entry <= 0 and px > 0:
+            entry = px
+            pos["entry_price"] = entry
+
+        # update trailing
+        pos["trail"] = trailing_update(float(pos.get("trail",0.0)), px, TRAIL_STOP_PCT, True)
+        state["positions"][b] = pos
+
+        pnl_pct = (px/entry - 1.0) * 100.0 if entry > 0 and px > 0 else 0.0
+
+        should_sell = False
+        sell_reason = ""
+
+        # Dust first
+        if b in to_sell_dust:
+            should_sell = True
+            sell_reason = f"Dust < ${DUST_MIN_USD}"
+
+        # Emergency SL
+        if not should_sell and EMERGENCY_SL_PCT > 0 and pnl_pct <= -EMERGENCY_SL_PCT:
+            should_sell = True
+            sell_reason = f"Emergency SL {pnl_pct:.2f}%"
+
+        # Take profit / stop loss
+        if not should_sell and TAKE_PROFIT_PCT > 0 and pnl_pct >= TAKE_PROFIT_PCT:
+            should_sell = True
+            sell_reason = f"TP {pnl_pct:.2f}%"
+        if not should_sell and STOP_LOSS_PCT > 0 and pnl_pct <= -STOP_LOSS_PCT:
+            should_sell = True
+            sell_reason = f"SL {pnl_pct:.2f}%"
+
+        # Trailing stop check
+        trail = float(pos.get("trail", 0.0))
+        if not should_sell and trail > 0 and px > 0 and px <= trail:
+            should_sell = True
+            sell_reason = f"Trail hit (px {px:.4f} <= {trail:.4f})"
+
+        # Rotation: if full and not in desired, or cash short and found better rank
+        in_desired = b in desired
+        if not should_sell and ROTATE_WHEN_FULL and len(holdings) >= MAX_POSITIONS and not in_desired:
+            should_sell = True
+            sell_reason = "Rotate when full"
+        if not should_sell and ROTATE_WHEN_CASH_SHORT and len(holdings) >= 1:
+            # sell worst ranked holding if we have no cash for a buy and this isn't among top N
+            pass  # handled below when planning buys
+
+        if should_sell and q > 0 and px > 0:
+            actions.append(("sell", b, q * px))  # notional for logging
+            append_spec(f"Queue SELL {b}: {sell_reason}")
+
+    # BUY planning
+    # compute available cash after reserve
+    cash_after_reserve = max(0.0, cash - min_cash_reserved(cash))
+    # plan top picks not already held
+    buys: List[str] = []
+    for b in desired:
+        if b not in holdings:
+            buys.append(b)
+
+    # if no cash but buys exist and ROTATE_WHEN_CASH_SHORT, sell worst-ranked current holding to fund
+    if buys and cash_after_reserve < USD_PER_TRADE and ROTATE_WHEN_CASH_SHORT and holdings:
+        # pick lowest ranked holding
+        rank_map = {b:i for i,(b,_) in enumerate(ranks)}
+        worst = None
+        worst_idx = -1
+        for b in holdings.keys():
+            idx = rank_map.get(b, 9999)
+            if idx > worst_idx:
+                worst_idx = idx
+                worst = b
+        if worst and worst not in [b for _,b,_ in actions if _=="sell"]:
+            # sell worst to free cash
+            q = holdings.get(worst, 0.0)
+            try:
+                px = float(ex.fetch_ticker(pair(worst)).get("last") or 0.0)
+            except Exception:
+                px = 0.0
+            if q > 0 and px > 0:
+                actions.append(("sell", worst, q*px))
+                append_spec(f"Queue SELL {worst}: rotate to fund buy")
+
+    # execute SELLS first
+    for side, b, notion in actions:
+        if side != "sell":
+            continue
+        try:
+            sym = pair(b)
+            # compute qty from balance fresh
+            bal = ex.fetch_free_balance()
+            q = float(bal.get(b, 0.0))
+            if q <= 0:
+                continue
+            qty, px = place_order(ex, b, "sell", q * px if False else q * (ex.fetch_ticker(sym).get("last") or 0.0))  # qty-based sell
+            # update state
+            st_pos = state["positions"].get(b, {"qty":0.0,"entry_price":px,"trail":0.0})
+            realized = (px - float(st_pos.get("entry_price",px))) * qty
+            state["daily_pnl"] = float(state.get("daily_pnl",0.0)) + realized
+            state["positions"].pop(b, None)
+            append_csv(KPI_CSV, [utcnow(),"SELL", b, "SELL", f"{qty:.8f}", f"{px:.6f}", f"{qty*px:.2f}", f"{realized:.2f}", ""])
+            if SLACK_WEBHOOK:
+                slack_trade_ping(
+                    SLACK_WEBHOOK,
+                    text=f"Sold {b} — qty {qty:.6f} @ ${px:.2f}",
+                    symbol=b, side="sell", qty=qty, price=px, color="#e01e5a"
+                )
+        except Exception as e:
+            append_spec(f"Sell error {b}: {e}")
+
+    # refresh balances after sells
+    cash, equity, raw_bal = fetch_cash_and_equity(ex)
+    cash_after_reserve = max(0.0, cash - min_cash_reserved(cash))
+
+    # recompute holdings map
+    holdings = {}
+    usd_key = pick_usd_key(raw_bal)
+    for b in UNIVERSE:
+        q = float(raw_bal.get(b, 0.0))
+        if q > 0:
+            holdings[b] = q
+
+    # Limit buy count by cap
+    buys_to_do = min(len(buys), max(0, MAX_POSITIONS - len(holdings)))
+
+    for b in buys[:buys_to_do]:
+        if cash_after_reserve < USD_PER_TRADE:
+            append_spec(f"No cash for buy {b} (need {USD_PER_TRADE}, have {cash_after_reserve:.2f})")
+            continue
+        try:
+            qty, px = place_order(ex, b, "buy", USD_PER_TRADE)
+            # update state
+            state["positions"][b] = {"qty": qty, "entry_price": px, "trail": 0.0}
+            state["daily_entries"] = int(state.get("daily_entries",0)) + 1
+            append_csv(KPI_CSV, [utcnow(),"BUY", b, "BUY", f"{qty:.8f}", f"{px:.6f}", f"{qty*px:.2f}", "", ""])
+            if SLACK_WEBHOOK:
+                slack_trade_ping(
+                    SLACK_WEBHOOK,
+                    text=f"Bought {b} — qty {qty:.6f} @ ${px:.2f}",
+                    symbol=b, side="buy", qty=qty, price=px, color="#2eb886"
+                )
+            cash_after_reserve -= USD_PER_TRADE
+        except Exception as e:
+            append_spec(f"Buy error {b}: {e}")
+
+    save_state(state)
+    print("Run complete.")
+    append_spec("Run complete.")
+
+# ---------- Entry ----------
 
 if __name__ == "__main__":
     try:
-        main()
+        if DRY_RUN == "ON":
+            print("🚧 DRY RUN — NO REAL ORDERS SENT 🚧")
+        else:
+            print("✅ LIVE MODE — REAL ORDERS ENABLED")
+        run()
     except Exception as e:
-        print(f"[FATAL] {e}"); 
-        slack_err("❌ BOT CRASH", text=str(e))
-        raise
+        err = "".join(traceback.format_exception(*sys.exc_info()))
+        ensure_dir(STATE_DIR)
+        with open(SPEC_GATE_REPORT, "a", encoding="utf-8") as f:
+            f.write("\n[ERROR]\n")
+            f.write(err)
+        print(f"[FATAL] {e}")
+        sys.exit(1)
