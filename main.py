@@ -14,16 +14,44 @@ import os, json, math, time, csv, pathlib
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Tuple
 
-# ---------- Optional Slack ----------
+# ---------- Slack (color cards) ----------
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
-def slack_post(text: str) -> None:
+
+def _ts() -> int:
+    # Slack expects seconds (not ms)
+    return int(time.time())
+
+def slack_card(title: str, text: str = "", color: str = "#aaaaaa", fields: List[Dict[str,str]] | None = None):
+    """Post a colored attachment to Slack (safe no-op if webhook not set)."""
     if not SLACK_WEBHOOK_URL:
         return
+    payload = {
+        "attachments": [
+            {
+                "color": color,
+                "fallback": title,
+                "title": title,
+                "text": text,
+                "fields": fields or [],
+                "ts": _ts(),
+            }
+        ]
+    }
     try:
         import requests
-        requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=6)
+        requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=6)
     except Exception:
-        pass  # never break trading on Slack failure
+        # never break trading on Slack errors
+        pass
+
+def slack_ok(title: str, text: str = "", fields: List[Dict[str,str]] | None = None):
+    slack_card(title, text, color="#2eb886", fields=fields)  # green
+
+def slack_warn(title: str, text: str = "", fields: List[Dict[str,str]] | None = None):
+    slack_card(title, text, color="#daa038", fields=fields)  # amber
+
+def slack_err(title: str, text: str = "", fields: List[Dict[str,str]] | None = None):
+    slack_card(title, text, color="#e01e5a", fields=fields)  # red
 
 # ---------- FS / utils ----------
 ROOT = pathlib.Path(".")
@@ -183,14 +211,28 @@ def place_market_buy(ex, symbol: str, usd_alloc: float, price_hint: float) -> Tu
     if DRY_RUN == "ON":
         print(f"[SIM BUY] {symbol} qty={qty:.8f} @ ~{price:.4f}  notional=${usd_alloc:.2f}")
         record_trade("sim", symbol, "buy", qty, price, "dry_run")
-        slack_post(f"🧪 DRY BUY {symbol} ≈ ${usd_alloc:.2f}")
+        slack_warn(
+            f"🧪 DRY BUY {symbol}",
+            fields=[
+                {"title":"Notional","value":f"${usd_alloc:.2f}","short":True},
+                {"title":"Price","value":f"{price:.4f}","short":True},
+            ],
+        )
         return qty, price
     if not HAS_KEYS: raise RuntimeError("Live BUY requested but API keys not present")
     order = ex.create_market_buy_order(symbol, qty)
     fill = float(order.get("average") or order.get("price") or price) if isinstance(order, dict) else price
     print(f"[LIVE BUY] {symbol} qty={qty:.8f} @ ~{fill:.4f}  notional≈${qty*fill:.2f}")
     record_trade("live", symbol, "buy", qty, fill, "market")
-    slack_post(f"🟢 BUY {symbol} qty={qty:.6f} ≈ ${qty*fill:.2f}  (SL {SL_PCT*100:.1f}%, TR {TRAIL_PCT*100:.1f}%, TP {TP1_PCT*100:.1f}% x {int(TP1_SIZE*100)}%)")
+    slack_ok(
+        f"🟢 BUY {symbol}",
+        fields=[
+            {"title":"Qty","value":f"{qty:.6f}","short":True},
+            {"title":"Fill","value":f"{fill:.4f}","short":True},
+            {"title":"Notional","value":f"${qty*fill:.2f}","short":True},
+            {"title":"Stops/TP","value":f"SL {SL_PCT*100:.1f}% · TR {TRAIL_PCT*100:.1f}% · TP {TP1_PCT*100:.1f}% x {int(TP1_SIZE*100)}%","short":False},
+        ],
+    )
     return qty, fill
 
 def place_market_sell(ex, symbol: str, qty: float, price_hint: float) -> Tuple[float,float]:
@@ -200,14 +242,28 @@ def place_market_sell(ex, symbol: str, qty: float, price_hint: float) -> Tuple[f
     if DRY_RUN == "ON":
         print(f"[SIM SELL] {symbol} qty={qty:.8f} @ ~{price:.4f}  notional≈${qty*price:.2f}")
         record_trade("sim", symbol, "sell", qty, price, "dry_run")
-        slack_post(f"🧪 DRY SELL {symbol} qty={qty:.6f} ≈ ${qty*price:.2f}")
+        slack_warn(
+            f"🧪 DRY SELL {symbol}",
+            fields=[
+                {"title":"Qty","value":f"{qty:.6f}","short":True},
+                {"title":"Px","value":f"{price:.4f}","short":True},
+                {"title":"Notional","value":f\"${qty*price:.2f}\",\"short\":True},
+            ],
+        )
         return qty, price
     if not HAS_KEYS: raise RuntimeError("Live SELL requested but API keys not present")
     order = ex.create_market_sell_order(symbol, qty)
     fill = float(order.get("average") or order.get("price") or price) if isinstance(order, dict) else price
     print(f"[LIVE SELL] {symbol} qty={qty:.8f} @ ~{fill:.4f}  notional≈${qty*fill:.2f}")
     record_trade("live", symbol, "sell", qty, fill, "market")
-    slack_post(f"🔴 SELL {symbol} qty={qty:.6f} ≈ ${qty*fill:.2f}")
+    slack_err(
+        f"🔴 SELL {symbol}",
+        fields=[
+            {"title":"Qty","value":f"{qty:.6f}","short":True},
+            {"title":"Fill","value":f"{fill:.4f}","short":True},
+            {"title":"Notional","value":f\"${qty*fill:.2f}\",\"short\":True},
+        ],
+    )
     return qty, fill
 
 # ---------- Exits (SL / TP / Trail / Dust) ----------
@@ -391,12 +447,26 @@ def main():
     for s in WHITELIST:
         qty = positions.get(s,{}).get("qty",0.0)
         if qty > 0: portfolio_value += qty * snapshot[s]["last"]
-    msg = f"{'🧪' if DRY_RUN=='ON' else '✅'} {BOT_NAME} summary: PV≈${portfolio_value:.2f} | USD≈${usd_free:.2f} | spent_today=${daily.get('spent',0.0):.2f}"
-    print(f"[SUMMARY] {msg}"); slack_post(msg)
+    msg_txt = f"PV≈${portfolio_value:.2f} | USD≈${usd_free:.2f} | spent_today=${daily.get('spent',0.0):.2f}"
+    print(f"[SUMMARY] {('🧪' if DRY_RUN=='ON' else '✅')} {BOT_NAME} summary: {msg_txt}")
+    slack_card(
+        title=("🧪 DRY RUN" if DRY_RUN=="ON" else "✅ LIVE SUMMARY"),
+        text="",
+        color="#777777" if DRY_RUN=="ON" else "#4caf50",
+        fields=[
+            {"title":"Bot","value":BOT_NAME,"short":True},
+            {"title":"Positions","value":str(len([1 for s in WHITELIST if positions.get(s,{}).get('qty',0)>0])),"short":True},
+            {"title":"PV","value":f"${portfolio_value:.2f}","short":True},
+            {"title":"USD Free","value":f"${usd_free:.2f}","short":True},
+            {"title":"Spent Today","value":f"${daily.get('spent',0.0):.2f}","short":True},
+        ],
+    )
     kpi(f"pv=${portfolio_value:.2f}; usd_free=${usd_free:.2f}; spent_today=${daily.get('spent',0.0):.2f}; buys_this_run=${spent:.2f}")
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"[FATAL] {e}"); raise
+        print(f"[FATAL] {e}"); 
+        slack_err("❌ BOT CRASH", text=str(e))
+        raise
