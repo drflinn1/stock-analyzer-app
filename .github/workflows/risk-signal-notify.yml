@@ -2,7 +2,7 @@ name: Risk Signal Notifier
 
 on:
   schedule:
-    - cron: "0 14 * * *"   # 14:00 UTC daily (adjust anytime)
+    - cron: "0 14 * * *"   # 14:00 UTC daily
   workflow_dispatch: {}
 
 jobs:
@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -18,7 +19,7 @@ jobs:
         run: |
           CURR="OFF"
           if [ -f ".state/risk_signal.txt" ]; then
-            RAW=$(cat .state/risk_signal.txt | tr -d '\r' | tr '[:lower:]' '[:upper:]')
+            RAW=$(tr -d '\r' < .state/risk_signal.txt | tr '[:lower:]' '[:upper:]')
             if [ "$RAW" = "ON" ] || [ "$RAW" = "OFF" ]; then
               CURR="$RAW"
             fi
@@ -30,46 +31,43 @@ jobs:
         run: |
           LAST="UNKNOWN"
           if [ -f ".state/last_risk_signal.txt" ]; then
-            LAST=$(cat .state/last_risk_signal.txt | tr -d '\r')
+            LAST=$(tr -d '\r' < .state/last_risk_signal.txt)
           fi
           echo "last=$LAST" >> "$GITHUB_OUTPUT"
-          echo "${{ steps.now.outputs.curr }}" > .state/last_risk_signal.txt
+          printf "%s" "${{ steps.now.outputs.curr }}" > .state/last_risk_signal.txt
 
       - name: Slack alert on flip (color card)
         if: ${{ env.SLACK_WEBHOOK_URL != '' && steps.cmp.outputs.last != 'UNKNOWN' && steps.cmp.outputs.last != steps.now.outputs.curr }}
         run: |
-          COLOR="#2eb886"
-          ICON="🟢"
+          COLOR="#2eb886"; ICON="🟢"
           if [ "${{ steps.now.outputs.curr }}" = "OFF" ]; then
-            COLOR="#e01e5a"
-            ICON="🔴"
+            COLOR="#e01e5a"; ICON="🔴"
           fi
-          read -r -d '' PAYLOAD <<'JSON'
+          LAST='${{ steps.cmp.outputs.last }}'
+          CURR='${{ steps.now.outputs.curr }}'
+          TS=$(date +%s)
+
+          cat > payload.json <<EOF
           {
             "attachments": [
               {
-                "color": "COLOR_HERE",
-                "title": "ICON_HERE Risk flip",
+                "color": "$COLOR",
+                "title": "$ICON Risk flip",
                 "fields": [
-                  {"title":"From","value":"LAST_HERE","short":true},
-                  {"title":"To","value":"CURR_HERE","short":true}
+                  { "title": "From", "value": "$LAST", "short": true },
+                  { "title": "To",   "value": "$CURR", "short": true }
                 ],
-                "ts": TIMESTAMP_HERE
+                "ts": $TS
               }
             ]
           }
-JSON
-          TS=$(date +%s)
-          PAYLOAD=${PAYLOAD//COLOR_HERE/$COLOR}
-          PAYLOAD=${PAYLOAD//ICON_HERE/$ICON}
-          PAYLOAD=${PAYLOAD//LAST_HERE/${{ steps.cmp.outputs.last }}}
-          PAYLOAD=${PAYLOAD//CURR_HERE/${{ steps.now.outputs.curr }}}
-          PAYLOAD=${PAYLOAD//TIMESTAMP_HERE/$TS}
-          curl -X POST -H 'Content-type: application/json' \
-            --data "$PAYLOAD" \
-            "${SLACK_WEBHOOK_URL}"
+          EOF
 
-      - name: Save last value
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data @payload.json \
+            "${SLACK_WEBHOOK_URL}" >/dev/null
+
+      - name: Save last value (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: risk-state
