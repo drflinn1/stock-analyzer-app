@@ -14,7 +14,6 @@ on:
         required: false
         default: ""
 
-# Prevent overlapping 15-minute runs
 concurrency:
   group: crypto-live-${{ github.ref }}
   cancel-in-progress: true
@@ -29,25 +28,28 @@ jobs:
       DRY_RUN:    ${{ inputs.DRY_RUN    || 'OFF' }}   # live by default for scheduled runs
 
       # ===== Night-mode sizing / risk knobs =====
-      MAX_POSITIONS: "6"          # 4–6 is good; 6 keeps some breadth
-      MAX_BUYS_PER_RUN: "1"       # keep churn low when choppy
-      SL_PCT: "0.04"              # 4% hard stop
-      TRAIL_PCT: "0.035"          # 3.5% trailing
-      TP1_PCT: "0.05"             # take 5% profit…
-      TP1_SIZE: "0.25"            # …on 25% of the position
-      RESERVE_CASH_PCT: "0.10"    # keep a small buffer
-      DAILY_NOTIONAL_CAP_USD: "0" # 0 disables; set e.g. 500 to cap new buys for the day
+      MAX_POSITIONS: "6"
+      MAX_BUYS_PER_RUN: "1"
+      SL_PCT: "0.04"
+      TRAIL_PCT: "0.035"
+      TP1_PCT: "0.05"
+      TP1_SIZE: "0.25"
+      RESERVE_CASH_PCT: "0.10"
+      DAILY_NOTIONAL_CAP_USD: "0"
 
-      # ===== Universe / rotation (keep your existing defaults if you prefer) =====
+      # ===== Universe / rotation =====
       USD_ONLY: "true"
       WHITELIST: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
       ROTATE_WHEN_CASH_SHORT: "true"
-      ROTATE_WHEN_FULL: "false"   # optional: reduce churn during dip scalps
+      ROTATE_WHEN_FULL: "false"
       DUST_MIN_USD: "2"
 
       # ===== Logging / misc =====
       BOT_NAME: "crypto-live"
       PYTHONUNBUFFERED: "1"
+
+      # ===== Slack (optional, safe to leave empty) =====
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
     steps:
       - name: Checkout
@@ -70,11 +72,9 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install ccxt pandas requests yfinance
+            pip install ccxt pandas requests matplotlib
           fi
 
-      # ---- Risk gate: read your current signal (produced by your notifier job or stored in repo state) ----
-      # Looks at .state/risk_signal.txt if present; otherwise falls back to OFF.
       - name: Compute risk
         id: risk
         shell: bash
@@ -89,21 +89,17 @@ jobs:
           echo "risk=$SIGNAL" >> "$GITHUB_OUTPUT"
           echo "Gate Summary → Risk: $SIGNAL | RUN_SWITCH: ${RUN_SWITCH} | DRY_RUN: ${DRY_RUN}"
 
-      # ---- Optional guard: skip buys if a simple daily notional cap is exceeded (bot should enforce as well) ----
       - name: Daily cap info (noop)
         if: ${{ always() }}
         run: |
           echo "DAILY_NOTIONAL_CAP_USD=${DAILY_NOTIONAL_CAP_USD} (0 means disabled; enforce inside main.py as well)"
 
-      # ---- Run the bot (LIVE requires secrets AND DRY_RUN=OFF AND Risk=ON) ----
       - name: Run bot (main.py)
         if: ${{ env.RUN_SWITCH == 'ON' && steps.risk.outputs.risk == 'ON' }}
         env:
-          # Pass Kraken API keys for live trading
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-
-          # Re-expose all envs to the process (some shells require explicit pass-through)
+          # pass-through
           RUN_SWITCH: ${{ env.RUN_SWITCH }}
           DRY_RUN: ${{ env.DRY_RUN }}
           MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
@@ -121,6 +117,7 @@ jobs:
           DUST_MIN_USD: ${{ env.DUST_MIN_USD }}
           BOT_NAME: ${{ env.BOT_NAME }}
           PYTHONUNBUFFERED: ${{ env.PYTHONUNBUFFERED }}
+          SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
         run: |
           echo "========== RUN CONFIG =========="
           echo "🚧 DRY_RUN=${DRY_RUN} — RUN_SWITCH=${RUN_SWITCH}"
@@ -131,7 +128,6 @@ jobs:
           echo "================================"
           python ./main.py
 
-      # ---- If Risk is OFF (or RUN_SWITCH is OFF), we still print why we skipped ----
       - name: Skipped (risk OFF or switch OFF)
         if: ${{ !(env.RUN_SWITCH == 'ON' && steps.risk.outputs.risk == 'ON') }}
         run: |
