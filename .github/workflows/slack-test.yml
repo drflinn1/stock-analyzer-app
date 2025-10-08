@@ -1,0 +1,20 @@
+name: Slack Test Message
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - name: Send test message
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "Missing SLACK_WEBHOOK_URL secret"; exit 1
+          fi
+          MSG="✅ Slack webhook test successful — BOT is ready for live alerts!"
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"${MSG}\"}" \
+            "$SLACK_WEBHOOK_URL"
