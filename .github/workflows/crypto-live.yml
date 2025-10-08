@@ -36,7 +36,7 @@ on:
 env:
   # core gates
   RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
-  DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
+  DRY_RUN: ${{ inputs.DRY_RUN || 'OFF' }}
   RISK_OVERRIDE: ${{ inputs.RISK_OVERRIDE || '' }}
 
   # sizing/rotation essentials
