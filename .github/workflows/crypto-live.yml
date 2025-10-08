@@ -1,73 +1,53 @@
-name: Crypto Live — Auto-Pick + Guards (every 15m)
+name: Crypto Live — Every 15 min (Guarded)
 
 on:
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
-      RUN_SWITCH:
-        description: "Set to ON to allow live trading (otherwise skip)"
-        default: "ON"
       DRY_RUN:
-        description: "If ON, simulate orders (no real trades)"
-        default: "ON"
-      RISK_OVERRIDE:
-        description: "Force risk gate: ON or OFF (leave blank to auto-compute)"
+        description: "Override dry-run (ON/OFF). Leave blank to use default below."
+        required: false
         default: ""
-      MAX_POSITIONS:
-        description: "Max concurrent positions"
-        default: "6"
-      MAX_BUYS_PER_RUN:
-        description: "Max new buys per run"
-        default: "1"
-      DUST_MIN_USD:
-        description: "Treat positions under this USD as dust"
-        default: "2"
-      EDGE_DELTA_PCT:
-        description: "Rotate if candidate beats worst hold by this %"
-        default: "5"
-      PROTECT_JSON:
-        description: 'Sell logic JSON. Ex: {"SL_PCT":0.04,"TRAIL_PCT":0.035,"TP1_PCT":0.05,"TP1_SIZE":0.25}'
-        default: '{"SL_PCT":0.04,"TRAIL_PCT":0.035,"TP1_PCT":0.05,"TP1_SIZE":0.25}'
-      ADVANCED_JSON:
-        description: 'Advanced JSON. Ex: {"MIN_TRADE_USD":8,"ALLOC_USD_PER_TRADE":"","SCREENER_TOP_N":12,"MIN_QVOL_USD":50000,"SPREAD_MAX_PCT":0.60,"MIN_NOTIONAL_USD":5,"ROTATE_WHEN_FULL":true,"ROTATE_WHEN_CASH_SHORT":true}'
-        default: '{"MIN_TRADE_USD":8,"ALLOC_USD_PER_TRADE":"","SCREENER_TOP_N":12,"MIN_QVOL_USD":50000,"SPREAD_MAX_PCT":0.60,"MIN_NOTIONAL_USD":5,"ROTATE_WHEN_FULL":true,"ROTATE_WHEN_CASH_SHORT":true}'
+      RUN_SWITCH:
+        description: "Master switch (ON/OFF). Leave blank to use default below."
+        required: false
+        default: ""
 
-env:
-  # core gates
-  RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
-  DRY_RUN: ${{ inputs.DRY_RUN || 'OFF' }}
-  RISK_OVERRIDE: ${{ inputs.RISK_OVERRIDE || '' }}
-
-  # sizing/rotation essentials
-  MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || '6' }}
-  MAX_BUYS_PER_RUN: ${{ inputs.MAX_BUYS_PER_RUN || '1' }}
-  DUST_MIN_USD: ${{ inputs.DUST_MIN_USD || '2' }}
-  EDGE_DELTA_PCT: ${{ inputs.EDGE_DELTA_PCT || '5' }}
-
-  # defaults (may be overridden by JSON step below)
-  MIN_TRADE_USD: "8"
-  ALLOC_USD_PER_TRADE: ""
-  SCREENER_TOP_N: "12"
-  MIN_QVOL_USD: "50000"
-  SPREAD_MAX_PCT: "0.60"
-  MIN_NOTIONAL_USD: "5"
-  ROTATE_WHEN_FULL: "true"
-  ROTATE_WHEN_CASH_SHORT: "true"
-
-  # sell logic defaults (may be overridden)
-  SL_PCT: "0.04"
-  TRAIL_PCT: "0.035"
-  TP1_PCT: "0.05"
-  TP1_SIZE: "0.25"
-
-  PYTHONUNBUFFERED: "1"
+# Prevent overlapping 15-minute runs
+concurrency:
+  group: crypto-live-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   live:
-    name: Live Crypto Run
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+
+    env:
+      # ===== Master switches =====
+      RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
+      DRY_RUN:    ${{ inputs.DRY_RUN    || 'OFF' }}   # live by default for scheduled runs
+
+      # ===== Night-mode sizing / risk knobs =====
+      MAX_POSITIONS: "6"          # 4–6 is good; 6 keeps some breadth
+      MAX_BUYS_PER_RUN: "1"       # keep churn low when choppy
+      SL_PCT: "0.04"              # 4% hard stop
+      TRAIL_PCT: "0.035"          # 3.5% trailing
+      TP1_PCT: "0.05"             # take 5% profit…
+      TP1_SIZE: "0.25"            # …on 25% of the position
+      RESERVE_CASH_PCT: "0.10"    # keep a small buffer
+      DAILY_NOTIONAL_CAP_USD: "0" # 0 disables; set e.g. 500 to cap new buys for the day
+
+      # ===== Universe / rotation (keep your existing defaults if you prefer) =====
+      USD_ONLY: "true"
+      WHITELIST: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
+      ROTATE_WHEN_CASH_SHORT: "true"
+      ROTATE_WHEN_FULL: "false"   # optional: reduce churn during dip scalps
+      DUST_MIN_USD: "2"
+
+      # ===== Logging / misc =====
+      BOT_NAME: "crypto-live"
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout
@@ -82,196 +62,81 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
-          python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install ccxt numpy pandas
+            pip install ccxt pandas requests yfinance
           fi
 
-      # Parse JSON inputs and export to env
-      - name: Apply JSON inputs → env
-        env:
-          PROTECT_JSON_RAW: ${{ inputs.PROTECT_JSON }}
-          ADVANCED_JSON_RAW: ${{ inputs.ADVANCED_JSON }}
-        run: |
-          python - <<'PY'
-          import os, json, sys
-          out = {}
-          def merge(js):
-              if not js: return
-              try:
-                  d = json.loads(js)
-                  if isinstance(d, dict):
-                      for k,v in d.items():
-                          out[str(k)] = v
-              except Exception:
-                  pass
-          merge(os.getenv("PROTECT_JSON_RAW",""))
-          merge(os.getenv("ADVANCED_JSON_RAW",""))
-          with open(os.environ["GITHUB_ENV"], "a") as fh:
-              for k,v in out.items():
-                  fh.write(f"{k}={v}\n")
-          print("Applied overrides:", out)
-          PY
-
-      # ---- Compute risk (breadth) --------------------------------------------
-      - name: Compute Risk Signal
+      # ---- Risk gate: read your current signal (produced by your notifier job or stored in repo state) ----
+      # Looks at .state/risk_signal.txt if present; otherwise falls back to OFF.
+      - name: Compute risk
         id: risk
-        env:
-          RISK_OVERRIDE: ${{ env.RISK_OVERRIDE }}
+        shell: bash
         run: |
-          python - <<'PY'
-          import os, json
-          result = {"risk":"OFF","reason":"default"}
-          ov=os.getenv("RISK_OVERRIDE","").strip().upper()
-          if ov in ("ON","OFF"):
-              result.update(risk=ov, reason="override")
-          else:
-              try:
-                  import ccxt
-                  ex=ccxt.kraken(); mk=ex.load_markets()
-                  cands=["BTC/USD","XBT/USD","ETH/USD","SOL/USD","DOGE/USD"]
-                  wanted={"BTC":"","ETH":"","SOL":"","DOGE":""}
-                  for s in cands:
-                      b=s.split("/")[0].replace("XBT","BTC")
-                      if s in mk and b in wanted and not wanted[b]: wanted[b]=s
-                  if not wanted["BTC"]: wanted["BTC"]="XBT/USD" if "XBT/USD" in mk else "BTC/USD"
-                  for k in ("ETH","SOL","DOGE"):
-                      if not wanted[k]: wanted[k]=f"{k}/USD"
-                  basket=[wanted["BTC"],wanted["ETH"],wanted["SOL"],wanted["DOGE"]]
-                  pos=0; det={}
-                  for sym in basket:
-                      try:
-                          t=ex.fetch_ticker(sym)
-                          pct=t.get("percentage")
-                          if pct is None:
-                              last,open_=t.get("last"),t.get("open")
-                              if isinstance(last,(int,float)) and isinstance(open_,(int,float)) and open_:
-                                  pct=(last/open_-1)*100.0
-                          det[sym]=pct
-                          if isinstance(pct,(int,float)) and pct>0: pos+=1
-                      except Exception: det[sym]=None
-                  result["risk"]="ON" if pos>=3 else "OFF"
-                  result["reason"]=f"{pos}/4 green"
-                  result["detail"]=det
-              except Exception as e:
-                  result.update(risk="OFF", reason=f"error:{type(e).__name__}")
-          print("RISK_SIGNAL_COMPUTE =>", json.dumps(result, indent=2))
-          with open(os.environ["GITHUB_OUTPUT"],"a") as fh:
-              fh.write(f"risk={result['risk']}\nreason={result['reason']}\n")
-          os.makedirs(".state",exist_ok=True)
-          open(".state/last_risk_signal.txt","w").write(result["risk"])
-          open(".state/last_risk_reason.txt","w").write(result["reason"])
-          open(".state/last_risk_detail.json","w").write(json.dumps(result, indent=2))
-          PY
+          SIGNAL="OFF"
+          if [ -f ".state/risk_signal.txt" ]; then
+            RAW=$(cat .state/risk_signal.txt | tr -d '\r' | tr '[:lower:]' '[:upper:]')
+            if [ "$RAW" = "ON" ] || [ "$RAW" = "OFF" ]; then
+              SIGNAL="$RAW"
+            fi
+          fi
+          echo "risk=$SIGNAL" >> "$GITHUB_OUTPUT"
+          echo "Gate Summary → Risk: $SIGNAL | RUN_SWITCH: ${RUN_SWITCH} | DRY_RUN: ${DRY_RUN}"
 
-      - name: Show computed risk
+      # ---- Optional guard: skip buys if a simple daily notional cap is exceeded (bot should enforce as well) ----
+      - name: Daily cap info (noop)
+        if: ${{ always() }}
         run: |
-          echo "Computed risk: ${{ steps.risk.outputs.risk }} (reason: ${{ steps.risk.outputs.reason }})"
-          echo "RUN_SWITCH=${RUN_SWITCH}"
+          echo "DAILY_NOTIONAL_CAP_USD=${DAILY_NOTIONAL_CAP_USD} (0 means disabled; enforce inside main.py as well)"
 
-      - name: Add job summary
-        run: |
-          {
-            echo "## Crypto Live — Gate Summary"
-            echo "- **RUN_SWITCH**: ${RUN_SWITCH}"
-            echo "- **Risk**: ${{ steps.risk.outputs.risk }} (_${{ steps.risk.outputs.reason }}_)"
-            echo "- **DRY_RUN**: ${DRY_RUN}"
-            echo "- **MAX_POSITIONS**: ${MAX_POSITIONS} / **MAX_BUYS_PER_RUN**: ${MAX_BUYS_PER_RUN}"
-            echo "- **DUST_MIN_USD**: ${DUST_MIN_USD}"
-            echo "- **SL_PCT**: ${SL_PCT}  **TRAIL_PCT**: ${TRAIL_PCT}  **TP1_PCT**: ${TP1_PCT}  **TP1_SIZE**: ${TP1_SIZE}"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # Screener (always) ------------------------------------------------------
-      - name: Market Strength Screener (Kraken USD)
-        env:
-          TOP_N: ${{ env.SCREENER_TOP_N }}
-          MIN_QVOL_USD: ${{ env.MIN_QVOL_USD }}
-          SPREAD_MAX_PCT: ${{ env.SPREAD_MAX_PCT }}
-          MIN_NOTIONAL_USD: ${{ env.MIN_NOTIONAL_USD }}
-        run: |
-          python - <<'PY'
-          import os, json, math, pathlib, ccxt
-          TOP_N=int(os.getenv("TOP_N","12"))
-          MIN_Q=float(os.getenv("MIN_QVOL_USD","50000"))
-          MAX_S=float(os.getenv("SPREAD_MAX_PCT","0.60"))
-          MINC=float(os.getenv("MIN_NOTIONAL_USD","5"))
-          ex=ccxt.kraken(); mk=ex.load_markets()
-          skip={"USDT","USDC","EUR","GBP","USD"}
-          syms=[]
-          for m in mk.values():
-              if m.get("spot") and m.get("quote")=="USD" and m.get("base") not in skip:
-                  mc=((m.get("limits") or {}).get("cost") or {}).get("min")
-                  if isinstance(mc,(int,float)) and mc and mc>MINC: continue
-                  syms.append(m["symbol"])
-          rows=[]
-          for s in syms:
-              try:
-                  t=ex.fetch_ticker(s)
-                  last=t.get("last"); open_=t.get("open")
-                  pct=t.get("percentage")
-                  if pct is None and isinstance(last,(int,float)) and isinstance(open_,(int,float)) and open_:
-                      pct=(last/open_-1)*100.0
-                  bid,ask=t.get("bid"),t.get("ask"); spread=None
-                  if isinstance(bid,(int,float)) and isinstance(ask,(int,float)) and bid>0 and ask>0:
-                      mid=(bid+ask)/2; 
-                      if mid>0: spread=(ask-bid)/mid*100.0
-                  qv=t.get("quoteVolume") or 0.0
-                  if spread is not None and spread>MAX_S: continue
-                  if qv<MIN_Q: continue
-                  rows.append({"symbol":s,"pct":pct if pct is not None else -9999,"last":last,"spread":spread,"qvol":qv})
-              except Exception: pass
-          rows.sort(key=lambda r:r["pct"], reverse=True)
-          top=rows[:TOP_N]
-          pathlib.Path(".state").mkdir(exist_ok=True)
-          (pathlib.Path(".state")/"top_candidates.json").write_text(json.dumps(top, indent=2))
-          def fmt(v,nd=2): 
-              return "-" if v is None else (f"{v:.{nd}f}" if isinstance(v,(int,float)) else str(v))
-          lines=["## Screener — Top Strength (Kraken USD)","","| # | Symbol | 24h % | Last | Spread % | 24h $Vol |","|---:|:------|------:|-----:|--------:|--------:|"]
-          for i,r in enumerate(top,1):
-              lines.append(f"| {i} | {r['symbol']} | {fmt(r['pct'])} | {fmt(r['last'])} | {fmt(r['spread'])} | {fmt(r['qvol'],0)} |")
-          with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as fh:
-              fh.write("\n".join(lines)+"\n")
-          PY
-
-      # Only run bot when BOTH gates are ON ------------------------------------
+      # ---- Run the bot (LIVE requires secrets AND DRY_RUN=OFF AND Risk=ON) ----
       - name: Run bot (main.py)
         if: ${{ env.RUN_SWITCH == 'ON' && steps.risk.outputs.risk == 'ON' }}
         env:
+          # Pass Kraken API keys for live trading
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
+          # Re-expose all envs to the process (some shells require explicit pass-through)
+          RUN_SWITCH: ${{ env.RUN_SWITCH }}
           DRY_RUN: ${{ env.DRY_RUN }}
           MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
           MAX_BUYS_PER_RUN: ${{ env.MAX_BUYS_PER_RUN }}
-          DUST_MIN_USD: ${{ env.DUST_MIN_USD }}
-          EDGE_DELTA_PCT: ${{ env.EDGE_DELTA_PCT }}
-          ROTATE_WHEN_FULL: ${{ env.ROTATE_WHEN_FULL }}
-          ROTATE_WHEN_CASH_SHORT: ${{ env.ROTATE_WHEN_CASH_SHORT }}
           SL_PCT: ${{ env.SL_PCT }}
           TRAIL_PCT: ${{ env.TRAIL_PCT }}
           TP1_PCT: ${{ env.TP1_PCT }}
           TP1_SIZE: ${{ env.TP1_SIZE }}
-          MIN_TRADE_USD: ${{ env.MIN_TRADE_USD }}
-          ALLOC_USD_PER_TRADE: ${{ env.ALLOC_USD_PER_TRADE }}
-          SPREAD_MAX_PCT: ${{ env.SPREAD_MAX_PCT }}
-          MIN_NOTIONAL_USD: ${{ env.MIN_NOTIONAL_USD }}
+          RESERVE_CASH_PCT: ${{ env.RESERVE_CASH_PCT }}
+          DAILY_NOTIONAL_CAP_USD: ${{ env.DAILY_NOTIONAL_CAP_USD }}
+          USD_ONLY: ${{ env.USD_ONLY }}
+          WHITELIST: ${{ env.WHITELIST }}
+          ROTATE_WHEN_CASH_SHORT: ${{ env.ROTATE_WHEN_CASH_SHORT }}
+          ROTATE_WHEN_FULL: ${{ env.ROTATE_WHEN_FULL }}
+          DUST_MIN_USD: ${{ env.DUST_MIN_USD }}
+          BOT_NAME: ${{ env.BOT_NAME }}
+          PYTHONUNBUFFERED: ${{ env.PYTHONUNBUFFERED }}
         run: |
-          echo "🚧 DRY_RUN=${DRY_RUN} — MAX_POSITIONS=${MAX_POSITIONS} — MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}"
+          echo "========== RUN CONFIG =========="
+          echo "🚧 DRY_RUN=${DRY_RUN} — RUN_SWITCH=${RUN_SWITCH}"
+          echo "MAX_POSITIONS=${MAX_POSITIONS} — MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}"
           echo "SL=${SL_PCT} TRAIL=${TRAIL_PCT} TP1=${TP1_PCT} x ${TP1_SIZE}"
+          echo "RESERVE_CASH_PCT=${RESERVE_CASH_PCT} — DUST_MIN_USD=${DUST_MIN_USD}"
+          echo "WHITELIST=${WHITELIST} — USD_ONLY=${USD_ONLY}"
+          echo "================================"
           python ./main.py
 
-      - name: Upload .state artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: state-${{ github.run_id }}
-          path: |
-            .state/**
-            **/kpi_history.csv
-            **/spec_gate_report.txt
-          if-no-files-found: ignore
+      # ---- If Risk is OFF (or RUN_SWITCH is OFF), we still print why we skipped ----
+      - name: Skipped (risk OFF or switch OFF)
+        if: ${{ !(env.RUN_SWITCH == 'ON' && steps.risk.outputs.risk == 'ON') }}
+        run: |
+          echo "Skipped bot run → Reason:"
+          echo "  RUN_SWITCH=${RUN_SWITCH}"
+          echo "  Risk=${{ steps.risk.outputs.risk || 'UNKNOWN' }}"
+          echo "  DRY_RUN=${DRY_RUN}"
+          echo "This is expected when Risk=OFF. The moment Risk=ON, this job will execute."
