@@ -16,7 +16,6 @@ on:
   schedule:
     - cron: "*/15 * * * *"  # every 15 minutes
 
-# Isolate from other workflows to avoid cancelling each other
 concurrency:
   group: crypto-live-kraken
   cancel-in-progress: false
@@ -25,7 +24,7 @@ env:
   PYTHON_VERSION: "3.11"
 
   # ===== Conservative defaults for a hands-free week =====
-  RESERVE_CASH_PCT: "15"          # keep 15% in cash  (main.py expects percent)
+  RESERVE_CASH_PCT: "15"          # keep 15% in cash (percent, not fraction)
   USD_PER_TRADE: "20"
   MIN_TRADE_NOTIONAL_USD: "5"
   DUST_MIN_USD: "2"
@@ -54,7 +53,6 @@ env:
 
   RUN_SWITCH: "ON"   # default; dialog can override for DRY_RUN only
 
-  # Outputs / artifacts
   STATE_DIR: ".state"
   KPI_CSV: ".state/kpi_history.csv"
   KPI_CHART: ".state/kpi_chart.png"
@@ -107,9 +105,9 @@ jobs:
           DRY_RUN: ${{ inputs.DRY_RUN }}
           RUN_SWITCH: ${{ inputs.RUN_SWITCH }}
 
-          # exchange secrets
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          # Prefer KRAKEN_*; fall back to your existing CCXT_* secrets
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || secrets.CCXT_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || secrets.CCXT_API_SECRET }}
 
           # optional Slack alerts
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
@@ -118,11 +116,11 @@ jobs:
 
       - name: Build KPI chart (optional)
         run: |
-            if [ -f tools/make_kpi_chart.py ] && [ -f "${{ env.KPI_CSV }}" ]; then
-              python tools/make_kpi_chart.py "${{ env.KPI_CSV }}" "${{ env.KPI_CHART }}" || true
-            else
-              echo "KPI chart script or CSV not found; skipping."
-            fi
+          if [ -f tools/make_kpi_chart.py ] && [ -f "${{ env.KPI_CSV }}" ]; then
+            python tools/make_kpi_chart.py "${{ env.KPI_CSV }}" "${{ env.KPI_CHART }}" || true
+          else
+            echo "KPI chart script or CSV not found; skipping."
+          fi
 
       - name: Upload .state artifacts
         if: always()
