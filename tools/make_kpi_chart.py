@@ -1,9 +1,9 @@
 # tools/make_kpi_chart.py
-# Reads .state/kpi_history.csv and writes .state/kpi_chart.png (last 30 days)
-import os, csv, math
+# Reads .state/kpi_history.csv and writes .state/kpi_chart.png (last ~500 points)
+import os, csv
 from datetime import datetime
 import matplotlib
-matplotlib.use("Agg")  # headless
+matplotlib.use("Agg")  # headless renderer for CI
 import matplotlib.pyplot as plt  # noqa: E402
 
 STATE_DIR = os.getenv("STATE_DIR", ".state")
@@ -17,41 +17,43 @@ def read_rows(path):
     with open(path, newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
         for d in r:
+            ts = (d.get("ts_utc") or "").strip()
             try:
-                ts = d.get("ts_utc") or ""
-                when = datetime.strptime(ts.split(".")[0], "%Y-%m-%d %H:%M:%S %Z") if "UTC" in ts else datetime.fromisoformat(ts.split(".")[0])
+                if "UTC" in ts:
+                    when = datetime.strptime(ts.split(".")[0], "%Y-%m-%d %H:%M:%S %Z")
+                else:
+                    when = datetime.fromisoformat(ts.split(".")[0])
             except Exception:
                 when = datetime.utcnow()
-            event = d.get("event","")
-            notional = float(d.get("notional") or 0.0)
-            pnl = float(d.get("pnl") or 0.0) if d.get("pnl") not in (None,"") else 0.0
-            rows.append((when, event, notional, pnl))
+            pnl = d.get("pnl")
+            try:
+                pnl = float(pnl) if pnl not in (None, "") else 0.0
+            except Exception:
+                pnl = 0.0
+            rows.append((when, pnl))
     rows.sort(key=lambda x: x[0])
-    return rows
+    return rows[-500:]  # keep recent
 
 def make_chart(rows):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    plt.figure(figsize=(10, 4))
     if not rows:
-        plt.figure(figsize=(8,3))
-        plt.title("KPI — no data yet")
+        plt.title("Cumulative P&L — no data yet")
         plt.savefig(OUT_PNG, dpi=140, bbox_inches="tight")
         return
-
-    times = [r[0] for r in rows][-500:]
-    pnls  = [r[3] for r in rows][-500:]
+    times = [r[0] for r in rows]
+    pnls  = [r[1] for r in rows]
     cum = []
     s = 0.0
     for x in pnls:
         s += x
         cum.append(s)
-
-    plt.figure(figsize=(10,4))
     plt.plot(times, cum, linewidth=2)
     plt.title("Cumulative P&L")
     plt.xlabel("Time")
     plt.ylabel("USD")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    os.makedirs(STATE_DIR, exist_ok=True)
     plt.savefig(OUT_PNG, dpi=140)
 
 if __name__ == "__main__":
