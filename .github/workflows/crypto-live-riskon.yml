@@ -9,9 +9,8 @@ on:
         options: ["ON", "OFF"]
         default: "OFF"
   schedule:
-    - cron: "*/5 * * * *"  # every 5 minutes
+    - cron: "*/5 * * * *"
 
-# Keep Risk-On isolated so it won't cancel other jobs
 concurrency:
   group: crypto-live-riskon
   cancel-in-progress: false
@@ -19,12 +18,11 @@ concurrency:
 env:
   PYTHON_VERSION: "3.11"
 
-  # ===== Risk-On Overrides =====
-  RESERVE_CASH_PCT: "5.0"          # keep 5% in cash (main.py expects percent, not fraction)
-  UNIVERSE_MIN_USD_VOL: "500000"   # ≥ $500k 24h USD volume
-  UNIVERSE_TOP_K: "12"             # scan top 12 bases by USD volume
+  # Risk-On emphasis
+  RESERVE_CASH_PCT: "5.0"
+  UNIVERSE_MIN_USD_VOL: "500000"
+  UNIVERSE_TOP_K: "12"
 
-  # ===== Strategy & exchange knobs used by main.py =====
   EXCHANGE: "kraken"
   QUOTE: "USD"
   AUTO_UNIVERSE: "true"
@@ -50,9 +48,8 @@ env:
   NONUNI_SELL_IF_DOWN_PCT: "0"
   NONUNI_KEEP_IF_WINNER_PCT: "6"
 
-  RUN_SWITCH: "ON"   # master kill switch checked by main.py
+  RUN_SWITCH: "ON"
 
-  # Outputs / artifacts
   STATE_DIR: ".state"
   KPI_CSV: ".state/kpi_history.csv"
   KPI_CHART: ".state/kpi_chart.png"
@@ -85,7 +82,7 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
-          else
+          else:
             pip install ccxt requests pandas matplotlib
           fi
 
@@ -98,23 +95,23 @@ jobs:
           echo "UNIVERSE_TOP_K=${{ env.UNIVERSE_TOP_K }}"
           echo "MAX_POSITIONS=${{ env.MAX_POSITIONS }}"
           echo "MAX_BUYS_PER_RUN=${{ env.MAX_BUYS_PER_RUN }}"
-          echo "QUOTE=${{ env.QUOTE }} AUTO_UNIVERSE=${{ env.AUTO_UNIVERSE }}"
           echo "================================================"
 
       - name: Run Bot
         env:
           DRY_RUN: ${{ inputs.DRY_RUN }}
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          # Prefer KRAKEN_*; fall back to existing CCXT_* secrets
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || secrets.CCXT_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || secrets.CCXT_API_SECRET }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          python -u main.py
+          python -u tools/safe_runner.py
 
-      - name: Build KPI chart (if tools/make_kpi_chart.py exists)
+      - name: Build KPI chart (if present)
         run: |
           if [ -f tools/make_kpi_chart.py ] && [ -f "${{ env.KPI_CSV }}" ]; then
             python tools/make_kpi_chart.py "${{ env.KPI_CSV }}" "${{ env.KPI_CHART }}" || true
-          else
+          else:
             echo "KPI chart script or CSV not found; skipping."
           fi
 
