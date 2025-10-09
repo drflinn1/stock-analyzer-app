@@ -9,14 +9,12 @@ def pick_time_column(df):
     for c in ["timestamp", "time", "date", "datetime", "run_time"]:
         if c in df.columns:
             return c
-    return df.columns[0]  # fall back to first column
+    return df.columns[0]
 
 def pick_value_column(df):
-    # try common KPI fields in preference order
     for c in ["equity", "balance", "nav", "pnl", "pnl_pct", "daily_pnl", "kpi"]:
         if c in df.columns:
             return c
-    # pick last numeric column
     nums = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     return nums[-1] if nums else df.columns[-1]
 
@@ -35,7 +33,6 @@ def main(csv_path, out_path):
     tcol = pick_time_column(df)
     vcol = pick_value_column(df)
 
-    # parse time if looks like datetime
     try:
         df[tcol] = pd.to_datetime(df[tcol])
     except Exception:
