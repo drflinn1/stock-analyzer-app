@@ -4,207 +4,141 @@ on:
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: "ON = simulate (no orders). OFF = live orders."
+        description: "ON = simulate (no orders), OFF = live"
         type: choice
-        required: false
+        options: ["ON", "OFF"]
         default: "OFF"
-        options: ["ON", "OFF"]
       RUN_SWITCH:
-        description: "Master on/off switch for the bot"
+        description: "Master on/off switch inside the bot"
         type: choice
-        required: false
-        default: "ON"
         options: ["ON", "OFF"]
+        default: "ON"
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/15 * * * *"  # every 15 minutes
 
-permissions:
-  contents: read
-
+# Isolate from other workflows to avoid cancelling each other
 concurrency:
-  group: crypto-live-${{ github.ref }}
-  cancel-in-progress: true
+  group: crypto-live-kraken
+  cancel-in-progress: false
 
 env:
-  # ---- Core toggles ----
-  DRY_RUN: ${{ inputs.DRY_RUN || 'OFF' }}
-  RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
+  PYTHON_VERSION: "3.11"
 
-  # ---- Auto-universe controls ----
-  AUTO_UNIVERSE: "true"                     # <— turn on automatic universe maintenance
-  UNIVERSE_STATIC: "BTC,ETH,SOL,DOGE,ADA,ZEC" # fallback/pinned list when AUTO_UNIVERSE=false
-  UNIVERSE_TOP_K: "6"                       # pick top-K by USD volume, after filters
-  UNIVERSE_EXCLUDE: "USDT,USDC,EUR,GBP,USD,SPX,PUMP,BABY"  # always exclude these bases
-  UNIVERSE_MIN_USD_VOL: "500000"            # min 24h USD volume to be eligible
-  MAX_SPREAD_PCT: "0.60"                    # skip pairs with bid/ask spread > this %
-  MIN_TRADE_NOTIONAL_USD: "5"               # skip pairs whose price*minQty < this
-
-  # ---- Exchange / quote ----
-  EXCHANGE: "kraken"
-  QUOTE: "USD"
-
-  # ---- Sizing & positions ----
-  MAX_POSITIONS: "6"
+  # ===== Conservative defaults for a hands-free week =====
+  RESERVE_CASH_PCT: "15"          # keep 15% in cash  (main.py expects percent)
   USD_PER_TRADE: "20"
-  RESERVE_CASH_PCT: "10"
-
-  # ---- Rotation & dust ----
-  ROTATE_WHEN_CASH_SHORT: "true"
-  ROTATE_WHEN_FULL: "false"
+  MIN_TRADE_NOTIONAL_USD: "5"
   DUST_MIN_USD: "2"
 
-  # ---- Guards ----
-  TAKE_PROFIT_PCT: "3.0"
-  STOP_LOSS_PCT: "2.0"
-  TRAIL_STOP_PCT: "1.0"
-  MAX_DAILY_LOSS_PCT: "5.0"
-  MAX_DAILY_ENTRIES: "6"
-  EMERGENCY_SL_PCT: "8.0"
+  MAX_POSITIONS: "6"
+  MAX_BUYS_PER_RUN: "1"
+  ROTATE_WHEN_FULL: "true"
+  ROTATE_WHEN_CASH_SHORT: "true"
 
-  # ---- Non-universe cleanup ----
-  CLEANUP_NON_UNIVERSE: "true"              # sell stray coins the bot doesn't manage
-  NONUNI_SELL_IF_DOWN_PCT: "0.0"            # sell non-universe if 24h% < this (0 = any red)
-  NONUNI_KEEP_IF_WINNER_PCT: "6.0"          # but keep if 24h% >= this (protect big winners)
+  AUTO_UNIVERSE: "true"
+  UNIVERSE_MIN_USD_VOL: "300000"
+  UNIVERSE_TOP_K: "10"
+  UNIVERSE_EXCLUDE: "USDT,USDC,EUR,GBP,USD,SPX,PUMP,BABY"
+  QUOTE: "USD"
 
-  # ---- Files & artifacts ----
+  TAKE_PROFIT_PCT: "3"
+  STOP_LOSS_PCT: "2"
+  TRAIL_STOP_PCT: "1"
+  EMERGENCY_SL_PCT: "8"
+  MAX_DAILY_LOSS_PCT: "5"
+  MAX_DAILY_ENTRIES: "4"
+
+  CLEANUP_NON_UNIVERSE: "true"
+  NONUNI_SELL_IF_DOWN_PCT: "0"
+  NONUNI_KEEP_IF_WINNER_PCT: "6"
+
+  RUN_SWITCH: "ON"   # default; dialog can override for DRY_RUN only
+
+  # Outputs / artifacts
   STATE_DIR: ".state"
-  POSITIONS_JSON: ".state/positions.json"
   KPI_CSV: ".state/kpi_history.csv"
-  SPEC_GATE_REPORT: ".state/spec_gate_report.txt"
-
-  # ---- Slack webhook secret ----
-  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  KPI_CHART: ".state/kpi_chart.png"
 
 jobs:
-  live:
-    name: Run bot
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}-${{ env.DRY_RUN }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install minimal deps (fast)
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install --no-cache-dir ccxt pandas numpy requests
-
-      # ---------- Heartbeat ----------
-      - name: Heartbeat — Slack "bot starting"
-        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
-        run: |
-          RUN_MODE="${{ env.DRY_RUN }}"
-          NOW="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-          MSG="🫀 *Crypto Live Heartbeat* — ${NOW}\nRepo: ${{ github.repository }}\nRef: ${{ github.ref_name }}\nRun: ${{ github.run_id }}\nMode: *${RUN_MODE}*\nSwitch: ${{ env.RUN_SWITCH }}"
-          payload=$(jq -n --arg text "$MSG" '{text: $text}')
-          curl -sS -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL" >/dev/null
-        env:
-          SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
-
-      - name: Heartbeat — echo fallback
-        if: ${{ env.SLACK_WEBHOOK_URL == '' }}
-        run: echo "Heartbeat OK — $(date -u) — DRY_RUN=${{ env.DRY_RUN }} RUN_SWITCH=${{ env.RUN_SWITCH }}"
-
-      # ---------- Run bot ----------
-      - name: Prepare state dir
-        run: |
-          mkdir -p "${STATE_DIR}"
-          : > "${SPEC_GATE_REPORT}" || true
-
-      - name: Print mode banner
-        run: |
-          if [ "${DRY_RUN}" = "ON" ]; then
-            echo "🚧 DRY RUN — NO REAL ORDERS SENT 🚧"
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
           else
-            echo "✅ LIVE MODE — REAL ORDERS ENABLED"
+            pip install ccxt requests pandas matplotlib
           fi
 
-      - name: Run main.py
+      - name: Print env banner
+        run: |
+          echo "================ STANDARD PRESET ================"
+          echo "DRY_RUN=${{ inputs.DRY_RUN }}  RUN_SWITCH=${{ inputs.RUN_SWITCH }}"
+          echo "RESERVE_CASH_PCT=${{ env.RESERVE_CASH_PCT }}%"
+          echo "USD_PER_TRADE=${{ env.USD_PER_TRADE }}  MIN_TRADE_NOTIONAL_USD=${{ env.MIN_TRADE_NOTIONAL_USD }}"
+          echo "MAX_POSITIONS=${{ env.MAX_POSITIONS }}  MAX_BUYS_PER_RUN=${{ env.MAX_BUYS_PER_RUN }}"
+          echo "AUTO_UNIVERSE=${{ env.AUTO_UNIVERSE }}  TOP_K=${{ env.UNIVERSE_TOP_K }}  MIN_USD_VOL=${{ env.UNIVERSE_MIN_USD_VOL }}"
+          echo "================================================="
+
+      - name: Run Bot
         env:
-          EXCHANGE: ${{ env.EXCHANGE }}
-          QUOTE: ${{ env.QUOTE }}
+          # runtime toggles
+          DRY_RUN: ${{ inputs.DRY_RUN }}
+          RUN_SWITCH: ${{ inputs.RUN_SWITCH }}
 
-          AUTO_UNIVERSE: ${{ env.AUTO_UNIVERSE }}
-          UNIVERSE_STATIC: ${{ env.UNIVERSE_STATIC }}
-          UNIVERSE_TOP_K: ${{ env.UNIVERSE_TOP_K }}
-          UNIVERSE_EXCLUDE: ${{ env.UNIVERSE_EXCLUDE }}
-          UNIVERSE_MIN_USD_VOL: ${{ env.UNIVERSE_MIN_USD_VOL }}
-          MAX_SPREAD_PCT: ${{ env.MAX_SPREAD_PCT }}
-          MIN_TRADE_NOTIONAL_USD: ${{ env.MIN_TRADE_NOTIONAL_USD }}
-
-          MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
-          USD_PER_TRADE: ${{ env.USD_PER_TRADE }}
-          RESERVE_CASH_PCT: ${{ env.RESERVE_CASH_PCT }}
-          ROTATE_WHEN_CASH_SHORT: ${{ env.ROTATE_WHEN_CASH_SHORT }}
-          ROTATE_WHEN_FULL: ${{ env.ROTATE_WHEN_FULL }}
-          DUST_MIN_USD: ${{ env.DUST_MIN_USD }}
-          TAKE_PROFIT_PCT: ${{ env.TAKE_PROFIT_PCT }}
-          STOP_LOSS_PCT: ${{ env.STOP_LOSS_PCT }}
-          TRAIL_STOP_PCT: ${{ env.TRAIL_STOP_PCT }}
-          MAX_DAILY_LOSS_PCT: ${{ env.MAX_DAILY_LOSS_PCT }}
-          MAX_DAILY_ENTRIES: ${{ env.MAX_DAILY_ENTRIES }}
-          EMERGENCY_SL_PCT: ${{ env.EMERGENCY_SL_PCT }}
-
-          CLEANUP_NON_UNIVERSE: ${{ env.CLEANUP_NON_UNIVERSE }}
-          NONUNI_SELL_IF_DOWN_PCT: ${{ env.NONUNI_SELL_IF_DOWN_PCT }}
-          NONUNI_KEEP_IF_WINNER_PCT: ${{ env.NONUNI_KEEP_IF_WINNER_PCT }}
-
-          RUN_SWITCH: ${{ env.RUN_SWITCH }}
-          DRY_RUN: ${{ env.DRY_RUN }}
-          STATE_DIR: ${{ env.STATE_DIR }}
-          POSITIONS_JSON: ${{ env.POSITIONS_JSON }}
-          KPI_CSV: ${{ env.KPI_CSV }}
-          SPEC_GATE_REPORT: ${{ env.SPEC_GATE_REPORT }}
-
+          # exchange secrets
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-        run: python -u main.py
 
-      # ---------- KPI chart ----------
-      - name: KPI chart — build PNG
-        if: always()
+          # optional Slack alerts
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          python -m pip install --no-cache-dir matplotlib
-          python tools/make_kpi_chart.py
-        env:
-          STATE_DIR: ${{ env.STATE_DIR }}
-          KPI_CSV: ${{ env.KPI_CSV }}
+          python -u main.py
 
-      # ---------- Slack completion ----------
-      - name: Slack — run completed
-        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
+      - name: Build KPI chart (optional)
         run: |
-          STATUS="${{ job.status }}"
-          NOW="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-          MSG="✅ *Crypto Live completed* — ${NOW}\nStatus: *${STATUS}*\nMode: *${{ env.DRY_RUN }}*\nArtifacts: positions.json / kpi_history.csv / spec_gate_report.txt / kpi_chart.png"
-          payload=$(jq -n --arg text "$MSG" '{text: $text}')
-          curl -sS -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL" >/dev/null
-        env:
-          SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+            if [ -f tools/make_kpi_chart.py ] && [ -f "${{ env.KPI_CSV }}" ]; then
+              python tools/make_kpi_chart.py "${{ env.KPI_CSV }}" "${{ env.KPI_CHART }}" || true
+            else
+              echo "KPI chart script or CSV not found; skipping."
+            fi
 
-      # ---------- Artifacts ----------
-      - name: Upload artifacts
+      - name: Upload .state artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: crypto-live-state-${{ github.run_id }}
+          name: standard-state-${{ github.run_id }}
           path: |
-            .state/positions.json
-            .state/kpi_history.csv
-            .state/spec_gate_report.txt
-            .state/kpi_chart.png
+            .state/**
+            !.state/**/*.tmp
           if-no-files-found: warn
+
+      - name: Upload logs (best-effort)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: standard-logs-${{ github.run_id }}
+          path: |
+            logs/**
+          if-no-files-found: ignore
