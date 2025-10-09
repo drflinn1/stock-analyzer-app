@@ -1,91 +1,121 @@
-name: Crypto Live — RISK-ON (manual)
+name: Crypto Live — Risk-On (every 5m)
 
 on:
-  workflow_dispatch:  # run by clicking "Run workflow" (no schedule so it won't overlap)
+  workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: "ON = paper, OFF = live"
+        type: choice
+        options: ["ON", "OFF"]
+        default: "OFF"
+  schedule:
+    - cron: "*/5 * * * *"  # every 5 minutes
 
-permissions:
-  contents: read
-
+# Keep Risk-On isolated so it won't cancel other jobs
 concurrency:
-  group: crypto-live-riskon-${{ github.ref }}
+  group: crypto-live-riskon
   cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.11"
+
+  # ===== Risk-On Overrides (main event) =====
+  # Deploy more capital, demand decent liquidity, scan a wider top list.
+  RESERVE_CASH_PCT: "0.05"         # Risk-On: keep only 5% in cash
+  UNIVERSE_MIN_USD_VOL: "500000"   # Require ≥ $500k 24h USD volume
+  UNIVERSE_TOP_K: "12"             # Consider up to top 12 symbols
+
+  # ===== House Knobs (kept same as your live file unless you say otherwise) =====
+  EXCHANGE: "kraken"
+  MAX_POSITIONS: "8"               # allow a bit more breadth in Risk-On
+  MAX_BUYS_PER_RUN: "2"            # Risk-On: can scale in faster
+  ROTATE_WHEN_FULL: "true"
+  ROTATE_WHEN_CASH_SHORT: "true"
+  DUST_MIN_USD: "2"
+  LOG_COLOR: "true"
+
+  # Outputs / artifacts
+  STATE_DIR: ".state"
+  KPI_CSV: ".state/kpi_history.csv"
+  KPI_CHART: ".state/kpi_chart.png"
 
 jobs:
   run:
-    name: Run Crypto Bot (Risk-On)
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install ccxt pandas numpy python-dateutil pytz requests
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Run trader (Risk-On Preset)
+      - name: Print preset banner
+        run: |
+          echo "================ RISK-ON PRESET ================"
+          echo "DRY_RUN=${{ inputs.DRY_RUN }}"
+          echo "RESERVE_CASH_PCT=${{ env.RESERVE_CASH_PCT }}"
+          echo "UNIVERSE_MIN_USD_VOL=${{ env.UNIVERSE_MIN_USD_VOL }}"
+          echo "UNIVERSE_TOP_K=${{ env.UNIVERSE_TOP_K }}"
+          echo "MAX_POSITIONS=${{ env.MAX_POSITIONS }}"
+          echo "MAX_BUYS_PER_RUN=${{ env.MAX_BUYS_PER_RUN }}"
+          echo "================================================"
+
+      - name: Run Bot
         env:
-          # core
-          DRY_RUN: ${{ vars.DRY_RUN || 'true' }}      # 'true' keeps it paper/sim until you're ready
-          EXCHANGE_ID: ${{ vars.EXCHANGE_ID || 'kraken' }}
-          CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
-          CCXT_API_SECRET: ${{ secrets.CCXT_API_SECRET }}
-          CCXT_API_PASSWORD: ${{ secrets.CCXT_API_PASSWORD }}
-          LOG_LEVEL: INFO
+          # Mode toggle for paper vs live
+          DRY_RUN: ${{ inputs.DRY_RUN }}
 
-          # quote + universe
-          QUOTE: USD
-          WHITELIST: BTC,ETH,SOL,DOGE
+          # Exchange secrets
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-          # 🚀 Risk-On Preset (more/faster trades, tighter exits)
-          LOOKBACK_MIN: "90"          # react faster to moves (≈1.5h vs 4h)
-          TOP_K: "3"                  # up to 3 coins at once
-          DOLLARS_PER_TRADE: "35"     # bigger per-trade size
-          TP_PCT: "0.028"             # take profits at +2.8%
-          SL_PCT: "0.015"             # cut losers quicker at -1.5%
-          TRAIL_ARM_PCT: "0.012"      # arm trailing earlier (+1.2%)
-          TRAIL_GIVEBACK_PCT: "0.008" # tighter giveback (0.8%)
-          COOLDOWN_MIN: "25"          # faster re-entries after sells
-          MAX_DAILY_ENTRIES: "8"      # allow more shots in a day
-
-          # guards
-          MIN_NOTIONAL: "10"
+          # (Optional) Slack webhook if you wired trade/risk alerts
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          python main.py
+          python -u main.py
 
-      - name: KPI tail (last line)
-        if: always()
+      # Optional KPI chart (safe if file isn’t present)
+      - name: Build KPI chart (if tools/make_kpi_chart.py exists)
         run: |
-          echo "---- KPI SUMMARY (tail of kpi_history.csv) ----"
-          tail -n 1 .state/kpi_history.csv || true
+          if [ -f tools/make_kpi_chart.py ] && [ -f "${{ env.KPI_CSV }}" ]; then
+            python tools/make_kpi_chart.py "${{ env.KPI_CSV }}" "${{ env.KPI_CHART }}" || true
+          else
+            echo "KPI chart script or CSV not found; skipping."
+          fi
 
-      - name: Debug .state contents
-        if: always()
-        run: |
-          echo "ls -la .state"; ls -la .state || true
-          echo "tree -a .state"
-          sudo apt-get update >/dev/null 2>&1 || true
-          sudo apt-get install -y tree >/dev/null 2>&1 || true
-          tree -a .state || true
-          echo "----- day_state.json -----"
-          cat .state/day_state.json || true
-
-      - name: Save state (upload .state)
+      - name: Upload .state artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: state-riskon-${{ github.run_id }}
+          name: riskon-state-${{ github.run_id }}
           path: |
-            ${{ github.workspace }}/.state/**
-            ${{ github.workspace }}/.state/*
-            ${{ github.workspace }}/.state
+            .state/**
+            !.state/**/*.tmp
           if-no-files-found: warn
-          retention-days: 7
+
+      - name: Upload logs (best-effort)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: riskon-logs-${{ github.run_id }}
+          path: |
+            logs/**
+          if-no-files-found: ignore
