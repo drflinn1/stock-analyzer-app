@@ -1,62 +1,59 @@
-# tools/make_kpi_chart.py
-# Reads .state/kpi_history.csv and writes .state/kpi_chart.png (last ~500 points)
-import os, csv
-from datetime import datetime
-import matplotlib
-matplotlib.use("Agg")  # headless renderer for CI
-import matplotlib.pyplot as plt  # noqa: E402
+#!/usr/bin/env python3
+# Usage: python tools/make_kpi_chart.py .state/kpi_history.csv .state/kpi_chart.png
+import sys
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
 
-STATE_DIR = os.getenv("STATE_DIR", ".state")
-KPI_CSV = os.getenv("KPI_CSV", f"{STATE_DIR}/kpi_history.csv")
-OUT_PNG = os.path.join(STATE_DIR, "kpi_chart.png")
+def pick_time_column(df):
+    for c in ["timestamp", "time", "date", "datetime", "run_time"]:
+        if c in df.columns:
+            return c
+    return df.columns[0]  # fall back to first column
 
-def read_rows(path):
-    rows = []
-    if not os.path.exists(path):
-        return rows
-    with open(path, newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for d in r:
-            ts = (d.get("ts_utc") or "").strip()
-            try:
-                if "UTC" in ts:
-                    when = datetime.strptime(ts.split(".")[0], "%Y-%m-%d %H:%M:%S %Z")
-                else:
-                    when = datetime.fromisoformat(ts.split(".")[0])
-            except Exception:
-                when = datetime.utcnow()
-            pnl = d.get("pnl")
-            try:
-                pnl = float(pnl) if pnl not in (None, "") else 0.0
-            except Exception:
-                pnl = 0.0
-            rows.append((when, pnl))
-    rows.sort(key=lambda x: x[0])
-    return rows[-500:]  # keep recent
+def pick_value_column(df):
+    # try common KPI fields in preference order
+    for c in ["equity", "balance", "nav", "pnl", "pnl_pct", "daily_pnl", "kpi"]:
+        if c in df.columns:
+            return c
+    # pick last numeric column
+    nums = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    return nums[-1] if nums else df.columns[-1]
 
-def make_chart(rows):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    plt.figure(figsize=(10, 4))
-    if not rows:
-        plt.title("Cumulative P&L — no data yet")
-        plt.savefig(OUT_PNG, dpi=140, bbox_inches="tight")
+def main(csv_path, out_path):
+    csv = Path(csv_path)
+    out = Path(out_path)
+    if not csv.exists():
+        print(f"[KPI] CSV not found: {csv}")
         return
-    times = [r[0] for r in rows]
-    pnls  = [r[1] for r in rows]
-    cum = []
-    s = 0.0
-    for x in pnls:
-        s += x
-        cum.append(s)
-    plt.plot(times, cum, linewidth=2)
-    plt.title("Cumulative P&L")
-    plt.xlabel("Time")
-    plt.ylabel("USD")
-    plt.grid(True, alpha=0.3)
+
+    df = pd.read_csv(csv)
+    if df.empty:
+        print("[KPI] CSV is empty; nothing to plot.")
+        return
+
+    tcol = pick_time_column(df)
+    vcol = pick_value_column(df)
+
+    # parse time if looks like datetime
+    try:
+        df[tcol] = pd.to_datetime(df[tcol])
+    except Exception:
+        pass
+
+    plt.figure(figsize=(9, 4.5))
+    plt.plot(df[tcol], df[vcol], linewidth=2)
+    plt.title(f"KPI — {vcol}")
+    plt.xlabel(tcol)
+    plt.ylabel(vcol)
     plt.tight_layout()
-    plt.savefig(OUT_PNG, dpi=140)
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out, dpi=140)
+    print(f"[KPI] Chart saved to {out}")
 
 if __name__ == "__main__":
-    rows = read_rows(KPI_CSV)
-    make_chart(rows)
-    print(f"Wrote {OUT_PNG}")
+    if len(sys.argv) < 3:
+        print("Usage: make_kpi_chart.py <kpi_csv> <out_png>")
+        sys.exit(0)
+    main(sys.argv[1], sys.argv[2])
