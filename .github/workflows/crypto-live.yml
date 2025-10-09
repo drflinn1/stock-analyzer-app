@@ -85,7 +85,7 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
-          else:
+          else
             pip install ccxt requests pandas matplotlib
           fi
 
@@ -101,16 +101,26 @@ jobs:
 
       - name: Run Bot
         env:
+          # runtime toggles
           DRY_RUN: ${{ inputs.DRY_RUN }}
           RUN_SWITCH: ${{ inputs.RUN_SWITCH }}
 
-          # Prefer KRAKEN_*; fall back to your existing CCXT_* secrets
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || secrets.CCXT_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || secrets.CCXT_API_SECRET }}
+          # provide both sets (some code reads one or the other)
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
+          CCXT_API_SECRET: ${{ secrets.CCXT_API_SECRET }}
 
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          python -u tools/safe_runner.py
+          set -e
+          # If KRAKEN_* missing but CCXT_* exist, copy them over so ccxt gets apiKey/secret
+          if [ -z "${KRAKEN_API_KEY}" ] && [ -n "${CCXT_API_KEY}" ]; then
+            export KRAKEN_API_KEY="${CCXT_API_KEY}"
+            export KRAKEN_API_SECRET="${CCXT_API_SECRET}"
+            echo "[env] Fallback: using CCXT_* values for KRAKEN_*"
+          fi
+          python -u main.py
 
       - name: Build KPI chart (optional)
         run: |
