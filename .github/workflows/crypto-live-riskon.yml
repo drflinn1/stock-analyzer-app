@@ -101,7 +101,7 @@ jobs:
         env:
           DRY_RUN: ${{ inputs.DRY_RUN }}
 
-          # provide both sets (for fallback below)
+          # provide both sets (fallback copies CCXT_* into KRAKEN_*)
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
           CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
