@@ -24,7 +24,7 @@ env:
   PYTHON_VERSION: "3.11"
 
   # ===== Conservative defaults for a hands-free week =====
-  RESERVE_CASH_PCT: "15"          # keep 15% in cash (percent, not fraction)
+  RESERVE_CASH_PCT: "15"          # percent, not fraction
   USD_PER_TRADE: "20"
   MIN_TRADE_NOTIONAL_USD: "5"
   DUST_MIN_USD: "2"
@@ -51,7 +51,7 @@ env:
   NONUNI_SELL_IF_DOWN_PCT: "0"
   NONUNI_KEEP_IF_WINNER_PCT: "6"
 
-  RUN_SWITCH: "ON"   # default; dialog can override for DRY_RUN only
+  RUN_SWITCH: "ON"
 
   STATE_DIR: ".state"
   KPI_CSV: ".state/kpi_history.csv"
@@ -85,7 +85,7 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
-          else
+          else:
             pip install ccxt requests pandas matplotlib
           fi
 
@@ -101,7 +101,6 @@ jobs:
 
       - name: Run Bot
         env:
-          # runtime toggles
           DRY_RUN: ${{ inputs.DRY_RUN }}
           RUN_SWITCH: ${{ inputs.RUN_SWITCH }}
 
@@ -109,10 +108,9 @@ jobs:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || secrets.CCXT_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || secrets.CCXT_API_SECRET }}
 
-          # optional Slack alerts
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          python -u main.py
+          python -u tools/safe_runner.py
 
       - name: Build KPI chart (optional)
         run: |
