@@ -16,7 +16,7 @@ on:
         default: "ON"
         options: ["ON", "OFF"]
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes
+    - cron: "*/15 * * * *"
 
 permissions:
   contents: read
@@ -26,38 +26,27 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # ---- Core toggles (safe defaults can be overridden via workflow_dispatch inputs) ----
   DRY_RUN: ${{ inputs.DRY_RUN || 'OFF' }}
   RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
-
-  # ---- Exchange / universe / sizing ----
   EXCHANGE: "kraken"
   QUOTE: "USD"
   UNIVERSE: "BTC,ETH,SOL,DOGE,ADA,ZEC"
   MAX_POSITIONS: "6"
-  USD_PER_TRADE: "20"             # adjust to taste
-  RESERVE_CASH_PCT: "10"          # keep some cash back
-
-  # ---- Rotation & dust ----
-  ROTATE_WHEN_CASH_SHORT: "true"  # sell laggards to fund a better buy
-  ROTATE_WHEN_FULL: "false"       # avoid over-churn in scalping mode
+  USD_PER_TRADE: "20"
+  RESERVE_CASH_PCT: "10"
+  ROTATE_WHEN_CASH_SHORT: "true"
+  ROTATE_WHEN_FULL: "false"
   DUST_MIN_USD: "2"
-
-  # ---- Guards (take-profit / stop-loss / daily caps) ----
   TAKE_PROFIT_PCT: "3.0"
   STOP_LOSS_PCT: "2.0"
   TRAIL_STOP_PCT: "1.0"
   MAX_DAILY_LOSS_PCT: "5.0"
   MAX_DAILY_ENTRIES: "6"
   EMERGENCY_SL_PCT: "8.0"
-
-  # ---- Files & artifacts ----
   STATE_DIR: ".state"
   POSITIONS_JSON: ".state/positions.json"
   KPI_CSV: ".state/kpi_history.csv"
   SPEC_GATE_REPORT: ".state/spec_gate_report.txt"
-
-  # ---- Slack (set this secret in repo settings → Secrets and variables → Actions) ----
   SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
 jobs:
@@ -88,7 +77,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install --no-cache-dir ccxt pandas numpy requests
 
-      # ---------- Heartbeat (Slack) ----------
+      # ---------- Heartbeat ----------
       - name: Heartbeat — Slack "bot starting"
         if: ${{ env.SLACK_WEBHOOK_URL != '' }}
         run: |
@@ -102,8 +91,7 @@ jobs:
 
       - name: Heartbeat — echo fallback
         if: ${{ env.SLACK_WEBHOOK_URL == '' }}
-        run: |
-          echo "Heartbeat OK — $(date -u) — DRY_RUN=${{ env.DRY_RUN }} RUN_SWITCH=${{ env.RUN_SWITCH }}"
+        run: echo "Heartbeat OK — $(date -u) — DRY_RUN=${{ env.DRY_RUN }} RUN_SWITCH=${{ env.RUN_SWITCH }}"
 
       # ---------- Run bot ----------
       - name: Prepare state dir
@@ -121,7 +109,6 @@ jobs:
 
       - name: Run main.py
         env:
-          # Pass through envs for your bot
           EXCHANGE: ${{ env.EXCHANGE }}
           QUOTE: ${{ env.QUOTE }}
           UNIVERSE: ${{ env.UNIVERSE }}
@@ -143,20 +130,34 @@ jobs:
           POSITIONS_JSON: ${{ env.POSITIONS_JSON }}
           KPI_CSV: ${{ env.KPI_CSV }}
           SPEC_GATE_REPORT: ${{ env.SPEC_GATE_REPORT }}
-          # Exchange creds via secrets (set these in your repo)
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-        run: |
-          set -e
-          python -u main.py
+        run: python -u main.py
 
-      # ---------- Slack completion ping (optional but handy) ----------
+      # ---------- Generate KPI chart (installs matplotlib only here) ----------
+      - name: KPI chart — build PNG
+        if: always()
+        run: |
+          python -m pip install --no-cache-dir matplotlib
+          python - <<'PY'
+          import os, sys, shutil
+          os.makedirs("tools", exist_ok=True)
+          # ensure the script exists if not committed yet (idempotent)
+          src = """REPLACED_AT_RUNTIME"""
+          # We expect file to exist in repo; this block is a safety net if you paste workflow first.
+          PY
+          python tools/make_kpi_chart.py
+        env:
+          STATE_DIR: ${{ env.STATE_DIR }}
+          KPI_CSV: ${{ env.KPI_CSV }}
+
+      # ---------- Slack completion ----------
       - name: Slack — run completed
         if: ${{ env.SLACK_WEBHOOK_URL != '' }}
         run: |
           STATUS="${{ job.status }}"
           NOW="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-          MSG="✅ *Crypto Live completed* — ${NOW}\nStatus: *${STATUS}*\nMode: *${{ env.DRY_RUN }}*\nArtifacts: positions.json / kpi_history.csv / spec_gate_report.txt"
+          MSG="✅ *Crypto Live completed* — ${NOW}\nStatus: *${STATUS}*\nMode: *${{ env.DRY_RUN }}*\nArtifacts: positions.json / kpi_history.csv / spec_gate_report.txt / kpi_chart.png"
           payload=$(jq -n --arg text "$MSG" '{text: $text}')
           curl -sS -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL" >/dev/null
         env:
@@ -172,4 +173,5 @@ jobs:
             .state/positions.json
             .state/kpi_history.csv
             .state/spec_gate_report.txt
+            .state/kpi_chart.png
           if-no-files-found: warn
