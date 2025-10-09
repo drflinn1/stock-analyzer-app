@@ -23,7 +23,7 @@ concurrency:
 env:
   PYTHON_VERSION: "3.11"
 
-  # ===== Conservative defaults for a hands-free week =====
+  # ===== conservative defaults (hands-free safe) =====
   RESERVE_CASH_PCT: "15"          # percent, not fraction
   USD_PER_TRADE: "20"
   MIN_TRADE_NOTIONAL_USD: "5"
@@ -105,7 +105,7 @@ jobs:
           DRY_RUN: ${{ inputs.DRY_RUN }}
           RUN_SWITCH: ${{ inputs.RUN_SWITCH }}
 
-          # provide both sets (some code reads one or the other)
+          # provide both sets (fallback below copies CCXT_* into KRAKEN_*)
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
           CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
@@ -114,7 +114,6 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           set -e
-          # If KRAKEN_* missing but CCXT_* exist, copy them over so ccxt gets apiKey/secret
           if [ -z "${KRAKEN_API_KEY}" ] && [ -n "${CCXT_API_KEY}" ]; then
             export KRAKEN_API_KEY="${CCXT_API_KEY}"
             export KRAKEN_API_SECRET="${CCXT_API_SECRET}"
