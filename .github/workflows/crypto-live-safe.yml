@@ -7,6 +7,7 @@ on:
         description: "Master switch"
         required: true
         type: choice
+        # Even if GH shows true/false, we accept and normalize below.
         options: [ON, OFF]
         default: ON
       DRY_RUN_STR:
@@ -61,10 +62,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # --- Inputs (exactly 10) ---
-  RUN_SWITCH: ${{ inputs.RUN_SWITCH_STR || 'ON' }}
-  DRY_RUN: ${{ inputs.DRY_RUN_STR || 'ON' }}
+  # Raw inputs (may be 'ON'/'OFF' or 'true'/'false')
+  RUN_SWITCH_RAW: ${{ inputs.RUN_SWITCH_STR || 'ON' }}
+  DRY_RUN_RAW: ${{ inputs.DRY_RUN_STR || 'ON' }}
   RISK_MODE: ${{ inputs.RISK_MODE || 'REQUIRE_ON' }}
+
+  # Numeric knobs
   UNIVERSE_TOP_K: ${{ inputs.UNIVERSE_TOP_K || 6 }}
   MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || 6 }}
   MAX_BUYS_PER_RUN: ${{ inputs.MAX_BUYS_PER_RUN || 1 }}
@@ -73,7 +76,7 @@ env:
   DAILY_CAP_USD: ${{ inputs.DAILY_CAP_USD || 100 }}
   RESERVE_CASH_PCT: ${{ inputs.RESERVE_CASH_PCT || 20 }}
 
-  # --- Advanced knobs (edit here when needed) ---
+  # Advanced guards (edit here any time)
   DUST_MIN_USD: 2
   ROTATE_WHEN_FULL: "true"
   ROTATE_WHEN_CASH_SHORT: "true"
@@ -82,16 +85,16 @@ env:
   MIN_24H_USD_VOLUME: 50000
   SPEC_GATE_EXCLUDE: "USDT/USD,USDC/USD,EUR/USD,GBP/USD,USD/USD,SPX/USD,PUMP/USD,BABY/USD,ALKIMI/USD"
 
-  # --- Paths / files ---
+  # Paths / files
   STATE_DIR: ".state"
   POSITIONS_FILE: ".state/positions.json"
   KPI_CSV: ".state/kpi_history.csv"
   KPI_CHART: "true"
 
-  # --- Optional Slack webhook (repo Secret) ---
+  # Optional Slack
   SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL || '' }}
 
-  # --- Exchange secrets (repo Secrets) ---
+  # Exchange secrets
   KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || '' }}
   KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || '' }}
 
@@ -101,6 +104,27 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Normalize ON/OFF toggles (accept true/false)
+        id: norm
+        run: |
+          norm() {
+            v="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+            if [ "$v" = "on" ] || [ "$v" = "true" ] || [ "$v" = "1" ] || [ "$v" = "yes" ]; then
+              echo "ON"
+            else
+              echo "OFF"
+            fi
+          }
+
+          RUN_SWITCH="$(norm "${RUN_SWITCH_RAW}")"
+          DRY_RUN="$(norm "${DRY_RUN_RAW}")"
+
+          echo "RUN_SWITCH=$RUN_SWITCH" >> "$GITHUB_ENV"
+          echo "DRY_RUN=$DRY_RUN" >> "$GITHUB_ENV"
+
+          echo "Normalized RUN_SWITCH=${RUN_SWITCH}"
+          echo "Normalized DRY_RUN=${DRY_RUN}"
+
       - name: Safety gate — Master switch
         if: env.RUN_SWITCH != 'ON'
         run: |
@@ -143,6 +167,7 @@ jobs:
       - name: Pre-flight summary
         run: |
           echo "=== CRYPTO LIVE SAFE BASELINE ==="
+          echo "RUN_SWITCH: $RUN_SWITCH"
           echo "DRY_RUN: $DRY_RUN"
           echo "RISK_MODE: $RISK_MODE (signal=${{ steps.risk.outputs.signal }})"
           echo "UNIVERSE_TOP_K: $UNIVERSE_TOP_K"
