@@ -4,23 +4,29 @@ on:
   workflow_dispatch:
     inputs:
       RUN_SWITCH:
-        description: "Master switch (ON/OFF)"
-        type: choice
-        options: [ON, OFF]
-        default: ON
+        description: "Master switch"
         required: true
+        type: choice
+        options:
+          - ON
+          - OFF
+        default: ON
       DRY_RUN:
         description: "Sim mode? (ON = no real orders)"
-        type: choice
-        options: [ON, OFF]
-        default: ON
         required: true
+        type: choice
+        options:
+          - ON
+          - OFF
+        default: ON
       RISK_MODE:
         description: "Run only when risk is ON?"
-        type: choice
-        options: [REQUIRE_ON, IGNORE]
-        default: REQUIRE_ON
         required: true
+        type: choice
+        options:
+          - REQUIRE_ON
+          - IGNORE
+        default: REQUIRE_ON
       UNIVERSE_TOP_K:
         description: "Auto-pick top K liquid/eligible pairs"
         type: number
