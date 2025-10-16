@@ -19,50 +19,72 @@ on:
       MIN_USD:
         description: 'Skip tiny lots below this USD value'
         required: false
-        default: '1.00'
+        default: '0.50'
 
 jobs:
   sell_all:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install ccxt
         run: |
           python -m pip install --upgrade pip
           pip install ccxt
 
-      - name: Force sell
+      - name: Force sell (cancel opens, round size, retry)
         env:
           DRY_RUN: ${{ inputs.DRY_RUN }}
           QUOTE: ${{ inputs.QUOTE }}
           EXCLUDE: ${{ inputs.EXCLUDE }}
           MIN_USD: ${{ inputs.MIN_USD }}
-
-          # Support both naming schemes
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || secrets.CCXT_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || secrets.CCXT_API_SECRET }}
         run: |
           python - <<'PY'
-          import os, sys, ccxt
+          import os, sys, math, time
+          import ccxt
+
           DRY = os.getenv("DRY_RUN","ON").upper()=="ON"
           quote = os.getenv("QUOTE","USD").upper()
           exclude = {s.strip().upper() for s in os.getenv("EXCLUDE","").split(",") if s.strip()}
-          min_usd = float(os.getenv("MIN_USD","1.0"))
+          min_usd = float(os.getenv("MIN_USD","0.5"))
+          key = os.getenv("KRAKEN_API_KEY")
+          sec = os.getenv("KRAKEN_API_SECRET")
+          if not key or not sec:
+              print("[FATAL] Missing Kraken keys."); sys.exit(1)
 
-          apiKey = os.getenv("KRAKEN_API_KEY")
-          secret = os.getenv("KRAKEN_API_SECRET")
-          if not apiKey or not secret:
-              print("[FATAL] Missing Kraken keys. Add KRAKEN_API_KEY/SECRET or CCXT_*.")
-              sys.exit(1)
+          ex = ccxt.kraken({"apiKey": key, "secret": sec, "enableRateLimit": True})
+          markets = ex.load_markets()
 
-          ex = ccxt.kraken({"apiKey": apiKey, "secret": secret, "enableRateLimit": True})
-          ex.load_markets()
+          # 1) Cancel any open orders that could be holding funds
+          try:
+              opens = ex.fetch_open_orders()
+          except Exception:
+              opens = []
+          if opens:
+              ids = [o['id'] for o in opens if 'id' in o]
+              for oid in ids:
+                  try:
+                      if DRY: print(f"[DRY] cancel {oid}")
+                      else: ex.cancel_order(oid)
+                  except Exception as e:
+                      print(f"[WARN] cancel {oid} failed: {e}")
+              time.sleep(1.0)
 
+          # 2) Helper to round amount by market precision
+          def round_amount(sym, amt):
+              m = markets.get(sym, {})
+              step = 1.0
+              p = (m.get('precision', {}) or {}).get('amount')
+              if isinstance(p, int):
+                  return float(f"{amt:.{max(p,0)}f}")
+              # fall back to conservative rounding
+              return float(f"{amt:.8f}")
+
+          # 3) Build sell list
           bal = ex.fetch_balance()
           totals = (bal or {}).get("total", {}) or {}
           sells = []
@@ -72,6 +94,9 @@ jobs:
               if b in ("USD","USDT","USDC",quote): continue
               if b in exclude: continue
               sym = f"{b}/{quote}"
+              if sym not in markets: 
+                  print(f"[SKIP] {sym} not in markets.")
+                  continue
               try:
                   t = ex.fetch_ticker(sym)
                   px = t.get("last") or t.get("bid") or t.get("ask") or 0.0
@@ -84,18 +109,25 @@ jobs:
               sells.append((sym, float(amt)))
 
           if not sells:
-              print("[INFO] Nothing to sell.")
-              sys.exit(0)
+              print("[INFO] Nothing to sell."); sys.exit(0)
 
+          # 4) Execute sells with rounding + retry small decrement if 'insufficient funds'
           for sym, amt in sells:
-              if DRY:
-                  print(f"[DRY] SELL {sym} amt={amt}")
-              else:
+              a = round_amount(sym, amt)
+              for attempt in range(3):
                   try:
-                      o = ex.create_order(sym, "market", "sell", amt)
-                      print(f"[LIVE] SELL {sym} id={o.get('id')} amt={amt}")
+                      if DRY:
+                          print(f"[DRY] SELL {sym} amt={a}")
+                      else:
+                          o = ex.create_order(sym, "market", "sell", a)
+                          print(f"[LIVE] SELL {sym} id={o.get('id')} amt={a}")
+                      break
                   except Exception as e:
-                      print(f"[ERROR] SELL {sym} failed: {e}")
-
+                      msg = str(e)
+                      print(f"[ERROR] SELL {sym} amt={a} failed: {msg}")
+                      if "Insufficient funds" in msg or "EOrder:Insufficient funds" in msg:
+                          a = max(0.0, a * 0.98)  # shave a little and retry
+                          continue
+                      break
           print("[DONE] Force sell sweep complete.")
           PY
