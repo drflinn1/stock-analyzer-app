@@ -59,42 +59,40 @@ jobs:
           ex = ccxt.kraken({"apiKey": key, "secret": sec, "enableRateLimit": True})
           markets = ex.load_markets()
 
-          # 1) Cancel any open orders that could be holding funds
+          # 1) Cancel open orders (they reserve funds)
           try:
               opens = ex.fetch_open_orders()
           except Exception:
               opens = []
-          if opens:
-              ids = [o['id'] for o in opens if 'id' in o]
-              for oid in ids:
-                  try:
-                      if DRY: print(f"[DRY] cancel {oid}")
-                      else: ex.cancel_order(oid)
-                  except Exception as e:
-                      print(f"[WARN] cancel {oid} failed: {e}")
-              time.sleep(1.0)
+          for o in opens:
+              oid = o.get('id')
+              if not oid: continue
+              try:
+                  if DRY: print(f"[DRY] cancel {oid}")
+                  else: ex.cancel_order(oid)
+              except Exception as e:
+                  print(f"[WARN] cancel {oid} failed: {e}")
+          time.sleep(1.0)
 
-          # 2) Helper to round amount by market precision
+          # 2) Precision-aware rounding
           def round_amount(sym, amt):
               m = markets.get(sym, {})
-              step = 1.0
               p = (m.get('precision', {}) or {}).get('amount')
-              if isinstance(p, int):
+              if isinstance(p, int):  # number of decimals
                   return float(f"{amt:.{max(p,0)}f}")
-              # fall back to conservative rounding
               return float(f"{amt:.8f}")
 
-          # 3) Build sell list
+          # 3) Build sells
           bal = ex.fetch_balance()
           totals = (bal or {}).get("total", {}) or {}
           sells = []
           for base, amt in totals.items():
               if not amt or amt <= 0: continue
               b = base.upper()
-              if b in ("USD","USDT","USDC",quote): continue
+              if b in (quote, "USD", "USDT", "USDC"): continue
               if b in exclude: continue
               sym = f"{b}/{quote}"
-              if sym not in markets: 
+              if sym not in markets:
                   print(f"[SKIP] {sym} not in markets.")
                   continue
               try:
@@ -111,7 +109,6 @@ jobs:
           if not sells:
               print("[INFO] Nothing to sell."); sys.exit(0)
 
-          # 4) Execute sells with rounding + retry small decrement if 'insufficient funds'
           for sym, amt in sells:
               a = round_amount(sym, amt)
               for attempt in range(3):
@@ -126,7 +123,7 @@ jobs:
                       msg = str(e)
                       print(f"[ERROR] SELL {sym} amt={a} failed: {msg}")
                       if "Insufficient funds" in msg or "EOrder:Insufficient funds" in msg:
-                          a = max(0.0, a * 0.98)  # shave a little and retry
+                          a = max(0.0, a * 0.98)  # shave and retry
                           continue
                       break
           print("[DONE] Force sell sweep complete.")
