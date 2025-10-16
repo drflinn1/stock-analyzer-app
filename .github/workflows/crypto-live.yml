@@ -7,14 +7,14 @@ on:
         description: "ON = simulate (no orders), OFF = live"
         type: choice
         options: ["ON", "OFF"]
-        default: "OFF"
+        default: "ON"
       RUN_SWITCH:
         description: "Master on/off switch inside the bot"
         type: choice
         options: ["ON", "OFF"]
         default: "ON"
   schedule:
-    - cron: "*/15 * * * *"  # every 15 minutes
+    - cron: "*/15 * * * *"
 
 concurrency:
   group: crypto-live-kraken
@@ -23,14 +23,15 @@ concurrency:
 env:
   PYTHON_VERSION: "3.11"
 
-  # ===== conservative defaults (hands-free safe) =====
+  # ===== conservative defaults (sell-only while stabilizing) =====
   RESERVE_CASH_PCT: "15"          # percent, not fraction
   USD_PER_TRADE: "20"
   MIN_TRADE_NOTIONAL_USD: "5"
-  DUST_MIN_USD: "2"
+  DUST_MIN_USD: "2"               # <-- only here (no duplicates)
 
   MAX_POSITIONS: "6"
-  MAX_BUYS_PER_RUN: "1"
+  MAX_BUYS_PER_RUN: "0"           # <-- set to "1" later to re-enable buys
+  CLEANUP_NON_UNIVERSE: "true"
   ROTATE_WHEN_FULL: "true"
   ROTATE_WHEN_CASH_SHORT: "true"
 
@@ -46,10 +47,6 @@ env:
   EMERGENCY_SL_PCT: "8"
   MAX_DAILY_LOSS_PCT: "5"
   MAX_DAILY_ENTRIES: "4"
-
-  CLEANUP_NON_UNIVERSE: "true"
-  NONUNI_SELL_IF_DOWN_PCT: "0"
-  NONUNI_KEEP_IF_WINNER_PCT: "6"
 
   RUN_SWITCH: "ON"
 
@@ -77,8 +74,7 @@ jobs:
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          restore-keys: ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
@@ -101,24 +97,16 @@ jobs:
 
       - name: Run Bot
         env:
-          # runtime toggles
           DRY_RUN: ${{ inputs.DRY_RUN }}
           RUN_SWITCH: ${{ inputs.RUN_SWITCH }}
 
-          # provide both sets (fallback below copies CCXT_* into KRAKEN_*)
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
-          CCXT_API_SECRET: ${{ secrets.CCXT_API_SECRET }}
+          # Support either naming scheme
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || secrets.CCXT_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || secrets.CCXT_API_SECRET }}
 
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           set -e
-          if [ -z "${KRAKEN_API_KEY}" ] && [ -n "${CCXT_API_KEY}" ]; then
-            export KRAKEN_API_KEY="${CCXT_API_KEY}"
-            export KRAKEN_API_SECRET="${CCXT_API_SECRET}"
-            echo "[env] Fallback: using CCXT_* values for KRAKEN_*"
-          fi
           python -u main.py
 
       - name: Build KPI chart (optional)
