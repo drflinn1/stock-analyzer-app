@@ -3,7 +3,7 @@ name: Crypto Live — Safe Baseline (every 5m)
 on:
   workflow_dispatch:
     inputs:
-      RUN_SWITCH:
+      RUN_SWITCH_STR:
         description: "Master switch"
         required: true
         type: choice
@@ -11,7 +11,7 @@ on:
           - ON
           - OFF
         default: ON
-      DRY_RUN:
+      DRY_RUN_STR:
         description: "Sim mode? (ON = no real orders)"
         required: true
         type: choice
@@ -68,8 +68,8 @@ concurrency:
 
 env:
   # --- Inputs (exactly 10) ---
-  RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
-  DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
+  RUN_SWITCH: ${{ inputs.RUN_SWITCH_STR || 'ON' }}
+  DRY_RUN: ${{ inputs.DRY_RUN_STR || 'ON' }}
   RISK_MODE: ${{ inputs.RISK_MODE || 'REQUIRE_ON' }}
   UNIVERSE_TOP_K: ${{ inputs.UNIVERSE_TOP_K || 6 }}
   MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || 6 }}
