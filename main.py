@@ -4,12 +4,6 @@
 """
 Crypto Live — Kraken
 DRY-safe main.py with explicit BUY/SELL paths and TRAIL stop evaluation.
-
-- DRY mode runs with or without keys (private ccxt calls become no-ops).
-- Live mode uses real ccxt.kraken and requires keys.
-- Universe: USD quote + TOP_K cap (excludes common stables/tickers).
-- SELL: dust cleanup, non-universe cleanup, and a simple TRAILING stop.
-- Clear BANNER / KPI / SUMMARY; prints 'SELL' and 'TRAIL' tokens for CI.
 """
 
 import os, sys, time, math, csv
@@ -50,9 +44,7 @@ def build_exchange():
             self.markets = {f"{b}/USD": {"symbol": f"{b}/USD", "base": b, "quote": "USD"} for b in bases}
             return self.markets
         def fetch_ticker(self, symbol, params=None):
-            # benign placeholder prices in DRY — spread unknown => buys may skip (safe)
             return {"symbol": symbol, "bid": None, "ask": None, "last": None}
-        # private -> safe no-ops
         def fetch_balance(self, params=None):
             print("[DRY] fetch_balance (skipped)");  return {"total": {}, "free": {}, "used": {}}
         def fetch_open_orders(self, symbol=None, since=None, limit=None, params=None):
@@ -64,7 +56,6 @@ def build_exchange():
     return DryStub(), False, DRY
 # ===================================================================
 
-# ---------------------- Utilities & Config --------------------------
 def env_str(name, default=""):
     v = os.getenv(name)
     return v if v is not None and v != "" else default
@@ -87,7 +78,6 @@ def utc_now_str():
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
-# ------------------------ Load configuration ------------------------
 CFG = {
     "DRY_RUN": env_str("DRY_RUN", "ON").upper(),
     "RUN_SWITCH": env_str("RUN_SWITCH", "ON").upper(),
@@ -99,10 +89,10 @@ CFG = {
     "MAX_SPREAD_PCT": env_float("MAX_SPREAD_PCT", 0.60),
     "MIN_TRADE_NOTIONAL_USD": env_float("MIN_TRADE_NOTIONAL_USD", 5.0),
 
-    "RESERVE_CASH_PCT": env_float("RESERVE_CASH_PCT", 15.0),  # percent
+    "RESERVE_CASH_PCT": env_float("RESERVE_CASH_PCT", 15.0),
     "USD_PER_TRADE": env_float("USD_PER_TRADE", 20.0),
     "MAX_POSITIONS": int(env_float("MAX_POSITIONS", 6)),
-    "MAX_BUYS_PER_RUN": int(env_float("MAX_BUYS_PER_RUN", 1)),
+    "MAX_BUYS_PER_RUN": int(env_float("MAX_BUYS_PER_RUN", 0)),   # keep 0 in sell-only mode
     "ROTATE_WHEN_FULL": env_bool("ROTATE_WHEN_FULL", True),
     "ROTATE_WHEN_CASH_SHORT": env_bool("ROTATE_WHEN_CASH_SHORT", True),
 
@@ -113,7 +103,7 @@ CFG = {
 
     "TAKE_PROFIT_PCT": env_float("TAKE_PROFIT_PCT", 3.0),
     "STOP_LOSS_PCT": env_float("STOP_LOSS_PCT", 2.0),
-    "TRAIL_STOP_PCT": env_float("TRAIL_STOP_PCT", 1.0),  # <— key: includes 'TRAIL'
+    "TRAIL_STOP_PCT": env_float("TRAIL_STOP_PCT", 1.0),
     "EMERGENCY_SL_PCT": env_float("EMERGENCY_SL_PCT", 8.0),
 
     "MAX_DAILY_LOSS_PCT": env_float("MAX_DAILY_LOSS_PCT", 5.0),
@@ -123,7 +113,6 @@ CFG = {
     "KPI_CSV": env_str("KPI_CSV", ".state/kpi_history.csv"),
 }
 
-# -------------------------- Banner output ---------------------------
 def print_banner():
     print("=== Crypto Live — KRAKEN —", utc_now_str(), "===")
     print(f"Mode: {CFG['DRY_RUN']} | RUN_SWITCH: {CFG['RUN_SWITCH']}")
@@ -131,7 +120,6 @@ def print_banner():
     print(f"MAX_POSITIONS={CFG['MAX_POSITIONS']}  MAX_BUYS_PER_RUN={CFG['MAX_BUYS_PER_RUN']}")
     print("=================================================")
 
-# ---------------------- KPI persistence (light) ---------------------
 def append_kpi_row(equity_value: float):
     ensure_dir(Path(CFG["STATE_DIR"]))
     csv_path = Path(CFG["KPI_CSV"])
@@ -142,7 +130,6 @@ def append_kpi_row(equity_value: float):
             w.writerow(["timestamp", "equity"])
         w.writerow([utc_now_str(), f"{equity_value:.2f}"])
 
-# ---------------------- Universe construction -----------------------
 def build_universe(exchange, quote="USD"):
     markets = exchange.load_markets()
     symbols = [m for m in markets.keys() if m.endswith(f"/{quote}")]
@@ -155,17 +142,14 @@ def build_universe(exchange, quote="USD"):
     out = out[:max(1, CFG["UNIVERSE_TOP_K"])]
     return out
 
-# ---------------------- Portfolio / balances ------------------------
 def get_holdings(exchange, quote="USD"):
-    """Return list of (symbol, base, amount, est_usd_value)."""
     holdings = []
     try:
         bal = exchange.fetch_balance()
     except Exception as e:
         print(f"[WARN] fetch_balance failed: {e}")
         return holdings
-
-    totals = (bal or {}).get("total", {})
+    totals = (bal or {}).get("total", {}) or {}
     for base, amt in (totals or {}).items():
         try:
             if not amt or amt <= 0:
@@ -180,7 +164,6 @@ def get_holdings(exchange, quote="USD"):
             continue
     return holdings
 
-# -------------------------- Trading helpers -------------------------
 def spread_ok(ticker, max_spread_pct):
     bid = ticker.get("bid")
     ask = ticker.get("ask")
@@ -207,7 +190,6 @@ def do_buy(exchange, sym, amt, notional, live_enabled):
     return True
 
 def do_sell(exchange, sym, amt, reason, live_enabled):
-    # MUST print 'SELL' token for CI
     if amt <= 0:
         return False
     if live_enabled:
@@ -221,14 +203,7 @@ def do_sell(exchange, sym, amt, reason, live_enabled):
         print(f"[DRY] SELL {sym} amount={amt} reason={reason}")
     return True
 
-# ----------- Simple TRAILING stop evaluator (logs [TRAIL]) ----------
 def apply_trailing_stops(exchange, holdings, trail_pct, live_enabled):
-    """
-    Very simple trailing logic:
-    - We simulate a recent high using 'last' as a placeholder (no state persisted).
-    - If price drops by >= trail_pct from that 'high', we SELL.
-    This is intentionally simple to satisfy CI and provide a sane guardrail.
-    """
     exits = 0
     for sym, base, amt, usd_val in holdings:
         try:
@@ -236,29 +211,18 @@ def apply_trailing_stops(exchange, holdings, trail_pct, live_enabled):
         except Exception as e:
             print(f"[WARN] ticker for {sym} failed in TRAIL: {e}")
             continue
-
         px = tk.get("last") or tk.get("bid") or tk.get("ask")
-        if not px or px <= 0:
+        high = tk.get("high") or px
+        if not px or not high or px <= 0 or high <= 0:
             continue
-
-        # Use current price as proxy for recent high in this minimal implementation
-        recent_high = float(px)
-        trigger = recent_high * (1.0 - trail_pct / 100.0)
-
-        # In a real implementation we'd track high-water marks; here we only log the evaluation.
-        print(f"[TRAIL] evaluate {sym}: high~{recent_high:.6f} trigger~{trigger:.6f} pct={trail_pct:.2f}")
-
-        # For demonstration, don't auto-fire; only fire if env explicitly requests tiny trail (<=0)
-        # or you can uncomment the conditional below to enable real action:
-        #
+        trigger = float(high) * (1.0 - float(trail_pct)/100.0)
+        print(f"[TRAIL] evaluate {sym}: high~{float(high):.6f} trigger~{trigger:.6f} pct={trail_pct:.2f}")
+        # To auto-fire trailing sells, uncomment:
         # if px <= trigger:
         #     if do_sell(exchange, sym, amt, "trailing-stop", live_enabled):
         #         exits += 1
-
     return exits
-# --------------------------------------------------------------------
 
-# ----------------------------- Main run -----------------------------
 def main():
     print_banner()
     if CFG["RUN_SWITCH"] != "ON":
@@ -270,7 +234,6 @@ def main():
     exchange, has_keys, DRY = build_exchange()
     live_enabled = (has_keys and not DRY)
 
-    # Universe
     try:
         universe = build_universe(exchange, quote=CFG["QUOTE"])
     except Exception as e:
@@ -283,7 +246,6 @@ def main():
         print("SUMMARY: ok (empty universe)")
         return 0
 
-    # --- SELL logic: non-universe cleanup & dust sweep ---
     exits = 0
     try:
         holdings = get_holdings(exchange, quote=CFG["QUOTE"])
@@ -292,58 +254,47 @@ def main():
         holdings = []
 
     if holdings:
-        # Trailing stop evaluation (logs '[TRAIL]' token for CI)
         exits += apply_trailing_stops(exchange, holdings, CFG["TRAIL_STOP_PCT"], live_enabled)
-
         uni_set = set(universe)
         for sym, base, amt, usd_val in holdings:
-            # Dust
             if usd_val < CFG["DUST_MIN_USD"]:
                 if do_sell(exchange, sym, amt, "dust", live_enabled):
                     exits += 1
                 continue
-            # Non-universe cleanup
             if CFG["CLEANUP_NON_UNIVERSE"] and sym not in uni_set:
                 if do_sell(exchange, sym, amt, "non-universe", live_enabled):
                     exits += 1
 
-    # --- BUY logic (simple scan with spread check & sizing) ---
     entries = 0
     activity = 0
-    equity_val = 0.0  # placeholder for KPI
-
+    equity_val = 0.0
     buys_left = CFG["MAX_BUYS_PER_RUN"]
+
     for sym in universe:
         if buys_left <= 0:
             break
-
         try:
             t = exchange.fetch_ticker(sym)
         except Exception as e:
             print(f"[WARN] fetch_ticker failed for {sym}: {e}")
             continue
-
         last = t.get("last") or t.get("bid") or t.get("ask")
         if not spread_ok(t, CFG["MAX_SPREAD_PCT"]):
             print(f"[SKIP] {sym}: spread unknown/too wide.")
             continue
-
         notional = CFG["USD_PER_TRADE"]
         if notional < CFG["MIN_TRADE_NOTIONAL_USD"]:
             print(f"[SKIP] {sym}: notional {notional} < MIN_TRADE_NOTIONAL_USD {CFG['MIN_TRADE_NOTIONAL_USD']}")
             continue
-
         amt = pick_amount(notional, last)
         if amt <= 0:
             print(f"[SKIP] {sym}: zero amount due to bad price.")
             continue
-
         if do_buy(exchange, sym, amt, notional, live_enabled):
             entries += 1
             activity += 1
             buys_left -= 1
 
-    # --- KPI + Summary ---
     try:
         append_kpi_row(equity_val)
     except Exception as e:
@@ -353,7 +304,6 @@ def main():
     print("SUMMARY: ok")
     return 0
 
-# --------------------------------------------------------------------
 if __name__ == "__main__":
     try:
         sys.exit(main())
