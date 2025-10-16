@@ -1,137 +1,249 @@
-name: Crypto Live — Kraken (every 15m)
+name: Crypto Live — Safe Baseline (every 5m)
 
 on:
   workflow_dispatch:
     inputs:
-      DRY_RUN:
-        description: "ON = simulate (no orders), OFF = live"
-        type: choice
-        options: ["ON", "OFF"]
-        default: "ON"
       RUN_SWITCH:
-        description: "Master on/off switch inside the bot"
+        description: "Master switch (ON/OFF)"
         type: choice
-        options: ["ON", "OFF"]
-        default: "ON"
+        options: [ON, OFF]
+        default: ON
+        required: true
+      DRY_RUN:
+        description: "Sim mode? (ON = no real orders)"
+        type: choice
+        options: [ON, OFF]
+        default: ON
+        required: true
+      RISK_MODE:
+        description: "Run only when risk is ON?"
+        type: choice
+        options: [REQUIRE_ON, IGNORE]
+        default: REQUIRE_ON
+        required: true
+      UNIVERSE_TOP_K:
+        description: "Auto-pick top K liquid/eligible pairs"
+        type: number
+        default: 6
+      MAX_POSITIONS:
+        description: "Max concurrent open positions"
+        type: number
+        default: 6
+      MAX_BUYS_PER_RUN:
+        description: "Throttle buys per run"
+        type: number
+        default: 1
+      MAX_SELLS_PER_RUN:
+        description: "Throttle sells per run"
+        type: number
+        default: 3
+      PER_TRADE_CAP_USD:
+        description: "Hard cap per new position (USD)"
+        type: number
+        default: 25
+      DAILY_CAP_USD:
+        description: "Max new buys per calendar day (USD)"
+        type: number
+        default: 100
+      RESERVE_CASH_PCT:
+        description: "Keep this % in cash (0-100)"
+        type: number
+        default: 20
+      DUST_MIN_USD:
+        description: "Sweep anything below this into cash (USD)"
+        type: number
+        default: 2
+      ROTATE_WHEN_FULL:
+        description: "If at cap, sell worst to fund a better entry"
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+      ROTATE_WHEN_CASH_SHORT:
+        description: "Allow rotation when cash < needed for next buy"
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+      MIN_NOTIONAL_USD:
+        description: "Exchange min-notional guard (USD)"
+        type: number
+        default: 5
+      MAX_SPREAD_PCT:
+        description: "Skip symbols with spread above this %"
+        type: number
+        default: 0.6
+      MIN_24H_USD_VOLUME:
+        description: "Skip illiquid pairs (24h USD volume)"
+        type: number
+        default: 50000
+      SPEC_GATE_EXCLUDE:
+        description: "Comma list to *exclude* (e.g. SPX/USD,PUMP/USD,PENGU/USD)"
+        type: string
+        default: "USDT/USD,USDC/USD,EUR/USD,GBP/USD,USD/USD,SPX/USD,PUMP/USD,BABY/USD,ALKIMI/USD"
+      KPI_CHART:
+        description: "Render KPI chart image from .state/kpi_history.csv"
+        type: choice
+        options: ["true","false"]
+        default: "true"
+
   schedule:
-    - cron: "*/15 * * * *"
+    # Every 5 minutes
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: read
 
 concurrency:
-  group: crypto-live-kraken
+  group: crypto-live-safe-baseline
   cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: "3.11"
+  # --- Master toggles (workflow_dispatch inputs override these defaults) ---
+  RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
+  DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
+  RISK_MODE: ${{ inputs.RISK_MODE || 'REQUIRE_ON' }}
 
-  # ===== conservative defaults (sell-only while stabilizing) =====
-  RESERVE_CASH_PCT: "15"          # percent, not fraction
-  USD_PER_TRADE: "20"
-  MIN_TRADE_NOTIONAL_USD: "5"
-  DUST_MIN_USD: "2"               # <-- only here (no duplicates)
+  # --- Risk / selection / sizing guards ---
+  UNIVERSE_TOP_K: ${{ inputs.UNIVERSE_TOP_K || 6 }}
+  MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || 6 }}
+  MAX_BUYS_PER_RUN: ${{ inputs.MAX_BUYS_PER_RUN || 1 }}
+  MAX_SELLS_PER_RUN: ${{ inputs.MAX_SELLS_PER_RUN || 3 }}
+  PER_TRADE_CAP_USD: ${{ inputs.PER_TRADE_CAP_USD || 25 }}
+  DAILY_CAP_USD: ${{ inputs.DAILY_CAP_USD || 100 }}
+  RESERVE_CASH_PCT: ${{ inputs.RESERVE_CASH_PCT || 20 }}
+  DUST_MIN_USD: ${{ inputs.DUST_MIN_USD || 2 }}
+  ROTATE_WHEN_FULL: ${{ inputs.ROTATE_WHEN_FULL || 'true' }}
+  ROTATE_WHEN_CASH_SHORT: ${{ inputs.ROTATE_WHEN_CASH_SHORT || 'true' }}
 
-  MAX_POSITIONS: "6"
-  MAX_BUYS_PER_RUN: "0"           # <-- set to "1" later to re-enable buys
-  CLEANUP_NON_UNIVERSE: "true"
-  ROTATE_WHEN_FULL: "true"
-  ROTATE_WHEN_CASH_SHORT: "true"
+  MIN_NOTIONAL_USD: ${{ inputs.MIN_NOTIONAL_USD || 5 }}
+  MAX_SPREAD_PCT: ${{ inputs.MAX_SPREAD_PCT || 0.6 }}
+  MIN_24H_USD_VOLUME: ${{ inputs.MIN_24H_USD_VOLUME || 50000 }}
+  SPEC_GATE_EXCLUDE: ${{ inputs.SPEC_GATE_EXCLUDE || 'USDT/USD,USDC/USD,EUR/USD,GBP/USD,USD/USD,SPX/USD,PUMP/USD,BABY/USD,ALKIMI/USD' }}
 
-  AUTO_UNIVERSE: "true"
-  UNIVERSE_MIN_USD_VOL: "300000"
-  UNIVERSE_TOP_K: "10"
-  UNIVERSE_EXCLUDE: "USDT,USDC,EUR,GBP,USD,SPX,PUMP,BABY"
-  QUOTE: "USD"
-
-  TAKE_PROFIT_PCT: "3"
-  STOP_LOSS_PCT: "2"
-  TRAIL_STOP_PCT: "1"
-  EMERGENCY_SL_PCT: "8"
-  MAX_DAILY_LOSS_PCT: "5"
-  MAX_DAILY_ENTRIES: "4"
-
-  RUN_SWITCH: "ON"
-
+  # --- Paths / files the bot already uses ---
   STATE_DIR: ".state"
+  POSITIONS_FILE: ".state/positions.json"
   KPI_CSV: ".state/kpi_history.csv"
-  KPI_CHART: ".state/kpi_chart.png"
+  KPI_CHART: ${{ inputs.KPI_CHART || 'true' }}
+
+  # --- Optional Slack webhook (set in repo Secrets) ---
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL || '' }}
+
+  # --- Kraken/CCXT secrets (must already be in repo Secrets) ---
+  KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || '' }}
+  KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || '' }}
 
 jobs:
   run:
+    name: Live Crypto Loop
     runs-on: ubuntu-latest
 
     steps:
+      - name: Safety gate — Master switch
+        if: env.RUN_SWITCH != 'ON'
+        run: |
+          echo "::warning::RUN_SWITCH is OFF. Skipping."
+          exit 0
+
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Set up Python
+      - name: Python setup & cache
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: ${{ runner.os }}-pip-
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install ccxt requests pandas matplotlib
-          fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # Keep these in case the project didn't pin them:
+          pip install ccxt pandas numpy matplotlib python-dateutil
 
-      - name: Print env banner
+      - name: Ensure .state exists
+        run: mkdir -p "${STATE_DIR}"
+
+      - name: Read current risk signal
+        id: risk
         run: |
-          echo "================ STANDARD PRESET ================"
-          echo "DRY_RUN=${{ inputs.DRY_RUN }}  RUN_SWITCH=${{ inputs.RUN_SWITCH }}"
-          echo "RESERVE_CASH_PCT=${{ env.RESERVE_CASH_PCT }}%"
-          echo "USD_PER_TRADE=${{ env.USD_PER_TRADE }}  MIN_TRADE_NOTIONAL_USD=${{ env.MIN_TRADE_NOTIONAL_USD }}"
-          echo "MAX_POSITIONS=${{ env.MAX_POSITIONS }}  MAX_BUYS_PER_RUN=${{ env.MAX_BUYS_PER_RUN }}"
-          echo "AUTO_UNIVERSE=${{ env.AUTO_UNIVERSE }}  TOP_K=${{ env.UNIVERSE_TOP_K }}  MIN_USD_VOL=${{ env.UNIVERSE_MIN_USD_VOL }}"
-          echo "================================================="
+          SIGNAL="ON"
+          if [ -f "${STATE_DIR}/risk_signal.txt" ]; then
+            SIGNAL="$(cat "${STATE_DIR}/risk_signal.txt" | tr -d '\r\n' | tr '[:lower:]' '[:upper:]')"
+          fi
+          echo "signal=${SIGNAL}" >> "$GITHUB_OUTPUT"
+          echo "RISK_SIGNAL=${SIGNAL}"
 
-      - name: Run Bot
+      - name: Risk gate (skip run if required)
+        if: env.RISK_MODE == 'REQUIRE_ON' && steps.risk.outputs.signal != 'ON'
+        run: |
+          echo "::notice::Risk gate engaged (RISK_MODE=REQUIRE_ON) and risk is ${{
+            steps.risk.outputs.signal }}. Skipping."
+          exit 0
+
+      - name: Pre-flight summary
+        run: |
+          echo "=== CRYPTO LIVE SAFE BASELINE ==="
+          echo "DRY_RUN: $DRY_RUN"
+          echo "RISK_MODE: $RISK_MODE (signal=${{ steps.risk.outputs.signal }})"
+          echo "UNIVERSE_TOP_K: $UNIVERSE_TOP_K"
+          echo "MAX_POSITIONS: $MAX_POSITIONS"
+          echo "MAX_BUYS_PER_RUN: $MAX_BUYS_PER_RUN"
+          echo "MAX_SELLS_PER_RUN: $MAX_SELLS_PER_RUN"
+          echo "PER_TRADE_CAP_USD: $PER_TRADE_CAP_USD"
+          echo "DAILY_CAP_USD: $DAILY_CAP_USD"
+          echo "RESERVE_CASH_PCT: $RESERVE_CASH_PCT%"
+          echo "DUST_MIN_USD: $DUST_MIN_USD"
+          echo "ROTATE_WHEN_FULL: $ROTATE_WHEN_FULL"
+          echo "ROTATE_WHEN_CASH_SHORT: $ROTATE_WHEN_CASH_SHORT"
+          echo "MIN_NOTIONAL_USD: $MIN_NOTIONAL_USD"
+          echo "MAX_SPREAD_PCT: $MAX_SPREAD_PCT"
+          echo "MIN_24H_USD_VOLUME: $MIN_24H_USD_VOLUME"
+          echo "SPEC_GATE_EXCLUDE: $SPEC_GATE_EXCLUDE"
+
+      # --- MAIN BOT RUN ---
+      # Your main.py already reads its config from env; no code patch needed.
+      - name: Run bot (safe baseline)
         env:
-          DRY_RUN: ${{ inputs.DRY_RUN }}
-          RUN_SWITCH: ${{ inputs.RUN_SWITCH }}
-
-          # Support either naming scheme
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || secrets.CCXT_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || secrets.CCXT_API_SECRET }}
-
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # pass-through; already in env, but make explicit for clarity
+          PYTHONUNBUFFERED: "1"
         run: |
-          set -e
-          python -u main.py
+          python main.py
 
-      - name: Build KPI chart (optional)
+      # --- Optional dust sweep (only when not in DRY_RUN) ---
+      - name: Dust Sweeper (live only)
+        if: env.DRY_RUN == 'OFF'
         run: |
-          if [ -f tools/make_kpi_chart.py ] && [ -f "${{ env.KPI_CSV }}" ]; then
-            python tools/make_kpi_chart.py "${{ env.KPI_CSV }}" "${{ env.KPI_CHART }}" || true
+          if [ -f tools/dust_sweeper.py ]; then
+            python tools/dust_sweeper.py
           else
-            echo "KPI chart script or CSV not found; skipping."
+            echo "::notice::tools/dust_sweeper.py not found; skipping."
           fi
 
-      - name: Upload .state artifacts
-        if: always()
+      # --- KPI Chart (no code patch required if your helper already exists) ---
+      - name: Generate KPI Chart
+        if: env.KPI_CHART == 'true'
+        run: |
+          if [ -f tools/make_kpi_chart.py ] && [ -f "${KPI_CSV}" ]; then
+            python tools/make_kpi_chart.py --csv "${KPI_CSV}" --out "${STATE_DIR}/kpi_chart.png" || true
+          else
+            echo "::notice::KPI chart helper or CSV missing; skipping."
+          fi
+
+      # --- Upload run artifacts for visibility/review ---
+      - name: Upload .state (positions, KPI, logs)
         uses: actions/upload-artifact@v4
         with:
-          name: standard-state-${{ github.run_id }}
+          name: crypto-state_${{ github.run_id }}
           path: |
             .state/**
-            !.state/**/*.tmp
-          if-no-files-found: warn
-
-      - name: Upload logs (best-effort)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: standard-logs-${{ github.run_id }}
-          path: |
-            logs/**
+            !.state/*.tmp
           if-no-files-found: ignore
+          retention-days: 14
+
+      # --- Lightweight Slack ping (only if webhook is configured) ---
+      - name: Slack summary (optional)
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          MSG="CryptoBot run: DRY_RUN=${DRY_RUN}, risk=${{ steps.risk.outputs.signal }}, max_pos=${MAX_POSITIONS}, buys/run=${MAX_BUYS_PER_RUN}"
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"${MSG}\"}" \
+            "$SLACK_WEBHOOK_URL" || true
