@@ -49,45 +49,9 @@ on:
         description: "Keep this % in cash (0-100)"
         type: number
         default: 20
-      DUST_MIN_USD:
-        description: "Sweep anything below this into cash (USD)"
-        type: number
-        default: 2
-      ROTATE_WHEN_FULL:
-        description: "If at cap, sell worst to fund a better entry"
-        type: choice
-        options: ["true", "false"]
-        default: "true"
-      ROTATE_WHEN_CASH_SHORT:
-        description: "Allow rotation when cash < needed for next buy"
-        type: choice
-        options: ["true", "false"]
-        default: "true"
-      MIN_NOTIONAL_USD:
-        description: "Exchange min-notional guard (USD)"
-        type: number
-        default: 5
-      MAX_SPREAD_PCT:
-        description: "Skip symbols with spread above this %"
-        type: number
-        default: 0.6
-      MIN_24H_USD_VOLUME:
-        description: "Skip illiquid pairs (24h USD volume)"
-        type: number
-        default: 50000
-      SPEC_GATE_EXCLUDE:
-        description: "Comma list to *exclude* (e.g. SPX/USD,PUMP/USD,PENGU/USD)"
-        type: string
-        default: "USDT/USD,USDC/USD,EUR/USD,GBP/USD,USD/USD,SPX/USD,PUMP/USD,BABY/USD,ALKIMI/USD"
-      KPI_CHART:
-        description: "Render KPI chart image from .state/kpi_history.csv"
-        type: choice
-        options: ["true","false"]
-        default: "true"
 
   schedule:
-    # Every 5 minutes
-    - cron: "*/5 * * * *"
+    - cron: "*/5 * * * *"   # every 5 minutes
 
 permissions:
   contents: read
@@ -97,12 +61,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # --- Master toggles (workflow_dispatch inputs override these defaults) ---
+  # --- Inputs (exactly 10) ---
   RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
   DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
   RISK_MODE: ${{ inputs.RISK_MODE || 'REQUIRE_ON' }}
-
-  # --- Risk / selection / sizing guards ---
   UNIVERSE_TOP_K: ${{ inputs.UNIVERSE_TOP_K || 6 }}
   MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || 6 }}
   MAX_BUYS_PER_RUN: ${{ inputs.MAX_BUYS_PER_RUN || 1 }}
@@ -110,25 +72,26 @@ env:
   PER_TRADE_CAP_USD: ${{ inputs.PER_TRADE_CAP_USD || 25 }}
   DAILY_CAP_USD: ${{ inputs.DAILY_CAP_USD || 100 }}
   RESERVE_CASH_PCT: ${{ inputs.RESERVE_CASH_PCT || 20 }}
-  DUST_MIN_USD: ${{ inputs.DUST_MIN_USD || 2 }}
-  ROTATE_WHEN_FULL: ${{ inputs.ROTATE_WHEN_FULL || 'true' }}
-  ROTATE_WHEN_CASH_SHORT: ${{ inputs.ROTATE_WHEN_CASH_SHORT || 'true' }}
 
-  MIN_NOTIONAL_USD: ${{ inputs.MIN_NOTIONAL_USD || 5 }}
-  MAX_SPREAD_PCT: ${{ inputs.MAX_SPREAD_PCT || 0.6 }}
-  MIN_24H_USD_VOLUME: ${{ inputs.MIN_24H_USD_VOLUME || 50000 }}
-  SPEC_GATE_EXCLUDE: ${{ inputs.SPEC_GATE_EXCLUDE || 'USDT/USD,USDC/USD,EUR/USD,GBP/USD,USD/USD,SPX/USD,PUMP/USD,BABY/USD,ALKIMI/USD' }}
+  # --- Advanced knobs (edit here when needed) ---
+  DUST_MIN_USD: 2
+  ROTATE_WHEN_FULL: "true"
+  ROTATE_WHEN_CASH_SHORT: "true"
+  MIN_NOTIONAL_USD: 5
+  MAX_SPREAD_PCT: 0.6
+  MIN_24H_USD_VOLUME: 50000
+  SPEC_GATE_EXCLUDE: "USDT/USD,USDC/USD,EUR/USD,GBP/USD,USD/USD,SPX/USD,PUMP/USD,BABY/USD,ALKIMI/USD"
 
-  # --- Paths / files the bot already uses ---
+  # --- Paths / files ---
   STATE_DIR: ".state"
   POSITIONS_FILE: ".state/positions.json"
   KPI_CSV: ".state/kpi_history.csv"
-  KPI_CHART: ${{ inputs.KPI_CHART || 'true' }}
+  KPI_CHART: "true"   # set to "false" to skip
 
   # --- Optional Slack webhook (set in repo Secrets) ---
   SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL || '' }}
 
-  # --- Kraken/CCXT secrets (must already be in repo Secrets) ---
+  # --- Kraken/CCXT secrets (must be in repo Secrets) ---
   KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || '' }}
   KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || '' }}
 
@@ -156,7 +119,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # Keep these in case the project didn't pin them:
           pip install ccxt pandas numpy matplotlib python-dateutil
 
       - name: Ensure .state exists
@@ -175,8 +137,7 @@ jobs:
       - name: Risk gate (skip run if required)
         if: env.RISK_MODE == 'REQUIRE_ON' && steps.risk.outputs.signal != 'ON'
         run: |
-          echo "::notice::Risk gate engaged (RISK_MODE=REQUIRE_ON) and risk is ${{
-            steps.risk.outputs.signal }}. Skipping."
+          echo "::notice::Risk gate engaged (RISK_MODE=REQUIRE_ON) and risk is ${{ steps.risk.outputs.signal }}. Skipping."
           exit 0
 
       - name: Pre-flight summary
@@ -199,16 +160,12 @@ jobs:
           echo "MIN_24H_USD_VOLUME: $MIN_24H_USD_VOLUME"
           echo "SPEC_GATE_EXCLUDE: $SPEC_GATE_EXCLUDE"
 
-      # --- MAIN BOT RUN ---
-      # Your main.py already reads its config from env; no code patch needed.
       - name: Run bot (safe baseline)
         env:
-          # pass-through; already in env, but make explicit for clarity
           PYTHONUNBUFFERED: "1"
         run: |
           python main.py
 
-      # --- Optional dust sweep (only when not in DRY_RUN) ---
       - name: Dust Sweeper (live only)
         if: env.DRY_RUN == 'OFF'
         run: |
@@ -218,7 +175,6 @@ jobs:
             echo "::notice::tools/dust_sweeper.py not found; skipping."
           fi
 
-      # --- KPI Chart (no code patch required if your helper already exists) ---
       - name: Generate KPI Chart
         if: env.KPI_CHART == 'true'
         run: |
@@ -228,7 +184,6 @@ jobs:
             echo "::notice::KPI chart helper or CSV missing; skipping."
           fi
 
-      # --- Upload run artifacts for visibility/review ---
       - name: Upload .state (positions, KPI, logs)
         uses: actions/upload-artifact@v4
         with:
@@ -239,7 +194,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      # --- Lightweight Slack ping (only if webhook is configured) ---
       - name: Slack summary (optional)
         if: env.SLACK_WEBHOOK_URL != ''
         run: |
