@@ -1,306 +1,144 @@
-name: Crypto Live — Safe Baseline (every 5m, NEW)
+name: Crypto Live — Safe (every 5m)
 
 on:
   workflow_dispatch:
     inputs:
-      MASTER_SWITCH:
-        description: "Master switch (true = allow run)"
-        type: choice
-        options: ["true","false"]
-        default: "true"
-      SIM_MODE:
-        description: "Sim mode (true = DRY_RUN ON)"
-        type: choice
-        options: ["true","false"]
-        default: "true"
-      REQUIRE_RISK_ON:
-        description: "Run only when risk is ON?"
-        type: choice
-        options: ["IGNORE","REQUIRE_ON"]
-        default: "IGNORE"
+      DRY_RUN:
+        description: "ON or OFF (default ON for safety)"
+        required: false
+        default: "ON"
   schedule:
     - cron: "*/5 * * * *"
 
-concurrency:
-  group: crypto-live-safe
-  cancel-in-progress: false
-
 env:
-  # Map inputs to ON/OFF strings your bot expects
-  RUN_SWITCH: ${{ (inputs.MASTER_SWITCH || 'true') == 'true' && 'ON' || 'OFF' }}
-  DRY_RUN:    ${{ (inputs.SIM_MODE      || 'true') == 'true' && 'ON' || 'OFF' }}
-  REQUIRE_RISK_ON: ${{ inputs.REQUIRE_RISK_ON || 'IGNORE' }}
+  # ---- Core bot toggles ----
+  DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
+  RUN_SWITCH: "ON"
 
-  # === Sizing/filters from repo Variables (with safe defaults) ===
-  MIN_BUY_USD:            ${{ vars.MIN_BUY_USD || '10' }}
-  RESERVE_CASH_PCT:       ${{ vars.RESERVE_CASH_PCT || '5' }}
-  MAX_POSITIONS:          ${{ vars.MAX_POSITIONS || '3' }}
-  MAX_BUYS_PER_RUN:       ${{ vars.MAX_BUYS_PER_RUN || '2' }}
-  UNIVERSE_TOP_K:         ${{ vars.UNIVERSE_TOP_K || '25' }}
-  ROTATE_WHEN_FULL:       ${{ vars.ROTATE_WHEN_FULL || 'true' }}
-  ROTATE_WHEN_CASH_SHORT: ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
+  # ---- Sizing / counts ----
+  MIN_BUY_USD: "10"
+  MAX_POSITIONS: "3"
+  MAX_BUYS_PER_RUN: "2"
 
-  # Optional universe filters you already use
-  AUTO_MIN_USD_VOL:       ${{ vars.AUTO_MIN_USD_VOL || '500000' }}
-  AUTO_MIN_PRICE:         ${{ vars.AUTO_MIN_PRICE   || '0.02' }}
-  AUTO_EXCLUDE:           ${{ vars.AUTO_EXCLUDE     || '' }}
-  CRYPTO_EXCHANGE:        ${{ vars.CRYPTO_EXCHANGE  || 'kraken' }}
+  # ---- Universe / selection ----
+  UNIVERSE_TOP_K: "25"
+  ROTATE_WHEN_FULL: "true"
+  ROTATE_WHEN_CASH_SHORT: "true"
 
-  # Optional dust guards (bot will use them if supported)
-  MIN_SELL_USD:           ${{ vars.MIN_SELL_USD || '10' }}
-  DUST_SKIP_STABLES:      ${{ vars.DUST_SKIP_STABLES || 'true' }}
+  # ---- Risk / reserve ----
+  RESERVE_CASH_PCT: "5"
+
+  # ---- Optional dust/sell knobs (safe to leave; ignored if not used by your code) ----
+  MIN_SELL_USD: "10"
+  DUST_MIN_USD: "2"
+  DUST_SKIP_STABLES: "true"
+
+  # ---- Paths ----
+  STATE_DIR: ".state"
+  KPI_CSV: ".state/kpi_history.csv"
+  KPI_IMG: ".state/kpi_chart.png"
 
 jobs:
   live:
-    name: Live Crypto Loop
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show effective knobs
-        run: |
-          echo "RUN_SWITCH=${RUN_SWITCH}"
-          echo "DRY_RUN=${DRY_RUN}"
-          echo "REQUIRE_RISK_ON=${REQUIRE_RISK_ON}"
-          echo "MIN_BUY_USD=${MIN_BUY_USD}"
-          echo "RESERVE_CASH_PCT=${RESERVE_CASH_PCT}"
-          echo "MAX_POSITIONS=${MAX_POSITIONS}"
-          echo "MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}"
-          echo "UNIVERSE_TOP_K=${UNIVERSE_TOP_K}"
-          echo "AUTO_MIN_USD_VOL=${AUTO_MIN_USD_VOL}"
-          echo "AUTO_MIN_PRICE=${AUTO_MIN_PRICE}"
-          echo "AUTO_EXCLUDE=${AUTO_EXCLUDE}"
-          echo "CRYPTO_EXCHANGE=${CRYPTO_EXCHANGE}"
-          echo "ROTATE_WHEN_FULL=${ROTATE_WHEN_FULL}"
-          echo "ROTATE_WHEN_CASH_SHORT=${ROTATE_WHEN_CASH_SHORT}"
-          echo "MIN_SELL_USD=${MIN_SELL_USD}"
-          echo "DUST_SKIP_STABLES=${DUST_SKIP_STABLES}"
-
-      - name: Master switch gate
-        shell: bash
-        run: |
-          if [[ "${RUN_SWITCH}" != "ON" ]]; then
-            echo "Master switch is OFF → exiting gracefully."
-            exit 0
-          fi
-
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps (best effort)
+      - name: Install deps
         shell: bash
         run: |
           set -e
-          if [[ -f "requirements.txt" ]]; then
-            python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            python -m pip install --upgrade pip || true
-            pip install pandas numpy matplotlib requests ccxt || true
+            pip install pandas matplotlib numpy pyyaml ccxt requests
           fi
 
-      - name: Risk gate (REQUIRE_ON)
-        shell: bash
-        run: |
-          if [[ "${REQUIRE_RISK_ON}" == "REQUIRE_ON" ]]; then
-            SIG="UNKNOWN"
-            if [[ -f ".state/last_risk_signal.txt" ]]; then
-              SIG=$(cat .state/last_risk_signal.txt | tr -d '\r\n' | tr '[:lower:]' '[:upper:]')
-            fi
-            echo "Last risk signal = ${SIG}"
-            if [[ "${SIG}" != "ON" ]]; then
-              echo "Risk is not ON → skipping trading loop gracefully."
-              exit 0
-            fi
-          fi
-
-      - name: Preflight — exchange keys present?
+      # ---------- Run the bot ----------
+      - name: Run CryptoBOT
         shell: bash
         env:
-          KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
+          # Kraken/Exchange keys if your code reads them from env
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          # Slack (optional) for later step
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           set -e
-          EX="${CRYPTO_EXCHANGE:-kraken}"
-          echo "Exchange=${EX}"
-          if [[ "$EX" == "kraken" ]]; then
-            if [[ -n "${KRAKEN_API_KEY}" && -n "${KRAKEN_API_SECRET}" ]]; then
-              echo "Kraken keys: present"
-            else
-              echo "Kraken keys: MISSING"; exit 1
-            fi
-          fi
+          python -V
+          echo "DRY_RUN=${DRY_RUN} RUN_SWITCH=${RUN_SWITCH}"
+          # Your main entrypoint (adjust if different)
+          python main.py
 
-      - name: Run bot
-        shell: bash
-        env:
-          # secrets & knobs for bot/ccxt
-          KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-
-          RUN_SWITCH: ${{ env.RUN_SWITCH }}
-          DRY_RUN: ${{ env.DRY_RUN }}
-          REQUIRE_RISK_ON: ${{ env.REQUIRE_RISK_ON }}
-
-          MIN_BUY_USD: ${{ env.MIN_BUY_USD }}
-          RESERVE_CASH_PCT: ${{ env.RESERVE_CASH_PCT }}
-          MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
-          MAX_BUYS_PER_RUN: ${{ env.MAX_BUYS_PER_RUN }}
-          UNIVERSE_TOP_K: ${{ env.UNIVERSE_TOP_K }}
-          AUTO_MIN_USD_VOL: ${{ env.AUTO_MIN_USD_VOL }}
-          AUTO_MIN_PRICE: ${{ env.AUTO_MIN_PRICE }}
-          AUTO_EXCLUDE: ${{ env.AUTO_EXCLUDE }}
-          CRYPTO_EXCHANGE: ${{ env.CRYPTO_EXCHANGE }}
-          ROTATE_WHEN_FULL: ${{ env.ROTATE_WHEN_FULL }}
-          ROTATE_WHEN_CASH_SHORT: ${{ env.ROTATE_WHEN_CASH_SHORT }}
-          MIN_SELL_USD: ${{ env.MIN_SELL_USD }}
-          DUST_SKIP_STABLES: ${{ env.DUST_SKIP_STABLES }}
-        run: |
-          set -e
-          echo "Starting bot… (DRY_RUN=${DRY_RUN})"
-          if [[ -f "main.py" ]]; then
-            python main.py
-          elif [[ -f "trader/crypto_engine.py" ]]; then
-            python trader/crypto_engine.py
-          else
-            echo "No known entrypoint found; proceeding with fallback state generation."
-          fi
-
-      - name: Print quick .state summary
-        if: always()
-        shell: bash
-        run: |
-          echo "----- .state summary (first lines) -----"
-          [[ -f ".state/run_summary.txt"  ]] && echo "[run_summary.txt]"  && head -n 50 .state/run_summary.txt  || true
-          [[ -f ".state/positions.json"   ]] && echo "[positions.json]"   && head -n 50 .state/positions.json   || true
-          [[ -f ".state/kpi_history.csv"  ]] && echo "[kpi_history.csv]"  && head -n 5  .state/kpi_history.csv  || true
-          [[ -f ".state/why_no_trade.txt" ]] && echo "[why_no_trade.txt]" && cat      .state/why_no_trade.txt   || true
-          echo "----------------------------------------"
-
-      # === KPI CHART ==========================================================
+      # ---------- Generate KPI chart (fix: proper heredoc) ----------
       - name: Generate KPI chart
         if: always()
         shell: bash
         run: |
           set -e
-          if [[ -f ".state/kpi_history.csv" ]]; then
-            python - <<'PY'
-import pandas as pd, matplotlib.pyplot as plt
+          if [[ -f "${KPI_CSV}" ]]; then
+            python <<'PY'
 import os
+import pandas as pd
+import matplotlib.pyplot as plt
+
+csv_path = os.environ.get("KPI_CSV", ".state/kpi_history.csv")
+img_path = os.environ.get("KPI_IMG", ".state/kpi_chart.png")
 os.makedirs(".state", exist_ok=True)
-df = pd.read_csv(".state/kpi_history.csv")
-# tolerate minimal header-only state
+
+try:
+    df = pd.read_csv(csv_path)
+except Exception as e:
+    print(f"Could not read KPI CSV: {e}")
+    raise SystemExit(0)
+
+# tolerate minimal/odd headers
 if df.shape[0] >= 1 and "equity" in df.columns:
     plt.figure()
     plt.plot(df.index, df["equity"])
     plt.title("CryptoBOT Equity (run history)")
-    plt.xlabel("run index")
-    plt.ylabel("equity (USD)")
+    plt.xlabel("Run #")
+    plt.ylabel("Equity (USD)")
     plt.tight_layout()
-    plt.savefig(".state/kpi_chart.png")
-    print("kpi_chart.png written")
+    plt.savefig(img_path)
+    print(f"Saved KPI chart -> {img_path}")
 else:
-    print("kpi_history.csv empty; skipping chart")
+    print("KPI CSV present but missing 'equity' column; skipping chart.")
 PY
           else
-            echo "No kpi_history.csv; skipping chart"
+            echo "No KPI CSV found at ${KPI_CSV}; skipping chart."
           fi
 
-      - name: Ensure minimal .state snapshot (even if no positions)
+      # ---------- Optional Slack ping (only if webhook is present) ----------
+      - name: Notify Slack (optional)
         if: always()
         shell: bash
-        run: |
-          set -e
-          mkdir -p .state
-          echo "RUN_ID=${{ github.run_id }}" > .state/run_summary.txt
-          echo "UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> .state/run_summary.txt
-          echo "DRY_RUN=${DRY_RUN}" >> .state/run_summary.txt
-          [[ -f ".state/positions.json" ]] || echo '{"positions":[],"note":"empty or no open positions at time of snapshot"}' > .state/positions.json
-          [[ -f ".state/kpi_history.csv" ]] || echo "timestamp,equity" > .state/kpi_history.csv
-          [[ -f ".state/last_risk_signal.txt" ]] || echo "ON" > .state/last_risk_signal.txt
-
-      - name: Flush .state to disk
-        if: always()
-        shell: bash
-        run: |
-          sync || true
-          sleep 1
-
-      - name: Verify .state folder contents
-        if: always()
-        shell: bash
-        run: |
-          echo "Listing .state before archiving:"
-          if [[ -d ".state" ]]; then
-            ls -alh .state || true
-          else
-            echo "(no .state directory)"
-          fi
-          echo "-------------------------------------"
-
-      - name: Create .state archive
-        if: always()
-        shell: bash
-        run: |
-          set -e
-          if [[ -d ".state" ]] && [[ $(ls -A .state 2>/dev/null | wc -l) -gt 0 ]]; then
-            tar -czf crypto-state_${{ github.run_id }}.tar.gz .state
-            echo "Archive created:"; ls -lh crypto-state_${{ github.run_id }}.tar.gz
-          else
-            echo "⚠️  .state is missing or empty — no archive will be created."
-            echo "No .state contents for run ${{ github.run_id }}" > EMPTY_STATE_NOTE.txt
-          fi
-
-      - name: Upload .state archive (if present)
-        if: always() && hashFiles('crypto-state_${{ github.run_id }}.tar.gz') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: crypto-state_${{ github.run_id }}
-          path: crypto-state_${{ github.run_id }}.tar.gz
-          if-no-files-found: ignore
-
-      - name: Upload empty-state note (if archive missing)
-        if: always() && hashFiles('crypto-state_${{ github.run_id }}.tar.gz') == ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: crypto-state_${{ github.run_id }}_EMPTY
-          path: EMPTY_STATE_NOTE.txt
-          if-no-files-found: ignore
-
-      # === SLACK NOTIFICATION ================================================
-      - name: Slack alert (if webhook configured)
-        if: always()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        shell: bash
         run: |
-          if [[ -z "${SLACK_WEBHOOK_URL}" ]]; then
-            echo "No SLACK_WEBHOOK_URL secret; skipping Slack."
-            exit 0
+          if [[ -n "${SLACK_WEBHOOK_URL}" ]]; then
+            STATUS="${{ job.status }}"
+            DRY="${{ env.DRY_RUN }}"
+            TEXT="Crypto Live — Safe run *${STATUS}* (DRY_RUN=${DRY}). Repo: $GITHUB_REPOSITORY • Run: $GITHUB_RUN_NUMBER"
+            curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"${TEXT}\"}" "${SLACK_WEBHOOK_URL}" >/dev/null 2>&1 || true
+          else
+            echo "SLACK_WEBHOOK_URL not set; skipping Slack."
           fi
-          RUN_ID="${{ github.run_id }}"
-          SUMMARY="unknown"
-          ENTRIES=0; EXITS=0
-          if [[ -f ".state/run_summary.txt" ]]; then
-            SUMMARY=$(tr -d '\r' < .state/run_summary.txt | tail -n +1 | tr '\n' ' ' | sed -E 's/ +/ /g')
-          fi
-          if [[ -f ".state/positions.json" ]]; then
-            ENTRIES=$(grep -o '"positions"' -n .state/positions.json >/dev/null && python - <<'PY'
-import json; 
-import sys
-with open(".state/positions.json","r") as f:
-    j=json.load(f)
-pos=j.get("positions",[])
-print(len(pos))
-PY
-)
-          fi
-          TEXT="CryptoBOT run $RUN_ID finished.\n$SUMMARY\nPositions: $ENTRIES"
-          # Send simple message (no image upload via webhook)
-          curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\": \"${TEXT//\"/\\\"}\"}" \
-            "${SLACK_WEBHOOK_URL}"
+
+      # ---------- Upload artifacts ----------
+      - name: Upload .state (KPI chart & logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-${{ github.run_number }}
+          path: |
+            .state/**
+          if-no-files-found: warn
