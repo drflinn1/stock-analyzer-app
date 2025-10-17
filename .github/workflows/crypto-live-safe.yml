@@ -144,14 +144,16 @@ jobs:
       - name: Ensure .state exists
         run: mkdir -p "${STATE_DIR}"
 
-      # NEW: create stub files so an artifact is ALWAYS produced
-      - name: Ensure baseline state files (always create stubs if missing)
+      # Create baseline files if missing (won't overwrite real ones)
+      - name: Ensure baseline state files (create stubs if missing)
         run: |
           if [ ! -f "${POSITIONS_FILE}" ]; then
             echo '{"positions":[],"asof_utc":"'"$(date -u +%FT%TZ)"'"}' > "${POSITIONS_FILE}"
+            echo "Created stub ${POSITIONS_FILE}"
           fi
           if [ ! -f "${KPI_CSV}" ]; then
             echo "ts,pl_usd,buy_count,sell_count" > "${KPI_CSV}"
+            echo "Created stub ${KPI_CSV}"
           fi
 
       - name: Read current risk signal
@@ -215,15 +217,23 @@ jobs:
             echo "::notice::KPI chart helper or CSV missing; skipping."
           fi
 
-      # NEW: show exactly what we’re about to upload
+      # If .state has no files yet, create stubs so we ALWAYS upload something
+      - name: Ensure stub files before upload (only if directory is empty)
+        run: |
+          if [ -z "$(find "${STATE_DIR}" -type f -maxdepth 1 2>/dev/null)" ]; then
+            echo '{"positions":[],"asof_utc":"'"$(date -u +%FT%TZ)"'"}' > "${STATE_DIR}/positions.json"
+            echo "ts,pl_usd,buy_count,sell_count" > "${STATE_DIR}/kpi_history.csv"
+            echo "Created stubs because .state was empty."
+          else
+            echo ".state already contains files; not writing stubs."
+          fi
+
       - name: List .state contents
         run: |
           echo "---- .state tree ----"
           ls -la "${STATE_DIR}" || true
           echo "---------------------"
-          if command -v tree >/dev/null 2>&1; then
-            tree -a "${STATE_DIR}" || true
-          fi
+          find "${STATE_DIR}" -type f || true
 
       - name: Upload .state (positions, KPI, logs)
         uses: actions/upload-artifact@v4
@@ -231,7 +241,6 @@ jobs:
           name: crypto-state_${{ github.run_id }}
           path: |
             .state/**
-            !.state/*.tmp
           if-no-files-found: warn
           retention-days: 14
 
