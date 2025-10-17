@@ -56,11 +56,8 @@ jobs:
         shell: bash
         run: |
           set -e
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install pandas matplotlib numpy pyyaml ccxt requests
-          fi
+          # Force-install plotting + common libs (even if requirements.txt exists)
+          pip install -U pandas matplotlib numpy pyyaml ccxt requests
 
       # ---------- Run the bot ----------
       - name: Run CryptoBOT
@@ -74,7 +71,7 @@ jobs:
           echo "DRY_RUN=${DRY_RUN} RUN_SWITCH=${RUN_SWITCH}"
           python main.py
 
-      # ---------- Generate KPI chart (call a script; no heredoc) ----------
+      # ---------- Generate KPI chart ----------
       - name: Generate KPI chart
         if: always()
         shell: bash
