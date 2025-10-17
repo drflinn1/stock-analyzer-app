@@ -1,319 +1,174 @@
-from __future__ import annotations
-import os, math, time, json
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+# -*- coding: utf-8 -*-
+"""
+Crypto engine utilities:
+- Build ccxt exchange
+- Universe scanning with sane filters
+- Position snapshot helper
+- Simple market buy/sell wrappers
+- Equity estimate (USD)
 
-try:
-    import ccxt  # type: ignore
-except Exception as e:
-    raise SystemExit(f"ccxt is required: {e}")
+Notes:
+- We trade spot only.
+- Symbols use Kraken's ccxt market symbols like "ADA/USD".
+"""
 
-STATE_DIR = Path(".state"); STATE_DIR.mkdir(parents=True, exist_ok=True)
-ROTATE_CD_PATH = STATE_DIR / "rotate_cooldown.json"
+import os
+import math
+from typing import Dict, List
 
-# ---- ENV ----
-DRY_RUN    = os.getenv("DRY_RUN", "true").lower() == "true"
-RUN_SWITCH = os.getenv("RUN_SWITCH", "on").lower().strip()
-EXCHANGE   = os.getenv("EXCHANGE", "kraken").lower()
+import ccxt
 
-KRAKEN_API_KEY    = os.getenv("KRAKEN_API_KEY", "")
-KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET", "")
+# ---------- Helpers ----------
+STABLES = {"USD", "USDT", "USDC", "EUR", "GBP"}
+EXCLUDE_TICKERS = {"SPX", "PUMP", "BABY", "ALKIMI"}  # expand as needed
 
-USD_PER_TRADE = float(os.getenv("USD_PER_TRADE", "35"))
-RESERVE_USD   = float(os.getenv("RESERVE_USD", "80"))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "6"))
-DAILY_MAX_TRADES = int(os.getenv("DAILY_MAX_TRADES", "6"))
-
-GUARANTEE_MIN_NEW = int(os.getenv("GUARANTEE_MIN_NEW", "1"))
-GUARANTEE_PICK = [s.strip().upper() for s in os.getenv("GUARANTEE_PICK", "").split(",") if s.strip()]
-
-QUOTE_ALLOW   = [q.strip().upper() for q in os.getenv("QUOTE_ALLOW", "USD,USDT").split(",") if q.strip()]
-CORE_WHITELIST = [s.strip().upper() for s in os.getenv("CORE_WHITELIST", "BTC/USD,ETH/USD,SOL/USD,DOGE/USD,ENA/USD,ENA/USDT").split(",") if s.strip()]
-SPEC_SYMBOLS   = [s.strip().upper() for s in os.getenv("SPEC_SYMBOLS", "").split(",") if s.strip()]
-PAIR_BLOCKLIST = set([s.strip().upper() for s in os.getenv("PAIR_BLOCKLIST", "").split(",") if s.strip()])
-
-TOP_K = int(os.getenv("TOP_K", "6"))
-MIN_NOTIONAL_USD = float(os.getenv("MIN_NOTIONAL_USD", "18"))  # safety floor
-
-# ---- Rotation knobs ----
-ROTATE_ENABLED = os.getenv("ROTATE_ENABLED", "true").lower() == "true"
-ROTATE_MIN_EDGE_PCT = float(os.getenv("ROTATE_MIN_EDGE_PCT", "2.0"))
-ROTATE_MAX_SWITCHES_PER_RUN = int(os.getenv("ROTATE_MAX_SWITCHES_PER_RUN", "1"))
-ROTATE_COOLDOWN_HOURS = float(os.getenv("ROTATE_COOLDOWN_HOURS", "6"))
-# NEW: allow rotation even when cash is short (no need to be “full”)
-ROTATE_WHEN_CASH_SHORT = os.getenv("ROTATE_WHEN_CASH_SHORT", "true").lower() == "true"
-
-def load_json(path: Path, default: Any) -> Any:
-    try: return json.loads(path.read_text(encoding="utf-8"))
-    except Exception: return default
-def save_json(path: Path, data: Any) -> None:
-    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-
-def now_utc() -> str: return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
-
-def new_exchange():
-    if EXCHANGE != "kraken":
-        raise SystemExit(f"Only kraken supported here (got {EXCHANGE})")
-    return ccxt.kraken({
-        "apiKey": KRAKEN_API_KEY, "secret": KRAKEN_API_SECRET,
-        "enableRateLimit": True, "options": {"adjustForTimeDifference": True},
+def build_exchange(api_key: str, api_secret: str, dry_run: bool) -> ccxt.Exchange:
+    ex = ccxt.kraken({
+        "apiKey": api_key or "",
+        "secret": api_secret or "",
+        "enableRateLimit": True,
+        "options": {"adjustForTimeDifference": True},
     })
+    # For DRY_RUN we still fetch markets/balances, just don't place orders.
+    ex.load_markets()
+    return ex
 
-def usd_balance(balances: Dict[str, Any]) -> float:
-    total = balances.get("total") or {}
-    return float(total.get("USD", 0.0))
-
-def list_open_bases(balances: Dict[str, Any]) -> Dict[str, float]:
-    """
-    Robust holdings detector: merge 'total' and 'free', ignore quotes & zeroes.
-    """
-    out: Dict[str, float] = {}
-    for key in ("total", "free"):
-        d = balances.get(key) or {}
-        for asset, amt in d.items():
-            try:
-                a = float(amt)
-            except Exception:
-                continue
-            if asset in ("USD", "USDT", "EUR", "GBP") or a <= 0.0:
-                continue
-            out[asset] = max(out.get(asset, 0.0), a)
-    return out
-
-def allowed_symbol(markets: Dict[str, Any], base: str) -> Optional[str]:
-    for q in QUOTE_ALLOW:
-        sym = f"{base}/{q}"
-        m = markets.get(sym)
-        if m and (m.get("active", True)) and sym.upper() not in PAIR_BLOCKLIST:
-            return sym
+def symbol_to_usd_market(ex: ccxt.Exchange, symbol: str) -> Dict:
+    """Return market dict for a symbol like 'ADA/USD' if listed."""
+    m = ex.markets.get(symbol)
+    if m:
+        return m
+    # sometimes ccxt uses 'ZUSD' internally; normalize already done by markets
     return None
 
-def fetch_change_pct(exch, symbol: str) -> Optional[float]:
-    try:
-        t = exch.fetch_ticker(symbol)
-        pc = t.get("percentage")
-        if pc is None:
-            last = t.get("last") or t.get("close"); openp = t.get("open")
-            if last is None or openp in (None, 0): return None
-            pc = (float(last) - float(openp)) / float(openp) * 100.0
-        return float(pc)
-    except Exception:
-        return None
+def _is_bad_coin(symbol: str) -> bool:
+    base, quote = symbol.split("/")
+    if base.upper() in EXCLUDE_TICKERS:
+        return True
+    if quote.upper() not in {"USD"}:
+        return True
+    if base.upper() in STABLES:  # skip stables on base side
+        return True
+    return False
 
-def amount_precision(market: Dict[str, Any]) -> int:
-    return int((market.get("precision", {}) or {}).get("amount", 8) or 8)
-def price_precision(market: Dict[str, Any]) -> int:
-    return int((market.get("precision", {}) or {}).get("price", 8) or 8)
-def min_amount(market: Dict[str, Any]) -> float:
-    return float(((market.get("limits", {}) or {}).get("amount", {}) or {}).get("min", 0.0) or 0.0)
-def min_cost(market: Dict[str, Any]) -> float:
-    return float(((market.get("limits", {}) or {}).get("cost", {}) or {}).get("min", 0.0) or 0.0)
-def round_to(x: float, prec: int) -> float:
-    f = 10 ** prec; return math.floor(x * f) / f
+def pick_candidates(ex: ccxt.Exchange, top_k: int = 25) -> List[Dict]:
+    """
+    Rank USD pairs by 24h percent change (descending) with liquidity filter.
+    Returns list of dicts: {symbol, price, change24h, quoteVolUsd}
+    """
+    tickers = ex.fetch_tickers()
+    out: List[Dict] = []
 
-def build_universe(exch, markets: Dict[str, Any]) -> List[str]:
-    syms: List[str] = []
-    for s in CORE_WHITELIST:
-        if s and s in markets and s.upper() not in PAIR_BLOCKLIST: syms.append(s)
-    for s in SPEC_SYMBOLS:
-        if s and s in markets and s.upper() not in PAIR_BLOCKLIST and s not in syms: syms.append(s)
+    for sym, t in tickers.items():
+        # Keep normalized Kraken symbols only ( 'XXX/USD' style )
+        if "/" not in sym or not sym.endswith("/USD"):
+            continue
+        if _is_bad_coin(sym):
+            continue
 
-    movers: List[Tuple[str, float]] = []
-    seen = set(syms); bases_seen = set(sym.split("/")[0] for sym in seen)
-    for sym, m in markets.items():
-        try: base, quote = sym.split("/")
-        except: continue
-        if quote.upper() not in QUOTE_ALLOW: continue
-        if sym.upper() in PAIR_BLOCKLIST: continue
-        if base in ("USD", "USDT", "EUR", "GBP"): continue
-        if sym in seen or base in bases_seen: continue
-        pct = fetch_change_pct(exch, sym)
-        if pct is None: continue
-        movers.append((sym, float(pct)))
-    movers.sort(key=lambda x: x[1], reverse=True)
-    for sym, _ in movers[:max(0, TOP_K - len(syms))]: syms.append(sym)
+        # 24h change %
+        change = t.get("percentage")
+        if change is None:
+            # rough fallback from last/close - open
+            last = t.get("last") or t.get("close")
+            open_ = t.get("open")
+            if last and open_:
+                change = (last - open_) / open_ * 100.0
+            else:
+                continue
 
-    # Prioritize guarantee picks first
-    prior: List[str] = []
-    for p in GUARANTEE_PICK:
-        if p in syms and p not in prior: prior.append(p)
-    for s in syms:
-        if s not in prior: prior.append(s)
-    return prior[:TOP_K]
+        # Volume filter: prefer coins with decent quoted volume in USD
+        quote_vol = t.get("quoteVolume") or 0.0
+        if quote_vol is None:
+            quote_vol = 0.0
+        if quote_vol < 10000:  # tiny coins out
+            continue
 
-def ensure_trade_allowed(bal: float) -> Tuple[float, float]:
-    return max(0.0, bal - RESERVE_USD), USD_PER_TRADE
-
-# --- Order helpers (Kraken) ---
-def kraken_market_buy(exch, symbol: str, usd_size: float, market: Dict[str, Any]) -> Tuple[bool, str]:
-    t = exch.fetch_ticker(symbol)
-    last = float(t.get("last") or t.get("close") or 0.0)
-    if last <= 0: return False, "no price"
-    amt_prec = amount_precision(market)
-    prc_prec = price_precision(market)
-    min_amt  = min_amount(market)
-    cost_min = min_cost(market)
-
-    target = max(usd_size, cost_min, MIN_NOTIONAL_USD)
-    amt = round_to(target / last, amt_prec)
-    if min_amt and amt < min_amt: amt = min_amt
-    notional = amt * last
-
-    if DRY_RUN:
-        return True, f"DRY_RUN BUY {symbol} amt={amt} last={round(last,prc_prec)} notional≈${notional:.2f} (min_amt={min_amt}, min_cost={cost_min}, target=${target:.2f})"
-    try:
-        o = exch.create_order(symbol, type="market", side="buy", amount=None, params={
-            "cost": round(target, 2),
-            "quoteOrderQty": round(target, 2),
-            "oflags": "viqc",
+        out.append({
+            "symbol": sym,
+            "price": float(t.get("last") or t.get("close") or 0.0),
+            "change24h": float(change),
+            "quoteVolUsd": float(quote_vol),
         })
-        oid = o.get("id") or "?"
-        return True, f"BUY ok {symbol} cost=${target:.2f} (amt≈{amt}) order_id={oid}"
-    except Exception as e1:
-        try:
-            o = exch.create_order(symbol, type="market", side="buy", amount=amt)
-            oid = o.get("id") or "?"
-            return True, f"BUY ok {symbol} amt={amt} notional≈${notional:.2f} order_id={oid}"
-        except Exception as e2:
-            return False, f"BUY error {symbol}: cost_try={e1}; amount_try={e2}; min_amt={min_amt} min_cost={cost_min} last={round(last,prc_prec)} target=${target:.2f} notional≈${notional:.2f}"
 
-def kraken_market_sell(exch, symbol: str, amount: float, market: Dict[str, Any]) -> Tuple[bool, str]:
-    amt_prec = amount_precision(market)
-    amt = round_to(float(amount), amt_prec)
-    if DRY_RUN:
-        return True, f"DRY_RUN SELL {symbol} amount={amt}"
-    try:
-        o = exch.create_order(symbol, type="market", side="sell", amount=amt)
-        oid = o.get("id") or "?"
-        return True, f"SELL ok {symbol} amount={amt} order_id={oid}"
-    except Exception as e:
-        return False, f"SELL error {symbol}: {e}"
+    out.sort(key=lambda r: (r["change24h"], r["quoteVolUsd"]), reverse=True)
+    return out[:max(1, top_k)]
 
-def create_market_buy(exch, symbol: str, usd_size: float) -> Tuple[bool,str]:
-    m = exch.markets[symbol]; return kraken_market_buy(exch, symbol, usd_size, m)
-def create_market_sell(exch, symbol: str, amount: float) -> Tuple[bool,str]:
-    m = exch.markets[symbol]; return kraken_market_sell(exch, symbol, amount, m)
+def fetch_positions_snapshot(ex: ccxt.Exchange):
+    """
+    Return list of open positions (spot holdings > 0) as:
+    {symbol, base, base_qty, price, usd_value}
+    """
+    balances = ex.fetch_balance()
+    prices = ex.fetch_tickers()
+    positions = []
+    for sym, m in ex.markets.items():
+        if _is_bad_coin(sym):
+            continue
+        if not sym.endswith("/USD"):
+            continue
+        base = m["base"]
+        free = balances.get(base, {}).get("free")
+        total = balances.get(base, {}).get("total")
+        qty = None
+        if total:
+            qty = float(total)
+        elif free:
+            qty = float(free)
+        if not qty or qty <= 0:
+            continue
 
-# ---- Rotation core ----
-def try_rotation(exch, markets, open_bases: Dict[str,float], universe_syms: List[str]) -> Tuple[int, List[str]]:
-    """Sell worst holding and buy best candidate if edge >= ROTATE_MIN_EDGE_PCT."""
-    if not ROTATE_ENABLED or not open_bases: return 0, []
-    cooldowns = load_json(ROTATE_CD_PATH, {})
-    now = time.time(); cd_secs = ROTATE_COOLDOWN_HOURS * 3600.0
+        price = prices.get(sym, {}).get("last") or prices.get(sym, {}).get("close") or 0.0
+        price = float(price or 0.0)
+        usd_value = qty * price
+        positions.append({
+            "symbol": sym,
+            "base": base,
+            "base_qty": qty,
+            "price": price,
+            "usd_value": usd_value,
+        })
+    return positions
 
-    holds: List[Tuple[str, str, float, float]] = []  # (base, sym, pct, amount)
-    for base, amt in open_bases.items():
-        sym = allowed_symbol(markets, base)
-        if not sym: continue
-        pct = fetch_change_pct(exch, sym)
-        if pct is None: continue
-        holds.append((base, sym, pct, float(amt)))
+def get_cash_balance_usd(ex: ccxt.Exchange) -> float:
+    bal = ex.fetch_balance()
+    usd = bal.get("USD", {})
+    free = float(usd.get("free") or 0.0)
+    total = float(usd.get("total") or free)
+    return max(free, total)
 
-    held_bases = {b for b,_,_,_ in holds}
-    cands: List[Tuple[str, float]] = []
-    for sym in universe_syms:
-        base = sym.split("/")[0]
-        if base in held_bases: continue
-        pct = fetch_change_pct(exch, sym)
-        if pct is None: continue
-        cands.append((sym, pct))
+def estimate_equity_usd(ex: ccxt.Exchange) -> float:
+    equity = get_cash_balance_usd(ex)
+    tickers = ex.fetch_tickers()
+    balances = ex.fetch_balance()
+    for sym, m in ex.markets.items():
+        if _is_bad_coin(sym) or not sym.endswith("/USD"):
+            continue
+        base = m["base"]
+        qty = float(balances.get(base, {}).get("total") or 0.0)
+        if qty <= 0:
+            continue
+        price = float((tickers.get(sym, {}) or {}).get("last") or 0.0)
+        equity += qty * price
+    return equity
 
-    if not holds or not cands: return 0, []
+# ---------- Order wrappers ----------
+def _ensure_min_notional(ex: ccxt.Exchange, symbol: str, spend_usd: float) -> float:
+    m = ex.markets[symbol]
+    min_cost = float(m.get("limits", {}).get("cost", {}).get("min") or 0.0)
+    if spend_usd < min_cost:
+        return min_cost
+    return spend_usd
 
-    best_sym, best_pct = max(cands, key=lambda x: x[1])
-    worst = min(holds, key=lambda x: x[2])
-    worst_base, worst_sym, worst_pct, worst_amt = worst
-    edge = best_pct - worst_pct
+def place_market_buy(ex: ccxt.Exchange, symbol: str, spend_usd: float):
+    spend_usd = _ensure_min_notional(ex, symbol, spend_usd)
+    price = float(ex.fetch_ticker(symbol)["last"])
+    amount = spend_usd / max(price, 1e-9)
+    amount = ex.amount_to_precision(symbol, amount)
+    print(f"[order] BUY {symbol} notional≈${spend_usd:.2f} qty≈{amount}")
+    return ex.create_market_buy_order(symbol, float(amount))
 
-    msgs = [f"ROTATE scan: best={best_sym} {best_pct:.2f}% vs worst={worst_sym} {worst_pct:.2f}% → edge={edge:.2f}%"]
-
-    if edge < ROTATE_MIN_EDGE_PCT:
-        msgs.append(f"ROTATE skip — edge {edge:.2f}% < min {ROTATE_MIN_EDGE_PCT:.2f}%")
-        return 0, msgs
-
-    cd = load_json(ROTATE_CD_PATH, {})
-    cd_until = float(cd.get(worst_sym, 0))
-    if now < cd_until:
-        rem_h = (cd_until - now)/3600.0
-        msgs.append(f"ROTATE skip — {worst_sym} on cooldown {rem_h:.1f}h")
-        return 0, msgs
-
-    ok_s, info_s = create_market_sell(exch, worst_sym, worst_amt); msgs.append(info_s)
-    if not ok_s:
-        msgs.append("ROTATE abort — sell failed"); return 0, msgs
-
-    ok_b, info_b = create_market_buy(exch, best_sym, USD_PER_TRADE); msgs.append(info_b)
-    if ok_b:
-        cd[worst_sym] = now + cd_secs; save_json(ROTATE_CD_PATH, cd)
-        msgs.append(f"ROTATE done — started cooldown on {worst_sym} for {ROTATE_COOLDOWN_HOURS:.0f}h")
-        return 1, msgs
-    else:
-        msgs.append("ROTATE error — buy failed (sell already completed)")
-        return 0, msgs
-
-def main() -> None:
-    print("============================================================")
-    print("🟢 LIVE TRADING")
-    print("============================================================")
-    print(f"{now_utc()} INFO: Starting trader in CRYPTO mode. Dry run={DRY_RUN}. Broker=ccxt")
-
-    if RUN_SWITCH != "on":
-        print(f"{now_utc()} INFO: RUN_SWITCH={RUN_SWITCH} → exiting early."); return
-
-    exch = new_exchange(); markets = exch.load_markets()
-    balances = exch.fetch_balance()
-    usd = usd_balance(balances)
-    print(f"{now_utc()} INFO: USD balance detected: ${usd:.2f}")
-
-    open_bases = list_open_bases(balances); open_count = len(open_bases)
-    symbols = build_universe(exch, markets)
-    print(f"{now_utc()} INFO: Universe (auto): top {TOP_K} → {symbols}")
-
-    cap_left = max(0, MAX_POSITIONS - open_count)
-    avail, per_trade = ensure_trade_allowed(usd)
-
-    buys = 0; switches = 0; reasons: List[str] = []
-    if cap_left <= 0: reasons.append("cap_left=0")  # informational, not a hard stop
-    if avail < per_trade: reasons.append(f"avail ${avail:.2f} < per_trade ${per_trade:.2f}")
-
-    # --- Normal buys (only if funds allow and we have capacity) ---
-    if cap_left > 0 and avail >= per_trade:
-        for sym in symbols:
-            if cap_left <= 0 or buys >= DAILY_MAX_TRADES: break
-            if sym.upper() in PAIR_BLOCKLIST: continue
-            ok, info = create_market_buy(exch, sym, per_trade)
-            if ok:
-                print(f"{now_utc()} INFO: {info}")
-                buys += 1; cap_left -= 1; avail -= per_trade
-            else:
-                if len(reasons) < 6: reasons.append(f"{sym}: {info}")
-
-    # --- Guarantee at least N buys (if funds allow) ---
-    if cap_left > 0 and avail >= per_trade and buys < GUARANTEE_MIN_NEW:
-        need = GUARANTEE_MIN_NEW - buys; forced = 0
-        for sym in symbols:
-            if forced >= need: break
-            ok, info = create_market_buy(exch, sym, per_trade)
-            if ok:
-                print(f"{now_utc()} INFO: GUARANTEE BUY → {info}")
-                forced += 1; buys += 1; cap_left -= 1; avail -= per_trade
-            else:
-                if len(reasons) < 10: reasons.append(f"guarantee {sym}: {info}")
-
-    # --- Rotation: run if fully allocated OR cash is short but we hold coins ---
-    rotate_ok_to_try = ROTATE_ENABLED and open_count > 0 and ((cap_left == 0) or (ROTATE_WHEN_CASH_SHORT and avail < per_trade))
-    if rotate_ok_to_try and switches < ROTATE_MAX_SWITCHES_PER_RUN:
-        did, msgs = try_rotation(exch, markets, open_bases, symbols)
-        for m in msgs: print(f"{now_utc()} INFO: {m}")
-        switches += did
-
-    if buys == 0 and switches == 0:
-        msg = f"No entry (cap_left={cap_left}, per_trade=${per_trade:.2f}, avail=${avail:.2f})"
-        if reasons: msg += " — " + "; ".join(reasons)
-        print(f"{now_utc()} INFO: {msg}")
-
-    print(f"{now_utc()} INFO: KPI SUMMARY: entries={buys} switches={switches} open={open_count} cap_left={cap_left} usd=${usd:.2f}")
-    print(f"{now_utc()} INFO: DONE.")
-
-if __name__ == "__main__":
-    main()
+def place_market_sell(ex: ccxt.Exchange, symbol: str, base_qty: float):
+    amount = ex.amount_to_precision(symbol, base_qty)
+    print(f"[order] SELL {symbol} qty≈{amount}")
+    return ex.create_market_sell_order(symbol, float(amount))
