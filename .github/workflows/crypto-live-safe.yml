@@ -75,7 +75,7 @@ env:
   DAILY_CAP_USD: ${{ inputs.DAILY_CAP_USD || 100 }}
   RESERVE_CASH_PCT: ${{ inputs.RESERVE_CASH_PCT || 20 }}
 
-  # Advanced guards (edit here any time)
+  # Guards
   DUST_MIN_USD: 2
   ROTATE_WHEN_FULL: "true"
   ROTATE_WHEN_CASH_SHORT: "true"
@@ -175,6 +175,8 @@ jobs:
       - name: Pre-flight summary
         run: |
           echo "=== CRYPTO LIVE SAFE BASELINE ==="
+          echo "PWD: $(pwd)"
+          echo "GITHUB_WORKSPACE: ${GITHUB_WORKSPACE}"
           echo "RUN_SWITCH: $RUN_SWITCH"
           echo "DRY_RUN: $DRY_RUN"
           echo "RISK_MODE: $RISK_MODE (signal=${{ steps.risk.outputs.signal }})"
@@ -220,7 +222,7 @@ jobs:
       # If .state has no files yet, create stubs so we ALWAYS upload something
       - name: Ensure stub files before upload (only if directory is empty)
         run: |
-          if [ -z "$(find "${STATE_DIR}" -type f -maxdepth 1 2>/dev/null)" ]; then
+          if [ -z "$(find "${STATE_DIR}" -maxdepth 1 -type f 2>/dev/null)" ]; then
             echo '{"positions":[],"asof_utc":"'"$(date -u +%FT%TZ)"'"}' > "${STATE_DIR}/positions.json"
             echo "ts,pl_usd,buy_count,sell_count" > "${STATE_DIR}/kpi_history.csv"
             echo "Created stubs because .state was empty."
@@ -228,19 +230,27 @@ jobs:
             echo ".state already contains files; not writing stubs."
           fi
 
-      - name: List .state contents
+      - name: List .state contents (absolute and relative)
         run: |
-          echo "---- .state tree ----"
-          ls -la "${STATE_DIR}" || true
-          echo "---------------------"
-          find "${STATE_DIR}" -type f || true
+          echo "---- workspace / pwd ----"
+          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
+          echo "pwd=$(pwd)"
+          echo "---- ls -la .state ----"
+          ls -la ".state" || true
+          echo "---- find relative ----"
+          find ".state" -type f -maxdepth 1 -printf "%p %k KB\n" 2>/dev/null || true
+          echo "---- find absolute ----"
+          find "${GITHUB_WORKSPACE}/.state" -type f -maxdepth 1 -printf "%p %k KB\n" 2>/dev/null || true
 
       - name: Upload .state (positions, KPI, logs)
         uses: actions/upload-artifact@v4
         with:
           name: crypto-state_${{ github.run_id }}
+          # Multiple patterns + absolute. This avoids glob quirks with dot-folders.
           path: |
-            .state/**
+            ${{ github.workspace }}/.state
+            ${{ github.workspace }}/.state/*
+            ${{ github.workspace }}/.state/**
           if-no-files-found: warn
           retention-days: 14
 
