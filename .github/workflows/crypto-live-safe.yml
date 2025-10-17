@@ -28,7 +28,7 @@ env:
   # ---- Risk / reserve ----
   RESERVE_CASH_PCT: "5"
 
-  # ---- Optional dust/sell knobs (safe to leave; ignored if not used by your code) ----
+  # ---- Optional dust/sell knobs (ignored if not used by your code) ----
   MIN_SELL_USD: "10"
   DUST_MIN_USD: "2"
   DUST_SKIP_STABLES: "true"
@@ -66,72 +66,21 @@ jobs:
       - name: Run CryptoBOT
         shell: bash
         env:
-          # Kraken/Exchange keys if your code reads them from env
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          # Slack (optional) for later step
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           set -e
           python -V
           echo "DRY_RUN=${DRY_RUN} RUN_SWITCH=${RUN_SWITCH}"
-          # Your main entrypoint (adjust if different)
           python main.py
 
-      # ---------- Generate KPI chart (fix: proper heredoc) ----------
+      # ---------- Generate KPI chart (call a script; no heredoc) ----------
       - name: Generate KPI chart
         if: always()
         shell: bash
         run: |
           set -e
-          if [[ -f "${KPI_CSV}" ]]; then
-            python <<'PY'
-import os
-import pandas as pd
-import matplotlib.pyplot as plt
-
-csv_path = os.environ.get("KPI_CSV", ".state/kpi_history.csv")
-img_path = os.environ.get("KPI_IMG", ".state/kpi_chart.png")
-os.makedirs(".state", exist_ok=True)
-
-try:
-    df = pd.read_csv(csv_path)
-except Exception as e:
-    print(f"Could not read KPI CSV: {e}")
-    raise SystemExit(0)
-
-# tolerate minimal/odd headers
-if df.shape[0] >= 1 and "equity" in df.columns:
-    plt.figure()
-    plt.plot(df.index, df["equity"])
-    plt.title("CryptoBOT Equity (run history)")
-    plt.xlabel("Run #")
-    plt.ylabel("Equity (USD)")
-    plt.tight_layout()
-    plt.savefig(img_path)
-    print(f"Saved KPI chart -> {img_path}")
-else:
-    print("KPI CSV present but missing 'equity' column; skipping chart.")
-PY
-          else
-            echo "No KPI CSV found at ${KPI_CSV}; skipping chart."
-          fi
-
-      # ---------- Optional Slack ping (only if webhook is present) ----------
-      - name: Notify Slack (optional)
-        if: always()
-        shell: bash
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          if [[ -n "${SLACK_WEBHOOK_URL}" ]]; then
-            STATUS="${{ job.status }}"
-            DRY="${{ env.DRY_RUN }}"
-            TEXT="Crypto Live — Safe run *${STATUS}* (DRY_RUN=${DRY}). Repo: $GITHUB_REPOSITORY • Run: $GITHUB_RUN_NUMBER"
-            curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"${TEXT}\"}" "${SLACK_WEBHOOK_URL}" >/dev/null 2>&1 || true
-          else
-            echo "SLACK_WEBHOOK_URL not set; skipping Slack."
-          fi
+          python tools/make_kpi_chart.py || echo "KPI chart step finished with non-fatal status."
 
       # ---------- Upload artifacts ----------
       - name: Upload .state (KPI chart & logs)
