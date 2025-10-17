@@ -7,7 +7,6 @@ on:
         description: "Master switch"
         required: true
         type: choice
-        # Even if GH shows true/false, we accept and normalize below.
         options: [ON, OFF]
         default: ON
       DRY_RUN_STR:
@@ -115,13 +114,10 @@ jobs:
               echo "OFF"
             fi
           }
-
           RUN_SWITCH="$(norm "${RUN_SWITCH_RAW}")"
           DRY_RUN="$(norm "${DRY_RUN_RAW}")"
-
           echo "RUN_SWITCH=$RUN_SWITCH" >> "$GITHUB_ENV"
           echo "DRY_RUN=$DRY_RUN" >> "$GITHUB_ENV"
-
           echo "Normalized RUN_SWITCH=${RUN_SWITCH}"
           echo "Normalized DRY_RUN=${DRY_RUN}"
 
@@ -147,6 +143,16 @@ jobs:
 
       - name: Ensure .state exists
         run: mkdir -p "${STATE_DIR}"
+
+      # NEW: create stub files so an artifact is ALWAYS produced
+      - name: Ensure baseline state files (always create stubs if missing)
+        run: |
+          if [ ! -f "${POSITIONS_FILE}" ]; then
+            echo '{"positions":[],"asof_utc":"'"$(date -u +%FT%TZ)"'"}' > "${POSITIONS_FILE}"
+          fi
+          if [ ! -f "${KPI_CSV}" ]; then
+            echo "ts,pl_usd,buy_count,sell_count" > "${KPI_CSV}"
+          fi
 
       - name: Read current risk signal
         id: risk
@@ -209,6 +215,16 @@ jobs:
             echo "::notice::KPI chart helper or CSV missing; skipping."
           fi
 
+      # NEW: show exactly what we’re about to upload
+      - name: List .state contents
+        run: |
+          echo "---- .state tree ----"
+          ls -la "${STATE_DIR}" || true
+          echo "---------------------"
+          if command -v tree >/dev/null 2>&1; then
+            tree -a "${STATE_DIR}" || true
+          fi
+
       - name: Upload .state (positions, KPI, logs)
         uses: actions/upload-artifact@v4
         with:
@@ -216,7 +232,7 @@ jobs:
           path: |
             .state/**
             !.state/*.tmp
-          if-no-files-found: ignore
+          if-no-files-found: warn
           retention-days: 14
 
       - name: Slack summary (optional)
