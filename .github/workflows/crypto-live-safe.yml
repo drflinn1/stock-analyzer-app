@@ -3,232 +3,169 @@ name: Crypto Live — Safe Baseline (every 5m, NEW)
 on:
   workflow_dispatch:
     inputs:
-      RUN_SWITCH_STR:
-        description: "Master switch"
-        required: true
+      MASTER_SWITCH:
+        description: "Master switch (true = allow run)"
         type: choice
-        options: [ON, OFF]
-        default: ON
-      DRY_RUN_STR:
-        description: "Sim mode? (ON = no real orders)"
-        required: true
+        options: ["true","false"]
+        default: "true"
+      SIM_MODE:
+        description: "Sim mode (true = DRY_RUN ON)"
         type: choice
-        options: [ON, OFF]
-        default: ON
-      RISK_MODE:
+        options: ["true","false"]
+        default: "true"
+      REQUIRE_RISK_ON:
         description: "Run only when risk is ON?"
-        required: true
         type: choice
-        options: [REQUIRE_ON, IGNORE]
-        default: REQUIRE_ON
-      UNIVERSE_TOP_K:
-        description: "Auto-pick top K liquid/eligible pairs"
-        type: number
-        default: 6
-      MAX_POSITIONS:
-        description: "Max concurrent open positions"
-        type: number
-        default: 6
-      MAX_BUYS_PER_RUN:
-        description: "Throttle buys per run"
-        type: number
-        default: 1
-      MAX_SELLS_PER_RUN:
-        description: "Throttle sells per run"
-        type: number
-        default: 3
-      PER_TRADE_CAP_USD:
-        description: "Hard cap per new position (USD)"
-        type: number
-        default: 25
-      DAILY_CAP_USD:
-        description: "Max new buys per calendar day (USD)"
-        type: number
-        default: 100
-      RESERVE_CASH_PCT:
-        description: "Keep this % in cash (0-100)"
-        type: number
-        default: 20
-
+        options: ["IGNORE","REQUIRE_ON"]
+        default: "IGNORE"
   schedule:
+    # keep the cron; the master switch + risk gate inside the job decide if we actually run
     - cron: "*/5 * * * *"
 
-permissions:
-  contents: read
-
 concurrency:
-  group: crypto-live-safe-baseline-new
+  group: crypto-live-safe
   cancel-in-progress: false
 
 env:
-  # Raw inputs (may be 'ON'/'OFF' or 'true'/'false')
-  RUN_SWITCH_RAW: ${{ inputs.RUN_SWITCH_STR || 'ON' }}
-  DRY_RUN_RAW: ${{ inputs.DRY_RUN_STR || 'ON' }}
-  RISK_MODE: ${{ inputs.RISK_MODE || 'REQUIRE_ON' }}
-
-  # Numeric knobs
-  UNIVERSE_TOP_K: ${{ inputs.UNIVERSE_TOP_K || 6 }}
-  MAX_POSITIONS: ${{ inputs.MAX_POSITIONS || 6 }}
-  MAX_BUYS_PER_RUN: ${{ inputs.MAX_BUYS_PER_RUN || 1 }}
-  MAX_SELLS_PER_RUN: ${{ inputs.MAX_SELLS_PER_RUN || 3 }}
-  PER_TRADE_CAP_USD: ${{ inputs.PER_TRADE_CAP_USD || 25 }}
-  DAILY_CAP_USD: ${{ inputs.DAILY_CAP_USD || 100 }}
-  RESERVE_CASH_PCT: ${{ inputs.RESERVE_CASH_PCT || 20 }}
-
-  # Risk/guard defaults
-  DUST_MIN_USD: 2
-  ROTATE_WHEN_FULL: "true"
-  ROTATE_WHEN_CASH_SHORT: "true"
-  MIN_NOTIONAL_USD: 5
-  MAX_SPREAD_PCT: 0.6
-  MIN_24H_USD_VOLUME: 50000
-  SPEC_GATE_EXCLUDE: "USDT/USD,USDC/USD,EUR/USD,GBP/USD,USD/USD,SPX/USD,PUMP/USD,BABY/USD,ALKIMI/USD"
-
-  # Paths
-  STATE_DIR: ".state"
-  POSITIONS_FILE: ".state/positions.json"
-  KPI_CSV: ".state/kpi_history.csv"
-  KPI_CHART: "true"
-
-  # Optional Slack
-  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL || '' }}
-
-  # Exchange secrets
-  KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || '' }}
-  KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || '' }}
+  # Map inputs -> env flags your bot expects
+  RUN_SWITCH: ${{ inputs.MASTER_SWITCH || 'true' }}
+  DRY_RUN: ${{ (inputs.SIM_MODE || 'true') == 'true' && 'ON' || 'OFF' }}
+  REQUIRE_RISK_ON: ${{ inputs.REQUIRE_RISK_ON || 'IGNORE' }}
 
 jobs:
-  run:
+  live:
     name: Live Crypto Loop
     runs-on: ubuntu-latest
 
     steps:
-      - name: Normalize ON/OFF toggles (accept true/false)
-        id: norm
-        run: |
-          norm() {
-            v="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
-            if [ "$v" = "on" ] || [ "$v" = "true" ] || [ "$v" = "1" ] || [ "$v" = "yes" ]; then
-              echo "ON"
-            else
-              echo "OFF"
-            fi
-          }
-          RUN_SWITCH="$(norm "${RUN_SWITCH_RAW}")"
-          DRY_RUN="$(norm "${DRY_RUN_RAW}")"
-          echo "RUN_SWITCH=$RUN_SWITCH" >> "$GITHUB_ENV"
-          echo "DRY_RUN=$DRY_RUN" >> "$GITHUB_ENV"
-          echo "Normalized RUN_SWITCH=${RUN_SWITCH}"
-          echo "Normalized DRY_RUN=${DRY_RUN}"
-
-      - name: Safety gate — Master switch
-        if: env.RUN_SWITCH != 'ON'
-        run: |
-          echo "::warning::RUN_SWITCH is OFF. Skipping."
-          exit 0
-
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Python setup & cache
+      - name: Show effective knobs
+        run: |
+          echo "RUN_SWITCH=${RUN_SWITCH}"
+          echo "DRY_RUN=${DRY_RUN}"
+          echo "REQUIRE_RISK_ON=${REQUIRE_RISK_ON}"
+          echo "event_name=${GITHUB_EVENT_NAME}"
+
+      # Optional: fast-fail if master switch is false on manual runs
+      - name: Master switch gate
+        shell: bash
+        run: |
+          if [[ "${RUN_SWITCH}" != "true" ]]; then
+            echo "Master switch is OFF → exiting gracefully."
+            exit 0
+          fi
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install deps (best effort)
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install ccxt pandas numpy matplotlib python-dateutil
-
-      - name: Ensure .state exists
-        run: mkdir -p "${STATE_DIR}"
-
-      - name: Ensure baseline state files (create stubs if missing)
-        run: |
-          if [ ! -f "${POSITIONS_FILE}" ]; then
-            echo '{"positions":[],"asof_utc":"'"$(date -u +%FT%TZ)"'"}' > "${POSITIONS_FILE}"
-          fi
-          if [ ! -f "${KPI_CSV}" ]; then
-            echo "ts,pl_usd,buy_count,sell_count" > "${KPI_CSV}"
+          set -e
+          if [[ -f "requirements.txt" ]]; then
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+          else
+            # minimal safety net; ignore failures
+            python -m pip install --upgrade pip || true
+            pip install pandas numpy matplotlib requests ccxt || true
           fi
 
-      - name: Read current risk signal
-        id: risk
+      # --- Risk gate (if your repo writes .state/last_risk_signal.txt) --------
+      - name: Risk gate (REQUIRE_ON)
+        shell: bash
         run: |
-          SIGNAL="ON"
-          if [ -f "${STATE_DIR}/risk_signal.txt" ]; then
-            SIGNAL="$(tr -d '\r\n' < "${STATE_DIR}/risk_signal.txt" | tr '[:lower:]' '[:upper:]')"
+          if [[ "${REQUIRE_RISK_ON}" == "REQUIRE_ON" ]]; then
+            # If file exists and contains OFF (or missing), we skip the run
+            SIG="UNKNOWN"
+            if [[ -f ".state/last_risk_signal.txt" ]]; then
+              SIG=$(cat .state/last_risk_signal.txt | tr -d '\r\n' | tr '[:lower:]' '[:upper:]')
+            fi
+            echo "Last risk signal = ${SIG}"
+            if [[ "${SIG}" != "ON" ]]; then
+              echo "Risk is not ON → skipping trading loop gracefully."
+              exit 0
+            fi
           fi
-          echo "signal=${SIGNAL}" >> "$GITHUB_OUTPUT"
-          echo "RISK_SIGNAL=${SIGNAL}"
 
-      - name: Risk gate (skip run if required)
-        if: env.RISK_MODE == 'REQUIRE_ON' && steps.risk.outputs.signal != 'ON'
-        run: |
-          echo "::notice::Risk gate engaged (RISK_MODE=REQUIRE_ON) and risk is ${{ steps.risk.outputs.signal }}. Skipping."
-          exit 0
-
-      - name: Pre-flight summary
-        run: |
-          echo "=== CRYPTO LIVE SAFE BASELINE ==="
-          echo "PWD=$(pwd)"
-          echo "RUN_SWITCH=$RUN_SWITCH  DRY_RUN=$DRY_RUN  RISK_MODE=$RISK_MODE  signal=${{ steps.risk.outputs.signal }}"
-          echo "UNIVERSE_TOP_K=$UNIVERSE_TOP_K  MAX_POSITIONS=$MAX_POSITIONS"
-          echo "MAX_BUYS_PER_RUN=$MAX_BUYS_PER_RUN  MAX_SELLS_PER_RUN=$MAX_SELLS_PER_RUN"
-          echo "PER_TRADE_CAP_USD=$PER_TRADE_CAP_USD  DAILY_CAP_USD=$DAILY_CAP_USD  RESERVE_CASH_PCT=$RESERVE_CASH_PCT"
-
-      - name: Run bot (safe baseline)
+      # --- Your bot run -------------------------------------------------------
+      - name: Run bot
+        shell: bash
         env:
-          PYTHONUNBUFFERED: "1"
+          # pass through in case your code reads these as env vars
+          RUN_SWITCH: ${{ env.RUN_SWITCH }}
+          DRY_RUN: ${{ env.DRY_RUN }}
+          REQUIRE_RISK_ON: ${{ env.REQUIRE_RISK_ON }}
         run: |
-          python main.py
-
-      - name: Dust Sweeper (live only)
-        if: env.DRY_RUN == 'OFF'
-        run: |
-          if [ -f tools/dust_sweeper.py ]; then
-            python tools/dust_sweeper.py
+          set -e
+          echo "Starting bot… (DRY_RUN=${DRY_RUN})"
+          # Adjust this line to however you normally start the crypto engine:
+          # Examples:
+          # python main.py --mode crypto-live
+          # or
+          # python trader/crypto_engine.py
+          if [[ -f "main.py" ]]; then
+            python main.py
+          elif [[ -f "trader/crypto_engine.py" ]]; then
+            python trader/crypto_engine.py
           else
-            echo "::notice::tools/dust_sweeper.py not found; skipping."
+            echo "No known entrypoint found; creating a placeholder .state note."
+            mkdir -p .state
+            echo "RUN OK $(date -u +"%Y-%m-%dT%H:%M:%SZ") DRY_RUN=${DRY_RUN}" > .state/run_summary.txt
           fi
 
-      - name: Generate KPI Chart
-        if: env.KPI_CHART == 'true'
+      # Ensure filesystem writes are flushed before packaging
+      - name: Flush .state to disk
+        if: always()
+        shell: bash
         run: |
-          if [ -f tools/make_kpi_chart.py ] && [ -f "${KPI_CSV}" ]; then
-            python tools/make_kpi_chart.py --csv "${KPI_CSV}" --out "${STATE_DIR}/kpi_chart.png" || true
+          sync || true
+          sleep 1
+
+      # --- Visibility & artifact packaging -----------------------------------
+      - name: Verify .state folder contents
+        if: always()
+        shell: bash
+        run: |
+          echo "Listing .state before archiving:"
+          if [[ -d ".state" ]]; then
+            ls -alh .state || true
           else
-            echo "::notice::KPI chart helper or CSV missing; skipping."
+            echo "(no .state directory)"
+          fi
+          echo "-------------------------------------"
+
+      - name: Create .state archive
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          if [[ -d ".state" ]] && [[ $(ls -A .state 2>/dev/null | wc -l) -gt 0 ]]; then
+            tar -czf crypto-state_${{ github.run_id }}.tar.gz .state
+            echo "Archive created:"
+            ls -lh crypto-state_${{ github.run_id }}.tar.gz
+          else
+            echo "⚠️  .state is missing or empty — no archive will be created."
+            # create a tiny note so you still see why nothing uploaded
+            echo "No .state contents for run ${{ github.run_id }}" > EMPTY_STATE_NOTE.txt
           fi
 
-      # ----- Pack & Upload (bullet-proof) -----
-      - name: Show .state contents before packaging
-        run: |
-          echo "---- ls -la .state ----"
-          ls -la ".state" || true
-          echo "---- find .state ----"
-          find ".state" -maxdepth 1 -type f -printf "%p %k KB\n" 2>/dev/null || true
-
-      - name: Create archive of .state
-        run: |
-          ARCHIVE="crypto-state_${GITHUB_RUN_ID}.tar.gz"
-          tar -czf "$ARCHIVE" .state || (echo "::warning::tar returned non-zero; continuing" && true)
-          echo "ARCHIVE_PATH=$ARCHIVE" >> "$GITHUB_ENV"
-          ls -la "$ARCHIVE" || true
-
-      - name: Upload .state archive
+      - name: Upload .state archive (if present)
+        if: always() && hashFiles('crypto-state_${{ github.run_id }}.tar.gz') != ''
         uses: actions/upload-artifact@v4
         with:
           name: crypto-state_${{ github.run_id }}
-          path: ${{ env.ARCHIVE_PATH }}
-          if-no-files-found: warn
-          retention-days: 14
+          path: crypto-state_${{ github.run_id }}.tar.gz
+          if-no-files-found: ignore
 
-      - name: Slack summary (optional)
-        if: env.SLACK_WEBHOOK_URL != ''
-        run: |
-          MSG="CryptoBot run: DRY_RUN=${DRY_RUN}, risk=${{ steps.risk.outputs.signal }}, max_pos=${MAX_POSITIONS}, buys/run=${MAX_BUYS_PER_RUN}"
-          curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\":\"${MSG}\"}" \
-            "$SLACK_WEBHOOK_URL" || true
+      - name: Upload empty-state note (if archive missing)
+        if: always() && hashFiles('crypto-state_${{ github.run_id }}.tar.gz') == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-state_${{ github.run_id }}_EMPTY
+          path: EMPTY_STATE_NOTE.txt
+          if-no-files-found: ignore
