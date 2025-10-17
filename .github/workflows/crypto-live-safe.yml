@@ -30,6 +30,15 @@ env:
   DRY_RUN: ${{ (inputs.SIM_MODE || 'true') == 'true' && 'ON' || 'OFF' }}
   REQUIRE_RISK_ON: ${{ inputs.REQUIRE_RISK_ON || 'IGNORE' }}
 
+  # === Common sizing/filters (pull from repo Variables if present) ===
+  MIN_BUY_USD:           ${{ vars.MIN_BUY_USD || '10' }}
+  RESERVE_CASH_PCT:      ${{ vars.RESERVE_CASH_PCT || '5' }}
+  MAX_POSITIONS:         ${{ vars.MAX_POSITIONS || '6' }}
+  MAX_BUYS_PER_RUN:      ${{ vars.MAX_BUYS_PER_RUN || '1' }}
+  UNIVERSE_TOP_K:        ${{ vars.UNIVERSE_TOP_K || '10' }}
+  ROTATE_WHEN_FULL:      ${{ vars.ROTATE_WHEN_FULL || 'true' }}
+  ROTATE_WHEN_CASH_SHORT:${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
+
 jobs:
   live:
     name: Live Crypto Loop
@@ -44,7 +53,13 @@ jobs:
           echo "RUN_SWITCH=${RUN_SWITCH}"
           echo "DRY_RUN=${DRY_RUN}"
           echo "REQUIRE_RISK_ON=${REQUIRE_RISK_ON}"
-          echo "event_name=${GITHUB_EVENT_NAME}"
+          echo "MIN_BUY_USD=${MIN_BUY_USD}"
+          echo "RESERVE_CASH_PCT=${RESERVE_CASH_PCT}"
+          echo "MAX_POSITIONS=${MAX_POSITIONS}"
+          echo "MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}"
+          echo "UNIVERSE_TOP_K=${UNIVERSE_TOP_K}"
+          echo "ROTATE_WHEN_FULL=${ROTATE_WHEN_FULL}"
+          echo "ROTATE_WHEN_CASH_SHORT=${ROTATE_WHEN_CASH_SHORT}"
 
       - name: Master switch gate
         shell: bash
@@ -71,7 +86,6 @@ jobs:
             pip install pandas numpy matplotlib requests ccxt || true
           fi
 
-      # Optional risk gate: skip real trading when signal isn't ON
       - name: Risk gate (REQUIRE_ON)
         shell: bash
         run: |
@@ -93,6 +107,13 @@ jobs:
           RUN_SWITCH: ${{ env.RUN_SWITCH }}
           DRY_RUN: ${{ env.DRY_RUN }}
           REQUIRE_RISK_ON: ${{ env.REQUIRE_RISK_ON }}
+          MIN_BUY_USD: ${{ env.MIN_BUY_USD }}
+          RESERVE_CASH_PCT: ${{ env.RESERVE_CASH_PCT }}
+          MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
+          MAX_BUYS_PER_RUN: ${{ env.MAX_BUYS_PER_RUN }}
+          UNIVERSE_TOP_K: ${{ env.UNIVERSE_TOP_K }}
+          ROTATE_WHEN_FULL: ${{ env.ROTATE_WHEN_FULL }}
+          ROTATE_WHEN_CASH_SHORT: ${{ env.ROTATE_WHEN_CASH_SHORT }}
         run: |
           set -e
           echo "Starting bot… (DRY_RUN=${DRY_RUN})"
@@ -104,29 +125,42 @@ jobs:
             echo "No known entrypoint found; proceeding with fallback state generation."
           fi
 
-      # ---- Ensure .state exists and has minimum files even with empty portfolio
+      # --- NEW: quick human-readable summary in the job log -------------
+      - name: Print quick .state summary
+        if: always()
+        shell: bash
+        run: |
+          echo "----- .state summary (first lines) -----"
+          if [[ -f ".state/run_summary.txt" ]]; then
+            echo "[run_summary.txt]"
+            head -n 50 .state/run_summary.txt || true
+          fi
+          if [[ -f ".state/positions.json" ]]; then
+            echo "[positions.json]"
+            head -n 50 .state/positions.json || true
+          fi
+          if [[ -f ".state/kpi_history.csv" ]]; then
+            echo "[kpi_history.csv]"
+            head -n 5 .state/kpi_history.csv || true
+          fi
+          if [[ -f ".state/why_no_trade.txt" ]]; then
+            echo "[why_no_trade.txt]"
+            cat .state/why_no_trade.txt || true
+          fi
+          echo "----------------------------------------"
+
       - name: Ensure minimal .state snapshot (even if no positions)
         if: always()
         shell: bash
         run: |
           set -e
           mkdir -p .state
-          # run summary (always)
           echo "RUN_ID=${{ github.run_id }}" > .state/run_summary.txt
           echo "UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> .state/run_summary.txt
           echo "DRY_RUN=${DRY_RUN}" >> .state/run_summary.txt
-          # positions.json (create if missing)
-          if [[ ! -f ".state/positions.json" ]]; then
-            echo '{"positions":[],"note":"empty or no open positions at time of snapshot"}' > .state/positions.json
-          fi
-          # kpi_history.csv (append header if missing)
-          if [[ ! -f ".state/kpi_history.csv" ]]; then
-            echo "ts_utc,equity,realized_pl,unrealized_pl,notes" > .state/kpi_history.csv
-          fi
-          # risk signal (default if missing)
-          if [[ ! -f ".state/last_risk_signal.txt" ]]; then
-            echo "ON" > .state/last_risk_signal.txt
-          fi
+          [[ -f ".state/positions.json" ]] || echo '{"positions":[],"note":"empty or no open positions at time of snapshot"}' > .state/positions.json
+          [[ -f ".state/kpi_history.csv" ]] || echo "ts_utc,equity,realized_pl,unrealized_pl,notes" > .state/kpi_history.csv
+          [[ -f ".state/last_risk_signal.txt" ]] || echo "ON" > .state/last_risk_signal.txt
 
       - name: Flush .state to disk
         if: always()
@@ -152,7 +186,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          if [[ -d ".state" ]] && [[ $(ls -A .state 2>/dev/null | wc -l) -gt 0 ]]; then
+          if [[ -d ".state" ]] && [[ $(ls -A .state 2>/dev/null | wc -l) > 0 ]]; then
             tar -czf crypto-state_${{ github.run_id }}.tar.gz .state
             echo "Archive created:"
             ls -lh crypto-state_${{ github.run_id }}.tar.gz
