@@ -31,13 +31,13 @@ env:
   REQUIRE_RISK_ON: ${{ inputs.REQUIRE_RISK_ON || 'IGNORE' }}
 
   # === Common sizing/filters (pull from repo Variables if present) ===
-  MIN_BUY_USD:           ${{ vars.MIN_BUY_USD || '10' }}
-  RESERVE_CASH_PCT:      ${{ vars.RESERVE_CASH_PCT || '5' }}
-  MAX_POSITIONS:         ${{ vars.MAX_POSITIONS || '6' }}
-  MAX_BUYS_PER_RUN:      ${{ vars.MAX_BUYS_PER_RUN || '1' }}
-  UNIVERSE_TOP_K:        ${{ vars.UNIVERSE_TOP_K || '10' }}
-  ROTATE_WHEN_FULL:      ${{ vars.ROTATE_WHEN_FULL || 'true' }}
-  ROTATE_WHEN_CASH_SHORT:${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
+  MIN_BUY_USD:            ${{ vars.MIN_BUY_USD || '10' }}
+  RESERVE_CASH_PCT:       ${{ vars.RESERVE_CASH_PCT || '5' }}
+  MAX_POSITIONS:          ${{ vars.MAX_POSITIONS || '6' }}
+  MAX_BUYS_PER_RUN:       ${{ vars.MAX_BUYS_PER_RUN || '1' }}
+  UNIVERSE_TOP_K:         ${{ vars.UNIVERSE_TOP_K || '10' }}
+  ROTATE_WHEN_FULL:       ${{ vars.ROTATE_WHEN_FULL || 'true' }}
+  ROTATE_WHEN_CASH_SHORT: ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
 
 jobs:
   live:
@@ -125,27 +125,22 @@ jobs:
             echo "No known entrypoint found; proceeding with fallback state generation."
           fi
 
-      # --- NEW: quick human-readable summary in the job log -------------
       - name: Print quick .state summary
         if: always()
         shell: bash
         run: |
           echo "----- .state summary (first lines) -----"
           if [[ -f ".state/run_summary.txt" ]]; then
-            echo "[run_summary.txt]"
-            head -n 50 .state/run_summary.txt || true
+            echo "[run_summary.txt]"; head -n 50 .state/run_summary.txt || true
           fi
           if [[ -f ".state/positions.json" ]]; then
-            echo "[positions.json]"
-            head -n 50 .state/positions.json || true
+            echo "[positions.json]"; head -n 50 .state/positions.json || true
           fi
           if [[ -f ".state/kpi_history.csv" ]]; then
-            echo "[kpi_history.csv]"
-            head -n 5 .state/kpi_history.csv || true
+            echo "[kpi_history.csv]"; head -n 5 .state/kpi_history.csv || true
           fi
           if [[ -f ".state/why_no_trade.txt" ]]; then
-            echo "[why_no_trade.txt]"
-            cat .state/why_no_trade.txt || true
+            echo "[why_no_trade.txt]"; cat .state/why_no_trade.txt || true
           fi
           echo "----------------------------------------"
 
@@ -186,10 +181,9 @@ jobs:
         shell: bash
         run: |
           set -e
-          if [[ -d ".state" ]] && [[ $(ls -A .state 2>/dev/null | wc -l) > 0 ]]; then
+          if [[ -d ".state" ]] && [[ $(ls -A .state 2>/dev/null | wc -l) -gt 0 ]]; then
             tar -czf crypto-state_${{ github.run_id }}.tar.gz .state
-            echo "Archive created:"
-            ls -lh crypto-state_${{ github.run_id }}.tar.gz
+            echo "Archive created:"; ls -lh crypto-state_${{ github.run_id }}.tar.gz
           else
             echo "⚠️  .state is missing or empty — no archive will be created."
             echo "No .state contents for run ${{ github.run_id }}" > EMPTY_STATE_NOTE.txt
