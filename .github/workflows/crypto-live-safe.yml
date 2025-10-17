@@ -19,7 +19,6 @@ on:
         options: ["IGNORE","REQUIRE_ON"]
         default: "IGNORE"
   schedule:
-    # keep the cron; the master switch + risk gate inside the job decide if we actually run
     - cron: "*/5 * * * *"
 
 concurrency:
@@ -27,7 +26,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Map inputs -> env flags your bot expects
   RUN_SWITCH: ${{ inputs.MASTER_SWITCH || 'true' }}
   DRY_RUN: ${{ (inputs.SIM_MODE || 'true') == 'true' && 'ON' || 'OFF' }}
   REQUIRE_RISK_ON: ${{ inputs.REQUIRE_RISK_ON || 'IGNORE' }}
@@ -48,7 +46,6 @@ jobs:
           echo "REQUIRE_RISK_ON=${REQUIRE_RISK_ON}"
           echo "event_name=${GITHUB_EVENT_NAME}"
 
-      # Optional: fast-fail if master switch is false on manual runs
       - name: Master switch gate
         shell: bash
         run: |
@@ -70,17 +67,15 @@ jobs:
             python -m pip install --upgrade pip
             pip install -r requirements.txt
           else
-            # minimal safety net; ignore failures
             python -m pip install --upgrade pip || true
             pip install pandas numpy matplotlib requests ccxt || true
           fi
 
-      # --- Risk gate (if your repo writes .state/last_risk_signal.txt) --------
+      # Optional risk gate: skip real trading when signal isn't ON
       - name: Risk gate (REQUIRE_ON)
         shell: bash
         run: |
           if [[ "${REQUIRE_RISK_ON}" == "REQUIRE_ON" ]]; then
-            # If file exists and contains OFF (or missing), we skip the run
             SIG="UNKNOWN"
             if [[ -f ".state/last_risk_signal.txt" ]]; then
               SIG=$(cat .state/last_risk_signal.txt | tr -d '\r\n' | tr '[:lower:]' '[:upper:]')
@@ -92,33 +87,47 @@ jobs:
             fi
           fi
 
-      # --- Your bot run -------------------------------------------------------
       - name: Run bot
         shell: bash
         env:
-          # pass through in case your code reads these as env vars
           RUN_SWITCH: ${{ env.RUN_SWITCH }}
           DRY_RUN: ${{ env.DRY_RUN }}
           REQUIRE_RISK_ON: ${{ env.REQUIRE_RISK_ON }}
         run: |
           set -e
           echo "Starting bot… (DRY_RUN=${DRY_RUN})"
-          # Adjust this line to however you normally start the crypto engine:
-          # Examples:
-          # python main.py --mode crypto-live
-          # or
-          # python trader/crypto_engine.py
           if [[ -f "main.py" ]]; then
             python main.py
           elif [[ -f "trader/crypto_engine.py" ]]; then
             python trader/crypto_engine.py
           else
-            echo "No known entrypoint found; creating a placeholder .state note."
-            mkdir -p .state
-            echo "RUN OK $(date -u +"%Y-%m-%dT%H:%M:%SZ") DRY_RUN=${DRY_RUN}" > .state/run_summary.txt
+            echo "No known entrypoint found; proceeding with fallback state generation."
           fi
 
-      # Ensure filesystem writes are flushed before packaging
+      # ---- Ensure .state exists and has minimum files even with empty portfolio
+      - name: Ensure minimal .state snapshot (even if no positions)
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          mkdir -p .state
+          # run summary (always)
+          echo "RUN_ID=${{ github.run_id }}" > .state/run_summary.txt
+          echo "UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> .state/run_summary.txt
+          echo "DRY_RUN=${DRY_RUN}" >> .state/run_summary.txt
+          # positions.json (create if missing)
+          if [[ ! -f ".state/positions.json" ]]; then
+            echo '{"positions":[],"note":"empty or no open positions at time of snapshot"}' > .state/positions.json
+          fi
+          # kpi_history.csv (append header if missing)
+          if [[ ! -f ".state/kpi_history.csv" ]]; then
+            echo "ts_utc,equity,realized_pl,unrealized_pl,notes" > .state/kpi_history.csv
+          fi
+          # risk signal (default if missing)
+          if [[ ! -f ".state/last_risk_signal.txt" ]]; then
+            echo "ON" > .state/last_risk_signal.txt
+          fi
+
       - name: Flush .state to disk
         if: always()
         shell: bash
@@ -126,7 +135,6 @@ jobs:
           sync || true
           sleep 1
 
-      # --- Visibility & artifact packaging -----------------------------------
       - name: Verify .state folder contents
         if: always()
         shell: bash
@@ -150,7 +158,6 @@ jobs:
             ls -lh crypto-state_${{ github.run_id }}.tar.gz
           else
             echo "⚠️  .state is missing or empty — no archive will be created."
-            # create a tiny note so you still see why nothing uploaded
             echo "No .state contents for run ${{ github.run_id }}" > EMPTY_STATE_NOTE.txt
           fi
 
