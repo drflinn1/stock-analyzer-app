@@ -26,12 +26,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Map inputs to the strings your bot expects (ON/OFF)
+  # Map inputs to the ON/OFF strings your bot expects
   RUN_SWITCH: ${{ (inputs.MASTER_SWITCH || 'true') == 'true' && 'ON' || 'OFF' }}
   DRY_RUN:    ${{ (inputs.SIM_MODE      || 'true') == 'true' && 'ON' || 'OFF' }}
   REQUIRE_RISK_ON: ${{ inputs.REQUIRE_RISK_ON || 'IGNORE' }}
 
-  # === Common sizing/filters (pulled from repo Variables if present) ===
+  # Bot knobs (from repo Variables if present)
   MIN_BUY_USD:            ${{ vars.MIN_BUY_USD || '10' }}
   RESERVE_CASH_PCT:       ${{ vars.RESERVE_CASH_PCT || '5' }}
   MAX_POSITIONS:          ${{ vars.MAX_POSITIONS || '3' }}
@@ -39,6 +39,12 @@ env:
   UNIVERSE_TOP_K:         ${{ vars.UNIVERSE_TOP_K || '25' }}
   ROTATE_WHEN_FULL:       ${{ vars.ROTATE_WHEN_FULL || 'true' }}
   ROTATE_WHEN_CASH_SHORT: ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
+
+  # Optional universe filters you already keep as Variables
+  AUTO_MIN_USD_VOL:       ${{ vars.AUTO_MIN_USD_VOL || '500000' }}
+  AUTO_MIN_PRICE:         ${{ vars.AUTO_MIN_PRICE   || '0.02' }}
+  AUTO_EXCLUDE:           ${{ vars.AUTO_EXCLUDE     || '' }}
+  CRYPTO_EXCHANGE:        ${{ vars.CRYPTO_EXCHANGE  || 'kraken' }}
 
 jobs:
   live:
@@ -59,6 +65,10 @@ jobs:
           echo "MAX_POSITIONS=${MAX_POSITIONS}"
           echo "MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}"
           echo "UNIVERSE_TOP_K=${UNIVERSE_TOP_K}"
+          echo "AUTO_MIN_USD_VOL=${AUTO_MIN_USD_VOL}"
+          echo "AUTO_MIN_PRICE=${AUTO_MIN_PRICE}"
+          echo "AUTO_EXCLUDE=${AUTO_EXCLUDE}"
+          echo "CRYPTO_EXCHANGE=${CRYPTO_EXCHANGE}"
           echo "ROTATE_WHEN_FULL=${ROTATE_WHEN_FULL}"
           echo "ROTATE_WHEN_CASH_SHORT=${ROTATE_WHEN_CASH_SHORT}"
 
@@ -102,17 +112,46 @@ jobs:
             fi
           fi
 
+      # --- NEW: exchange key preflight (won't print secrets) --------------
+      - name: Preflight — exchange keys present?
+        shell: bash
+        env:
+          KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        run: |
+          set -e
+          EX="${CRYPTO_EXCHANGE:-kraken}"
+          echo "Exchange=${EX}"
+          if [[ "$EX" == "kraken" ]]; then
+            if [[ -n "${KRAKEN_API_KEY}" && -n "${KRAKEN_API_SECRET}" ]]; then
+              echo "Kraken keys: present"
+            else
+              echo "Kraken keys: MISSING"
+              echo "To fix: add repo secrets KRAKEN_API_KEY and KRAKEN_API_SECRET."
+              exit 1
+            fi
+          fi
+
       - name: Run bot
         shell: bash
         env:
+          # pass secrets (for ccxt) and knobs (for your bot)
+          KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
           RUN_SWITCH: ${{ env.RUN_SWITCH }}
           DRY_RUN: ${{ env.DRY_RUN }}
           REQUIRE_RISK_ON: ${{ env.REQUIRE_RISK_ON }}
+
           MIN_BUY_USD: ${{ env.MIN_BUY_USD }}
           RESERVE_CASH_PCT: ${{ env.RESERVE_CASH_PCT }}
           MAX_POSITIONS: ${{ env.MAX_POSITIONS }}
           MAX_BUYS_PER_RUN: ${{ env.MAX_BUYS_PER_RUN }}
           UNIVERSE_TOP_K: ${{ env.UNIVERSE_TOP_K }}
+          AUTO_MIN_USD_VOL: ${{ env.AUTO_MIN_USD_VOL }}
+          AUTO_MIN_PRICE: ${{ env.AUTO_MIN_PRICE }}
+          AUTO_EXCLUDE: ${{ env.AUTO_EXCLUDE }}
+          CRYPTO_EXCHANGE: ${{ env.CRYPTO_EXCHANGE }}
           ROTATE_WHEN_FULL: ${{ env.ROTATE_WHEN_FULL }}
           ROTATE_WHEN_CASH_SHORT: ${{ env.ROTATE_WHEN_CASH_SHORT }}
         run: |
@@ -126,7 +165,6 @@ jobs:
             echo "No known entrypoint found; proceeding with fallback state generation."
           fi
 
-      # Quick human-readable peek at what the bot wrote
       - name: Print quick .state summary
         if: always()
         shell: bash
@@ -146,7 +184,6 @@ jobs:
           fi
           echo "----------------------------------------"
 
-      # Ensure .state exists even if no trades were made
       - name: Ensure minimal .state snapshot (even if no positions)
         if: always()
         shell: bash
