@@ -1,56 +1,41 @@
-#!/usr/bin/env python3
-# Usage: python tools/make_kpi_chart.py .state/kpi_history.csv .state/kpi_chart.png
+import os
 import sys
-import pandas as pd
-import matplotlib.pyplot as plt
-from pathlib import Path
 
-def pick_time_column(df):
-    for c in ["timestamp", "time", "date", "datetime", "run_time"]:
-        if c in df.columns:
-            return c
-    return df.columns[0]
+# Lazy imports so the step can "succeed" even if matplotlib isn't present in some contexts
+try:
+    import pandas as pd
+    import matplotlib.pyplot as plt
+except Exception as e:
+    print(f"[make_kpi_chart] Missing deps: {e}")
+    sys.exit(0)  # non-fatal for the workflow
 
-def pick_value_column(df):
-    for c in ["equity", "balance", "nav", "pnl", "pnl_pct", "daily_pnl", "kpi"]:
-        if c in df.columns:
-            return c
-    nums = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    return nums[-1] if nums else df.columns[-1]
+STATE_DIR = os.environ.get("STATE_DIR", ".state")
+CSV_PATH  = os.environ.get("KPI_CSV", os.path.join(STATE_DIR, "kpi_history.csv"))
+IMG_PATH  = os.environ.get("KPI_IMG", os.path.join(STATE_DIR, "kpi_chart.png"))
 
-def main(csv_path, out_path):
-    csv = Path(csv_path)
-    out = Path(out_path)
-    if not csv.exists():
-        print(f"[KPI] CSV not found: {csv}")
-        return
+os.makedirs(STATE_DIR, exist_ok=True)
 
-    df = pd.read_csv(csv)
-    if df.empty:
-        print("[KPI] CSV is empty; nothing to plot.")
-        return
+if not os.path.exists(CSV_PATH):
+    print(f"[make_kpi_chart] No KPI CSV at {CSV_PATH}; skipping.")
+    sys.exit(0)
 
-    tcol = pick_time_column(df)
-    vcol = pick_value_column(df)
+try:
+    df = pd.read_csv(CSV_PATH)
+except Exception as e:
+    print(f"[make_kpi_chart] Could not read KPI CSV: {e}")
+    sys.exit(0)
 
+if df.shape[0] >= 1 and "equity" in df.columns:
     try:
-        df[tcol] = pd.to_datetime(df[tcol])
-    except Exception:
-        pass
-
-    plt.figure(figsize=(9, 4.5))
-    plt.plot(df[tcol], df[vcol], linewidth=2)
-    plt.title(f"KPI — {vcol}")
-    plt.xlabel(tcol)
-    plt.ylabel(vcol)
-    plt.tight_layout()
-
-    out.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out, dpi=140)
-    print(f"[KPI] Chart saved to {out}")
-
-if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: make_kpi_chart.py <kpi_csv> <out_png>")
-        sys.exit(0)
-    main(sys.argv[1], sys.argv[2])
+        plt.figure()
+        plt.plot(df.index, df["equity"])
+        plt.title("CryptoBOT Equity (run history)")
+        plt.xlabel("Run #")
+        plt.ylabel("Equity (USD)")
+        plt.tight_layout()
+        plt.savefig(IMG_PATH)
+        print(f"[make_kpi_chart] Saved KPI chart -> {IMG_PATH}")
+    except Exception as e:
+        print(f"[make_kpi_chart] Failed to render/save chart: {e}")
+else:
+    print("[make_kpi_chart] KPI CSV present but missing 'equity' column; skipping chart.")
