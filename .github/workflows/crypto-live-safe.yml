@@ -26,12 +26,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Map inputs to the ON/OFF strings your bot expects
+  # Map inputs to ON/OFF strings your bot expects
   RUN_SWITCH: ${{ (inputs.MASTER_SWITCH || 'true') == 'true' && 'ON' || 'OFF' }}
   DRY_RUN:    ${{ (inputs.SIM_MODE      || 'true') == 'true' && 'ON' || 'OFF' }}
   REQUIRE_RISK_ON: ${{ inputs.REQUIRE_RISK_ON || 'IGNORE' }}
 
-  # Bot knobs (from repo Variables if present)
+  # === Sizing/filters from repo Variables (with safe defaults) ===
   MIN_BUY_USD:            ${{ vars.MIN_BUY_USD || '10' }}
   RESERVE_CASH_PCT:       ${{ vars.RESERVE_CASH_PCT || '5' }}
   MAX_POSITIONS:          ${{ vars.MAX_POSITIONS || '3' }}
@@ -40,11 +40,15 @@ env:
   ROTATE_WHEN_FULL:       ${{ vars.ROTATE_WHEN_FULL || 'true' }}
   ROTATE_WHEN_CASH_SHORT: ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
 
-  # Optional universe filters you already keep as Variables
+  # Optional universe filters you already use
   AUTO_MIN_USD_VOL:       ${{ vars.AUTO_MIN_USD_VOL || '500000' }}
   AUTO_MIN_PRICE:         ${{ vars.AUTO_MIN_PRICE   || '0.02' }}
   AUTO_EXCLUDE:           ${{ vars.AUTO_EXCLUDE     || '' }}
   CRYPTO_EXCHANGE:        ${{ vars.CRYPTO_EXCHANGE  || 'kraken' }}
+
+  # Optional dust guards (bot will use them if supported)
+  MIN_SELL_USD:           ${{ vars.MIN_SELL_USD || '10' }}
+  DUST_SKIP_STABLES:      ${{ vars.DUST_SKIP_STABLES || 'true' }}
 
 jobs:
   live:
@@ -71,6 +75,8 @@ jobs:
           echo "CRYPTO_EXCHANGE=${CRYPTO_EXCHANGE}"
           echo "ROTATE_WHEN_FULL=${ROTATE_WHEN_FULL}"
           echo "ROTATE_WHEN_CASH_SHORT=${ROTATE_WHEN_CASH_SHORT}"
+          echo "MIN_SELL_USD=${MIN_SELL_USD}"
+          echo "DUST_SKIP_STABLES=${DUST_SKIP_STABLES}"
 
       - name: Master switch gate
         shell: bash
@@ -112,7 +118,6 @@ jobs:
             fi
           fi
 
-      # --- NEW: exchange key preflight (won't print secrets) --------------
       - name: Preflight — exchange keys present?
         shell: bash
         env:
@@ -126,16 +131,14 @@ jobs:
             if [[ -n "${KRAKEN_API_KEY}" && -n "${KRAKEN_API_SECRET}" ]]; then
               echo "Kraken keys: present"
             else
-              echo "Kraken keys: MISSING"
-              echo "To fix: add repo secrets KRAKEN_API_KEY and KRAKEN_API_SECRET."
-              exit 1
+              echo "Kraken keys: MISSING"; exit 1
             fi
           fi
 
       - name: Run bot
         shell: bash
         env:
-          # pass secrets (for ccxt) and knobs (for your bot)
+          # secrets & knobs for bot/ccxt
           KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
@@ -154,6 +157,8 @@ jobs:
           CRYPTO_EXCHANGE: ${{ env.CRYPTO_EXCHANGE }}
           ROTATE_WHEN_FULL: ${{ env.ROTATE_WHEN_FULL }}
           ROTATE_WHEN_CASH_SHORT: ${{ env.ROTATE_WHEN_CASH_SHORT }}
+          MIN_SELL_USD: ${{ env.MIN_SELL_USD }}
+          DUST_SKIP_STABLES: ${{ env.DUST_SKIP_STABLES }}
         run: |
           set -e
           echo "Starting bot… (DRY_RUN=${DRY_RUN})"
@@ -170,19 +175,40 @@ jobs:
         shell: bash
         run: |
           echo "----- .state summary (first lines) -----"
-          if [[ -f ".state/run_summary.txt" ]]; then
-            echo "[run_summary.txt]"; head -n 50 .state/run_summary.txt || true
-          fi
-          if [[ -f ".state/positions.json" ]]; then
-            echo "[positions.json]"; head -n 50 .state/positions.json || true
-          fi
-          if [[ -f ".state/kpi_history.csv" ]]; then
-            echo "[kpi_history.csv]"; head -n 5 .state/kpi_history.csv || true
-          fi
-          if [[ -f ".state/why_no_trade.txt" ]]; then
-            echo "[why_no_trade.txt]"; cat .state/why_no_trade.txt || true
-          fi
+          [[ -f ".state/run_summary.txt"  ]] && echo "[run_summary.txt]"  && head -n 50 .state/run_summary.txt  || true
+          [[ -f ".state/positions.json"   ]] && echo "[positions.json]"   && head -n 50 .state/positions.json   || true
+          [[ -f ".state/kpi_history.csv"  ]] && echo "[kpi_history.csv]"  && head -n 5  .state/kpi_history.csv  || true
+          [[ -f ".state/why_no_trade.txt" ]] && echo "[why_no_trade.txt]" && cat      .state/why_no_trade.txt   || true
           echo "----------------------------------------"
+
+      # === KPI CHART ==========================================================
+      - name: Generate KPI chart
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          if [[ -f ".state/kpi_history.csv" ]]; then
+            python - <<'PY'
+import pandas as pd, matplotlib.pyplot as plt
+import os
+os.makedirs(".state", exist_ok=True)
+df = pd.read_csv(".state/kpi_history.csv")
+# tolerate minimal header-only state
+if df.shape[0] >= 1 and "equity" in df.columns:
+    plt.figure()
+    plt.plot(df.index, df["equity"])
+    plt.title("CryptoBOT Equity (run history)")
+    plt.xlabel("run index")
+    plt.ylabel("equity (USD)")
+    plt.tight_layout()
+    plt.savefig(".state/kpi_chart.png")
+    print("kpi_chart.png written")
+else:
+    print("kpi_history.csv empty; skipping chart")
+PY
+          else
+            echo "No kpi_history.csv; skipping chart"
+          fi
 
       - name: Ensure minimal .state snapshot (even if no positions)
         if: always()
@@ -194,7 +220,7 @@ jobs:
           echo "UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> .state/run_summary.txt
           echo "DRY_RUN=${DRY_RUN}" >> .state/run_summary.txt
           [[ -f ".state/positions.json" ]] || echo '{"positions":[],"note":"empty or no open positions at time of snapshot"}' > .state/positions.json
-          [[ -f ".state/kpi_history.csv" ]] || echo "ts_utc,equity,realized_pl,unrealized_pl,notes" > .state/kpi_history.csv
+          [[ -f ".state/kpi_history.csv" ]] || echo "timestamp,equity" > .state/kpi_history.csv
           [[ -f ".state/last_risk_signal.txt" ]] || echo "ON" > .state/last_risk_signal.txt
 
       - name: Flush .state to disk
@@ -244,3 +270,37 @@ jobs:
           name: crypto-state_${{ github.run_id }}_EMPTY
           path: EMPTY_STATE_NOTE.txt
           if-no-files-found: ignore
+
+      # === SLACK NOTIFICATION ================================================
+      - name: Slack alert (if webhook configured)
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        shell: bash
+        run: |
+          if [[ -z "${SLACK_WEBHOOK_URL}" ]]; then
+            echo "No SLACK_WEBHOOK_URL secret; skipping Slack."
+            exit 0
+          fi
+          RUN_ID="${{ github.run_id }}"
+          SUMMARY="unknown"
+          ENTRIES=0; EXITS=0
+          if [[ -f ".state/run_summary.txt" ]]; then
+            SUMMARY=$(tr -d '\r' < .state/run_summary.txt | tail -n +1 | tr '\n' ' ' | sed -E 's/ +/ /g')
+          fi
+          if [[ -f ".state/positions.json" ]]; then
+            ENTRIES=$(grep -o '"positions"' -n .state/positions.json >/dev/null && python - <<'PY'
+import json; 
+import sys
+with open(".state/positions.json","r") as f:
+    j=json.load(f)
+pos=j.get("positions",[])
+print(len(pos))
+PY
+)
+          fi
+          TEXT="CryptoBOT run $RUN_ID finished.\n$SUMMARY\nPositions: $ENTRIES"
+          # Send simple message (no image upload via webhook)
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\": \"${TEXT//\"/\\\"}\"}" \
+            "${SLACK_WEBHOOK_URL}"
