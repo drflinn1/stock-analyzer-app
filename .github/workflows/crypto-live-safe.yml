@@ -26,16 +26,17 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RUN_SWITCH: ${{ inputs.MASTER_SWITCH || 'true' }}
-  DRY_RUN: ${{ (inputs.SIM_MODE || 'true') == 'true' && 'ON' || 'OFF' }}
+  # Map inputs to the strings your bot expects (ON/OFF)
+  RUN_SWITCH: ${{ (inputs.MASTER_SWITCH || 'true') == 'true' && 'ON' || 'OFF' }}
+  DRY_RUN:    ${{ (inputs.SIM_MODE      || 'true') == 'true' && 'ON' || 'OFF' }}
   REQUIRE_RISK_ON: ${{ inputs.REQUIRE_RISK_ON || 'IGNORE' }}
 
-  # === Common sizing/filters (pull from repo Variables if present) ===
+  # === Common sizing/filters (pulled from repo Variables if present) ===
   MIN_BUY_USD:            ${{ vars.MIN_BUY_USD || '10' }}
   RESERVE_CASH_PCT:       ${{ vars.RESERVE_CASH_PCT || '5' }}
-  MAX_POSITIONS:          ${{ vars.MAX_POSITIONS || '6' }}
-  MAX_BUYS_PER_RUN:       ${{ vars.MAX_BUYS_PER_RUN || '1' }}
-  UNIVERSE_TOP_K:         ${{ vars.UNIVERSE_TOP_K || '10' }}
+  MAX_POSITIONS:          ${{ vars.MAX_POSITIONS || '3' }}
+  MAX_BUYS_PER_RUN:       ${{ vars.MAX_BUYS_PER_RUN || '2' }}
+  UNIVERSE_TOP_K:         ${{ vars.UNIVERSE_TOP_K || '25' }}
   ROTATE_WHEN_FULL:       ${{ vars.ROTATE_WHEN_FULL || 'true' }}
   ROTATE_WHEN_CASH_SHORT: ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
 
@@ -64,7 +65,7 @@ jobs:
       - name: Master switch gate
         shell: bash
         run: |
-          if [[ "${RUN_SWITCH}" != "true" ]]; then
+          if [[ "${RUN_SWITCH}" != "ON" ]]; then
             echo "Master switch is OFF → exiting gracefully."
             exit 0
           fi
@@ -125,6 +126,7 @@ jobs:
             echo "No known entrypoint found; proceeding with fallback state generation."
           fi
 
+      # Quick human-readable peek at what the bot wrote
       - name: Print quick .state summary
         if: always()
         shell: bash
@@ -144,6 +146,7 @@ jobs:
           fi
           echo "----------------------------------------"
 
+      # Ensure .state exists even if no trades were made
       - name: Ensure minimal .state snapshot (even if no positions)
         if: always()
         shell: bash
