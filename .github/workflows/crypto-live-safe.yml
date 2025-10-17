@@ -11,29 +11,23 @@ on:
     - cron: "*/5 * * * *"
 
 env:
-  # ---- Core bot toggles ----
   DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
   RUN_SWITCH: "ON"
 
-  # ---- Sizing / counts ----
   MIN_BUY_USD: "10"
   MAX_POSITIONS: "3"
   MAX_BUYS_PER_RUN: "2"
 
-  # ---- Universe / selection ----
   UNIVERSE_TOP_K: "25"
   ROTATE_WHEN_FULL: "true"
   ROTATE_WHEN_CASH_SHORT: "true"
 
-  # ---- Risk / reserve ----
   RESERVE_CASH_PCT: "5"
 
-  # ---- Optional dust/sell knobs (ignored if not used by your code) ----
   MIN_SELL_USD: "10"
   DUST_MIN_USD: "2"
   DUST_SKIP_STABLES: "true"
 
-  # ---- Paths ----
   STATE_DIR: ".state"
   KPI_CSV: ".state/kpi_history.csv"
   KPI_IMG: ".state/kpi_chart.png"
@@ -56,10 +50,8 @@ jobs:
         shell: bash
         run: |
           set -e
-          # Force-install plotting + common libs (even if requirements.txt exists)
           pip install -U pandas matplotlib numpy pyyaml ccxt requests
 
-      # ---------- Run the bot ----------
       - name: Run CryptoBOT
         shell: bash
         env:
@@ -86,5 +78,6 @@ jobs:
         with:
           name: state-${{ github.run_number }}
           path: |
-            .state/**
-          if-no-files-found: warn
+            ./.state
+            ./.state/**
+          if-no-files-found: ignore
