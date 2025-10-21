@@ -1,4 +1,3 @@
-# Refresh visibility
 name: 🔁 Crypto Live — RESET (Full Restore)
 
 on:
@@ -18,15 +17,20 @@ env:
   RUN_SWITCH: "ON"
   DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
   RESET_MODE: ${{ inputs.RESET_MODE || 'FORCE_LIQUIDATE' }}
+
+  # Guard / sizing knobs (baseline values)
   MIN_SELL_USD: 10
   DUST_MIN_USD: 2
   DUST_SKIP_STABLES: true
+
   UNIVERSE_TOP_K: 25
   MAX_POSITIONS: 3
   MAX_BUYS_PER_RUN: 0
   ROTATE_WHEN_FULL: false
   ROTATE_WHEN_CASH_SHORT: false
   RESERVE_CASH_PCT: 5
+
+  # Secrets
   SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
   KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
   KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
@@ -51,14 +55,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
 
+      # --- MAIN RESET STEP (no changes needed to use) ---
       - name: 🧼 Reset or Liquidate
         run: |
           echo "=== Starting CryptoBot RESET ==="
           echo "Mode: $RESET_MODE"
           echo "Dry run: $DRY_RUN"
-
           mkdir -p .state
-
           if [ "$RESET_MODE" = "FORCE_LIQUIDATE" ]; then
             echo "💣 FORCE LIQUIDATING all positions..."
             python trader/broker_crypto_ccxt.py --force-liquidate --dry-run=$DRY_RUN
@@ -67,8 +70,36 @@ jobs:
             rm -rf .state/positions.json .state/kpi_history.csv
             python tools/dust_sweeper.py --min-usd=$DUST_MIN_USD --skip-stables=$DUST_SKIP_STABLES --dry-run=$DRY_RUN
           fi
-
           echo "✅ Reset completed."
+
+      # --- NEW ONE-LINER EFFECT (you asked for) ---
+      # EXACT PLACEMENT: put this step immediately AFTER the "🧼 Reset or Liquidate" step and BEFORE the artifact upload.
+      - name: 🧱 Write September baseline guard-pack (.state/baseline_config.json)
+        run: |
+          mkdir -p .state
+          # Write a baseline snapshot using current env knobs (no wiping; safe to run every time)
+          cat > .state/baseline_config.json <<JSON
+          {
+            "created_at": "$(date -u +\"%Y-%m-%dT%H:%M:%SZ\")",
+            "label": "September Good Baseline",
+            "guards": {
+              "UNIVERSE_TOP_K": ${UNIVERSE_TOP_K},
+              "MAX_POSITIONS": ${MAX_POSITIONS},
+              "MAX_BUYS_PER_RUN": ${MAX_BUYS_PER_RUN},
+              "ROTATE_WHEN_FULL": ${ROTATE_WHEN_FULL},
+              "ROTATE_WHEN_CASH_SHORT": ${ROTATE_WHEN_CASH_SHORT},
+              "RESERVE_CASH_PCT": ${RESERVE_CASH_PCT},
+              "MIN_SELL_USD": ${MIN_SELL_USD},
+              "DUST_MIN_USD": ${DUST_MIN_USD},
+              "DUST_SKIP_STABLES": ${DUST_SKIP_STABLES}
+            },
+            "notes": [
+              "Auto-written by crypto-live-reset.yml after reset.",
+              "Use DRY_RUN=ON to simulate other steps safely."
+            ]
+          }
+          JSON
+          echo "Wrote .state/baseline_config.json"
 
       - name: 📤 Upload state artifacts
         if: always()
