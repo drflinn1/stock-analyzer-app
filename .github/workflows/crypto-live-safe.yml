@@ -1,85 +1,104 @@
-name: Crypto Live — ONE $10 TEST (manual)
+name: 🔴 Crypto Live — SAFE (manual $10 test)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: 'ON = simulate, OFF = live'
+        required: false
+        default: 'OFF'
 
 env:
-  # --- FORCE LIVE for this one test ---
-  DRY_RUN: "OFF"
+  # ---- Force conservative test defaults ----
   RUN_SWITCH: "ON"
+  DRY_RUN: ${{ inputs.DRY_RUN || 'OFF' }}
 
-  # --- One tiny buy only ---
+  # One tiny buy only
   MIN_BUY_USD: "10"
   MAX_BUYS_PER_RUN: "1"
   MAX_POSITIONS: "1"
 
-  # --- Disable churn for the test ---
-  ROTATE_WHEN_FULL: "false"
-  ROTATE_WHEN_CASH_SHORT: "false"
-
-  # --- Keep everything else safe/default ---
+  # Guards (will be overridden by baseline file if present)
   UNIVERSE_TOP_K: "25"
   RESERVE_CASH_PCT: "5"
+  ROTATE_WHEN_FULL: "false"
+  ROTATE_WHEN_CASH_SHORT: "true"
   MIN_SELL_USD: "10"
   DUST_MIN_USD: "2"
   DUST_SKIP_STABLES: "true"
 
-  STATE_DIR: ".state"
-  KPI_CSV: ".state/kpi_history.csv"
-  KPI_IMG: ".state/kpi_chart.png"
+  # Secrets
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+  KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
 jobs:
-  live_test:
+  live_safe:
+    name: ▶️ Run SAFE manual test
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
+
     steps:
-      - name: Checkout
+      - name: 🧩 Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      # <<< NEW: auto-load baseline guard-pack if .state/baseline_config.json exists >>>
+      - name: 🔽 Load baseline guard-pack (if present)
+        if: ${{ hashFiles('.state/baseline_config.json') != '' }}
+        run: |
+          echo "Loading guards from .state/baseline_config.json ..."
+          python - <<'PY'
+import json, os
+p = '.state/baseline_config.json'
+with open(p, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+guards = (data.get('guards') or {})
+env_path = os.environ['GITHUB_ENV']
+with open(env_path, 'a', encoding='utf-8') as env:
+    for k in [
+        'UNIVERSE_TOP_K','MAX_POSITIONS','MAX_BUYS_PER_RUN',
+        'ROTATE_WHEN_FULL','ROTATE_WHEN_CASH_SHORT','RESERVE_CASH_PCT',
+        'MIN_SELL_USD','DUST_MIN_USD','DUST_SKIP_STABLES'
+    ]:
+        v = guards.get(k)
+        if isinstance(v, bool):
+            v = str(v).lower()
+        env.write(f"{k}={v}\n")
+print("Baseline guards loaded into env.")
+PY
+
+      - name: ⚙️ Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install deps
-        shell: bash
+      - name: 📦 Install dependencies
         run: |
-          set -e
-          pip install -U pandas matplotlib numpy pyyaml ccxt requests
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Sanity check (must be LIVE)
-        shell: bash
-        run: |
-          echo "DRY_RUN=${DRY_RUN}"
-          if [[ "${DRY_RUN}" == "ON" ]]; then
-            echo "This test workflow must run LIVE. Aborting."
-            exit 1
-          fi
-
-      - name: Run CryptoBOT (LIVE $10 test)
-        shell: bash
+      - name: 🤖 Run Crypto Bot (SAFE)
         env:
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          MODE: "CRYPTO"
         run: |
-          set -e
-          python -V
-          echo "Mode should be LIVE. RUN_SWITCH=${RUN_SWITCH}"
+          echo "DRY_RUN=${DRY_RUN}  MIN_BUY_USD=${MIN_BUY_USD}  MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}  MAX_POSITIONS=${MAX_POSITIONS}"
           python main.py
 
-      - name: Generate KPI chart
-        if: always()
-        shell: bash
+      - name: 📊 Make KPI chart (optional)
         run: |
-          set -e
-          python tools/make_kpi_chart.py || echo "KPI chart step finished with non-fatal status."
+          mkdir -p .state
+          python tools/make_kpi_chart.py || true
 
-      - name: Upload .state (KPI chart & logs)
-        if: always()
+      - name: 📤 Upload artifacts (.state)
         uses: actions/upload-artifact@v4
         with:
-          name: state-${{ github.run_number }}
-          path: |
-            ./.state
-            ./.state/**
-          if-no-files-found: ignore
+          name: crypto-live-safe-state
+          path: .state
+
+      - name: 📡 Slack Notify (optional)
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          msg="SAFE run finished. DRY_RUN=${DRY_RUN} | MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN} | MAX_POSITIONS=${MAX_POSITIONS}"
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"$msg\"}" \
+            $SLACK_WEBHOOK_URL
