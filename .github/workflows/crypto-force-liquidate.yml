@@ -4,12 +4,24 @@ on:
   workflow_dispatch:
     inputs:
       CONFIRM:
-        description: 'Type EXACTLY: I UNDERSTAND THIS WILL SELL ALL NON-USD ASSETS'
+        description: "Type EXACTLY: I UNDERSTAND THIS WILL SELL ALL NON-USD ASSETS"
         required: true
       DRY_RUN:
-        description: 'true = simulate only, false = place real sells'
+        description: "true = simulate only, false = place real sells"
         required: true
-        default: 'true'
+        default: "true"
+      MIN_SELL_USD:
+        description: "Skip sells smaller than this (e.g., 10)"
+        required: false
+        default: "10"
+      DUST_MIN_USD:
+        description: "Treat positions smaller than this as dust (skip). Example: 2"
+        required: false
+        default: "2"
+      DUST_SKIP_STABLES:
+        description: "Skip stables during liquidation (true/false)"
+        required: false
+        default: "true"
 
 env:
   PYTHON_VERSION: "3.11"
@@ -20,14 +32,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install deps
+        shell: bash
         run: |
+          set -e
           python -m pip install --upgrade pip
           pip install ccxt==4.4.46
 
@@ -37,5 +53,10 @@ jobs:
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
           KRAKEN_API_PASSWORD: ${{ secrets.KRAKEN_API_PASSWORD }}
           DRY_RUN: ${{ github.event.inputs.DRY_RUN }}
+          MIN_SELL_USD: ${{ github.event.inputs.MIN_SELL_USD }}
+          DUST_MIN_USD: ${{ github.event.inputs.DUST_MIN_USD }}
+          DUST_SKIP_STABLES: ${{ github.event.inputs.DUST_SKIP_STABLES }}
+        shell: bash
         run: |
+          set -e
           python -u scripts/force_liquidate_kraken.py
