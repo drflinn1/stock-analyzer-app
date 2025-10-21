@@ -1,29 +1,25 @@
-name: Crypto Live — Safe (every 5m)
+name: Crypto Live — ONE $10 TEST (manual)
 
 on:
-  workflow_dispatch:
-    inputs:
-      DRY_RUN:
-        description: "ON or OFF (default ON for safety)"
-        required: false
-        default: "ON"
-  schedule:
-    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
 
 env:
-  DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
+  # --- FORCE LIVE for this one test ---
+  DRY_RUN: "OFF"
   RUN_SWITCH: "ON"
 
+  # --- One tiny buy only ---
   MIN_BUY_USD: "10"
-  MAX_POSITIONS: "3"
-  MAX_BUYS_PER_RUN: "2"
+  MAX_BUYS_PER_RUN: "1"
+  MAX_POSITIONS: "1"
 
+  # --- Disable churn for the test ---
+  ROTATE_WHEN_FULL: "false"
+  ROTATE_WHEN_CASH_SHORT: "false"
+
+  # --- Keep everything else safe/default ---
   UNIVERSE_TOP_K: "25"
-  ROTATE_WHEN_FULL: "true"
-  ROTATE_WHEN_CASH_SHORT: "true"
-
   RESERVE_CASH_PCT: "5"
-
   MIN_SELL_USD: "10"
   DUST_MIN_USD: "2"
   DUST_SKIP_STABLES: "true"
@@ -33,10 +29,9 @@ env:
   KPI_IMG: ".state/kpi_chart.png"
 
 jobs:
-  live:
+  live_test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,7 +47,16 @@ jobs:
           set -e
           pip install -U pandas matplotlib numpy pyyaml ccxt requests
 
-      - name: Run CryptoBOT
+      - name: Sanity check (must be LIVE)
+        shell: bash
+        run: |
+          echo "DRY_RUN=${DRY_RUN}"
+          if [[ "${DRY_RUN}" == "ON" ]]; then
+            echo "This test workflow must run LIVE. Aborting."
+            exit 1
+          fi
+
+      - name: Run CryptoBOT (LIVE $10 test)
         shell: bash
         env:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
@@ -60,10 +64,9 @@ jobs:
         run: |
           set -e
           python -V
-          echo "DRY_RUN=${DRY_RUN} RUN_SWITCH=${RUN_SWITCH}"
+          echo "Mode should be LIVE. RUN_SWITCH=${RUN_SWITCH}"
           python main.py
 
-      # ---------- Generate KPI chart ----------
       - name: Generate KPI chart
         if: always()
         shell: bash
@@ -71,7 +74,6 @@ jobs:
           set -e
           python tools/make_kpi_chart.py || echo "KPI chart step finished with non-fatal status."
 
-      # ---------- Upload artifacts ----------
       - name: Upload .state (KPI chart & logs)
         if: always()
         uses: actions/upload-artifact@v4
