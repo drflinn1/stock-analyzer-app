@@ -1,0 +1,88 @@
+name: 🔁 Crypto Live — RESET (Full Restore)
+
+on:
+  workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: 'Use OFF for real trades; ON for simulation only'
+        required: false
+        default: 'ON'
+      RESET_MODE:
+        description: 'Choose: FORCE_LIQUIDATE or CLEAN_REINIT'
+        required: false
+        default: 'FORCE_LIQUIDATE'
+
+env:
+  RUN_NAME: "CryptoBot RESET"
+  RUN_SWITCH: "ON"
+  DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
+  RESET_MODE: ${{ inputs.RESET_MODE || 'FORCE_LIQUIDATE' }}
+  MIN_SELL_USD: 10
+  DUST_MIN_USD: 2
+  DUST_SKIP_STABLES: true
+  UNIVERSE_TOP_K: 25
+  MAX_POSITIONS: 3
+  MAX_BUYS_PER_RUN: 0
+  ROTATE_WHEN_FULL: false
+  ROTATE_WHEN_CASH_SHORT: false
+  RESERVE_CASH_PCT: 5
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+  KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
+jobs:
+  reset:
+    name: 🔄 Reset Crypto Portfolio
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 🧩 Checkout repo
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+
+      - name: 🧼 Reset or Liquidate
+        run: |
+          echo "=== Starting CryptoBot RESET ==="
+          echo "Mode: $RESET_MODE"
+          echo "Dry run: $DRY_RUN"
+
+          mkdir -p .state
+
+          if [ "$RESET_MODE" = "FORCE_LIQUIDATE" ]; then
+            echo "💣 FORCE LIQUIDATING all positions..."
+            python trader/broker_crypto_ccxt.py --force-liquidate --dry-run=$DRY_RUN
+          else
+            echo "🧹 CLEAN REINIT — clearing old state and dust..."
+            rm -rf .state/positions.json .state/kpi_history.csv
+            python tools/dust_sweeper.py --min-usd=$DUST_MIN_USD --skip-stables=$DUST_SKIP_STABLES --dry-run=$DRY_RUN
+          fi
+
+          echo "✅ Reset completed."
+
+      - name: 📤 Upload state artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-reset-state
+          path: .state
+
+      - name: 📡 Slack Notify (optional)
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          msg="*${RUN_NAME}* finished. Mode: ${RESET_MODE} | DryRun: ${DRY_RUN}"
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"$msg\"}" \
+            $SLACK_WEBHOOK_URL
+
+      - name: ✅ Done
+        run: echo "CryptoBot RESET completed successfully."
