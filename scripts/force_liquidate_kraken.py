@@ -1,203 +1,131 @@
 #!/usr/bin/env python3
-import os, time, csv
-from datetime import datetime
-from typing import Dict, Tuple, Optional
+# -*- coding: utf-8 -*-
 
-import ccxt
+"""
+Force liquidation script for Kraken via ccxt.
+- Sells all non-USD spot holdings at market.
+- Skips stables if DUST_SKIP_STABLES=true.
+- Skips tiny positions below DUST_MIN_USD; and below MIN_SELL_USD for actual sell.
+- Honors DRY_RUN=true to only print actions.
 
-USD_KEYS = {"USD", "ZUSD"}
-STABLES = {"USDT", "USDC", "DAI"}
+Env (passed by workflow):
+  KRAKEN_API_KEY, KRAKEN_API_SECRET, KRAKEN_API_PASSWORD (optional)
+  DRY_RUN: "true" | "false"
+  MIN_SELL_USD: default 10
+  DUST_MIN_USD: default 2
+  DUST_SKIP_STABLES: "true" | "false"
+"""
 
-def now_ts():
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+import os
+import sys
+import time
+from typing import Dict
 
-def fnum(x) -> str:
+import ccxt  # type: ignore
+
+def env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1","true","on","yes")
+
+def env_float(name: str, default: float) -> float:
     try:
-        return f"{float(x):,.8f}".rstrip('0').rstrip('.')
-    except Exception:
-        return str(x)
-
-def safe_float(x, default=0.0):
-    try:
-        return float(x)
+        return float(os.environ.get(name, default))
     except Exception:
         return default
 
-def pick_symbol_to_usd(markets: Dict[str, dict], base: str) -> Tuple[Optional[str], Optional[str]]:
-    for candidate in (f"{base}/USD", f"{base.upper()}/USD"):
-        if candidate in markets and markets[candidate].get("active"):
-            return candidate, None
-    for b in (base, base.upper()):
-        s1 = f"{b}/USDT"
-        if s1 in markets and markets[s1].get("active") and "USDT/USD" in markets and markets["USDT/USD"].get("active"):
-            return s1, "USDT/USD"
-    for b in (base, base.upper()):
-        s1 = f"{b}/USDC"
-        if s1 in markets and markets[s1].get("active") and "USDC/USD" in markets and markets["USDC/USD"].get("active"):
-            return s1, "USDC/USD"
-    return None, None
-
-def base_candidates(asset_code: str):
-    u = asset_code.upper()
-    cands = [u]
-    if u.startswith(("X", "Z")) and len(u) > 3:
-        cands.append(u[1:])
-    if u.endswith(".S"):
-        cands.append(u.replace(".S", ""))
-    return cands
-
 def main():
-    dry_run = (os.getenv("DRY_RUN", "true").lower() == "true")
-    api_key = os.getenv("KRAKEN_API_KEY", "")
-    api_sec = os.getenv("KRAKEN_API_SECRET", "")
-    api_pwd = os.getenv("KRAKEN_API_PASSWORD") or None
+    api_key = os.environ.get("KRAKEN_API_KEY", "")
+    api_secret = os.environ.get("KRAKEN_API_SECRET", "")
+    api_password = os.environ.get("KRAKEN_API_PASSWORD", None)
 
-    print("="*80)
-    print(f"[{now_ts()}] 🚨 FORCE LIQUIDATE START  (DRY_RUN={dry_run})")
-    print("="*80)
+    if not api_key or not api_secret:
+        print("[force] Missing Kraken API credentials. Aborting.")
+        sys.exit(1)
 
-    if not api_key or not api_sec:
-        print("ERROR: Missing KRAKEN_API_KEY or KRAKEN_API_SECRET.")
-        raise SystemExit(2)
+    DRY_RUN = env_bool("DRY_RUN", True)
+    MIN_SELL_USD = env_float("MIN_SELL_USD", 10.0)
+    DUST_MIN_USD = env_float("DUST_MIN_USD", 2.0)
+    DUST_SKIP_STABLES = env_bool("DUST_SKIP_STABLES", True)
 
-    exchange = ccxt.kraken({
+    print(f"[force] DRY_RUN={DRY_RUN}  MIN_SELL_USD={MIN_SELL_USD}  DUST_MIN_USD={DUST_MIN_USD}  DUST_SKIP_STABLES={DUST_SKIP_STABLES}")
+
+    ex = ccxt.kraken({
         "apiKey": api_key,
-        "secret": api_sec,
-        "password": api_pwd,
+        "secret": api_secret,
+        "password": api_password or None,
         "enableRateLimit": True,
+        "options": {"adjustForTimeDifference": True},
     })
+    ex.load_markets()
 
-    exchange.load_markets()
-    markets: Dict[str, dict] = exchange.markets
+    # Stables we won't sell into themselves
+    STABLES = {"USD", "USDT", "USDC", "EUR", "GBP"}
 
-    # 0) Cancel open orders
-    try:
-        print(f"[{now_ts()}] Cancelling open orders…")
-        open_orders = exchange.fetch_open_orders()
-        if open_orders:
-            print(f"Found {len(open_orders)} open orders.")
-            if not dry_run:
-                for o in open_orders:
-                    try:
-                        exchange.cancel_order(o["id"], symbol=o.get("symbol"))
-                        time.sleep(exchange.rateLimit/1000)
-                    except Exception as e:
-                        print(f"Cancel failed for {o.get('id')}: {e}")
-            else:
-                print("  (SIMULATION) Skipping actual cancels.")
-        else:
-            print("No open orders.")
-    except Exception as e:
-        print(f"Warn: could not fetch/cancel open orders: {e}")
+    balances = ex.fetch_balance()
+    tickers = ex.fetch_tickers()
 
-    # 1) Snapshot balances → CSV
-    print(f"[{now_ts()}] Fetching balances…")
-    bal = exchange.fetch_balance()
-    total = bal.get("total", {}) or {}
-    snapshot_path = f"force_liquidate_snapshot_{int(time.time())}.csv"
-    with open(snapshot_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["asset", "total"])
-        for k, v in sorted(total.items()):
-            amt = safe_float(v)
-            if amt:
-                w.writerow([k, amt])
-    print(f"Saved pre-liquidation snapshot: {snapshot_path}")
+    def usd_price(symbol: str) -> float:
+        t = tickers.get(symbol, {})
+        return float(t.get("last") or t.get("close") or 0.0)
 
-    # 2) Build liquidation list
-    liquidation: Dict[str, float] = {}
-    usd_total = 0.0
-    for asset, amount in total.items():
-        amt = safe_float(amount)
-        if amt <= 0:
+    # Collect all non-USD spot holdings
+    to_liquidate = []
+    for sym, m in ex.markets.items():
+        # we only care about USD-quoted spot markets
+        if "/" not in sym or not sym.endswith("/USD"):
             continue
-        if asset in USD_KEYS:
-            usd_total += amt
+        base = m["base"]
+        if DUST_SKIP_STABLES and base.upper() in STABLES:
             continue
-        liquidation[asset] = amt
+        qty = float(balances.get(base, {}).get("total") or 0.0)
+        if qty <= 0:
+            continue
+        price = usd_price(sym)
+        usd_val = qty * price
+        if usd_val < DUST_MIN_USD:
+            print(f"[force] Skip dust {sym}: qty={qty:.8f} (~${usd_val:.2f})")
+            continue
+        to_liquidate.append((sym, qty, price, usd_val))
 
-    print(f"USD/ZUSD balance: {fnum(usd_total)}")
-    if not liquidation:
-        print("Nothing to liquidate. Exiting cleanly.")
+    if not to_liquidate:
+        cash = float(balances.get("USD", {}).get("total") or 0.0)
+        print(f"[force] Nothing to liquidate. USD balance=${cash:.2f}")
         return
 
-    sell_results = []
-    for asset, amt in liquidation.items():
-        print("-"*80)
-        print(f"[{now_ts()}] Asset {asset} — amount {fnum(amt)}")
+    total_positions = 0
+    sold_notional = 0.0
 
-        selected = None
-        for cand in base_candidates(asset):
-            s1, s2 = pick_symbol_to_usd(markets, cand)
-            if s1:
-                selected = (cand, s1, s2)
-                break
-        if not selected:
-            print(f"!! No USD path found for {asset}. Skipping (left as-is).")
+    for sym, qty, price, usd_val in to_liquidate:
+        if usd_val < MIN_SELL_USD:
+            print(f"[force] Skip small {sym}: ~${usd_val:.2f} < MIN_SELL_USD({MIN_SELL_USD})")
             continue
 
-        base, first_leg, second_leg = selected
-
-        # First leg
-        try:
-            m1 = markets[first_leg]
-            min_amt = (m1.get("limits", {}) or {}).get("amount", {}).get("min") or 0.0
-            use_amt = max(0.0, float(amt) * 0.999)  # leave dust
-            if use_amt < float(min_amt):
-                print(f"Too small for {first_leg}: amt={fnum(use_amt)} < min={fnum(min_amt)}. Skipping.")
-                continue
-
-            use_amt_precise = exchange.amount_to_precision(first_leg, use_amt)
-            print(f"First leg: MARKET SELL {use_amt_precise} {base} on {first_leg}")
-            if not dry_run:
-                order1 = exchange.create_order(first_leg, "market", "sell", float(use_amt_precise))
-                print(f"  → Order1 id {order1.get('id')}")
-            else:
-                print("  (SIMULATION) Not placing order.")
-            time.sleep(exchange.rateLimit/1000)
-        except Exception as e:
-            print(f"ERROR first leg {first_leg}: {e}")
+        # Precision & min notional
+        qty = float(ex.amount_to_precision(sym, qty))
+        m = ex.markets.get(sym, {})
+        min_cost = float(((m.get("limits") or {}).get("cost") or {}).get("min") or 0.0)
+        if min_cost and usd_val < min_cost:
+            print(f"[force] Skip {sym}: ~${usd_val:.2f} < exchange min cost ${min_cost}")
             continue
 
-        # Second leg (stable → USD)
-        if second_leg:
+        print(f"[force] SELL {sym} qty≈{qty} (~${usd_val:.2f}) @ ~${price:.6f}")
+        if not DRY_RUN:
             try:
-                time.sleep(exchange.rateLimit/1000)
-                bal2 = exchange.fetch_balance() if not dry_run else {"total": {}}
-                stable_ccy = second_leg.split("/")[0]
-                stable_amt = safe_float(bal2.get("total", {}).get(stable_ccy, 0))
-                if stable_amt <= 0:
-                    print(f"Second leg: no {stable_ccy} detected (may be pending). You can re-run later.")
-                else:
-                    stable_amt_use = stable_amt * 0.999
-                    stable_amt_precise = exchange.amount_to_precision(second_leg, stable_amt_use)
-                    print(f"Second leg: MARKET SELL {stable_amt_precise} {stable_ccy} on {second_leg}")
-                    if not dry_run:
-                        order2 = exchange.create_order(second_leg, "market", "sell", float(stable_amt_precise))
-                        print(f"  → Order2 id {order2.get('id')}")
-                    else:
-                        print("  (SIMULATION) Not placing order.")
-                    time.sleep(exchange.rateLimit/1000)
+                ex.create_market_sell_order(sym, qty)
+                total_positions += 1
+                sold_notional += usd_val
+                # polite rate-limit
+                time.sleep(0.75)
             except Exception as e:
-                print(f"ERROR second leg {second_leg}: {e}")
+                print(f"[force] Sell failed for {sym}: {e}")
 
-        sell_results.append((asset, amt, first_leg, second_leg or ""))
+    balances_after = ex.fetch_balance()
+    cash_after = float(balances_after.get("USD", {}).get("total") or balances_after.get("USD", {}).get("free") or 0.0)
 
-    # 4) Final USD total
-    try:
-        time.sleep(exchange.rateLimit/1000)
-        final_bal = exchange.fetch_balance()
-        final_usd = sum(safe_float(final_bal.get("total", {}).get(k, 0)) for k in USD_KEYS)
-        print("-"*80)
-        print(f"[{now_ts()}] ✅ Done. USD-equivalents after liquidations: {fnum(final_usd)} (DRY_RUN={dry_run})")
-    except Exception as e:
-        print(f"Warn: could not fetch final USD: {e}")
-
-    print("="*80)
-    print("SUMMARY of attempted sells:")
-    for row in sell_results:
-        print(f"  - {row[0]}  amt={fnum(row[1])}  via {row[2]}  then {row[3]}")
-    print("="*80)
+    print(f"[summary] Positions sold: {total_positions}  Notional≈${sold_notional:.2f}")
+    print(f"[summary] USD balance after liquidation: ${cash_after:.2f}")
 
 if __name__ == "__main__":
     main()
