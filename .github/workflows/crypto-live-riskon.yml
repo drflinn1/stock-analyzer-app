@@ -1,145 +1,102 @@
-name: Crypto Live — Risk-On (every 5m)
+name: 🟢 Crypto Live — RISK-ON (every 5m)
 
 on:
+  schedule:
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: "ON = paper, OFF = live"
-        type: choice
-        options: ["ON", "OFF"]
-        default: "OFF"
-  schedule:
-    - cron: "*/5 * * * *"
-
-concurrency:
-  group: crypto-live-riskon
-  cancel-in-progress: false
+        description: 'ON = simulate, OFF = live'
+        required: false
+        default: 'ON'
 
 env:
-  PYTHON_VERSION: "3.11"
+  RUN_SWITCH: "ON"
+  DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
 
-  # Risk-On emphasis
-  RESERVE_CASH_PCT: "5.0"
-  UNIVERSE_MIN_USD_VOL: "500000"
-  UNIVERSE_TOP_K: "12"
-
-  EXCHANGE: "kraken"
-  QUOTE: "USD"
-  AUTO_UNIVERSE: "true"
-  UNIVERSE_EXCLUDE: "USDT,USDC,EUR,GBP,USD,SPX,PUMP,BABY"
-  MAX_SPREAD_PCT: "0.60"
-  MIN_TRADE_NOTIONAL_USD: "5"
-
-  MAX_POSITIONS: "8"
-  USD_PER_TRADE: "20"
-  MAX_BUYS_PER_RUN: "2"
+  # Baseline guards (can be overridden by baseline file)
+  UNIVERSE_TOP_K: "25"
+  MAX_POSITIONS: "3"
+  MAX_BUYS_PER_RUN: "1"
+  RESERVE_CASH_PCT: "5"
   ROTATE_WHEN_FULL: "true"
   ROTATE_WHEN_CASH_SHORT: "true"
+  MIN_BUY_USD: "10"
+  MIN_SELL_USD: "10"
   DUST_MIN_USD: "2"
+  DUST_SKIP_STABLES: "true"
 
-  TAKE_PROFIT_PCT: "3"
-  STOP_LOSS_PCT: "2"
-  TRAIL_STOP_PCT: "1"
-  EMERGENCY_SL_PCT: "8"
-  MAX_DAILY_LOSS_PCT: "5"
-  MAX_DAILY_ENTRIES: "6"
-
-  CLEANUP_NON_UNIVERSE: "true"
-  NONUNI_SELL_IF_DOWN_PCT: "0"
-  NONUNI_KEEP_IF_WINNER_PCT: "6"
-
-  RUN_SWITCH: "ON"
-
-  STATE_DIR: ".state"
-  KPI_CSV: ".state/kpi_history.csv"
-  KPI_CHART: ".state/kpi_chart.png"
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+  KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
 jobs:
-  run:
+  live_riskon:
+    name: ▶️ Run RISK-ON loop
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout
+      - name: 🧩 Checkout repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Set up Python
+      # <<< NEW: auto-load baseline guard-pack if .state/baseline_config.json exists >>>
+      - name: 🔽 Load baseline guard-pack (if present)
+        if: ${{ hashFiles('.state/baseline_config.json') != '' }}
+        run: |
+          echo "Loading guards from .state/baseline_config.json ..."
+          python - <<'PY'
+import json, os
+p = '.state/baseline_config.json'
+with open(p, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+guards = (data.get('guards') or {})
+env_path = os.environ['GITHUB_ENV']
+with open(env_path, 'a', encoding='utf-8') as env:
+    for k in [
+        'UNIVERSE_TOP_K','MAX_POSITIONS','MAX_BUYS_PER_RUN',
+        'ROTATE_WHEN_FULL','ROTATE_WHEN_CASH_SHORT','RESERVE_CASH_PCT',
+        'MIN_SELL_USD','DUST_MIN_USD','DUST_SKIP_STABLES'
+    ]:
+        v = guards.get(k)
+        if isinstance(v, bool):
+            v = str(v).lower()
+        env.write(f"{k}={v}\n")
+print("Baseline guards loaded into env.")
+PY
+
+      - name: ⚙️ Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: '3.11'
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install deps
+      - name: 📦 Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install ccxt requests pandas matplotlib
-          fi
+          pip install -r requirements.txt
 
-      - name: Print preset banner
-        run: |
-          echo "================ RISK-ON PRESET ================"
-          echo "DRY_RUN=${{ inputs.DRY_RUN }}"
-          echo "RESERVE_CASH_PCT=${{ env.RESERVE_CASH_PCT }}%"
-          echo "UNIVERSE_MIN_USD_VOL=${{ env.UNIVERSE_MIN_USD_VOL }}"
-          echo "UNIVERSE_TOP_K=${{ env.UNIVERSE_TOP_K }}"
-          echo "MAX_POSITIONS=${{ env.MAX_POSITIONS }}"
-          echo "MAX_BUYS_PER_RUN=${{ env.MAX_BUYS_PER_RUN }}"
-          echo "================================================"
-
-      - name: Run Bot
+      - name: 🤖 Run Crypto Bot (RISK-ON)
         env:
-          DRY_RUN: ${{ inputs.DRY_RUN }}
-
-          # provide both sets (fallback copies CCXT_* into KRAKEN_*)
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          CCXT_API_KEY: ${{ secrets.CCXT_API_KEY }}
-          CCXT_API_SECRET: ${{ secrets.CCXT_API_SECRET }}
-
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          MODE: "CRYPTO"
         run: |
-          set -e
-          if [ -z "${KRAKEN_API_KEY}" ] && [ -n "${CCXT_API_KEY}" ]; then
-            export KRAKEN_API_KEY="${CCXT_API_KEY}"
-            export KRAKEN_API_SECRET="${CCXT_API_SECRET}"
-            echo "[env] Fallback: using CCXT_* values for KRAKEN_*"
-          fi
-          python -u main.py
+          echo "DRY_RUN=${DRY_RUN}  UNIVERSE_TOP_K=${UNIVERSE_TOP_K}  MAX_POSITIONS=${MAX_POSITIONS}  MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}"
+          python main.py
 
-      - name: Build KPI chart (if present)
+      - name: 📊 Make KPI chart (optional)
         run: |
-          if [ -f tools/make_kpi_chart.py ] && [ -f "${{ env.KPI_CSV }}" ]; then
-            python tools/make_kpi_chart.py "${{ env.KPI_CSV }}" "${{ env.KPI_CHART }}" || true
-          else
-            echo "KPI chart script or CSV not found; skipping."
-          fi
+          mkdir -p .state
+          python tools/make_kpi_chart.py || true
 
-      - name: Upload .state artifacts
-        if: always()
+      - name: 📤 Upload artifacts (.state)
         uses: actions/upload-artifact@v4
         with:
-          name: riskon-state-${{ github.run_id }}
-          path: |
-            .state/**
-            !.state/**/*.tmp
-          if-no-files-found: warn
+          name: crypto-live-riskon-state
+          path: .state
 
-      - name: Upload logs (best-effort)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: riskon-logs-${{ github.run_id }}
-          path: |
-            logs/**
-          if-no-files-found: ignore
+      - name: 📡 Slack Notify (optional)
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          msg="RISK-ON run finished. DRY_RUN=${DRY_RUN} | TOP_K=${UNIVERSE_TOP_K} | MAX_POSITIONS=${MAX_POSITIONS}"
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"$msg\"}" \
+            $SLACK_WEBHOOK_URL
