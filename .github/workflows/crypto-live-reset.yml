@@ -18,7 +18,6 @@ env:
   DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
   RESET_MODE: ${{ inputs.RESET_MODE || 'FORCE_LIQUIDATE' }}
 
-  # Guard / sizing knobs (baseline values)
   MIN_SELL_USD: 10
   DUST_MIN_USD: 2
   DUST_SKIP_STABLES: true
@@ -30,7 +29,6 @@ env:
   ROTATE_WHEN_CASH_SHORT: false
   RESERVE_CASH_PCT: 5
 
-  # Secrets
   SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
   KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
   KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
@@ -55,7 +53,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
 
-      # --- MAIN RESET STEP (no changes needed to use) ---
       - name: 🧼 Reset or Liquidate
         run: |
           echo "=== Starting CryptoBot RESET ==="
@@ -72,12 +69,9 @@ jobs:
           fi
           echo "✅ Reset completed."
 
-      # --- NEW ONE-LINER EFFECT (you asked for) ---
-      # EXACT PLACEMENT: put this step immediately AFTER the "🧼 Reset or Liquidate" step and BEFORE the artifact upload.
       - name: 🧱 Write September baseline guard-pack (.state/baseline_config.json)
         run: |
           mkdir -p .state
-          # Write a baseline snapshot using current env knobs (no wiping; safe to run every time)
           cat > .state/baseline_config.json <<JSON
           {
             "created_at": "$(date -u +\"%Y-%m-%dT%H:%M:%SZ\")",
@@ -100,6 +94,11 @@ jobs:
           }
           JSON
           echo "Wrote .state/baseline_config.json"
+
+      - name: 📂 List .state
+        run: |
+          echo "Contents of .state:"
+          ls -al .state || true
 
       - name: 📤 Upload state artifacts
         if: always()
