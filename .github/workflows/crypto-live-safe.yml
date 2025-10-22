@@ -48,49 +48,50 @@ jobs:
 
       # 2) Fallback baseline if missing
       - name: 🧱 Fallback: write baseline from env (only if missing)
+        shell: bash
         run: |
           mkdir -p .state
           if [ ! -f ".state/baseline_config.json" ]; then
             echo "No baseline artifact found; writing fallback baseline from env..."
-            cat > .state/baseline_config.json <<JSON
-            {
-              "label": "Fallback Baseline (from env)",
-              "guards": {
-                "UNIVERSE_TOP_K": ${UNIVERSE_TOP_K},
-                "MAX_POSITIONS": ${MAX_POSITIONS},
-                "MAX_BUYS_PER_RUN": ${MAX_BUYS_PER_RUN:-1},
-                "ROTATE_WHEN_FULL": ${ROTATE_WHEN_FULL},
-                "ROTATE_WHEN_CASH_SHORT": ${ROTATE_WHEN_CASH_SHORT},
-                "RESERVE_CASH_PCT": ${RESERVE_CASH_PCT},
-                "MIN_SELL_USD": ${MIN_SELL_USD},
-                "DUST_MIN_USD": ${DUST_MIN_USD},
-                "DUST_SKIP_STABLES": ${DUST_SKIP_STABLES}
-              }
-            }
-            JSON
+            cat <<'JSON' > .state/baseline_config.json
+{
+  "label": "Fallback Baseline (from env)",
+  "guards": {
+    "UNIVERSE_TOP_K": ${UNIVERSE_TOP_K},
+    "MAX_POSITIONS": ${MAX_POSITIONS},
+    "MAX_BUYS_PER_RUN": ${MAX_BUYS_PER_RUN:-1},
+    "ROTATE_WHEN_FULL": ${ROTATE_WHEN_FULL},
+    "ROTATE_WHEN_CASH_SHORT": ${ROTATE_WHEN_CASH_SHORT},
+    "RESERVE_CASH_PCT": ${RESERVE_CASH_PCT},
+    "MIN_SELL_USD": ${MIN_SELL_USD},
+    "DUST_MIN_USD": ${DUST_MIN_USD},
+    "DUST_SKIP_STABLES": ${DUST_SKIP_STABLES}
+  }
+}
+JSON
           fi
           ls -al .state || true
 
       # 3) Load baseline guard-pack
       - name: 🔽 Load baseline guard-pack
         if: ${{ hashFiles('.state/baseline_config.json') != '' }}
+        shell: python
         run: |
-          python - <<'PY'
-import json, os
-p = '.state/baseline_config.json'
-with open(p, 'r', encoding='utf-8') as f:
-    guards = (json.load(f).get('guards') or {})
-with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
-    for k in [
-        'UNIVERSE_TOP_K','MAX_POSITIONS','MAX_BUYS_PER_RUN',
-        'ROTATE_WHEN_FULL','ROTATE_WHEN_CASH_SHORT','RESERVE_CASH_PCT',
-        'MIN_SELL_USD','DUST_MIN_USD','DUST_SKIP_STABLES'
-    ]:
-        v = guards.get(k)
-        if isinstance(v, bool): v = str(v).lower()
-        env.write(f"{k}={v}\n")
-print("Baseline guards loaded.")
-PY
+          import json, os
+          p = '.state/baseline_config.json'
+          with open(p, 'r', encoding='utf-8') as f:
+              guards = (json.load(f).get('guards') or {})
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              for k in [
+                  'UNIVERSE_TOP_K','MAX_POSITIONS','MAX_BUYS_PER_RUN',
+                  'ROTATE_WHEN_FULL','ROTATE_WHEN_CASH_SHORT','RESERVE_CASH_PCT',
+                  'MIN_SELL_USD','DUST_MIN_USD','DUST_SKIP_STABLES'
+              ]:
+                  v = guards.get(k)
+                  if isinstance(v, bool):
+                      v = str(v).lower()
+                  env.write(f"{k}={v}\n")
+          print("Baseline guards loaded.")
 
       - name: ⚙️ Setup Python
         uses: actions/setup-python@v5
