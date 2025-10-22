@@ -1,0 +1,21 @@
+run_switch: "ON"
+dry_run: "ON"
+sizing:
+  min_buy_usd: 10
+  min_sell_usd: 10
+  reserve_cash_pct: 5
+  max_positions: 3
+  max_buys_per_run: 2
+universe:
+  top_k: 25
+rotation:
+  when_full: true
+  when_cash_short: true
+dust:
+  min_usd: 2
+  skip_stables: true
+sell:
+  take_profit_pct: 0.02      # TAKE_PROFIT
+  stop_loss_pct: 0.03        # STOP_LOSS
+  trail_arm_pct: 0.03        # TRAIL arm
+  trail_giveback_pct: 0.015  # TRAIL giveback
