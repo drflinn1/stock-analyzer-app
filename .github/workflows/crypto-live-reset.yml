@@ -93,19 +93,26 @@ jobs:
             ]
           }
           JSON
-          echo "Wrote .state/baseline_config.json"
+          echo "✅ Wrote .state/baseline_config.json"
+          ls -al .state
 
-      - name: 📂 List .state
+      - name: 📦 Verify baseline file exists
         run: |
-          echo "Contents of .state:"
-          ls -al .state || true
+          if [ -f ".state/baseline_config.json" ]; then
+            echo "✅ Baseline file confirmed present:"
+            cat .state/baseline_config.json
+          else
+            echo "❌ Missing baseline_config.json — check write step."
+            exit 1
+          fi
 
       - name: 📤 Upload state artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: crypto-reset-state
-          path: .state
+          path: .state/
+          if-no-files-found: warn
 
       - name: 📡 Slack Notify (optional)
         if: env.SLACK_WEBHOOK_URL != ''
