@@ -88,39 +88,4 @@ jobs:
                   env.write(f"{k}={v}\n")
           print("Baseline guards loaded into env.")
 
-      # HARD CAP for SAFE run only (~$10 spend)
-      - name: SAFE override: cap buy to ~$10 for this run
-        run: |
-          echo "RESERVE_CASH_PCT=96" >> "$GITHUB_ENV"
-          echo "MAX_POSITIONS=25" >> "$GITHUB_ENV"
-          echo "MAX_BUYS_PER_RUN=1" >> "$GITHUB_ENV"
-          echo "MIN_BUY_USD=10" >> "$GITHUB_ENV"
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run Crypto Bot (SAFE)
-        env:
-          MODE: "CRYPTO"
-        run: |
-          echo "DRY_RUN=${DRY_RUN}  UNIVERSE_TOP_K=${UNIVERSE_TOP_K}  MAX_POSITIONS=${MAX_POSITIONS}  MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}  RESERVE_CASH_PCT=${RESERVE_CASH_PCT}  MIN_BUY_USD=${MIN_BUY_USD}"
-          python main.py
-
-      - name: Upload artifacts (.state)
-        uses: actions/upload-artifact@v4
-        with:
-          name: crypto-live-safe-state
-          path: .state
-
-      - name: Slack Notify (optional)
-        if: env.SLACK_WEBHOOK_URL != ''
-        run: |
-          msg="SAFE run finished. DRY_RUN=${DRY_RUN} | TOP_K=${UNIVERSE_TOP_K} | MAX_POS=${MAX_POSITIONS}"
-          curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"$msg\"}" $SLACK_WEBHOOK_URL
+      # ✅ FIXED: proper indentation and shell for
