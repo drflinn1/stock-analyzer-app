@@ -6,19 +6,17 @@ on:
       DRY_RUN:
         description: 'ON = simulate, OFF = live'
         required: false
-        default: 'OFF'
+        default: 'ON'
 
 env:
-  # ---- Force conservative test defaults ----
+  # Conservative test defaults (these mirror your Sept. baseline)
   RUN_SWITCH: "ON"
-  DRY_RUN: ${{ inputs.DRY_RUN || 'OFF' }}
+  DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
 
-  # One tiny buy only
   MIN_BUY_USD: "10"
   MAX_BUYS_PER_RUN: "1"
   MAX_POSITIONS: "1"
 
-  # Guards (will be overridden by baseline file if present)
   UNIVERSE_TOP_K: "25"
   RESERVE_CASH_PCT: "5"
   ROTATE_WHEN_FULL: "false"
@@ -27,7 +25,6 @@ env:
   DUST_MIN_USD: "2"
   DUST_SKIP_STABLES: "true"
 
-  # Secrets
   SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
   KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
   KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
@@ -42,29 +39,55 @@ jobs:
       - name: 🧩 Checkout repo
         uses: actions/checkout@v4
 
-      # <<< NEW: auto-load baseline guard-pack if .state/baseline_config.json exists >>>
-      - name: 🔽 Load baseline guard-pack (if present)
+      # 1) Try to pull baseline from the RESET run's artifact
+      - name: ⬇️ Download baseline artifact (if present)
+        uses: actions/download-artifact@v4
+        with:
+          name: crypto-reset-state
+          path: .state
+        continue-on-error: true
+
+      # 2) If artifact wasn't found, write a baseline from current env
+      - name: 🧱 Fallback: write baseline from env (only if missing)
+        run: |
+          mkdir -p .state
+          if [ ! -f ".state/baseline_config.json" ]; then
+            echo "No baseline artifact found; writing fallback baseline from env..."
+            cat > .state/baseline_config.json <<JSON
+            {
+              "label": "Fallback Baseline (from env)",
+              "guards": {
+                "UNIVERSE_TOP_K": ${UNIVERSE_TOP_K},
+                "MAX_POSITIONS": ${MAX_POSITIONS},
+                "MAX_BUYS_PER_RUN": ${MAX_BUYS_PER_RUN:-1},
+                "ROTATE_WHEN_FULL": ${ROTATE_WHEN_FULL},
+                "ROTATE_WHEN_CASH_SHORT": ${ROTATE_WHEN_CASH_SHORT},
+                "RESERVE_CASH_PCT": ${RESERVE_CASH_PCT},
+                "MIN_SELL_USD": ${MIN_SELL_USD},
+                "DUST_MIN_USD": ${DUST_MIN_USD},
+                "DUST_SKIP_STABLES": ${DUST_SKIP_STABLES}
+              }
+            }
+            JSON
+          fi
+          ls -al .state || true
+
+      # 3) Load baseline guard-pack into env
+      - name: 🔽 Load baseline guard-pack
         if: ${{ hashFiles('.state/baseline_config.json') != '' }}
         run: |
-          echo "Loading guards from .state/baseline_config.json ..."
           python - <<'PY'
 import json, os
-p = '.state/baseline_config.json'
-with open(p, 'r', encoding='utf-8') as f:
-    data = json.load(f)
-guards = (data.get('guards') or {})
-env_path = os.environ['GITHUB_ENV']
-with open(env_path, 'a', encoding='utf-8') as env:
-    for k in [
-        'UNIVERSE_TOP_K','MAX_POSITIONS','MAX_BUYS_PER_RUN',
-        'ROTATE_WHEN_FULL','ROTATE_WHEN_CASH_SHORT','RESERVE_CASH_PCT',
-        'MIN_SELL_USD','DUST_MIN_USD','DUST_SKIP_STABLES'
-    ]:
-        v = guards.get(k)
-        if isinstance(v, bool):
-            v = str(v).lower()
+with open('.state/baseline_config.json','r',encoding='utf-8') as f:
+    guards=(json.load(f).get('guards') or {})
+with open(os.environ['GITHUB_ENV'],'a',encoding='utf-8') as env:
+    for k in ['UNIVERSE_TOP_K','MAX_POSITIONS','MAX_BUYS_PER_RUN',
+              'ROTATE_WHEN_FULL','ROTATE_WHEN_CASH_SHORT','RESERVE_CASH_PCT',
+              'MIN_SELL_USD','DUST_MIN_USD','DUST_SKIP_STABLES']:
+        v=guards.get(k)
+        if isinstance(v,bool): v=str(v).lower()
         env.write(f"{k}={v}\n")
-print("Baseline guards loaded into env.")
+print("Baseline guards loaded.")
 PY
 
       - name: ⚙️ Setup Python
@@ -81,7 +104,7 @@ PY
         env:
           MODE: "CRYPTO"
         run: |
-          echo "DRY_RUN=${DRY_RUN}  MIN_BUY_USD=${MIN_BUY_USD}  MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}  MAX_POSITIONS=${MAX_POSITIONS}"
+          echo "DRY_RUN=${DRY_RUN}  UNIVERSE_TOP_K=${UNIVERSE_TOP_K}  MAX_POSITIONS=${MAX_POSITIONS}  MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}"
           python main.py
 
       - name: 📊 Make KPI chart (optional)
@@ -98,7 +121,7 @@ PY
       - name: 📡 Slack Notify (optional)
         if: env.SLACK_WEBHOOK_URL != ''
         run: |
-          msg="SAFE run finished. DRY_RUN=${DRY_RUN} | MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN} | MAX_POSITIONS=${MAX_POSITIONS}"
+          msg="SAFE run finished. DRY_RUN=${DRY_RUN} | TOP_K=${UNIVERSE_TOP_K} | MAX_POS=${MAX_POSITIONS}"
           curl -X POST -H 'Content-type: application/json' \
             --data "{\"text\":\"$msg\"}" \
             $SLACK_WEBHOOK_URL
