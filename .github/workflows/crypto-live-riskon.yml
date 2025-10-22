@@ -1,4 +1,4 @@
-name: 🟢 Crypto Live — RISK-ON (every 5m)
+name: Crypto Live — RISK-ON (every 5m)
 
 on:
   schedule:
@@ -14,7 +14,7 @@ env:
   RUN_SWITCH: "ON"
   DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
 
-  # Baseline guards (can be overridden by baseline file)
+  # Baseline defaults (overridden by baseline file if present)
   UNIVERSE_TOP_K: "25"
   MAX_POSITIONS: "3"
   MAX_BUYS_PER_RUN: "1"
@@ -32,71 +32,89 @@ env:
 
 jobs:
   live_riskon:
-    name: ▶️ Run RISK-ON loop
+    name: Run RISK-ON loop
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
-      - name: 🧩 Checkout repo
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      # <<< NEW: auto-load baseline guard-pack if .state/baseline_config.json exists >>>
-      - name: 🔽 Load baseline guard-pack (if present)
-        if: ${{ hashFiles('.state/baseline_config.json') != '' }}
-        run: |
-          echo "Loading guards from .state/baseline_config.json ..."
-          python - <<'PY'
-import json, os
-p = '.state/baseline_config.json'
-with open(p, 'r', encoding='utf-8') as f:
-    data = json.load(f)
-guards = (data.get('guards') or {})
-env_path = os.environ['GITHUB_ENV']
-with open(env_path, 'a', encoding='utf-8') as env:
-    for k in [
-        'UNIVERSE_TOP_K','MAX_POSITIONS','MAX_BUYS_PER_RUN',
-        'ROTATE_WHEN_FULL','ROTATE_WHEN_CASH_SHORT','RESERVE_CASH_PCT',
-        'MIN_SELL_USD','DUST_MIN_USD','DUST_SKIP_STABLES'
-    ]:
-        v = guards.get(k)
-        if isinstance(v, bool):
-            v = str(v).lower()
-        env.write(f"{k}={v}\n")
-print("Baseline guards loaded into env.")
-PY
+      - name: Download baseline artifact (if present)
+        uses: actions/download-artifact@v4
+        with:
+          name: crypto-reset-state
+          path: .state
+        continue-on-error: true
 
-      - name: ⚙️ Setup Python
+      - name: Ensure baseline guard-pack file
+        shell: python
+        run: |
+          import json, os, pathlib
+          def to_bool(x, default=False):
+              if x is None: return default
+              return str(x).strip().lower() in {"1","true","yes","on"}
+          state = pathlib.Path(".state"); state.mkdir(parents=True, exist_ok=True)
+          f = state / "baseline_config.json"
+          if not f.exists():
+              guards = {
+                  "UNIVERSE_TOP_K": int(os.getenv("UNIVERSE_TOP_K","25")),
+                  "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS","3")),
+                  "MAX_BUYS_PER_RUN": int(os.getenv("MAX_BUYS_PER_RUN","1")),
+                  "ROTATE_WHEN_FULL": to_bool(os.getenv("ROTATE_WHEN_FULL","true"), True),
+                  "ROTATE_WHEN_CASH_SHORT": to_bool(os.getenv("ROTATE_WHEN_CASH_SHORT","true"), True),
+                  "RESERVE_CASH_PCT": float(os.getenv("RESERVE_CASH_PCT","5")),
+                  "MIN_SELL_USD": float(os.getenv("MIN_SELL_USD","10")),
+                  "DUST_MIN_USD": float(os.getenv("DUST_MIN_USD","2")),
+                  "DUST_SKIP_STABLES": to_bool(os.getenv("DUST_SKIP_STABLES","true"), True),
+              }
+              data = {"label":"Fallback Baseline (from env)","guards":guards}
+              with f.open("w", encoding="utf-8") as w: json.dump(data, w, indent=2)
+              print("Wrote fallback baseline_config.json")
+          else:
+              print("Found baseline_config.json from artifact")
+
+      - name: Load baseline guard-pack
+        if: ${{ hashFiles('.state/baseline_config.json') != '' }}
+        shell: python
+        run: |
+          import json, os
+          with open(".state/baseline_config.json","r",encoding="utf-8") as f:
+              guards = (json.load(f).get("guards") or {})
+          with open(os.environ["GITHUB_ENV"],"a",encoding="utf-8") as env:
+              for k in ["UNIVERSE_TOP_K","MAX_POSITIONS","MAX_BUYS_PER_RUN",
+                        "ROTATE_WHEN_FULL","ROTATE_WHEN_CASH_SHORT","RESERVE_CASH_PCT",
+                        "MIN_SELL_USD","DUST_MIN_USD","DUST_SKIP_STABLES"]:
+                  v = guards.get(k)
+                  if isinstance(v,bool): v = str(v).lower()
+                  env.write(f"{k}={v}\n")
+          print("Baseline guards loaded into env.")
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 📦 Install dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 🤖 Run Crypto Bot (RISK-ON)
+      - name: Run Crypto Bot (RISK-ON)
         env:
           MODE: "CRYPTO"
         run: |
-          echo "DRY_RUN=${DRY_RUN}  UNIVERSE_TOP_K=${UNIVERSE_TOP_K}  MAX_POSITIONS=${MAX_POSITIONS}  MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}"
+          echo "DRY_RUN=${DRY_RUN}  UNIVERSE_TOP_K=${UNIVERSE_TOP_K}  MAX_POSITIONS=${MAX_POSITIONS}  MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}  RESERVE_CASH_PCT=${RESERVE_CASH_PCT}"
           python main.py
 
-      - name: 📊 Make KPI chart (optional)
-        run: |
-          mkdir -p .state
-          python tools/make_kpi_chart.py || true
-
-      - name: 📤 Upload artifacts (.state)
+      - name: Upload artifacts (.state)
         uses: actions/upload-artifact@v4
         with:
           name: crypto-live-riskon-state
           path: .state
 
-      - name: 📡 Slack Notify (optional)
+      - name: Slack Notify (optional)
         if: env.SLACK_WEBHOOK_URL != ''
         run: |
-          msg="RISK-ON run finished. DRY_RUN=${DRY_RUN} | TOP_K=${UNIVERSE_TOP_K} | MAX_POSITIONS=${MAX_POSITIONS}"
-          curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\":\"$msg\"}" \
-            $SLACK_WEBHOOK_URL
+          msg="RISK-ON run finished. DRY_RUN=${DRY_RUN} | TOP_K=${UNIVERSE_TOP_K} | MAX_POS=${MAX_POSITIONS}"
+          curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"$msg\"}" $SLACK_WEBHOOK_URL
