@@ -12,7 +12,7 @@ env:
   RUN_SWITCH: "ON"
   DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
 
-  # Conservative defaults (match September baseline)
+  # Conservative defaults (baseline-like)
   MIN_BUY_USD: "10"
   MAX_BUYS_PER_RUN: "1"
   MAX_POSITIONS: "1"
@@ -24,7 +24,6 @@ env:
   DUST_MIN_USD: "2"
   DUST_SKIP_STABLES: "true"
 
-  # Secrets
   SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
   KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
   KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
@@ -39,7 +38,6 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # 1) Try to pull baseline from RESET artifact
       - name: Download baseline artifact (if present)
         uses: actions/download-artifact@v4
         with:
@@ -47,7 +45,6 @@ jobs:
           path: .state
         continue-on-error: true
 
-      # 2) Ensure baseline exists (fallback create via Python if missing)
       - name: Ensure baseline guard-pack file
         shell: python
         run: |
@@ -75,7 +72,6 @@ jobs:
           else:
               print("Found baseline_config.json from artifact")
 
-      # 3) Load baseline -> environment
       - name: Load baseline guard-pack
         if: ${{ hashFiles('.state/baseline_config.json') != '' }}
         shell: python
@@ -92,6 +88,14 @@ jobs:
                   env.write(f"{k}={v}\n")
           print("Baseline guards loaded into env.")
 
+      # HARD CAP for SAFE run only (~$10 spend)
+      - name: SAFE override: cap buy to ~$10 for this run
+        run: |
+          echo "RESERVE_CASH_PCT=96" >> "$GITHUB_ENV"
+          echo "MAX_POSITIONS=25" >> "$GITHUB_ENV"
+          echo "MAX_BUYS_PER_RUN=1" >> "$GITHUB_ENV"
+          echo "MIN_BUY_USD=10" >> "$GITHUB_ENV"
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -106,7 +110,7 @@ jobs:
         env:
           MODE: "CRYPTO"
         run: |
-          echo "DRY_RUN=${DRY_RUN}  UNIVERSE_TOP_K=${UNIVERSE_TOP_K}  MAX_POSITIONS=${MAX_POSITIONS}  MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}"
+          echo "DRY_RUN=${DRY_RUN}  UNIVERSE_TOP_K=${UNIVERSE_TOP_K}  MAX_POSITIONS=${MAX_POSITIONS}  MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}  RESERVE_CASH_PCT=${RESERVE_CASH_PCT}  MIN_BUY_USD=${MIN_BUY_USD}"
           python main.py
 
       - name: Upload artifacts (.state)
