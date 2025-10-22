@@ -1,5 +1,4 @@
-# .github/workflows/crypto-live.yml
-name: "Crypto Live — September Baseline (15m DRY-RUN)"
+name: Crypto Live - September Baseline (15m DRY-RUN)
 
 on:
   workflow_dispatch:
@@ -13,7 +12,7 @@ on:
         required: false
         default: "ON"
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes
+    - cron: "*/15 * * * *"
 
 permissions:
   contents: read
@@ -23,11 +22,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Safety & toggles (inputs override vars)
-  DRY_RUN: ${{ inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}
-  RUN_SWITCH: ${{ inputs.RUN_SWITCH || vars.RUN_SWITCH || 'ON' }}
+  DRY_RUN:               ${{ inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}
+  RUN_SWITCH:            ${{ inputs.RUN_SWITCH || vars.RUN_SWITCH || 'ON' }}
 
-  # Sizing & universe knobs (fall back to sensible defaults)
   MIN_BUY_USD:           ${{ vars.MIN_BUY_USD || '10' }}
   MIN_SELL_USD:          ${{ vars.MIN_SELL_USD || '10' }}
   DUST_MIN_USD:          ${{ vars.DUST_MIN_USD || '2' }}
@@ -41,12 +38,11 @@ env:
   ROTATE_WHEN_FULL:      ${{ vars.ROTATE_WHEN_FULL || 'true' }}
   ROTATE_WHEN_CASH_SHORT:${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
 
-  # Slack (optional)
   SLACK_WEBHOOK_URL:     ${{ secrets.SLACK_WEBHOOK_URL }}
 
 jobs:
   prepare:
-    name: "Prep / Gate"
+    name: Prep / Gate
     runs-on: ubuntu-latest
     outputs:
       should_run: ${{ steps.switch.outputs.should_run }}
@@ -61,17 +57,14 @@ jobs:
           fi
 
   bot:
-    name: "Run Bot"
+    name: Run Bot
     needs: prepare
     if: needs.prepare.outputs.should_run == 'true'
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -99,14 +92,12 @@ jobs:
 
       - name: Run Crypto Engine
         env:
-          # Broker/API secrets (set these in repo → Settings → Secrets and variables)
           KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           mkdir -p .state
           set -o pipefail
-          python -u main.py --mode crypto-live \
-            | tee .state/run.log
+          python -u main.py --mode crypto-live | tee .state/run.log
 
       - name: Make KPI chart (optional)
         if: always()
