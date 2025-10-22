@@ -1,4 +1,4 @@
-name: Crypto Live — SAFE (manual $10 test)
+name: Crypto Live — SAFE
 
 on:
   workflow_dispatch:
