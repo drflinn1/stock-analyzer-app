@@ -9,7 +9,6 @@ on:
         default: 'ON'
 
 env:
-  # Conservative test defaults (these mirror your Sept. baseline)
   RUN_SWITCH: "ON"
   DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
 
@@ -39,7 +38,7 @@ jobs:
       - name: 🧩 Checkout repo
         uses: actions/checkout@v4
 
-      # 1) Try to pull baseline from the RESET run's artifact
+      # 1) Try to pull baseline from RESET artifact
       - name: ⬇️ Download baseline artifact (if present)
         uses: actions/download-artifact@v4
         with:
@@ -47,7 +46,7 @@ jobs:
           path: .state
         continue-on-error: true
 
-      # 2) If artifact wasn't found, write a baseline from current env
+      # 2) Fallback baseline if missing
       - name: 🧱 Fallback: write baseline from env (only if missing)
         run: |
           mkdir -p .state
@@ -72,20 +71,23 @@ jobs:
           fi
           ls -al .state || true
 
-      # 3) Load baseline guard-pack into env
+      # 3) Load baseline guard-pack
       - name: 🔽 Load baseline guard-pack
         if: ${{ hashFiles('.state/baseline_config.json') != '' }}
         run: |
           python - <<'PY'
 import json, os
-with open('.state/baseline_config.json','r',encoding='utf-8') as f:
-    guards=(json.load(f).get('guards') or {})
-with open(os.environ['GITHUB_ENV'],'a',encoding='utf-8') as env:
-    for k in ['UNIVERSE_TOP_K','MAX_POSITIONS','MAX_BUYS_PER_RUN',
-              'ROTATE_WHEN_FULL','ROTATE_WHEN_CASH_SHORT','RESERVE_CASH_PCT',
-              'MIN_SELL_USD','DUST_MIN_USD','DUST_SKIP_STABLES']:
-        v=guards.get(k)
-        if isinstance(v,bool): v=str(v).lower()
+p = '.state/baseline_config.json'
+with open(p, 'r', encoding='utf-8') as f:
+    guards = (json.load(f).get('guards') or {})
+with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+    for k in [
+        'UNIVERSE_TOP_K','MAX_POSITIONS','MAX_BUYS_PER_RUN',
+        'ROTATE_WHEN_FULL','ROTATE_WHEN_CASH_SHORT','RESERVE_CASH_PCT',
+        'MIN_SELL_USD','DUST_MIN_USD','DUST_SKIP_STABLES'
+    ]:
+        v = guards.get(k)
+        if isinstance(v, bool): v = str(v).lower()
         env.write(f"{k}={v}\n")
 print("Baseline guards loaded.")
 PY
