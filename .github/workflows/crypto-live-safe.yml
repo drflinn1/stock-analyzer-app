@@ -12,10 +12,10 @@ env:
   RUN_SWITCH: "ON"
   DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
 
+  # Conservative defaults (match September baseline)
   MIN_BUY_USD: "10"
   MAX_BUYS_PER_RUN: "1"
   MAX_POSITIONS: "1"
-
   UNIVERSE_TOP_K: "25"
   RESERVE_CASH_PCT: "5"
   ROTATE_WHEN_FULL: "false"
@@ -24,6 +24,7 @@ env:
   DUST_MIN_USD: "2"
   DUST_SKIP_STABLES: "true"
 
+  # Secrets
   SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
   KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
   KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
@@ -46,52 +47,50 @@ jobs:
           path: .state
         continue-on-error: true
 
-      # 2) Fallback baseline if missing
-      - name: Fallback: write baseline from env (only if missing)
-        shell: bash
+      # 2) Ensure baseline exists (fallback create via Python if missing)
+      - name: Ensure baseline guard-pack file
+        shell: python
         run: |
-          mkdir -p .state
-          if [ ! -f ".state/baseline_config.json" ]; then
-            echo "No baseline artifact found; writing fallback baseline from env..."
-            cat <<'JSON' > .state/baseline_config.json
-{
-  "label": "Fallback Baseline (from env)",
-  "guards": {
-    "UNIVERSE_TOP_K": ${UNIVERSE_TOP_K},
-    "MAX_POSITIONS": ${MAX_POSITIONS},
-    "MAX_BUYS_PER_RUN": ${MAX_BUYS_PER_RUN:-1},
-    "ROTATE_WHEN_FULL": ${ROTATE_WHEN_FULL},
-    "ROTATE_WHEN_CASH_SHORT": ${ROTATE_WHEN_CASH_SHORT},
-    "RESERVE_CASH_PCT": ${RESERVE_CASH_PCT},
-    "MIN_SELL_USD": ${MIN_SELL_USD},
-    "DUST_MIN_USD": ${DUST_MIN_USD},
-    "DUST_SKIP_STABLES": ${DUST_SKIP_STABLES}
-  }
-}
-JSON
-          fi
-          ls -al .state || true
+          import json, os, pathlib
+          def to_bool(x, default=False):
+              if x is None: return default
+              return str(x).strip().lower() in {"1","true","yes","on"}
+          state = pathlib.Path(".state"); state.mkdir(parents=True, exist_ok=True)
+          f = state / "baseline_config.json"
+          if not f.exists():
+              guards = {
+                  "UNIVERSE_TOP_K": int(os.getenv("UNIVERSE_TOP_K","25")),
+                  "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS","1")),
+                  "MAX_BUYS_PER_RUN": int(os.getenv("MAX_BUYS_PER_RUN","1")),
+                  "ROTATE_WHEN_FULL": to_bool(os.getenv("ROTATE_WHEN_FULL","false")),
+                  "ROTATE_WHEN_CASH_SHORT": to_bool(os.getenv("ROTATE_WHEN_CASH_SHORT","true"), True),
+                  "RESERVE_CASH_PCT": float(os.getenv("RESERVE_CASH_PCT","5")),
+                  "MIN_SELL_USD": float(os.getenv("MIN_SELL_USD","10")),
+                  "DUST_MIN_USD": float(os.getenv("DUST_MIN_USD","2")),
+                  "DUST_SKIP_STABLES": to_bool(os.getenv("DUST_SKIP_STABLES","true"), True),
+              }
+              data = {"label":"Fallback Baseline (from env)","guards":guards}
+              with f.open("w", encoding="utf-8") as w: json.dump(data, w, indent=2)
+              print("Wrote fallback baseline_config.json")
+          else:
+              print("Found baseline_config.json from artifact")
 
-      # 3) Load baseline guard-pack
+      # 3) Load baseline -> environment
       - name: Load baseline guard-pack
         if: ${{ hashFiles('.state/baseline_config.json') != '' }}
         shell: python
         run: |
           import json, os
-          p = '.state/baseline_config.json'
-          with open(p, 'r', encoding='utf-8') as f:
-              guards = (json.load(f).get('guards') or {})
-          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
-              for k in [
-                  'UNIVERSE_TOP_K','MAX_POSITIONS','MAX_BUYS_PER_RUN',
-                  'ROTATE_WHEN_FULL','ROTATE_WHEN_CASH_SHORT','RESERVE_CASH_PCT',
-                  'MIN_SELL_USD','DUST_MIN_USD','DUST_SKIP_STABLES'
-              ]:
+          with open(".state/baseline_config.json","r",encoding="utf-8") as f:
+              guards = (json.load(f).get("guards") or {})
+          with open(os.environ["GITHUB_ENV"],"a",encoding="utf-8") as env:
+              for k in ["UNIVERSE_TOP_K","MAX_POSITIONS","MAX_BUYS_PER_RUN",
+                        "ROTATE_WHEN_FULL","ROTATE_WHEN_CASH_SHORT","RESERVE_CASH_PCT",
+                        "MIN_SELL_USD","DUST_MIN_USD","DUST_SKIP_STABLES"]:
                   v = guards.get(k)
-                  if isinstance(v, bool):
-                      v = str(v).lower()
+                  if isinstance(v,bool): v = str(v).lower()
                   env.write(f"{k}={v}\n")
-          print("Baseline guards loaded.")
+          print("Baseline guards loaded into env.")
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -110,11 +109,6 @@ JSON
           echo "DRY_RUN=${DRY_RUN}  UNIVERSE_TOP_K=${UNIVERSE_TOP_K}  MAX_POSITIONS=${MAX_POSITIONS}  MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}"
           python main.py
 
-      - name: Make KPI chart (optional)
-        run: |
-          mkdir -p .state
-          python tools/make_kpi_chart.py || true
-
       - name: Upload artifacts (.state)
         uses: actions/upload-artifact@v4
         with:
@@ -125,6 +119,4 @@ JSON
         if: env.SLACK_WEBHOOK_URL != ''
         run: |
           msg="SAFE run finished. DRY_RUN=${DRY_RUN} | TOP_K=${UNIVERSE_TOP_K} | MAX_POS=${MAX_POSITIONS}"
-          curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\":\"$msg\"}" \
-            $SLACK_WEBHOOK_URL
+          curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"$msg\"}" $SLACK_WEBHOOK_URL
