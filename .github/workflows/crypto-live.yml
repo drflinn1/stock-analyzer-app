@@ -1,10 +1,15 @@
-name: Crypto Live — September Baseline (15m DRY-RUN)
+# .github/workflows/crypto-live.yml
+name: "Crypto Live — September Baseline (15m DRY-RUN)"
 
 on:
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: "ON = simulate, OFF = live trading"
+        description: "ON or OFF (overrides repo variable)"
+        required: false
+        default: "ON"
+      RUN_SWITCH:
+        description: "ON to run bot step, OFF to skip (for maintenance)"
         required: false
         default: "ON"
   schedule:
@@ -12,100 +17,121 @@ on:
 
 permissions:
   contents: read
-  actions: read
-  id-token: write
 
 concurrency:
-  group: crypto-live
+  group: crypto-live-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  EXCHANGE: "kraken"
-  STATE_DIR: ".state"
-  POSITIONS_JSON: ".state/positions.json"
-  KPI_CSV: ".state/kpi_history.csv"
-  GUARD_FILE: ".state/guard.yaml"
+  # Safety & toggles (inputs override vars)
+  DRY_RUN: ${{ inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}
+  RUN_SWITCH: ${{ inputs.RUN_SWITCH || vars.RUN_SWITCH || 'ON' }}
+
+  # Sizing & universe knobs (fall back to sensible defaults)
+  MIN_BUY_USD:           ${{ vars.MIN_BUY_USD || '10' }}
+  MIN_SELL_USD:          ${{ vars.MIN_SELL_USD || '10' }}
+  DUST_MIN_USD:          ${{ vars.DUST_MIN_USD || '2' }}
+  DUST_SKIP_STABLES:     ${{ vars.DUST_SKIP_STABLES || 'true' }}
+
+  MAX_POSITIONS:         ${{ vars.MAX_POSITIONS || '3' }}
+  MAX_BUYS_PER_RUN:      ${{ vars.MAX_BUYS_PER_RUN || '2' }}
+  UNIVERSE_TOP_K:        ${{ vars.UNIVERSE_TOP_K || '25' }}
+  RESERVE_CASH_PCT:      ${{ vars.RESERVE_CASH_PCT || '5' }}
+
+  ROTATE_WHEN_FULL:      ${{ vars.ROTATE_WHEN_FULL || 'true' }}
+  ROTATE_WHEN_CASH_SHORT:${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
+
+  # Slack (optional)
+  SLACK_WEBHOOK_URL:     ${{ secrets.SLACK_WEBHOOK_URL }}
 
 jobs:
-  run:
-    name: CryptoBot 15m Run (DRY-RUN)
+  prepare:
+    name: "Prep / Gate"
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    outputs:
+      should_run: ${{ steps.switch.outputs.should_run }}
+    steps:
+      - name: Evaluate RUN_SWITCH
+        id: switch
+        run: |
+          if [ "${RUN_SWITCH^^}" = "ON" ]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_run=false" >> $GITHUB_OUTPUT
+          fi
+
+  bot:
+    name: "Run Bot"
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        shell: bash
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [[ -f requirements.txt ]]; then
+          if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install ccxt pyyaml pandas
+            pip install pandas numpy matplotlib requests
           fi
 
-      - name: Ensure .state and guard.yaml
-        shell: bash
+      - name: Show configuration
+        run: |
+          echo "DRY_RUN=${DRY_RUN}"
+          echo "RUN_SWITCH=${RUN_SWITCH}"
+          echo "MAX_POSITIONS=${MAX_POSITIONS}"
+          echo "MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}"
+          echo "UNIVERSE_TOP_K=${UNIVERSE_TOP_K}"
+          echo "RESERVE_CASH_PCT=${RESERVE_CASH_PCT}"
+          echo "ROTATE_WHEN_FULL=${ROTATE_WHEN_FULL}"
+          echo "ROTATE_WHEN_CASH_SHORT=${ROTATE_WHEN_CASH_SHORT}"
+          echo "MIN_BUY_USD=${MIN_BUY_USD}  MIN_SELL_USD=${MIN_SELL_USD}"
+          echo "DUST_MIN_USD=${DUST_MIN_USD}  DUST_SKIP_STABLES=${DUST_SKIP_STABLES}"
+
+      - name: Run Crypto Engine
+        env:
+          # Broker/API secrets (set these in repo → Settings → Secrets and variables)
+          KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           mkdir -p .state
-          if [[ ! -f "${GUARD_FILE}" ]]; then
-            cat > "${GUARD_FILE}" <<'YAML'
-run_switch: "ON"
-dry_run: "ON"
-sizing:
-  min_buy_usd: 10
-  min_sell_usd: 10
-  reserve_cash_pct: 5
-  max_positions: 3
-  max_buys_per_run: 2
-universe:
-  top_k: 25
-rotation:
-  when_full: true
-  when_cash_short: true
-dust:
-  min_usd: 2
-  skip_stables: true
-sell:
-  take_profit_pct: 0.02      # TAKE_PROFIT
-  stop_loss_pct: 0.03        # STOP_LOSS
-  trail_arm_pct: 0.03        # TRAIL arm
-  trail_giveback_pct: 0.015  # TRAIL giveback
-YAML
-          fi
-          [[ -f "${POSITIONS_JSON}" ]] || echo "{}" > "${POSITIONS_JSON}"
-          [[ -f "${KPI_CSV}" ]] || echo "timestamp,base,bal_usd,pnl_day_usd,buys,sells,open_positions" > "${KPI_CSV}"
+          set -o pipefail
+          python -u main.py --mode crypto-live \
+            | tee .state/run.log
 
-      - name: Run CryptoBot (Dry-run safe)
-        env:
-          EXCHANGE: ${{ env.EXCHANGE }}
-          STATE_DIR: ${{ env.STATE_DIR }}
-          POSITIONS_JSON: ${{ env.POSITIONS_JSON }}
-          KPI_CSV: ${{ env.KPI_CSV }}
-          GUARD_FILE: ${{ env.GUARD_FILE }}
-          DRY_RUN: ${{ inputs.DRY_RUN }}
+      - name: Make KPI chart (optional)
+        if: always()
         run: |
-          echo "Starting CryptoBot (Exchange=${EXCHANGE}, DRY_RUN=${DRY_RUN})"
-          python main.py --mode crypto --exchange "${EXCHANGE}" --dryrun "${DRY_RUN}"
+          if [ -f tools/make_kpi_chart.py ]; then
+            python tools/make_kpi_chart.py || true
+          fi
 
-      - name: Upload .state artifact
+      - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: state-after-run
-          path: .state/**
-          retention-days: 7
+          name: crypto-live-${{ github.run_number }}
+          path: |
+            .state/*
+            .state/.* || true
+            .state/kpi_chart.png
+            .state/run.log
 
-      - name: Summary
-        shell: bash
+      - name: Slack notify (optional)
+        if: always() && env.SLACK_WEBHOOK_URL != ''
         run: |
-          echo "### ✅ CryptoBot September Baseline run complete" >> $GITHUB_STEP_SUMMARY
-          echo "- Exchange: ${EXCHANGE}" >> $GITHUB_STEP_SUMMARY
-          echo "- DRY_RUN: ${DRY_RUN}" >> $GITHUB_STEP_SUMMARY
-          echo "- Schedule: every 15 minutes" >> $GITHUB_STEP_SUMMARY
+          STATUS="${{ job.status }}"
+          TEXT="*Crypto Live* run #${{ github.run_number }} finished with *${STATUS}*.
+          DRY_RUN=${DRY_RUN}, MAX_POSITIONS=${MAX_POSITIONS}, TOP_K=${UNIVERSE_TOP_K}"
+          curl -X POST -H 'Content-type: application/json' \
+            --data "$(jq -nc --arg t "$TEXT" '{text:$t}')" \
+            "$SLACK_WEBHOOK_URL"
