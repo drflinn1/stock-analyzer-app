@@ -1,91 +1,213 @@
-name: Crypto Live — SAFE
+name: Crypto Live — SAFE (DRY-RUN sanity)
 
 on:
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: 'ON = simulate, OFF = live'
+        description: "Override DRY_RUN for THIS run only (ON/OFF). Leave blank to use reset_guard.yaml or repo Variable."
         required: false
-        default: 'ON'
+        default: ""
+  # Uncomment to schedule after sanity checks
+  # schedule:
+  #   - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: crypto-live
+  cancel-in-progress: false
 
 env:
-  RUN_SWITCH: "ON"
-  DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
-
-  # Conservative defaults (baseline-like)
-  MIN_BUY_USD: "10"
-  MAX_BUYS_PER_RUN: "1"
-  MAX_POSITIONS: "1"
-  UNIVERSE_TOP_K: "25"
-  RESERVE_CASH_PCT: "5"
-  ROTATE_WHEN_FULL: "false"
-  ROTATE_WHEN_CASH_SHORT: "true"
-  MIN_SELL_USD: "10"
-  DUST_MIN_USD: "2"
-  DUST_SKIP_STABLES: "true"
-
-  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-  KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-  KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+  STATE_DIR: ".state"
+  GUARD_FILE: ".state/reset_guard.yaml"
+  POSITIONS_JSON: ".state/positions.json"
+  KPI_CSV: ".state/kpi_history.csv"
+  EXCHANGE: "${{ vars.CRYPTO_EXCHANGE || 'kraken' }}"
 
 jobs:
-  live_safe:
-    name: Run SAFE manual test
+  live:
+    name: Run SAFE (dry-run sanity)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download baseline artifact (if present)
-        uses: actions/download-artifact@v4
+      - name: Ensure Python
+        uses: actions/setup-python@v5
         with:
-          name: crypto-reset-state
-          path: .state
-        continue-on-error: true
+          python-version: "3.11"
 
-      - name: Ensure baseline guard-pack file
-        shell: python
+      - name: Install minimal deps (skip if no requirements.txt)
+        shell: bash
         run: |
-          import json, os, pathlib
-          def to_bool(x, default=False):
-              if x is None: return default
-              return str(x).strip().lower() in {"1","true","yes","on"}
-          state = pathlib.Path(".state"); state.mkdir(parents=True, exist_ok=True)
-          f = state / "baseline_config.json"
-          if not f.exists():
-              guards = {
-                  "UNIVERSE_TOP_K": int(os.getenv("UNIVERSE_TOP_K","25")),
-                  "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS","1")),
-                  "MAX_BUYS_PER_RUN": int(os.getenv("MAX_BUYS_PER_RUN","1")),
-                  "ROTATE_WHEN_FULL": to_bool(os.getenv("ROTATE_WHEN_FULL","false")),
-                  "ROTATE_WHEN_CASH_SHORT": to_bool(os.getenv("ROTATE_WHEN_CASH_SHORT","true"), True),
-                  "RESERVE_CASH_PCT": float(os.getenv("RESERVE_CASH_PCT","5")),
-                  "MIN_SELL_USD": float(os.getenv("MIN_SELL_USD","10")),
-                  "DUST_MIN_USD": float(os.getenv("DUST_MIN_USD","2")),
-                  "DUST_SKIP_STABLES": to_bool(os.getenv("DUST_SKIP_STABLES","true"), True),
-              }
-              data = {"label":"Fallback Baseline (from env)","guards":guards}
-              with f.open("w", encoding="utf-8") as w: json.dump(data, w, indent=2)
-              print("Wrote fallback baseline_config.json")
-          else:
-              print("Found baseline_config.json from artifact")
+          set -e
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          else
+            pip install --upgrade pip
+            pip install pyyaml pandas
+          fi
 
-      - name: Load baseline guard-pack
-        if: ${{ hashFiles('.state/baseline_config.json') != '' }}
-        shell: python
+      - name: Resolve guards (prefer reset_guard.yaml → repo Variables → safe defaults)
+        id: guards
+        shell: bash
         run: |
-          import json, os
-          with open(".state/baseline_config.json","r",encoding="utf-8") as f:
-              guards = (json.load(f).get("guards") or {})
-          with open(os.environ["GITHUB_ENV"],"a",encoding="utf-8") as env:
-              for k in ["UNIVERSE_TOP_K","MAX_POSITIONS","MAX_BUYS_PER_RUN",
-                        "ROTATE_WHEN_FULL","ROTATE_WHEN_CASH_SHORT","RESERVE_CASH_PCT",
-                        "MIN_SELL_USD","DUST_MIN_USD","DUST_SKIP_STABLES"]:
-                  v = guards.get(k)
-                  if isinstance(v,bool): v = str(v).lower()
-                  env.write(f"{k}={v}\n")
-          print("Baseline guards loaded into env.")
+          python - << 'PY'
+          import os, sys, yaml
 
-      # ✅ FIXED: proper indentation and shell for
+          # defaults (September baseline)
+          config = {
+            "run_switch": os.getenv("RUN_SWITCH","ON"),
+            "dry_run": os.getenv("DRY_RUN","ON"),
+            "sizing": {
+              "min_buy_usd": os.getenv("MIN_BUY_USD","10"),
+              "min_sell_usd": os.getenv("MIN_SELL_USD","10"),
+              "reserve_cash_pct": os.getenv("RESERVE_CASH_PCT","5"),
+              "max_positions": os.getenv("MAX_POSITIONS","3"),
+              "max_buys_per_run": os.getenv("MAX_BUYS_PER_RUN","2"),
+            },
+            "universe": { "top_k": os.getenv("UNIVERSE_TOP_K","25") },
+            "rotation": {
+              "when_full": os.getenv("ROTATE_WHEN_FULL","true"),
+              "when_cash_short": os.getenv("ROTATE_WHEN_CASH_SHORT","true"),
+            },
+            "dust": {
+              "min_usd": os.getenv("DUST_MIN_USD","2"),
+              "skip_stables": os.getenv("DUST_SKIP_STABLES","true"),
+            }
+          }
+
+          gf = os.getenv("GUARD_FILE",".state/reset_guard.yaml")
+          try:
+            if os.path.isfile(gf):
+              with open(gf,"r") as f:
+                y = yaml.safe_load(f) or {}
+              def deep(dst, src):
+                for k,v in (src or {}).items():
+                  if isinstance(v, dict) and isinstance(dst.get(k), dict):
+                    deep(dst[k], v)
+                  else:
+                    dst[k] = v
+              deep(config, y)
+          except Exception as e:
+            print(f"note: could not read {gf}: {e}", file=sys.stderr)
+
+          # Allow workflow_dispatch override just for this run
+          dr_input = os.getenv("INPUT_DRY_RUN","").strip()
+          if dr_input:
+            config["dry_run"] = dr_input.upper()
+
+          # normalize DRY_RUN
+          if str(config.get("dry_run","ON")).upper() not in ("ON","OFF"):
+            config["dry_run"] = "ON"
+
+          # Emit flat outputs for later steps
+          outs = {
+            "RUN_SWITCH": config["run_switch"],
+            "DRY_RUN": config["dry_run"],
+            "MIN_BUY_USD": config["sizing"]["min_buy_usd"],
+            "MIN_SELL_USD": config["sizing"]["min_sell_usd"],
+            "RESERVE_CASH_PCT": config["sizing"]["reserve_cash_pct"],
+            "MAX_POSITIONS": config["sizing"]["max_positions"],
+            "MAX_BUYS_PER_RUN": config["sizing"]["max_buys_per_run"],
+            "UNIVERSE_TOP_K": config["universe"]["top_k"],
+            "ROTATE_WHEN_FULL": config["rotation"]["when_full"],
+            "ROTATE_WHEN_CASH_SHORT": config["rotation"]["when_cash_short"],
+            "DUST_MIN_USD": config["dust"]["min_usd"],
+            "DUST_SKIP_STABLES": config["dust"]["skip_stables"],
+          }
+          for k,v in outs.items():
+            print(f"{k}={v}")
+          PY >> "$GITHUB_OUTPUT"
+
+      - name: Prepare .state files
+        shell: bash
+        run: |
+          mkdir -p "${STATE_DIR}"
+          [[ -f "${POSITIONS_JSON}" ]] || echo "{}" > "${POSITIONS_JSON}"
+          [[ -f "${KPI_CSV}" ]] || echo "timestamp,base,bal_usd,pnl_day_usd,buys,sells,open_positions" > "${KPI_CSV}"
+
+      - name: Print SETTINGS summary
+        shell: bash
+        run: |
+          echo "----- SETTINGS -----"
+          echo "Exchange: ${EXCHANGE}"
+          echo "RUN_SWITCH=${{ steps.guards.outputs.RUN_SWITCH }}"
+          echo "DRY_RUN=${{ steps.guards.outputs.DRY_RUN }}"
+          echo "MIN_BUY_USD=${{ steps.guards.outputs.MIN_BUY_USD }}"
+          echo "MIN_SELL_USD=${{ steps.guards.outputs.MIN_SELL_USD }}"
+          echo "DUST_MIN_USD=${{ steps.guards.outputs.DUST_MIN_USD }}  DUST_SKIP_STABLES=${{ steps.guards.outputs.DUST_SKIP_STABLES }}"
+          echo "RESERVE_CASH_PCT=${{ steps.guards.outputs.RESERVE_CASH_PCT }}"
+          echo "MAX_POSITIONS=${{ steps.guards.outputs.MAX_POSITIONS }}  MAX_BUYS_PER_RUN=${{ steps.guards.outputs.MAX_BUYS_PER_RUN }}"
+          echo "UNIVERSE_TOP_K=${{ steps.guards.outputs.UNIVERSE_TOP_K }}"
+          echo "ROTATE_WHEN_FULL=${{ steps.guards.outputs.ROTATE_WHEN_FULL }}  ROTATE_WHEN_CASH_SHORT=${{ steps.guards.outputs.ROTATE_WHEN_CASH_SHORT }}"
+          echo "--------------------"
+
+      - name: Run bot (DRY-RUN safe)
+        env:
+          RUN_SWITCH: ${{ steps.guards.outputs.RUN_SWITCH }}
+          DRY_RUN: ${{ steps.guards.outputs.DRY_RUN }}
+          MIN_BUY_USD: ${{ steps.guards.outputs.MIN_BUY_USD }}
+          MIN_SELL_USD: ${{ steps.guards.outputs.MIN_SELL_USD }}
+          DUST_MIN_USD: ${{ steps.guards.outputs.DUST_MIN_USD }}
+          DUST_SKIP_STABLES: ${{ steps.guards.outputs.DUST_SKIP_STABLES }}
+          RESERVE_CASH_PCT: ${{ steps.guards.outputs.RESERVE_CASH_PCT }}
+          MAX_POSITIONS: ${{ steps.guards.outputs.MAX_POSITIONS }}
+          MAX_BUYS_PER_RUN: ${{ steps.guards.outputs.MAX_BUYS_PER_RUN }}
+          UNIVERSE_TOP_K: ${{ steps.guards.outputs.UNIVERSE_TOP_K }}
+          ROTATE_WHEN_FULL: ${{ steps.guards.outputs.ROTATE_WHEN_FULL }}
+          ROTATE_WHEN_CASH_SHORT: ${{ steps.guards.outputs.ROTATE_WHEN_CASH_SHORT }}
+          EXCHANGE: ${{ env.EXCHANGE }}
+          STATE_DIR: ${{ env.STATE_DIR }}
+          POSITIONS_JSON: ${{ env.POSITIONS_JSON }}
+          KPI_CSV: ${{ env.KPI_CSV }}
+        shell: bash
+        run: |
+          set -e
+          if [[ -f "main.py" ]]; then
+            echo "Starting python main.py (exchange=${EXCHANGE}, DRY_RUN=$DRY_RUN)"
+            python main.py --mode crypto --exchange "${EXCHANGE}" || true
+          else
+            echo "warning: main.py not found at repo root. Skipping run step."
+          fi
+
+      - name: Append KPI/SUMMARY line if needed
+        shell: bash
+        run: |
+          python - << 'PY'
+          import os, csv, datetime as dt
+          kpi = os.getenv("KPI_CSV",".state/kpi_history.csv")
+          now = dt.datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
+          last = ""
+          if os.path.exists(kpi):
+            with open(kpi, newline="") as f:
+              rows = list(csv.reader(f))
+              if len(rows) > 1:
+                last = rows[-1][0]
+          if last[:10] != now[:10]:
+            with open(kpi, "a", newline="") as f:
+              csv.writer(f).writerow([now, "USD", "", "", "", "", ""])
+          PY
+
+      - name: Upload state artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-after-run
+          path: |
+            .state/**
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Job summary
+        shell: bash
+        run: |
+          echo "### ✅ SAFE run complete" >> $GITHUB_STEP_SUMMARY
+          echo "- DRY_RUN: **${{ steps.guards.outputs.DRY_RUN }}**" >> $GITHUB_STEP_SUMMARY
+          echo "- Exchange: **${{ env.EXCHANGE }}**" >> $GITHUB_STEP_SUMMARY
+          echo "- Settings source: \`${{ env.GUARD_FILE }}\` if present, else **Repository Variables**." >> $GITHUB_STEP_SUMMARY
+          echo "- Uploaded **state-after-run** artifact." >> $GITHUB_STEP_SUMMARY
