@@ -1,122 +1,182 @@
-name: Crypto Live — RESET (Full Restore)
+name: Crypto Live — RESET (Clean Restore & Guard Reload)
 
 on:
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: 'Use OFF for real trades; ON for simulation only'
+        description: "DRY_RUN switch for this run only (ON/OFF)"
         required: false
-        default: 'ON'
-      RESET_MODE:
-        description: 'Choose: FORCE_LIQUIDATE or CLEAN_REINIT'
+        default: "ON"
+      CLEAN_STATE:
+        description: "Force wipe and recreate .state/ (true/false)"
         required: false
-        default: 'FORCE_LIQUIDATE'
+        default: "true"
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: crypto-live
+  cancel-in-progress: false
 
 env:
-  RUN_NAME: "CryptoBot RESET"
+  # ---- Safety-first defaults (can be overridden by repo Variables) ----
   RUN_SWITCH: "ON"
-  DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
-  RESET_MODE: ${{ inputs.RESET_MODE || 'FORCE_LIQUIDATE' }}
-
-  MIN_SELL_USD: 10
-  DUST_MIN_USD: 2
-  DUST_SKIP_STABLES: true
-
-  UNIVERSE_TOP_K: 25
-  MAX_POSITIONS: 3
-  MAX_BUYS_PER_RUN: 0
-  ROTATE_WHEN_FULL: false
-  ROTATE_WHEN_CASH_SHORT: false
-  RESERVE_CASH_PCT: 5
-
-  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-  KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-  KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+  DRY_RUN_DEFAULT: "ON"           # the baseline; workflow_dispatch DRY_RUN overrides per-run
+  #
+  # Guard rails & sizing caps (safe September-style baseline)
+  MIN_BUY_USD: "10"
+  MIN_SELL_USD: "10"
+  DUST_MIN_USD: "2"
+  DUST_SKIP_STABLES: "true"
+  RESERVE_CASH_PCT: "5"
+  MAX_POSITIONS: "3"
+  MAX_BUYS_PER_RUN: "2"
+  UNIVERSE_TOP_K: "25"
+  ROTATE_WHEN_FULL: "true"
+  ROTATE_WHEN_CASH_SHORT: "true"
+  #
+  # Files/paths
+  STATE_DIR: ".state"
+  KPI_CSV: ".state/kpi_history.csv"
+  POSITIONS_JSON: ".state/positions.json"
+  GUARD_FILE: ".state/reset_guard.yaml"
+  RESET_FLAG: ".state/RESET_OK"
 
 jobs:
   reset:
-    name: Reset Crypto Portfolio
+    name: Clean Restore & Guard Reload
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
+      - name: Decide DRY_RUN for this job
+        id: dry
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
+          # Per-run dispatch value takes priority; otherwise use repo Variable DRY_RUN else default.
+          DR_INPUT="${{ inputs.DRY_RUN }}"
+          DR_VAR="${{ vars.DRY_RUN }}"
+          DR_DEF="${DRY_RUN_DEFAULT}"
+          if [[ -n "$DR_INPUT" ]]; then DR="$DR_INPUT";
+          elif [[ -n "$DR_VAR" ]]; then DR="$DR_VAR";
+          else DR="$DR_DEF"; fi
+          DR=$(echo "$DR" | tr '[:lower:]' '[:upper:]')
+          if [[ "$DR" != "ON" && "$DR" != "OFF" ]]; then DR="ON"; fi
+          echo "DRY_RUN=$DR" >> "$GITHUB_OUTPUT"
+          echo "Resolved DRY_RUN=$DR"
 
-      - name: Reset or Liquidate
+      - name: Compute effective guard values (repo Variables override env defaults)
+        id: guards
+        shell: bash
         run: |
-          echo "=== Starting CryptoBot RESET ==="
-          echo "Mode: $RESET_MODE"
-          echo "Dry run: $DRY_RUN"
-          mkdir -p .state
-          if [ "$RESET_MODE" = "FORCE_LIQUIDATE" ]; then
-            echo "Forcing liquidation of all positions..."
-            python trader/broker_crypto_ccxt.py --force-liquidate --dry-run=$DRY_RUN
-          else
-            echo "Clean reinit: clearing local state and sweeping dust..."
-            rm -rf .state/positions.json .state/kpi_history.csv
-            python tools/dust_sweeper.py --min-usd=$DUST_MIN_USD --skip-stables=$DUST_SKIP_STABLES --dry-run=$DRY_RUN
+          getv() { local key="$1"; local def="$2"; local val="${!key}"; local rvar="${{ toJson(vars) }}"; 
+            # prefer GitHub Variables if set, else current env default
+            if echo "$rvar" | grep -q "\"$key\":"; then
+              # pull from vars map with jq-like primitive using grep/sed
+              val=$(echo "$rvar" | tr ',' '\n' | grep "\"$key\"" | head -n1 | sed 's/.*: "\(.*\)".*/\1/')
+            fi
+            echo "${val:-$def}"
+          }
+
+          MIN_BUY_USD=$(getv MIN_BUY_USD "${MIN_BUY_USD}")
+          MIN_SELL_USD=$(getv MIN_SELL_USD "${MIN_SELL_USD}")
+          DUST_MIN_USD=$(getv DUST_MIN_USD "${DUST_MIN_USD}")
+          DUST_SKIP_STABLES=$(getv DUST_SKIP_STABLES "${DUST_SKIP_STABLES}")
+          RESERVE_CASH_PCT=$(getv RESERVE_CASH_PCT "${RESERVE_CASH_PCT}")
+          MAX_POSITIONS=$(getv MAX_POSITIONS "${MAX_POSITIONS}")
+          MAX_BUYS_PER_RUN=$(getv MAX_BUYS_PER_RUN "${MAX_BUYS_PER_RUN}")
+          UNIVERSE_TOP_K=$(getv UNIVERSE_TOP_K "${UNIVERSE_TOP_K}")
+          ROTATE_WHEN_FULL=$(getv ROTATE_WHEN_FULL "${ROTATE_WHEN_FULL}")
+          ROTATE_WHEN_CASH_SHORT=$(getv ROTATE_WHEN_CASH_SHORT "${ROTATE_WHEN_CASH_SHORT}")
+          RUN_SWITCH=$(getv RUN_SWITCH "${RUN_SWITCH}")
+
+          {
+            echo "MIN_BUY_USD=$MIN_BUY_USD"
+            echo "MIN_SELL_USD=$MIN_SELL_USD"
+            echo "DUST_MIN_USD=$DUST_MIN_USD"
+            echo "DUST_SKIP_STABLES=$DUST_SKIP_STABLES"
+            echo "RESERVE_CASH_PCT=$RESERVE_CASH_PCT"
+            echo "MAX_POSITIONS=$MAX_POSITIONS"
+            echo "MAX_BUYS_PER_RUN=$MAX_BUYS_PER_RUN"
+            echo "UNIVERSE_TOP_K=$UNIVERSE_TOP_K"
+            echo "ROTATE_WHEN_FULL=$ROTATE_WHEN_FULL"
+            echo "ROTATE_WHEN_CASH_SHORT=$ROTATE_WHEN_CASH_SHORT"
+            echo "RUN_SWITCH=$RUN_SWITCH"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Clean & recreate .state
+        if: ${{ inputs.CLEAN_STATE == 'true' }}
+        shell: bash
+        run: |
+          rm -rf "${STATE_DIR}"
+          mkdir -p "${STATE_DIR}"
+
+      - name: Ensure baseline files exist
+        shell: bash
+        run: |
+          mkdir -p "${STATE_DIR}"
+          # positions.json baseline
+          if [[ ! -f "${POSITIONS_JSON}" ]]; then
+            echo "{}" > "${POSITIONS_JSON}"
           fi
-          echo "Reset step completed."
+          # kpi_history.csv baseline
+          if [[ ! -f "${KPI_CSV}" ]]; then
+            echo "timestamp,base,bal_usd,pnl_day_usd,buys,sells,open_positions" > "${KPI_CSV}"
+          fi
 
-      - name: Write baseline guard-pack
-        shell: python
+      - name: Write safe guard preset (reset_guard.yaml)
+        shell: bash
         run: |
-          import json, os, pathlib, datetime
-          p = pathlib.Path(".state"); p.mkdir(parents=True, exist_ok=True)
-          guards = {
-            "UNIVERSE_TOP_K": int(os.getenv("UNIVERSE_TOP_K","25")),
-            "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS","3")),
-            "MAX_BUYS_PER_RUN": int(os.getenv("MAX_BUYS_PER_RUN","0")),
-            "ROTATE_WHEN_FULL": os.getenv("ROTATE_WHEN_FULL","false") in ("true","1","on"),
-            "ROTATE_WHEN_CASH_SHORT": os.getenv("ROTATE_WHEN_CASH_SHORT","false") in ("true","1","on"),
-            "RESERVE_CASH_PCT": float(os.getenv("RESERVE_CASH_PCT","5")),
-            "MIN_SELL_USD": float(os.getenv("MIN_SELL_USD","10")),
-            "DUST_MIN_USD": float(os.getenv("DUST_MIN_USD","2")),
-            "DUST_SKIP_STABLES": os.getenv("DUST_SKIP_STABLES","true") in ("true","1","on"),
-          }
-          data = {
-            "created_at": datetime.datetime.utcnow().isoformat()+"Z",
-            "label": "September Good Baseline",
-            "guards": guards,
-            "notes": [
-              "Auto-written by crypto-live-reset.yml after reset.",
-              "Use DRY_RUN=ON to simulate safely."
-            ]
-          }
-          with open(".state/baseline_config.json","w",encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-          print("Wrote .state/baseline_config.json")
-          print(json.dumps(data, indent=2))
+          cat > "${GUARD_FILE}" << 'YAML'
+          # Auto-generated by crypto-live-reset.yml
+          # Conservative, September-style baseline guards and caps
+          run_switch: "${{ steps.guards.outputs.RUN_SWITCH }}"
+          dry_run: "${{ steps.dry.outputs.DRY_RUN }}"
+          sizing:
+            min_buy_usd: ${{ steps.guards.outputs.MIN_BUY_USD }}
+            min_sell_usd: ${{ steps.guards.outputs.MIN_SELL_USD }}
+            reserve_cash_pct: ${{ steps.guards.outputs.RESERVE_CASH_PCT }}
+            max_positions: ${{ steps.guards.outputs.MAX_POSITIONS }}
+            max_buys_per_run: ${{ steps.guards.outputs.MAX_BUYS_PER_RUN }}
+          universe:
+            top_k: ${{ steps.guards.outputs.UNIVERSE_TOP_K }}
+          rotation:
+            when_full: ${{ steps.guards.outputs.ROTATE_WHEN_FULL }}
+            when_cash_short: ${{ steps.guards.outputs.ROTATE_WHEN_CASH_SHORT }}
+          dust:
+            min_usd: ${{ steps.guards.outputs.DUST_MIN_USD }}
+            skip_stables: ${{ steps.guards.outputs.DUST_SKIP_STABLES }}
+          YAML
+          echo "Wrote ${GUARD_FILE}"
 
-      - name: Verify baseline file exists
+      - name: Mark reset flag
+        shell: bash
         run: |
-          test -f .state/baseline_config.json && echo "Baseline present." || (echo "Missing baseline_config.json"; exit 1)
-          ls -al .state || true
+          date -u +"%Y-%m-%dT%H:%M:%SZ RESET_OK (DRY_RUN=${{ steps.dry.outputs.DRY_RUN }})" > "${RESET_FLAG}"
+          echo "Reset flag written."
 
-      - name: Upload state artifacts
-        if: always()
+      - name: Upload .state artifact (for visual confirm)
         uses: actions/upload-artifact@v4
         with:
-          name: crypto-reset-state
-          path: .state/
+          name: state-after-reset
+          path: |
+            .state/**
           if-no-files-found: warn
+          retention-days: 7
 
-      - name: Slack Notify (optional)
-        if: env.SLACK_WEBHOOK_URL != ''
+      - name: Job summary
+        shell: bash
         run: |
-          msg="*${RUN_NAME}* finished. Mode: ${RESET_MODE} | DryRun: ${DRY_RUN}"
-          curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"$msg\"}" $SLACK_WEBHOOK_URL
-
-      - name: Done
-        run: echo "CryptoBot RESET completed successfully."
+          echo "### ✅ Reset complete" >> $GITHUB_STEP_SUMMARY
+          echo "- DRY_RUN: **${{ steps.dry.outputs.DRY_RUN }}**" >> $GITHUB_STEP_SUMMARY
+          echo "- Wrote guards to \`${{ env.GUARD_FILE }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Cleaned & prepared \`${{ env.STATE_DIR }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Uploaded **state-after-reset** artifact (download to verify)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> Next: run your normal workflow in DRY_RUN=ON to sanity-check buys/sells without touching funds." >> $GITHUB_STEP_SUMMARY
