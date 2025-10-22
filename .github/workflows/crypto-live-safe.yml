@@ -7,9 +7,8 @@ on:
         description: "Override DRY_RUN for THIS run only (ON/OFF). Leave blank to use reset_guard.yaml or repo Variable."
         required: false
         default: ""
-  # Uncomment to schedule after sanity checks
   # schedule:
-  #   - cron: "*/15 * * * *"
+  #   - cron: "*/15 * * * *"  # enable after sanity checks
 
 permissions:
   contents: read
@@ -45,85 +44,105 @@ jobs:
       - name: Install minimal deps (skip if no requirements.txt)
         shell: bash
         run: |
-          set -e
           if [[ -f requirements.txt ]]; then
             pip install -r requirements.txt
           else
-            pip install --upgrade pip
+            python -m pip install --upgrade pip
             pip install pyyaml pandas
           fi
 
-      - name: Resolve guards (prefer reset_guard.yaml → repo Variables → safe defaults)
+      - name: Resolve guards (sanitize YAML → parse → fallback to repo Variables on error)
         id: guards
         shell: bash
         run: |
           python - << 'PY'
-          import os, sys, yaml
+          import os, sys, yaml, re
 
-          # defaults (September baseline)
+          def env(k, d): 
+            v = os.getenv(k)
+            return v if v not in (None, "") else d
+
+          # Safe defaults (September baseline)
           config = {
-            "run_switch": os.getenv("RUN_SWITCH","ON"),
-            "dry_run": os.getenv("DRY_RUN","ON"),
+            "run_switch": env("RUN_SWITCH","ON"),
+            "dry_run": env("DRY_RUN","ON"),
             "sizing": {
-              "min_buy_usd": os.getenv("MIN_BUY_USD","10"),
-              "min_sell_usd": os.getenv("MIN_SELL_USD","10"),
-              "reserve_cash_pct": os.getenv("RESERVE_CASH_PCT","5"),
-              "max_positions": os.getenv("MAX_POSITIONS","3"),
-              "max_buys_per_run": os.getenv("MAX_BUYS_PER_RUN","2"),
+              "min_buy_usd": env("MIN_BUY_USD","10"),
+              "min_sell_usd": env("MIN_SELL_USD","10"),
+              "reserve_cash_pct": env("RESERVE_CASH_PCT","5"),
+              "max_positions": env("MAX_POSITIONS","3"),
+              "max_buys_per_run": env("MAX_BUYS_PER_RUN","2"),
             },
-            "universe": { "top_k": os.getenv("UNIVERSE_TOP_K","25") },
+            "universe": { "top_k": env("UNIVERSE_TOP_K","25") },
             "rotation": {
-              "when_full": os.getenv("ROTATE_WHEN_FULL","true"),
-              "when_cash_short": os.getenv("ROTATE_WHEN_CASH_SHORT","true"),
+              "when_full": env("ROTATE_WHEN_FULL","true"),
+              "when_cash_short": env("ROTATE_WHEN_CASH_SHORT","true"),
             },
             "dust": {
-              "min_usd": os.getenv("DUST_MIN_USD","2"),
-              "skip_stables": os.getenv("DUST_SKIP_STABLES","true"),
+              "min_usd": env("DUST_MIN_USD","2"),
+              "skip_stables": env("DUST_SKIP_STABLES","true"),
             }
           }
 
-          gf = os.getenv("GUARD_FILE",".state/reset_guard.yaml")
-          try:
-            if os.path.isfile(gf):
-              with open(gf,"r") as f:
-                y = yaml.safe_load(f) or {}
+          gf = env("GUARD_FILE",".state/reset_guard.yaml")
+          parsed_from_file = False
+          if os.path.isfile(gf):
+            try:
+              # Read and sanitize: normalize newlines, strip BOM, replace smart quotes/dashes, remove tabs and control chars
+              raw = open(gf, "rb").read()
+              text = raw.decode("utf-8-sig", errors="ignore")
+              text = text.replace("\r\n","\n").replace("\r","\n")
+              trans = {
+                "\u2013":"-", "\u2014":"-",
+                "\u2018":"'", "\u2019":"'", "\u201c":'"', "\u201d":'"',
+                "\u00a0":" "
+              }
+              for a,b in trans.items(): text = text.replace(a,b)
+              text = text.replace("\t","  ")
+              text = re.sub(r"[\u0000-\u0008\u000b\u000c\u000e-\u001f]", "", text)
+
+              y = yaml.safe_load(text) or {}
+              # Deep merge y into config
               def deep(dst, src):
                 for k,v in (src or {}).items():
                   if isinstance(v, dict) and isinstance(dst.get(k), dict):
                     deep(dst[k], v)
                   else:
-                    dst[k] = v
+                    dst[k] = str(v) if isinstance(v, bool) else v
               deep(config, y)
-          except Exception as e:
-            print(f"note: could not read {gf}: {e}", file=sys.stderr)
+              parsed_from_file = True
+            except Exception as e:
+              print(f"note: failed to parse {gf}: {e}", file=sys.stderr)
+          else:
+            print(f"note: {gf} not found; using repo Variables/defaults.", file=sys.stderr)
 
           # Allow workflow_dispatch override just for this run
           dr_input = os.getenv("INPUT_DRY_RUN","").strip()
           if dr_input:
             config["dry_run"] = dr_input.upper()
 
-          # normalize DRY_RUN
+          # Normalize DRY_RUN
           if str(config.get("dry_run","ON")).upper() not in ("ON","OFF"):
             config["dry_run"] = "ON"
 
-          # Emit flat outputs for later steps
+          # Emit outputs (always exit 0)
           outs = {
             "RUN_SWITCH": config["run_switch"],
             "DRY_RUN": config["dry_run"],
-            "MIN_BUY_USD": config["sizing"]["min_buy_usd"],
-            "MIN_SELL_USD": config["sizing"]["min_sell_usd"],
-            "RESERVE_CASH_PCT": config["sizing"]["reserve_cash_pct"],
-            "MAX_POSITIONS": config["sizing"]["max_positions"],
-            "MAX_BUYS_PER_RUN": config["sizing"]["max_buys_per_run"],
-            "UNIVERSE_TOP_K": config["universe"]["top_k"],
-            "ROTATE_WHEN_FULL": config["rotation"]["when_full"],
-            "ROTATE_WHEN_CASH_SHORT": config["rotation"]["when_cash_short"],
-            "DUST_MIN_USD": config["dust"]["min_usd"],
-            "DUST_SKIP_STABLES": config["dust"]["skip_stables"],
+            "MIN_BUY_USD": str(config["sizing"]["min_buy_usd"]),
+            "MIN_SELL_USD": str(config["sizing"]["min_sell_usd"]),
+            "RESERVE_CASH_PCT": str(config["sizing"]["reserve_cash_pct"]),
+            "MAX_POSITIONS": str(config["sizing"]["max_positions"]),
+            "MAX_BUYS_PER_RUN": str(config["sizing"]["max_buys_per_run"]),
+            "UNIVERSE_TOP_K": str(config["universe"]["top_k"]),
+            "ROTATE_WHEN_FULL": str(config["rotation"]["when_full"]),
+            "ROTATE_WHEN_CASH_SHORT": str(config["rotation"]["when_cash_short"]),
+            "DUST_MIN_USD": str(config["dust"]["min_usd"]),
+            "DUST_SKIP_STABLES": str(config["dust"]["skip_stables"]),
+            "SOURCE": "reset_guard.yaml" if parsed_from_file else "repo_variables",
           }
-          for k,v in outs.items():
-            print(f"{k}={v}")
-          PY >> "$GITHUB_OUTPUT"
+          for k,v in outs.items(): print(f"{k}={v}")
+          PY
 
       - name: Prepare .state files
         shell: bash
@@ -136,6 +155,7 @@ jobs:
         shell: bash
         run: |
           echo "----- SETTINGS -----"
+          echo "Source: ${{ steps.guards.outputs.SOURCE }}"
           echo "Exchange: ${EXCHANGE}"
           echo "RUN_SWITCH=${{ steps.guards.outputs.RUN_SWITCH }}"
           echo "DRY_RUN=${{ steps.guards.outputs.DRY_RUN }}"
@@ -168,7 +188,6 @@ jobs:
           KPI_CSV: ${{ env.KPI_CSV }}
         shell: bash
         run: |
-          set -e
           if [[ -f "main.py" ]]; then
             echo "Starting python main.py (exchange=${EXCHANGE}, DRY_RUN=$DRY_RUN)"
             python main.py --mode crypto --exchange "${EXCHANGE}" || true
@@ -207,7 +226,7 @@ jobs:
         shell: bash
         run: |
           echo "### ✅ SAFE run complete" >> $GITHUB_STEP_SUMMARY
+          echo "- Source: **${{ steps.guards.outputs.SOURCE }}**" >> $GITHUB_STEP_SUMMARY
           echo "- DRY_RUN: **${{ steps.guards.outputs.DRY_RUN }}**" >> $GITHUB_STEP_SUMMARY
           echo "- Exchange: **${{ env.EXCHANGE }}**" >> $GITHUB_STEP_SUMMARY
-          echo "- Settings source: \`${{ env.GUARD_FILE }}\` if present, else **Repository Variables**." >> $GITHUB_STEP_SUMMARY
           echo "- Uploaded **state-after-run** artifact." >> $GITHUB_STEP_SUMMARY
