@@ -71,11 +71,12 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
+          # If you have a requirements.txt, install it first
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
-          else
-            pip install pandas numpy matplotlib requests
           fi
+          # Ensure the ones we need for this workflow
+          pip install --upgrade pyyaml matplotlib pandas numpy requests
 
       - name: Show configuration
         run: |
@@ -105,6 +106,13 @@ jobs:
           if [ -f tools/make_kpi_chart.py ]; then
             python tools/make_kpi_chart.py || true
           fi
+
+      - name: Ensure artifact folder
+        if: always()
+        run: |
+          mkdir -p .state
+          # Create a tiny placeholder so upload-artifact never warns when the run exits early
+          touch .state/.keep
 
       - name: Upload artifacts
         if: always()
