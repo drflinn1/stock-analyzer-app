@@ -1,4 +1,4 @@
-name: 🔁 Crypto Live — RESET (Full Restore)
+name: Crypto Live — RESET (Full Restore)
 
 on:
   workflow_dispatch:
@@ -35,78 +35,76 @@ env:
 
 jobs:
   reset:
-    name: 🔄 Reset Crypto Portfolio
+    name: Reset Crypto Portfolio
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
-      - name: 🧩 Checkout repo
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: ⚙️ Setup Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 📦 Install dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
 
-      - name: 🧼 Reset or Liquidate
+      - name: Reset or Liquidate
         run: |
           echo "=== Starting CryptoBot RESET ==="
           echo "Mode: $RESET_MODE"
           echo "Dry run: $DRY_RUN"
           mkdir -p .state
           if [ "$RESET_MODE" = "FORCE_LIQUIDATE" ]; then
-            echo "💣 FORCE LIQUIDATING all positions..."
+            echo "Forcing liquidation of all positions..."
             python trader/broker_crypto_ccxt.py --force-liquidate --dry-run=$DRY_RUN
           else
-            echo "🧹 CLEAN REINIT — clearing old state and dust..."
+            echo "Clean reinit: clearing local state and sweeping dust..."
             rm -rf .state/positions.json .state/kpi_history.csv
             python tools/dust_sweeper.py --min-usd=$DUST_MIN_USD --skip-stables=$DUST_SKIP_STABLES --dry-run=$DRY_RUN
           fi
-          echo "✅ Reset completed."
+          echo "Reset step completed."
 
-      - name: 🧱 Write September baseline guard-pack (.state/baseline_config.json)
+      - name: Write baseline guard-pack
+        shell: python
         run: |
-          mkdir -p .state
-          cat > .state/baseline_config.json <<JSON
-          {
-            "created_at": "$(date -u +\"%Y-%m-%dT%H:%M:%SZ\")",
+          import json, os, pathlib, datetime
+          p = pathlib.Path(".state"); p.mkdir(parents=True, exist_ok=True)
+          guards = {
+            "UNIVERSE_TOP_K": int(os.getenv("UNIVERSE_TOP_K","25")),
+            "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS","3")),
+            "MAX_BUYS_PER_RUN": int(os.getenv("MAX_BUYS_PER_RUN","0")),
+            "ROTATE_WHEN_FULL": os.getenv("ROTATE_WHEN_FULL","false") in ("true","1","on"),
+            "ROTATE_WHEN_CASH_SHORT": os.getenv("ROTATE_WHEN_CASH_SHORT","false") in ("true","1","on"),
+            "RESERVE_CASH_PCT": float(os.getenv("RESERVE_CASH_PCT","5")),
+            "MIN_SELL_USD": float(os.getenv("MIN_SELL_USD","10")),
+            "DUST_MIN_USD": float(os.getenv("DUST_MIN_USD","2")),
+            "DUST_SKIP_STABLES": os.getenv("DUST_SKIP_STABLES","true") in ("true","1","on"),
+          }
+          data = {
+            "created_at": datetime.datetime.utcnow().isoformat()+"Z",
             "label": "September Good Baseline",
-            "guards": {
-              "UNIVERSE_TOP_K": ${UNIVERSE_TOP_K},
-              "MAX_POSITIONS": ${MAX_POSITIONS},
-              "MAX_BUYS_PER_RUN": ${MAX_BUYS_PER_RUN},
-              "ROTATE_WHEN_FULL": ${ROTATE_WHEN_FULL},
-              "ROTATE_WHEN_CASH_SHORT": ${ROTATE_WHEN_CASH_SHORT},
-              "RESERVE_CASH_PCT": ${RESERVE_CASH_PCT},
-              "MIN_SELL_USD": ${MIN_SELL_USD},
-              "DUST_MIN_USD": ${DUST_MIN_USD},
-              "DUST_SKIP_STABLES": ${DUST_SKIP_STABLES}
-            },
+            "guards": guards,
             "notes": [
               "Auto-written by crypto-live-reset.yml after reset.",
-              "Use DRY_RUN=ON to simulate other steps safely."
+              "Use DRY_RUN=ON to simulate safely."
             ]
           }
-          JSON
-          echo "✅ Wrote .state/baseline_config.json"
-          ls -al .state
+          with open(".state/baseline_config.json","w",encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+          print("Wrote .state/baseline_config.json")
+          print(json.dumps(data, indent=2))
 
-      - name: 📦 Verify baseline file exists
+      - name: Verify baseline file exists
         run: |
-          if [ -f ".state/baseline_config.json" ]; then
-            echo "✅ Baseline file confirmed present:"
-            cat .state/baseline_config.json
-          else
-            echo "❌ Missing baseline_config.json — check write step."
-            exit 1
-          fi
+          test -f .state/baseline_config.json && echo "Baseline present." || (echo "Missing baseline_config.json"; exit 1)
+          ls -al .state || true
 
-      - name: 📤 Upload state artifacts
+      - name: Upload state artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -114,13 +112,11 @@ jobs:
           path: .state/
           if-no-files-found: warn
 
-      - name: 📡 Slack Notify (optional)
+      - name: Slack Notify (optional)
         if: env.SLACK_WEBHOOK_URL != ''
         run: |
           msg="*${RUN_NAME}* finished. Mode: ${RESET_MODE} | DryRun: ${DRY_RUN}"
-          curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\":\"$msg\"}" \
-            $SLACK_WEBHOOK_URL
+          curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"$msg\"}" $SLACK_WEBHOOK_URL
 
-      - name: ✅ Done
+      - name: Done
         run: echo "CryptoBot RESET completed successfully."
