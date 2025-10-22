@@ -1,7 +1,10 @@
 streamlit
 yfinance
+pyyaml
 pandas
 numpy
+matplotlib
+requests
 plotly
 python-dotenv
 streamlit-autorefresh
@@ -15,4 +18,5 @@ ccxt
 scipy>=1.10.0
 alpaca-py>=0.12
 yfinance>=0.2.40
+
 
