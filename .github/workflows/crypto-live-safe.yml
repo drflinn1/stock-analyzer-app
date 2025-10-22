@@ -1,4 +1,4 @@
-name: 🔴 Crypto Live — SAFE (manual $10 test)
+name: Crypto Live — SAFE (manual $10 test)
 
 on:
   workflow_dispatch:
@@ -30,16 +30,16 @@ env:
 
 jobs:
   live_safe:
-    name: ▶️ Run SAFE manual test
+    name: Run SAFE manual test
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
-      - name: 🧩 Checkout repo
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       # 1) Try to pull baseline from RESET artifact
-      - name: ⬇️ Download baseline artifact (if present)
+      - name: Download baseline artifact (if present)
         uses: actions/download-artifact@v4
         with:
           name: crypto-reset-state
@@ -47,7 +47,7 @@ jobs:
         continue-on-error: true
 
       # 2) Fallback baseline if missing
-      - name: 🧱 Fallback: write baseline from env (only if missing)
+      - name: Fallback: write baseline from env (only if missing)
         shell: bash
         run: |
           mkdir -p .state
@@ -73,7 +73,7 @@ JSON
           ls -al .state || true
 
       # 3) Load baseline guard-pack
-      - name: 🔽 Load baseline guard-pack
+      - name: Load baseline guard-pack
         if: ${{ hashFiles('.state/baseline_config.json') != '' }}
         shell: python
         run: |
@@ -93,35 +93,35 @@ JSON
                   env.write(f"{k}={v}\n")
           print("Baseline guards loaded.")
 
-      - name: ⚙️ Setup Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 📦 Install dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 🤖 Run Crypto Bot (SAFE)
+      - name: Run Crypto Bot (SAFE)
         env:
           MODE: "CRYPTO"
         run: |
           echo "DRY_RUN=${DRY_RUN}  UNIVERSE_TOP_K=${UNIVERSE_TOP_K}  MAX_POSITIONS=${MAX_POSITIONS}  MAX_BUYS_PER_RUN=${MAX_BUYS_PER_RUN}"
           python main.py
 
-      - name: 📊 Make KPI chart (optional)
+      - name: Make KPI chart (optional)
         run: |
           mkdir -p .state
           python tools/make_kpi_chart.py || true
 
-      - name: 📤 Upload artifacts (.state)
+      - name: Upload artifacts (.state)
         uses: actions/upload-artifact@v4
         with:
           name: crypto-live-safe-state
           path: .state
 
-      - name: 📡 Slack Notify (optional)
+      - name: Slack Notify (optional)
         if: env.SLACK_WEBHOOK_URL != ''
         run: |
           msg="SAFE run finished. DRY_RUN=${DRY_RUN} | TOP_K=${UNIVERSE_TOP_K} | MAX_POS=${MAX_POSITIONS}"
