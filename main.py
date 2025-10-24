@@ -2,25 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-Crypto Live — Engine (Kraken, mean-revert buys + SELL LOGIC GUARD)
+Crypto Live — Engine (Kraken) with:
+- Mean-revert buys
+- TAKE_PROFIT / STOP_LOSS / TRAILING exits
+- Restricted-market auto-blacklist (EAccount:Invalid permissions)
+- Toggle: SKIP_RESTRICTED (default True)
 
-Adds SELL logic:
-- TAKE_PROFIT_PCT: sell when price >= entry*(1+TP)
-- STOP_LOSS_PCT:   sell when price <= entry*(1-SL)
-- TRAILING_STOP_PCT: after price makes a new peak, sell if it falls by TSL from that peak
-  (trailing is only armed once gain >= TRAILING_ARM_PCT)
-
-State:
-- .state/spot_positions.json keeps (entry, peak, amount) per symbol to evaluate exits.
-
-Env (wired via workflow repo Variables or defaults here):
-  DRY_RUN (ON/OFF)
-  KRAKEN_API_KEY / KRAKEN_API_SECRET
-  MIN_BUY_USD, MAX_POSITIONS, MAX_BUYS_PER_RUN, UNIVERSE_TOP_K,
-  RESERVE_CASH_PCT, ROTATE_WHEN_FULL, ROTATE_WHEN_CASH_SHORT,
-  DUST_MIN_USD, DUST_SKIP_STABLES,
-  TAKE_PROFIT_PCT (default 3), STOP_LOSS_PCT (default 4),
-  TRAILING_STOP_PCT (default 2), TRAILING_ARM_PCT (default 1.5)
+Artifacts written under .state/:
+  - run.log
+  - kpi_history.csv
+  - spec_gate_report.txt
+  - spot_positions.json        (entry/peak/amount per symbol)
+  - restricted_markets.json    (persisted blacklist)
 """
 
 from __future__ import annotations
@@ -29,25 +22,28 @@ from typing import Dict, List, Tuple
 import ccxt
 import pandas as pd
 
+# ---------------- paths ----------------
 STATE_DIR = pathlib.Path(".state")
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 RUN_LOG  = STATE_DIR / "run.log"
 KPI_CSV  = STATE_DIR / "kpi_history.csv"
 SPEC_TXT = STATE_DIR / "spec_gate_report.txt"
-POS_JSON = STATE_DIR / "spot_positions.json"  # entry/peak/amount per symbol
+POS_JSON = STATE_DIR / "spot_positions.json"
+RESTRICTED_JSON = STATE_DIR / "restricted_markets.json"
 
 # ---------------- tiny logger ----------------
 class Log:
     def __init__(self): self.lines=[]
-    def _emit(self, msg): 
+    def _emit(self, msg):
         ts = dt.datetime.utcnow().isoformat()+"+00:00"
-        line=f"[{ts}] {msg}"
+        line = f"[{ts}] {msg}"
         print(line, flush=True); self.lines.append(line)
     def info(self,m): self._emit(m)
     def warn(self,m): self._emit("warn: "+m)
     def error(self,m): self._emit("ERROR: "+m)
     def buy(self,pair,px): self._emit(f"[BUY] {pair} @ {px:.5f}")
     def sell(self,pair,px,reason): self._emit(f"[SELL] {pair} @ {px:.5f} reason={reason}")
+    def skipped(self,pair,reason): self._emit(f"SKIPPED_RESTRICTED {pair} reason={reason}")
     def summary(self,buys,sells,open_,dry): self._emit(f"SUMMARY buys={buys} sells={sells} open={open_} DRY_RUN={dry}")
 
 log = Log()
@@ -55,7 +51,7 @@ log = Log()
 # ---------------- env helpers ----------------
 def env_str(n,d=""): return str(os.getenv(n,d))
 def env_bool(n,d="false"): return env_str(n,d).strip().lower() in ("1","true","on","yes","y")
-def env_float(n,d="0"): 
+def env_float(n,d="0"):
     try: return float(env_str(n,d))
     except: return float(d)
 def env_int(n,d="0"):
@@ -74,11 +70,14 @@ ROTATE_WHEN_CASH_SHORT = env_bool("ROTATE_WHEN_CASH_SHORT","true")
 DUST_MIN_USD    = env_float("DUST_MIN_USD","2")
 DUST_SKIP_STABLES = env_bool("DUST_SKIP_STABLES","true")
 
-# --- SELL LOGIC knobs (add these as repo Variables later if you want) ---
-TAKE_PROFIT_PCT    = env_float("TAKE_PROFIT_PCT","3.0")     # <<< TAKE_PROFIT keyword for guard
-STOP_LOSS_PCT      = env_float("STOP_LOSS_PCT","4.0")       # <<< STOP_LOSS keyword for guard
-TRAILING_STOP_PCT  = env_float("TRAILING_STOP_PCT","2.0")   # <<< trailing keyword for guard
-TRAILING_ARM_PCT   = env_float("TRAILING_ARM_PCT","1.5")    # gain needed to arm trailing stop
+# SELL logic
+TAKE_PROFIT_PCT    = env_float("TAKE_PROFIT_PCT","3.0")     # TAKE_PROFIT keyword
+STOP_LOSS_PCT      = env_float("STOP_LOSS_PCT","4.0")       # STOP_LOSS keyword
+TRAILING_STOP_PCT  = env_float("TRAILING_STOP_PCT","2.0")   # trailing keyword
+TRAILING_ARM_PCT   = env_float("TRAILING_ARM_PCT","1.5")
+
+# Toggle for restricted-market avoidance
+SKIP_RESTRICTED = env_bool("SKIP_RESTRICTED","true")
 
 API_KEY = env_str("KRAKEN_API_KEY","")
 API_SEC = env_str("KRAKEN_API_SECRET","")
@@ -104,12 +103,27 @@ def append_kpi_csv(bal_usd: float):
 
 def write_spec(txt:str): SPEC_TXT.write_text(txt, encoding="utf-8")
 
+def load_json(path: pathlib.Path, default):
+    if path.exists():
+        try: return json.loads(path.read_text())
+        except: return default
+    return default
+
+def save_json(path: pathlib.Path, obj):
+    path.write_text(json.dumps(obj, indent=2))
+
 def load_positions() -> Dict[str,dict]:
-    if POS_JSON.exists():
-        try: return json.loads(POS_JSON.read_text())
-        except: return {}
-    return {}
-def save_positions(d:Dict[str,dict]): POS_JSON.write_text(json.dumps(d, indent=2))
+    return load_json(POS_JSON, {})
+
+def save_positions(d:Dict[str,dict]):
+    save_json(POS_JSON, d)
+
+def load_restricted() -> Dict[str,bool]:
+    # stored as { "BLESS/USD": true, ... }
+    return load_json(RESTRICTED_JSON, {})
+
+def save_restricted(d:Dict[str,bool]):
+    save_json(RESTRICTED_JSON, d)
 
 def safe_get(d,*keys,default=None):
     cur=d
@@ -159,16 +173,33 @@ def best_bid_ask(pair:str) -> Tuple[float,float]:
         return float(bid or 0), float(ask or 0)
     except: return (0.0,0.0)
 
+def is_restricted_symbol(symbol: str, restricted: Dict[str,bool]) -> bool:
+    return SKIP_RESTRICTED and restricted.get(symbol, False)
+
+def mark_restricted(symbol: str, restricted: Dict[str,bool], reason: str):
+    if not restricted.get(symbol):
+        restricted[symbol] = True
+        save_restricted(restricted)
+    log.skipped(symbol, reason)
+
 # ---------------- trade ops ----------------
-def place_order_with_log(symbol:str, side:str, amount:float):
+def place_order_with_log(symbol:str, side:str, amount:float, restricted: Dict[str,bool]):
+    """Create a market order; if Kraken rejects due to jurisdiction/permissions, blacklist symbol and return None."""
     try:
         resp = kraken.create_order(symbol=symbol, type="market", side=side, amount=amount)
         txid = safe_get(resp, "id", default=None)
         log.info(f'EXCHANGE OK AddOrder accepted | txid={txid} | side={side} symbol={symbol} amount={amount}')
         return resp
     except Exception as e:
-        log.error(f'EXCHANGE_ERROR AddOrder exception: {e} | side={side} symbol={symbol} amount={amount}')
-        raise
+        emsg = str(e)
+        # Kraken will reply e.g. 'EAccount:Invalid permissions:BLESS trading restricted for US:WA.'
+        # Catch-and-blacklist on those—no crash.
+        if "Invalid permissions" in emsg or "restricted for" in emsg or "EAccount" in emsg:
+            mark_restricted(symbol, restricted, emsg)
+            return None
+        # other errors bubble but won’t stop the whole job
+        log.warn(f'order failed {symbol}: {e}')
+        return None
 
 # ---------------- strategy helpers ----------------
 def pick_candidates(pairs:List[str], top_k:int) -> List[Tuple[str,float,float]]:
@@ -193,13 +224,6 @@ def symbol_for_base(base:str, markets:Dict[str,dict]) -> str|None:
 
 # ---------------- SELL RULES ----------------
 def check_sell_rules(symbol:str, price:float, pos:dict) -> str|None:
-    """
-    Returns reason string if we should sell now, else None.
-    Implements:
-      - TAKE_PROFIT (>= TAKE_PROFIT_PCT)
-      - STOP_LOSS (<= STOP_LOSS_PCT)
-      - trailing stop (armed after TRAILING_ARM_PCT gain; drop >= TRAILING_STOP_PCT from peak)
-    """
     entry = float(pos.get("entry",0))
     peak  = float(pos.get("peak",entry))
     if entry <= 0 or price <= 0:
@@ -216,7 +240,7 @@ def check_sell_rules(symbol:str, price:float, pos:dict) -> str|None:
     if gain <= -abs(STOP_LOSS_PCT):
         return f"STOP_LOSS {gain:.2f}% ≤ -{abs(STOP_LOSS_PCT):.2f}%"
 
-    # trailing (only if armed)
+    # trailing (armed)
     if gain >= TRAILING_ARM_PCT and dd_from_peak >= TRAILING_STOP_PCT:
         return f"TRAILING_DROP {dd_from_peak:.2f}% ≥ {TRAILING_STOP_PCT:.2f}% (armed at +{TRAILING_ARM_PCT:.2f}%)"
 
@@ -233,50 +257,51 @@ def main():
         f"ROTATE_WHEN_FULL={ROTATE_WHEN_FULL} ROTATE_WHEN_CASH_SHORT={ROTATE_WHEN_CASH_SHORT}",
         f"DUST_MIN_USD={DUST_MIN_USD} DUST_SKIP_STABLES={DUST_SKIP_STABLES}",
         f"TAKE_PROFIT_PCT={TAKE_PROFIT_PCT} STOP_LOSS_PCT={STOP_LOSS_PCT} TRAILING_STOP_PCT={TRAILING_STOP_PCT} TRAILING_ARM_PCT={TRAILING_ARM_PCT}",
+        f"SKIP_RESTRICTED={SKIP_RESTRICTED}",
     ]
 
     markets = kraken.load_markets()
     usd_pairs = list_usd_pairs(limit=80)
+    restricted = load_restricted()  # persisted across runs
+
+    # Remove restricted markets up front to avoid churn
+    if SKIP_RESTRICTED:
+        usd_pairs = [s for s in usd_pairs if not is_restricted_symbol(s, restricted)]
 
     raw_bal = fetch_balance_raw()
     usd_cash = usd_cash_from_raw(raw_bal)
 
-    # Load per-symbol position state
     pos_state = load_positions()
 
-    # --- SELL PASS over existing holdings ---
-    # Determine open positions (value >= dust)
+    # --- SELL pass ---
     open_symbols=[]
     for base, amt in raw_bal.items():
         bu = base.upper()
         if bu in ("USD","ZUSD"): continue
         sym = symbol_for_base(bu, markets)
         if not sym: continue
+        if is_restricted_symbol(sym, restricted):
+            # If we hold a restricted asset, we won't attempt to trade it; just skip.
+            log.skipped(sym, "present in holdings but restricted for jurisdiction")
+            continue
         _, ask = best_bid_ask(sym)
         value = float(amt) * float(ask or 0)
         if value >= max(2.0, DUST_MIN_USD):
             open_symbols.append((sym, bu, float(amt), float(ask or 0)))
 
-    # Evaluate exits
     for sym, base, amt, price in open_symbols:
-        # init state if missing
         st = pos_state.get(sym, {"entry": price, "peak": price, "amount": amt})
-        # keep amount synced if it grew/shrank
         st["amount"] = amt
-        # update peak
         if price > st.get("peak", price): st["peak"] = price
         pos_state[sym] = st
 
         reason = check_sell_rules(sym, price, st)
         if reason and not DRY_RUN:
-            try:
-                place_order_with_log(sym, "sell", amt)
+            resp = place_order_with_log(sym, "sell", amt, restricted)
+            if resp is not None:
                 log.sell(sym, price, reason)
                 sells += 1
-                # remove from state after sell
                 pos_state.pop(sym, None)
-            except Exception as e:
-                log.warn(f"sell failed {sym}: {e}")
         elif reason and DRY_RUN:
             log.sell(sym, price, reason + " (DRY_RUN)")
             sells += 1
@@ -286,7 +311,7 @@ def main():
     raw_bal = fetch_balance_raw()
     usd_cash = usd_cash_from_raw(raw_bal)
 
-    # Count open positions after sells (ignore dust)
+    # Count open positions (ignore dust)
     opens_after = 0
     for base, amt in raw_bal.items():
         bu=base.upper()
@@ -297,21 +322,17 @@ def main():
         if float(amt)*float(ask or 0) >= max(2.0, DUST_MIN_USD):
             opens_after += 1
 
-    # --- BUY PASS (mean-revert) ---
+    # --- BUY pass ---
     candidates = pick_candidates(usd_pairs, UNIVERSE_TOP_K)
     buys_allowed = max(0, MAX_BUYS_PER_RUN)
-
-    rotate = False
-    if opens_after >= MAX_POSITIONS and ROTATE_WHEN_FULL:
-        rotate = True; spec.append("Rotation reason: FULL")
-    if not can_afford_buy(usd_cash) and ROTATE_WHEN_CASH_SHORT:
-        rotate = True; spec.append("Rotation reason: CASH_SHORT")
-
-    # (optional) very light rotation: already handled by SELL stage via rules; skip extra churn
 
     for pair, last, ch in candidates:
         if buys >= buys_allowed: break
         if opens_after >= MAX_POSITIONS: break
+        if is_restricted_symbol(pair, restricted):
+            log.skipped(pair, "blacklisted (restricted)")
+            continue
+
         _, ask = best_bid_ask(pair)
         px = ask or last
         if not px or px <= 0: continue
@@ -322,19 +343,17 @@ def main():
         if DRY_RUN:
             log.buy(pair, px)
             buys += 1; opens_after += 1; usd_cash -= MIN_BUY_USD
-            # set entry/peak in state (simulate)
             pos_state[pair] = {"entry": px, "peak": px, "amount": amount}
         else:
-            try:
-                place_order_with_log(pair, "buy", amount)
-                log.buy(pair, px)
-                buys += 1; opens_after += 1; usd_cash -= MIN_BUY_USD
-                # initialize state for this symbol
-                pos_state[pair] = {"entry": px, "peak": px, "amount": amount}
-            except Exception as e:
-                log.warn(f"buy failed {pair}: {e}")
+            resp = place_order_with_log(pair, "buy", amount, restricted)
+            if resp is None:
+                # order rejected; if it was due to restriction, we've already blacklisted and logged
+                continue
+            log.buy(pair, px)
+            buys += 1; opens_after += 1; usd_cash -= MIN_BUY_USD
+            pos_state[pair] = {"entry": px, "peak": px, "amount": amount}
 
-    # KPI: current USD balance snapshot (best-effort)
+    # KPI
     try:
         bal_now = usd_cash_from_raw(fetch_balance_raw())
     except:
@@ -344,6 +363,7 @@ def main():
 
     # Save state/artifacts
     save_positions(pos_state)
+    save_restricted(restricted)
     log.summary(buys, sells, opens_after, DRY_RUN)
     write_artifacts()
     write_spec("\n".join(spec))
