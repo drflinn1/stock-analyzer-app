@@ -83,17 +83,20 @@ jobs:
             .state/spike_scan/momentum_report.txt
             .state/spike_scan/momentum_top10.png
 
-      # Optional Slack – Set a repository Secret named SLACK_WEBHOOK to enable.
+      # Optional Slack – if you add a repository Secret named SLACK_WEBHOOK,
+      # this step will run; otherwise it is skipped cleanly.
       - name: Slack notify (optional)
-        if: ${{ success() && secrets.SLACK_WEBHOOK != '' }}
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        if: ${{ env.SLACK_WEBHOOK != '' }}
         run: |
           python - << 'PY'
-          import os, json, pathlib, base64
-          report = pathlib.Path('.state/spike_scan/momentum_report.txt').read_text()[-3500:]
-          payload = {"text": f"*Momentum Spike — Scan Completed*\\n```{report}```"}
-          import urllib.request
-          req = urllib.request.Request(os.environ['SLACK_WEBHOOK'], data=json.dumps(payload).encode(), headers={'Content-Type':'application/json'})
+          import os, json, pathlib, urllib.request
+          p = pathlib.Path('.state/spike_scan/momentum_report.txt')
+          text = p.read_text()[-3500:] if p.exists() else "No report produced."
+          payload = {"text": f"*Momentum Spike — Scan Completed*\n```{text}```"}
+          req = urllib.request.Request(os.environ['SLACK_WEBHOOK'],
+                                       data=json.dumps(payload).encode(),
+                                       headers={'Content-Type':'application/json'})
           urllib.request.urlopen(req).read()
           PY
