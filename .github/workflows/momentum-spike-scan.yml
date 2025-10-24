@@ -1,65 +1,79 @@
 name: Momentum Spike — Scan (Dry-Run)
-schedule:
-- cron: "*/30 * * * *" # every 30 minutes (UTC)
 
+on:
+  workflow_dispatch:
+    inputs:
+      MIN_24H_PCT:
+        description: "Minimum 24h % change to flag"
+        default: "30"
+        required: false
+      MIN_BASE_VOL_USD:
+        description: "Minimum 24h USD/USDT quote volume"
+        default: "25000"
+        required: false
+      MIN_PRICE_USD:
+        description: "Minimum last price in USD"
+        default: "0.01"
+        required: false
+      EXCLUDE_STABLES:
+        description: "Exclude stablecoins (true/false)"
+        default: "true"
+        required: false
+      EXCHANGE:
+        description: "ccxt exchange id"
+        default: "kraken"
+        required: false
+      TIMEFRAME:
+        description: "Candle timeframe"
+        default: "1h"
+        required: false
+      LOOKBACK_HOURS:
+        description: "Hours of candles to fetch"
+        default: "72"
+        required: false
+      EMA_WINDOW:
+        description: "EMA window (hours)"
+        default: "20"
+        required: false
+  schedule:
+    - cron: "*/30 * * * *"  # every 30 minutes (UTC)
 
 jobs:
-scan:
-runs-on: ubuntu-latest
-steps:
-- name: Checkout
-uses: actions/checkout@v4
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-- name: Setup Python
-uses: actions/setup-python@v5
-with:
-python-version: '3.11'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt pandas numpy
 
+      - name: Run Momentum Spike Scanner
+        env:
+          EXCHANGE: ${{ inputs.EXCHANGE || vars.EXCHANGE || 'kraken' }}
+          MIN_24H_PCT: ${{ inputs.MIN_24H_PCT || vars.MIN_24H_PCT || '30' }}
+          MIN_BASE_VOL_USD: ${{ inputs.MIN_BASE_VOL_USD || vars.MIN_BASE_VOL_USD || '25000' }}
+          MIN_PRICE_USD: ${{ inputs.MIN_PRICE_USD || vars.MIN_PRICE_USD || '0.01' }}
+          EXCLUDE_STABLES: ${{ inputs.EXCLUDE_STABLES || vars.EXCLUDE_STABLES || 'true' }}
+          WHITELIST: ${{ vars.WHITELIST }}
+          BLACKLIST: ${{ vars.BLACKLIST }}
+          TIMEFRAME: ${{ inputs.TIMEFRAME || vars.TIMEFRAME || '1h' }}
+          LOOKBACK_HOURS: ${{ inputs.LOOKBACK_HOURS || vars.LOOKBACK_HOURS || '72' }}
+          EMA_WINDOW: ${{ inputs.EMA_WINDOW || vars.EMA_WINDOW || '20' }}
+        run: |
+          python scripts/scan_momentum_spikes.py
 
-- name: Install deps
-run: |
-python -m pip install --upgrade pip
-pip install ccxt pandas numpy
-
-
-- name: Run Momentum Spike Scanner
-env:
-EXCHANGE: ${{ inputs.EXCHANGE || vars.EXCHANGE || 'kraken' }}
-MIN_24H_PCT: ${{ inputs.MIN_24H_PCT || vars.MIN_24H_PCT || '30' }}
-MIN_BASE_VOL_USD: ${{ inputs.MIN_BASE_VOL_USD || vars.MIN_BASE_VOL_USD || '25000' }}
-MIN_PRICE_USD: ${{ inputs.MIN_PRICE_USD || vars.MIN_PRICE_USD || '0.01' }}
-EXCLUDE_STABLES: ${{ inputs.EXCLUDE_STABLES || vars.EXCLUDE_STABLES || 'true' }}
-WHITELIST: ${{ vars.WHITELIST }}
-BLACKLIST: ${{ vars.BLACKLIST }}
-TIMEFRAME: ${{ inputs.TIMEFRAME || vars.TIMEFRAME || '1h' }}
-LOOKBACK_HOURS: ${{ inputs.LOOKBACK_HOURS || vars.LOOKBACK_HOURS || '72' }}
-EMA_WINDOW: ${{ inputs.EMA_WINDOW || vars.EMA_WINDOW || '20' }}
-run: |
-python scripts/scan_momentum_spikes.py
-
-
-- name: Upload artifacts (CSV + report)
-uses: actions/upload-artifact@v4
-with:
-name: momentum-spike-scan
-path: |
-.state/spike_scan/momentum_candidates.csv
-.state/spike_scan/momentum_report.txt
-
-
-# Optional: Slack notify (commented). Add your webhook as a Repository Secret named SLACK_WEBHOOK.
-# - name: Notify Slack (optional)
-# if: always()
-# env:
-# SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-# run: |
-# python - << 'PY'
-# import os, json, pathlib
-# p = pathlib.Path('.state/spike_scan/momentum_report.txt')
-# text = p.read_text() if p.exists() else "No report produced."
-# payload = {"text": f"*Momentum Spike — Scan Completed*\n```{text[-3500:]}```"}
-# import urllib.request
-# req = urllib.request.Request(os.environ['SLACK_WEBHOOK'], data=json.dumps(payload).encode(), headers={'Content-Type':'application/json'})
-# urllib.request.urlopen(req).read()
-# PY
+      - name: Upload artifacts (CSV + report)
+        uses: actions/upload-artifact@v4
+        with:
+          name: momentum-spike-scan
+          path: |
+            .state/spike_scan/momentum_candidates.csv
+            .state/spike_scan/momentum_report.txt
