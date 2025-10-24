@@ -1,8 +1,8 @@
-name: Crypto Live — Overnight (LIVE, Sept Baseline)
+name: Crypto Live Overnight (LIVE, Sept Baseline)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       DRY_RUN:
@@ -25,39 +25,38 @@ jobs:
       contents: read
 
     env:
-      # --- Behavior toggles ---
+      # Behavior toggles
       DRY_RUN: ${{ inputs.DRY_RUN || 'OFF' }}
       RUN_BOT: ${{ inputs.RUN_BOT || 'ON' }}
 
-      # --- Exchange ---
+      # Exchange
       EXCHANGE: kraken
 
-      # --- Variables (use repo Variables; fallbacks shown) ---
-      MIN_BUY_USD:       ${{ vars.MIN_BUY_USD || '18' }}      # opened a bit
+      # Repo variables (safe wideners)
+      MIN_BUY_USD:       ${{ vars.MIN_BUY_USD || '18' }}
       MAX_POSITIONS:     ${{ vars.MAX_POSITIONS || '3' }}
-      MAX_BUYS_PER_RUN:  ${{ vars.MAX_BUYS_PER_RUN || '2' }}  # opened a bit
-      UNIVERSE_TOP_K:    ${{ vars.UNIVERSE_TOP_K || '40' }}   # opened a bit
-      RESERVE_CASH_PCT:  ${{ vars.RESERVE_CASH_PCT || '15' }} # optional buffer
+      MAX_BUYS_PER_RUN:  ${{ vars.MAX_BUYS_PER_RUN || '2' }}
+      UNIVERSE_TOP_K:    ${{ vars.UNIVERSE_TOP_K || '40' }}
+      RESERVE_CASH_PCT:  ${{ vars.RESERVE_CASH_PCT || '15' }}
       ROTATE_WHEN_FULL:        ${{ vars.ROTATE_WHEN_FULL || 'true' }}
       ROTATE_WHEN_CASH_SHORT:  ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
       DUST_MIN_USD:      ${{ vars.DUST_MIN_USD || '2' }}
       DUST_SKIP_STABLES: ${{ vars.DUST_SKIP_STABLES || 'true' }}
 
-      # --- Exit rules (unchanged logic) ---
+      # Exit rules
       TAKE_PROFIT_PCT:   ${{ vars.TAKE_PROFIT_PCT || '3' }}
       STOP_LOSS_PCT:     ${{ vars.STOP_LOSS_PCT || '5' }}
       TRAILING_STOP_PCT: ${{ vars.TRAILING_STOP_PCT || '2' }}
       TRAILING_ARM_PCT:  ${{ vars.TRAILING_ARM_PCT || '1.5' }}
 
-      # --- Restricted-market toggle ---
+      # Restricted markets
       SKIP_RESTRICTED:   ${{ vars.SKIP_RESTRICTED || 'true' }}
 
-      # --- Kraken secrets ---
+      # Kraken secrets
       KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
       PYTHONUNBUFFERED: "1"
-      JOB_STATUS: ${{ job.status }}
 
     steps:
       - name: Checkout
@@ -78,14 +77,16 @@ jobs:
         run: |
           python - << 'PY'
           import os
+          echo = lambda k: print(f"{k} =", os.getenv(k, ""))
           print("Have KRAKEN_API_KEY:", bool(os.getenv("KRAKEN_API_KEY")))
           print("Have KRAKEN_API_SECRET:", bool(os.getenv("KRAKEN_API_SECRET")))
-          print("DRY_RUN =", os.getenv("DRY_RUN"))
-          print("SKIP_RESTRICTED =", os.getenv("SKIP_RESTRICTED"))
-          print("MAX_BUYS_PER_RUN =", os.getenv("MAX_BUYS_PER_RUN"))
-          print("MAX_POSITIONS =", os.getenv("MAX_POSITIONS"))
-          print("MIN_BUY_USD =", os.getenv("MIN_BUY_USD"))
-          print("UNIVERSE_TOP_K =", os.getenv("UNIVERSE_TOP_K"))
+          for k in [
+            "DRY_RUN","RUN_BOT","MIN_BUY_USD","MAX_POSITIONS","MAX_BUYS_PER_RUN",
+            "UNIVERSE_TOP_K","RESERVE_CASH_PCT","ROTATE_WHEN_FULL","ROTATE_WHEN_CASH_SHORT",
+            "DUST_MIN_USD","DUST_SKIP_STABLES","TAKE_PROFIT_PCT","STOP_LOSS_PCT",
+            "TRAILING_STOP_PCT","TRAILING_ARM_PCT","SKIP_RESTRICTED"
+          ]:
+              echo(k)
           PY
 
       - name: Run Crypto Engine
@@ -107,30 +108,31 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: crypto-live-overnight-${{ github.run_number }}
-          path: |
-            .state/*
+          path: .state/*
           if-no-files-found: warn
 
-      # -------- Slack notifier with Top Profit Flag --------
       - name: Slack notify (optional)
         if: ${{ env.SLACK_WEBHOOK_URL != '' }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          JOB_STATUS: ${{ env.JOB_STATUS }}
         run: |
-          PAYLOAD=$(python - << 'PY'
-          import json, os, pathlib
+          python - << 'PY'
+          import json, os, pathlib, sys
+          def read(p):
+              try: return pathlib.Path(p).read_text(encoding="utf-8")
+              except: return ""
           def read_lines(p):
-            try:
-              return pathlib.Path(p).read_text(encoding="utf-8").splitlines()
-            except:
-              return []
+              try: return pathlib.Path(p).read_text(encoding="utf-8").splitlines()
+              except: return []
           flags = read_lines(".state/profit_flags.txt")
-          top = flags[1] if len(flags) > 1 else ""
+          top = flags[1] if len(flags) > 1 else "(none)"
           runlog = read_lines(".state/run.log")
           summary = runlog[-1] if runlog else ""
-          txt = f"OVERNIGHT STATUS={os.environ.get('JOB_STATUS','unknown')}\nTop mover: {top or '(none)'}\n{summary}"
-          print(json.dumps({"text": txt}))
+          payload = json.dumps({"text": f"OVERNIGHT STATUS=${{ job.status }}\nTop mover: {top}\n{summary}"})
+          import urllib.request
+          req = urllib.request.Request(os.environ["SLACK_WEBHOOK_URL"], data=payload.encode(), headers={"Content-Type":"application/json"})
+          try:
+              urllib.request.urlopen(req, timeout=10)
+          except Exception as e:
+              print("Slack post failed:", e, file=sys.stderr)
           PY
-          )
-          curl -sS -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL" || true
