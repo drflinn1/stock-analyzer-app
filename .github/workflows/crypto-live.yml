@@ -39,7 +39,16 @@ jobs:
       DUST_MIN_USD:      ${{ vars.DUST_MIN_USD || '2' }}
       DUST_SKIP_STABLES: ${{ vars.DUST_SKIP_STABLES || 'true' }}
 
-      # --- Kraken secrets (THIS WAS MISSING) ---
+      # --- SELL logic knobs (optional repo Variables) ---
+      TAKE_PROFIT_PCT:   ${{ vars.TAKE_PROFIT_PCT || '3' }}
+      STOP_LOSS_PCT:     ${{ vars.STOP_LOSS_PCT || '4' }}
+      TRAILING_STOP_PCT: ${{ vars.TRAILING_STOP_PCT || '2' }}
+      TRAILING_ARM_PCT:  ${{ vars.TRAILING_ARM_PCT || '1.5' }}
+
+      # --- NEW: Restricted-market toggle ---
+      SKIP_RESTRICTED:   ${{ vars.SKIP_RESTRICTED || 'true' }}
+
+      # --- Kraken secrets (runtime) ---
       KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
@@ -66,6 +75,7 @@ jobs:
           import os
           print("Have KRAKEN_API_KEY:", bool(os.getenv("KRAKEN_API_KEY")))
           print("Have KRAKEN_API_SECRET:", bool(os.getenv("KRAKEN_API_SECRET")))
+          print("SKIP_RESTRICTED =", os.getenv("SKIP_RESTRICTED"))
           PY
 
       - name: Run Crypto Engine
