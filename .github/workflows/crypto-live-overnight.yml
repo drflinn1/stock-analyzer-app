@@ -1,0 +1,114 @@
+name: Crypto Live — Overnight (LIVE, Sept Baseline)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes (same cadence)
+  workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: "ON or OFF (overrides default) — OFF = live"
+        required: false
+        default: "OFF"       # manual runs default to LIVE too
+      RUN_BOT:
+        description: "ON to run bot step (turn OFF to only render KPI/artifacts)"
+        required: false
+        default: "ON"
+
+concurrency:
+  group: crypto-live           # ensure no overlap if another crypto-live job is enabled
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      # --- Behavior toggles ---
+      DRY_RUN: ${{ inputs.DRY_RUN || 'OFF' }}   # <-- difference from baseline: default LIVE
+      RUN_BOT: ${{ inputs.RUN_BOT || 'ON' }}
+
+      # --- Exchange selection ---
+      EXCHANGE: kraken
+
+      # --- Repo Variables (same as baseline; still your Sept config) ---
+      MIN_BUY_USD:       ${{ vars.MIN_BUY_USD || '15' }}
+      MAX_POSITIONS:     ${{ vars.MAX_POSITIONS || '3' }}
+      MAX_BUYS_PER_RUN:  ${{ vars.MAX_BUYS_PER_RUN || '2' }}
+      UNIVERSE_TOP_K:    ${{ vars.UNIVERSE_TOP_K || '25' }}
+      RESERVE_CASH_PCT:  ${{ vars.RESERVE_CASH_PCT || '5' }}
+      ROTATE_WHEN_FULL:        ${{ vars.ROTATE_WHEN_FULL || 'true' }}
+      ROTATE_WHEN_CASH_SHORT:  ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
+      DUST_MIN_USD:      ${{ vars.DUST_MIN_USD || '2' }}
+      DUST_SKIP_STABLES: ${{ vars.DUST_SKIP_STABLES || 'true' }}
+
+      # --- Sell logic knobs (unchanged; same as baseline) ---
+      TAKE_PROFIT_PCT:   ${{ vars.TAKE_PROFIT_PCT || '3' }}
+      STOP_LOSS_PCT:     ${{ vars.STOP_LOSS_PCT || '5' }}
+      TRAILING_STOP_PCT: ${{ vars.TRAILING_STOP_PCT || '2' }}
+      TRAILING_ARM_PCT:  ${{ vars.TRAILING_ARM_PCT || '1.5' }}
+
+      # --- Restricted-market toggle (same as baseline) ---
+      SKIP_RESTRICTED:   ${{ vars.SKIP_RESTRICTED || 'true' }}
+
+      # --- Kraken secrets (runtime) ---
+      KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
+      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          pip install ccxt pandas pyyaml matplotlib
+
+      - name: Sanity check (no secret values shown)
+        run: |
+          python - << 'PY'
+          import os
+          print("Have KRAKEN_API_KEY:", bool(os.getenv("KRAKEN_API_KEY")))
+          print("Have KRAKEN_API_SECRET:", bool(os.getenv("KRAKEN_API_SECRET")))
+          print("DRY_RUN =", os.getenv("DRY_RUN"))
+          print("SKIP_RESTRICTED =", os.getenv("SKIP_RESTRICTED"))
+          PY
+
+      - name: Run Crypto Engine
+        if: env.RUN_BOT == 'ON'
+        run: |
+          mkdir -p .state
+          python main.py
+
+      - name: Make KPI chart (optional)
+        run: |
+          if [ -f tools/make_kpi_chart.py ]; then
+            python tools/make_kpi_chart.py --column bal_usd || true
+          fi
+
+      - name: Ensure artifact folder
+        run: mkdir -p .state
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-live-overnight-${{ github.run_number }}
+          path: |
+            .state/*
+          if-no-files-found: ignore
+
+      - name: Slack notify (optional)
+        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"OVERNIGHT STATUS=${{ job.status }}\"}" "$SLACK_WEBHOOK_URL"
