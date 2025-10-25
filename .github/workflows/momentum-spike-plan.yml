@@ -21,6 +21,9 @@ on:
       EXCLUDE_STABLES:
         description: "Exclude stablecoins (true/false)"
         default: "true"
+      SPIKE_FOCUS_PCT:
+        description: "Prioritize coins with 24h% >= this value first"
+        default: "50"
 
 jobs:
   plan:
@@ -41,12 +44,13 @@ jobs:
 
       - name: Run Paper-Trade Planner
         env:
-          ACCOUNT_BAL_USD: ${{ inputs.ACCOUNT_BAL_USD }}
-          MAX_POSITIONS: ${{ inputs.MAX_POSITIONS }}
-          MIN_BUY_USD: ${{ inputs.MIN_BUY_USD }}
-          MAX_BUY_USD: ${{ inputs.MAX_BUY_USD }}
+          ACCOUNT_BAL_USD:  ${{ inputs.ACCOUNT_BAL_USD }}
+          MAX_POSITIONS:    ${{ inputs.MAX_POSITIONS }}
+          MIN_BUY_USD:      ${{ inputs.MIN_BUY_USD }}
+          MAX_BUY_USD:      ${{ inputs.MAX_BUY_USD }}
           RESERVE_CASH_PCT: ${{ inputs.RESERVE_CASH_PCT }}
-          EXCLUDE_STABLES: ${{ inputs.EXCLUDE_STABLES }}
+          EXCLUDE_STABLES:  ${{ inputs.EXCLUDE_STABLES }}
+          SPIKE_FOCUS_PCT:  ${{ inputs.SPIKE_FOCUS_PCT }}
         run: |
           python scripts/plan_momentum_trades.py
 
