@@ -1,0 +1,59 @@
+name: Momentum Spike — Plan (Dry-Run)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ACCOUNT_BAL_USD:
+        description: "Total paper account balance (USD)"
+        default: "500"
+      MAX_POSITIONS:
+        description: "Max positions to plan"
+        default: "3"
+      MIN_BUY_USD:
+        description: "Min per-trade allocation"
+        default: "10"
+      MAX_BUY_USD:
+        description: "Max per-trade allocation"
+        default: "50"
+      RESERVE_CASH_PCT:
+        description: "Reserve cash % to keep unallocated"
+        default: "10"
+      EXCLUDE_STABLES:
+        description: "Exclude stablecoins (true/false)"
+        default: "true"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy
+
+      - name: Run Paper-Trade Planner
+        env:
+          ACCOUNT_BAL_USD: ${{ inputs.ACCOUNT_BAL_USD }}
+          MAX_POSITIONS: ${{ inputs.MAX_POSITIONS }}
+          MIN_BUY_USD: ${{ inputs.MIN_BUY_USD }}
+          MAX_BUY_USD: ${{ inputs.MAX_BUY_USD }}
+          RESERVE_CASH_PCT: ${{ inputs.RESERVE_CASH_PCT }}
+          EXCLUDE_STABLES: ${{ inputs.EXCLUDE_STABLES }}
+        run: |
+          python scripts/plan_momentum_trades.py
+
+      - name: Upload plan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: momentum-spike-plan
+          path: |
+            .state/spike_plan/trades.json
+            .state/spike_plan/plan_report.txt
