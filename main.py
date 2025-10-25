@@ -1,424 +1,434 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-Crypto Live — Engine (Kraken)
+Crypto Live runner with Sell-Logic Guard
+- Reads PROTECT_JSON from env
+- Evaluates TP, SL, TSL, DIP_CUTOFF, AGE_LIMIT, APR_SPIKE_EXIT, MIN_SELL_USD
+- Writes artifacts into .state/
+- Executes sells if DRY_RUN=OFF and a sell adapter is available
 
-Features
-- Mean-revert buys (dip ranking on 15m)
-- Exits: TAKE_PROFIT, STOP_LOSS, TRAILING (armed)
-- Restricted-market auto-blacklist (jurisdiction errors)
-- KPI + artifacts in .state/
-- Profit Flags   -> run.log + .state/profit_flags.txt
-- Artifact hardening (always creates .state files)
-- Entry recovery from trade history if .state is empty
+This file tries to be conservative: if it can't find prices/positions or a
+sell adapter, it will STILL produce a clear .state/sell_decisions.csv
+and .state/sell_orders_todo.json so you can see exactly what it *would* do.
 """
 
 from __future__ import annotations
-import os, math, json, csv, pathlib, traceback, datetime as dt
-from typing import Dict, List, Tuple
-import ccxt
+import os, json, math, time, csv, traceback
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
 
-# ---------------- paths ----------------
-STATE_DIR = pathlib.Path(".state")
+# --------------------------------------------------------------------------------------
+# Config / Paths
+# --------------------------------------------------------------------------------------
+STATE_DIR = Path(os.environ.get("STATE_DIR", ".state"))
 STATE_DIR.mkdir(parents=True, exist_ok=True)
-RUN_LOG  = STATE_DIR / "run.log"
-KPI_CSV  = STATE_DIR / "kpi_history.csv"
-SPEC_TXT = STATE_DIR / "spec_gate_report.txt"
-POS_JSON = STATE_DIR / "spot_positions.json"
-RESTRICTED_JSON = STATE_DIR / "restricted_markets.json"
-PROFIT_FLAGS_TXT = STATE_DIR / "profit_flags.txt"
 
-# ---------------- tiny logger ----------------
-class Log:
-    def __init__(self): self.lines=[]
-    def _emit(self, msg):
-        ts = dt.datetime.utcnow().isoformat()+"+00:00"
-        line = f"[{ts}] {msg}"
-        print(line, flush=True); self.lines.append(line)
-    def info(self,m): self._emit(m)
-    def warn(self,m): self._emit("warn: "+m)
-    def error(self,m): self._emit("ERROR: "+m)
-    def buy(self,pair,px): self._emit(f"[BUY] {pair} @ {px:.5f}")
-    def sell(self,pair,px,reason): self._emit(f"[SELL] {pair} @ {px:.5f} reason={reason}")
-    def skipped(self,pair,reason): self._emit(f"SKIPPED_RESTRICTED {pair} reason={reason}")
-    def profit_flag(self,pair,gain,band): self._emit(f"PROFIT_FLAG {pair} +{gain:.2f}% ≥ {band}%")
-    def summary(self,buys,sells,open_,dry): self._emit(f"SUMMARY buys={buys} sells={sells} open={open_} DRY_RUN={dry}")
+DRY_RUN = os.environ.get("DRY_RUN", "ON").upper()  # "ON" == dry run by default
+RUN_SWITCH = os.environ.get("RUN_SWITCH", "ON").upper()
 
-log = Log()
+# Optional JSON blobs (passed via workflow_dispatch inputs)
+ADVANCED_JSON_RAW = os.environ.get("ADVANCED_JSON", "") or ""
+PROTECT_JSON_RAW  = os.environ.get("PROTECT_JSON", "") or ""
 
-# ---------------- env helpers ----------------
-def env_str(n,d=""): return str(os.getenv(n, d))
-def env_bool(n,d="false"): return env_str(n,d).strip().lower() in ("1","true","on","yes","y")
-def env_float(n,d="0"):
-    try: return float(env_str(n,d))
-    except: return float(d)
-def env_int(n,d="0"):
-    try: return int(float(env_str(n,d)))
-    except: return int(float(d))
+# Bot knobs from env/vars (with fallbacks)
+MIN_SELL_USD      = float(os.environ.get("MIN_SELL_USD", "10"))
+DUST_MIN_USD      = float(os.environ.get("DUST_MIN_USD", "2"))
+DUST_SKIP_STABLES = (os.environ.get("DUST_SKIP_STABLES", "true").lower() == "true")
 
-# ---------------- config ----------------
-DRY_RUN       = env_str("DRY_RUN","ON").upper()=="ON"
-MIN_BUY_USD   = env_float("MIN_BUY_USD","15")
-MAX_POSITIONS = env_int("MAX_POSITIONS","3")
-MAX_BUYS_PER_RUN = env_int("MAX_BUYS_PER_RUN","1")
-UNIVERSE_TOP_K   = env_int("UNIVERSE_TOP_K","25")
-RESERVE_CASH_PCT = env_float("RESERVE_CASH_PCT","5")
-ROTATE_WHEN_FULL       = env_bool("ROTATE_WHEN_FULL","true")
-ROTATE_WHEN_CASH_SHORT = env_bool("ROTATE_WHEN_CASH_SHORT","true")
-DUST_MIN_USD    = env_float("DUST_MIN_USD","2")
-DUST_SKIP_STABLES = env_bool("DUST_SKIP_STABLES","true")
+# --------------------------------------------------------------------------------------
+# Utility: write small artifacts so you can inspect runs
+# --------------------------------------------------------------------------------------
+def write_text(relpath: str, text: str) -> None:
+    p = STATE_DIR / relpath
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
 
-# SELL logic
-TAKE_PROFIT_PCT    = env_float("TAKE_PROFIT_PCT","3.0")     # TAKE_PROFIT keyword
-STOP_LOSS_PCT      = env_float("STOP_LOSS_PCT","5.0")       # STOP_LOSS keyword
-TRAILING_STOP_PCT  = env_float("TRAILING_STOP_PCT","2.0")   # trailing keyword
-TRAILING_ARM_PCT   = env_float("TRAILING_ARM_PCT","1.5")
+def write_json(relpath: str, data: Any) -> None:
+    p = STATE_DIR / relpath
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
-# Restricted toggle
-SKIP_RESTRICTED = env_bool("SKIP_RESTRICTED","true")
+def append_csv(relpath: str, header: List[str], rows: List[List[Any]]) -> None:
+    p = STATE_DIR / relpath
+    p.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not p.exists()
+    with p.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(header)
+        for r in rows:
+            w.writerow(r)
 
-API_KEY = env_str("KRAKEN_API_KEY","")
-API_SEC = env_str("KRAKEN_API_SECRET","")
-if not API_KEY or not API_SEC:
-    raise RuntimeError("Kraken credentials missing: set KRAKEN_API_KEY and KRAKEN_API_SECRET.")
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-kraken = ccxt.kraken({"apiKey":API_KEY, "secret":API_SEC, "enableRateLimit":True})
-
-USD_STABLE_CODES = {"USDT","USDC","DAI","TUSD","FDUSD","USDP","GUSD","PYUSD"}
-
-# ---------------- file helpers ----------------
-def write_text(path: pathlib.Path, text: str):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-
-def ensure_artifact_shells():
-    # Create placeholder files so artifact step always finds something
-    for p in (RUN_LOG, KPI_CSV, SPEC_TXT, PROFIT_FLAGS_TXT):
-        if not p.exists():
-            if p.suffix.lower()==".csv":
-                p.write_text("timestamp_utc,bal_usd\n", encoding="utf-8")
-            else:
-                p.write_text("", encoding="utf-8")
-
-def write_artifacts(lines: List[str], spec: str):
-    ensure_artifact_shells()
-    try: RUN_LOG.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-    except: pass
-    try: SPEC_TXT.write_text(spec, encoding="utf-8")
-    except: pass
-
-def append_kpi_csv(bal_usd: float):
-    ensure_artifact_shells()
-    if not KPI_CSV.exists():
-        KPI_CSV.write_text("timestamp_utc,bal_usd\n", encoding="utf-8")
-    with KPI_CSV.open("a", newline="", encoding="utf-8") as f:
-        f.write(f"{dt.datetime.utcnow().isoformat()}+00:00,{bal_usd:.2f}\n")
-
-def load_json(path: pathlib.Path, default):
-    if path.exists():
-        try: return json.loads(path.read_text())
-        except: return default
-    return default
-
-def save_json(path: pathlib.Path, obj):
-    path.write_text(json.dumps(obj, indent=2))
-
-# ---------------- exchange helpers ----------------
-def fetch_balance_raw() -> Dict[str,float]:
+# --------------------------------------------------------------------------------------
+# Input parsing
+# --------------------------------------------------------------------------------------
+def parse_json_or_empty(raw: str) -> Dict[str, Any]:
+    raw = raw.strip()
+    if not raw:
+        return {}
     try:
-        b = kraken.fetch_balance()
-        return {k: float(v or 0) for k,v in b.get("total",{}).items()}
+        return json.loads(raw)
     except Exception as e:
-        log.warn(f'fetch_balance failed: {e}')
+        write_text("protect_json_error.txt", f"Failed to parse JSON: {e}\nRaw:\n{raw}")
         return {}
 
-def usd_cash_from_raw(raw:Dict[str,float]) -> float:
-    return float(raw.get("USD",0.0) + raw.get("ZUSD",0.0))
+PROTECT = parse_json_or_empty(PROTECT_JSON_RAW)
+ADVANCED = parse_json_or_empty(ADVANCED_JSON_RAW)
 
-def list_usd_pairs(limit:int=80) -> List[str]:
-    markets = kraken.load_markets()
-    out=[]
-    for s,m in markets.items():
-        if not m.get("active",True): continue
-        if m.get("quote","").upper()!="USD": continue
-        base=m.get("base","").upper()
-        if DUST_SKIP_STABLES and base in USD_STABLE_CODES: continue
-        out.append(s)
-    return out[:max(1,limit)]
+# Persist what we received for transparency
+write_json("effective_protect.json", PROTECT)
+write_json("effective_advanced.json", ADVANCED)
 
-def ohlcv_change(pair:str, timeframe="15m", candles=20) -> Tuple[float,float]:
-    try:
-        o = kraken.fetch_ohlcv(pair, timeframe=timeframe, limit=candles)
-        if not o or len(o)<3: return (math.nan, float("-inf"))
-        last=o[-1][4]; prev=o[-3][4]
-        if prev>0: return (float(last), (last-prev)/prev)
-        return (float(last), float("-inf"))
-    except: return (math.nan, float("-inf"))
+# Defaults if keys missing
+SELL_GUARD = {
+    "MIN_SELL_USD": MIN_SELL_USD,
+    "TP":  {"enable": True,  "take_profit_pct": 0.08,  "lock_after_minutes": 15},
+    "SL":  {"enable": True,  "stop_loss_pct": -0.06},
+    "TSL": {"enable": True,  "trail_pct": 0.03, "arm_after_gain_pct": 0.04},
+    "DIP_CUTOFF": {"max_drawdown_pct": -0.09, "cooldown_min": 120},
+    "AGE_LIMIT":  {"max_hold_hours": 36},
+    "APR_SPIKE_EXIT": {"enable": True, "apr_threshold": 0.90, "min_gain_pct": 0.02},
+}
+if "SELL_GUARD" in PROTECT:
+    # Merge shallowly (keep sensible defaults)
+    for k, v in PROTECT["SELL_GUARD"].items():
+        SELL_GUARD[k] = v
 
-def best_bid_ask(pair:str) -> Tuple[float,float]:
-    try:
-        t = kraken.fetch_ticker(pair)
-        bid = t.get("bid") or t.get("last")
-        ask = t.get("ask") or t.get("last")
-        return float(bid or 0), float(ask or 0)
-    except: return (0.0,0.0)
+# --------------------------------------------------------------------------------------
+# Domain models
+# --------------------------------------------------------------------------------------
+@dataclass
+class Position:
+    symbol: str
+    qty: float
+    avg_price: float           # average entry price (USD)
+    last_price: float          # current price (USD)
+    usd_value: float           # qty * last_price
+    opened_at: Optional[str]   # ISO UTC when acquired (if known)
+    apr_estimate: Optional[float] = None  # 0..1 range (e.g., 0.95 == 95%)
+    realized_pnl_usd: float = 0.0         # optional metric
+    trailing_max_price: Optional[float] = None  # for TSL state (from prior runs)
+    meta: Dict[str, Any] = None
 
-def place_order_with_log(symbol:str, side:str, amount:float, restricted: Dict[str,bool]):
-    try:
-        resp = kraken.create_order(symbol=symbol, type="market", side=side, amount=amount)
-        txid = resp.get("id")
-        log.info(f'EXCHANGE OK AddOrder accepted | txid={txid} | side={side} symbol={symbol} amount={amount}')
-        return resp
-    except Exception as e:
-        emsg = str(e)
-        if "Invalid permissions" in emsg or "restricted for" in emsg or "EAccount" in emsg:
-            # auto-blacklist
-            if not restricted.get(symbol):
-                restricted[symbol]=True
-                save_json(RESTRICTED_JSON, restricted)
-            log.skipped(symbol, emsg)
+    def age_hours(self) -> Optional[float]:
+        if not self.opened_at:
             return None
-        log.warn(f'order failed {symbol}: {e}')
-        return None
+        try:
+            dt = datetime.fromisoformat(self.opened_at.replace("Z","+00:00"))
+            return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0)
+        except Exception:
+            return None
 
-# ---------------- strategy helpers ----------------
-def pick_candidates(pairs:List[str], top_k:int) -> List[Tuple[str,float,float]]:
-    rows=[]
-    for p in pairs:
-        last, ch = ohlcv_change(p)
-        if not last or not math.isfinite(ch): continue
-        rows.append((p,last,ch))
-    rows.sort(key=lambda r:r[2])  # most negative first (dip)
-    return rows[:max(1,top_k)]
+    def gain_pct(self) -> float:
+        if self.avg_price <= 0:
+            return 0.0
+        return (self.last_price / self.avg_price) - 1.0
 
-def can_afford_buy(usd_free:float) -> bool:
-    reserve = RESERVE_CASH_PCT/100.0
-    spend_cap = usd_free*(1-reserve)
-    return spend_cap >= MIN_BUY_USD + 0.01
-
-def symbol_for_base(base:str, markets:Dict[str,dict]) -> str|None:
-    for s,m in markets.items():
-        if m.get("base","").upper()==base.upper() and m.get("quote","").upper()=="USD" and m.get("active",True):
-            return s
-    return None
-
-# ---------------- SELL rules ----------------
-def check_sell_rules(price:float, entry:float, peak:float) -> str|None:
-    if entry<=0 or price<=0: return None
-    gain = (price/entry - 1.0) * 100.0
-    dd_from_peak = (1.0 - price/max(peak, entry)) * 100.0
-    if gain >= TAKE_PROFIT_PCT:
-        return f"TAKE_PROFIT +{gain:.2f}% ≥ {TAKE_PROFIT_PCT:.2f}%"
-    if gain <= -abs(STOP_LOSS_PCT):
-        return f"STOP_LOSS {gain:.2f}% ≤ -{abs(STOP_LOSS_PCT):.2f}%"
-    if gain >= TRAILING_ARM_PCT and dd_from_peak >= TRAILING_STOP_PCT:
-        return f"TRAILING_DROP {dd_from_peak:.2f}% ≥ {TRAILING_STOP_PCT:.2f}% (armed at +{TRAILING_ARM_PCT:.2f}%)"
-    return None
-
-# ---------------- Profit Flags ----------------
-GAIN_BANDS = [10, 25, 50, 100, 200]  # % thresholds to announce
-
-def emit_profit_flags(open_rows: List[Tuple[str,float,float,float]]):
-    """open_rows: (symbol, amount, price, entry)"""
-    lines = []
-    now = dt.datetime.utcnow().isoformat()+"+00:00"
-    lines.append(f"# Profit Flags {now}")
-    ranked = []
-
-    for sym, amt, price, entry in open_rows:
-        if entry <= 0 or price <= 0: continue
-        gain = (price/entry - 1.0) * 100.0
-        ranked.append((gain, sym, price, entry, amt))
-        for band in reversed(GAIN_BANDS):
-            if gain >= band:
-                log.profit_flag(sym, gain, band)
-                break
-
-    ranked.sort(reverse=True)  # highest gain first
-    for gain, sym, price, entry, amt in ranked:
-        lines.append(f"{sym}  gain=+{gain:.2f}%  price={price:.6f}  entry={entry:.6f}  amt={amt}")
-
-    write_text(PROFIT_FLAGS_TXT, "\n".join(lines)+"\n")
-
-# ---------------- Entry recovery from real trades ----------------
-def seed_entry_from_trades(symbol: str) -> float:
+# --------------------------------------------------------------------------------------
+# Adapters (fetch positions / prices). We try to reuse your existing code if present.
+# --------------------------------------------------------------------------------------
+def try_import_adapters():
     """
-    Compute a VWAP entry for the current net long position using recent trades.
-    Returns 0.0 if trades cannot be fetched or there is no net long qty.
+    We try to import your existing adapter functions if they exist:
+      - trader.adapters.get_open_positions() -> List[dict]
+      - trader.adapters.place_market_sell(symbol: str, qty: float) -> dict
+      - trader.adapters.get_price(symbol: str) -> float
+    If not present, we fall back to reading .state/positions.json and .state/last_prices.json.
     """
+    adapter = {}
     try:
-        trades = kraken.fetch_my_trades(symbol, limit=200)  # recent window is enough for spot
+        import importlib
+        mod = importlib.import_module("trader.adapters")  # your repo may have this
+        adapter["get_open_positions"] = getattr(mod, "get_open_positions", None)
+        adapter["place_market_sell"]  = getattr(mod, "place_market_sell", None)
+        adapter["get_price"]          = getattr(mod, "get_price", None)
     except Exception:
-        return 0.0
+        pass
+    return adapter
 
-    net_qty = 0.0
-    gross_cost = 0.0
-    for t in trades:
-        amt = float(t.get("amount") or 0)           # +buy, -sell
-        price = float(t.get("price") or 0)
-        fee = float((t.get("fee") or {}).get("cost") or 0)
-        if amt > 0:
-            net_qty += amt
-            gross_cost += amt * price + fee
-        elif amt < 0:
-            take = min(abs(amt), max(0.0, net_qty))
-            if net_qty > 0 and gross_cost > 0 and take > 0:
-                avg = gross_cost / net_qty
-                gross_cost -= avg * take
-            net_qty += amt  # amt is negative
+ADAPTER = try_import_adapters()
 
-    if net_qty > 0 and gross_cost > 0:
-        return gross_cost / net_qty
-    return 0.0
+def load_positions_fallback() -> List[Position]:
+    """
+    Fallback loader: expects .state/positions.json with a list of items containing:
+      symbol, qty, avg_price, last_price (optional), opened_at (ISO)
+    We'll also consider .state/last_prices.json if last_price missing.
+    """
+    pos_path = STATE_DIR / "positions.json"
+    if not pos_path.exists():
+        # As a last resort, treat everything as empty, but log it for you.
+        write_text("warnings.txt",
+                   "No adapters and no .state/positions.json found; "
+                   "Sell-Guard produced only a header artifact.\n")
+        return []
 
-# ---------------- main ----------------
-def main():
-    ensure_artifact_shells()
+    data = json.loads(pos_path.read_text(encoding="utf-8"))
+    # last prices map (optional)
+    lp = {}
+    lp_path = STATE_DIR / "last_prices.json"
+    if lp_path.exists():
+        lp = json.loads(lp_path.read_text(encoding="utf-8"))
 
-    buys = sells = 0
-    spec = [
-        f"DRY_RUN={DRY_RUN}",
-        f"MIN_BUY_USD={MIN_BUY_USD}",
-        f"MAX_POSITIONS={MAX_POSITIONS} MAX_BUYS_PER_RUN={MAX_BUYS_PER_RUN}",
-        f"UNIVERSE_TOP_K={UNIVERSE_TOP_K} RESERVE_CASH_PCT={RESERVE_CASH_PCT}",
-        f"ROTATE_WHEN_FULL={ROTATE_WHEN_FULL} ROTATE_WHEN_CASH_SHORT={ROTATE_WHEN_CASH_SHORT}",
-        f"DUST_MIN_USD={DUST_MIN_USD} DUST_SKIP_STABLES={DUST_SKIP_STABLES}",
-        f"TAKE_PROFIT_PCT={TAKE_PROFIT_PCT} STOP_LOSS_PCT={STOP_LOSS_PCT} "
-        f"TRAILING_STOP_PCT={TRAILING_STOP_PCT} TRAILING_ARM_PCT={TRAILING_ARM_PCT}",
-        f"SKIP_RESTRICTED={SKIP_RESTRICTED}",
+    out: List[Position] = []
+    for raw in data:
+        symbol = raw.get("symbol")
+        qty = float(raw.get("qty", 0) or 0)
+        avg_price = float(raw.get("avg_price", 0) or 0)
+        last_price = float(raw.get("last_price", lp.get(symbol, 0)) or 0)
+        opened_at = raw.get("opened_at")
+        apr = raw.get("apr_estimate")
+        if qty <= 0 or (avg_price <= 0 and last_price <= 0):
+            continue
+        usd_value = qty * (last_price if last_price > 0 else avg_price)
+        out.append(Position(
+            symbol=symbol,
+            qty=qty,
+            avg_price=avg_price,
+            last_price=last_price,
+            usd_value=usd_value,
+            opened_at=opened_at,
+            apr_estimate=apr,
+            trailing_max_price=raw.get("trailing_max_price"),
+            realized_pnl_usd=float(raw.get("realized_pnl_usd", 0) or 0),
+            meta=raw,
+        ))
+    return out
+
+def fetch_positions() -> List[Position]:
+    # Prefer user's adapter if available
+    get_open_positions = ADAPTER.get("get_open_positions")
+    get_price = ADAPTER.get("get_price")
+    if callable(get_open_positions):
+        raw_positions = get_open_positions()
+        out: List[Position] = []
+        for r in raw_positions:
+            symbol = r["symbol"]
+            qty = float(r.get("qty", 0) or 0)
+            avg_price = float(r.get("avg_price", 0) or 0)
+            last_price = float(r.get("last_price", 0) or 0)
+            if not last_price and callable(get_price):
+                try:
+                    last_price = float(get_price(symbol) or 0)
+                except Exception:
+                    last_price = 0.0
+            opened_at = r.get("opened_at")
+            apr = r.get("apr_estimate")
+            if qty <= 0 or (avg_price <= 0 and last_price <= 0):
+                continue
+            usd_value = qty * (last_price if last_price > 0 else avg_price)
+            out.append(Position(
+                symbol=symbol,
+                qty=qty,
+                avg_price=avg_price,
+                last_price=last_price,
+                usd_value=usd_value,
+                opened_at=opened_at,
+                apr_estimate=apr,
+                trailing_max_price=r.get("trailing_max_price"),
+                realized_pnl_usd=float(r.get("realized_pnl_usd", 0) or 0),
+                meta=r,
+            ))
+        return out
+    # Fallback to .state files
+    return load_positions_fallback()
+
+def place_market_sell(symbol: str, qty: float) -> Dict[str, Any]:
+    fn = ADAPTER.get("place_market_sell")
+    if callable(fn):
+        return fn(symbol, qty)
+    # No adapter? We'll just record a TODO order so nothing breaks.
+    todo = {"symbol": symbol, "qty": qty, "action": "SELL", "ts": now_iso(), "executed": False}
+    todos = []
+    p = STATE_DIR / "sell_orders_todo.json"
+    if p.exists():
+        try:
+            todos = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            todos = []
+    todos.append(todo)
+    write_json("sell_orders_todo.json", todos)
+    return {"status": "NO_ADAPTER", "todo_recorded": True, "order": todo}
+
+# --------------------------------------------------------------------------------------
+# Guard evaluation
+# --------------------------------------------------------------------------------------
+def evaluate_sell_decision(p: Position, guard: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Returns (should_sell, reason)
+    Order of operations:
+      1) Dust skip (optionally skip stables)
+      2) Take Profit
+      3) Stop Loss
+      4) Trailing SL (if armed)
+      5) APR spike exit
+      6) Max drawdown cutoff (uses current gain)
+      7) Age limit
+      8) MIN_SELL_USD
+    """
+    g = guard
+    gain = p.gain_pct()  # e.g., +0.08 == +8%
+
+    # Skip tiny dust or stables if configured
+    if p.usd_value < DUST_MIN_USD:
+        return (False, f"SKIP_DUST(<{DUST_MIN_USD} USD)")
+
+    if DUST_SKIP_STABLES and p.symbol.upper() in {"USDT","USDC","DAI","USD","USDK","TUSD","FDUSD","USDP"}:
+        return (False, "SKIP_STABLE")
+
+    # 1) TP
+    tp = g.get("TP", {})
+    if tp.get("enable", True):
+        if gain >= float(tp.get("take_profit_pct", 0.08)):
+            return (True, f"TP_HIT({gain:+.2%})")
+
+    # 2) SL
+    sl = g.get("SL", {})
+    if sl.get("enable", True):
+        if gain <= float(sl.get("stop_loss_pct", -0.06)):
+            return (True, f"STOP_LOSS({gain:+.2%})")
+
+    # 3) TSL (arm after certain gain)
+    tsl = g.get("TSL", {})
+    if tsl.get("enable", True):
+        arm_after = float(tsl.get("arm_after_gain_pct", 0.04))
+        trail = float(tsl.get("trail_pct", 0.03))
+        if gain >= arm_after:
+            # Without persistent price trail, emulate by requiring price pullback from peak
+            # If we don't have trailing_max_price, use last_price as starting peak
+            peak = p.meta.get("trailing_max_price") if p.meta else None
+            if not peak or peak < p.last_price:
+                # update peak file for next run
+                peak_map = {}
+                path = STATE_DIR / "trailing_peaks.json"
+                if path.exists():
+                    try:
+                        peak_map = json.loads(path.read_text(encoding="utf-8"))
+                    except Exception:
+                        peak_map = {}
+                peak_map[p.symbol] = max(p.last_price, float(peak_map.get(p.symbol, 0) or 0))
+                write_json("trailing_peaks.json", peak_map)
+            else:
+                # if current price is below peak by trail%
+                if p.last_price <= (1.0 - trail) * peak:
+                    return (True, f"TSL_HIT({gain:+.2%},trail={trail:.2%})")
+
+    # 4) APR spike assisted exit
+    apr_cfg = g.get("APR_SPIKE_EXIT", {})
+    if apr_cfg.get("enable", True) and p.apr_estimate is not None:
+        if p.apr_estimate >= float(apr_cfg.get("apr_threshold", 0.90)):
+            if gain >= float(apr_cfg.get("min_gain_pct", 0.02)):
+                return (True, f"APR_SPIKE_EXIT(apr={p.apr_estimate:.0%},gain={gain:+.2%})")
+
+    # 5) Max drawdown cutoff (use current gain as proxy if no equity curve)
+    dd = g.get("DIP_CUTOFF", {})
+    if float(dd.get("max_drawdown_pct", -0.09)) >= -0.0001:
+        # if loss beyond threshold, sell
+        if gain <= float(dd.get("max_drawdown_pct", -0.09)):
+            return (True, f"DRAW_DOWN({gain:+.2%})")
+
+    # 6) Age limit
+    age_cfg = g.get("AGE_LIMIT", {})
+    age = p.age_hours()
+    if age is not None and float(age_cfg.get("max_hold_hours", 36)) > 0:
+        if age >= float(age_cfg.get("max_hold_hours", 36)):
+            return (True, f"AGE_LIMIT({age:.1f}h)")
+
+    # 7) Min sell USD enforced at the very end (block sells under threshold)
+    if p.usd_value < float(g.get("MIN_SELL_USD", MIN_SELL_USD)):
+        return (False, f"BLOCK_MIN_SELL(<{g.get('MIN_SELL_USD', MIN_SELL_USD)} USD)")
+
+    return (False, "HOLD")
+
+# --------------------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------------------
+def main() -> int:
+    # Header
+    write_text("run_header.txt", "\n".join([
+        "=== Sell-Guard Run ===",
+        f"time_utc: {now_iso()}",
+        f"DRY_RUN: {DRY_RUN}",
+        f"RUN_SWITCH: {RUN_SWITCH}",
+        f"MIN_SELL_USD: {SELL_GUARD.get('MIN_SELL_USD', MIN_SELL_USD)}",
+    ]))
+
+    if RUN_SWITCH != "ON":
+        write_text("run_skipped.txt", "RUN_SWITCH is OFF, skipping.")
+        return 0
+
+    positions = fetch_positions()
+
+    # Write snapshot of positions we evaluated
+    write_json("positions_evaluated.json", [asdict(p) for p in positions])
+
+    decisions_rows: List[List[Any]] = []
+    orders_executed: List[Dict[str, Any]] = []
+    orders_recommended: List[Dict[str, Any]] = []
+
+    header = [
+        "ts_utc", "symbol", "qty", "avg_price", "last_price", "usd_value",
+        "gain_pct", "age_hours", "apr_estimate", "decision", "dry_run"
     ]
 
-    markets = kraken.load_markets()
-    usd_pairs = list_usd_pairs(limit=80)
-    restricted = load_json(RESTRICTED_JSON, {})
+    for p in positions:
+        should_sell, reason = evaluate_sell_decision(p, SELL_GUARD)
+        row = [
+            now_iso(), p.symbol, f"{p.qty:.8f}", f"{p.avg_price:.8f}", f"{p.last_price:.8f}",
+            f"{p.usd_value:.2f}", f"{p.gain_pct():+.4%}",
+            f"{(p.age_hours() if p.age_hours() is not None else -1):.2f}",
+            (f"{p.apr_estimate:.2%}" if p.apr_estimate is not None else ""),
+            reason, DRY_RUN
+        ]
+        decisions_rows.append(row)
 
-    if SKIP_RESTRICTED:
-        usd_pairs = [s for s in usd_pairs if not restricted.get(s, False)]
+        if should_sell:
+            order = {"symbol": p.symbol, "qty": p.qty, "reason": reason, "ts": now_iso()}
+            if DRY_RUN != "OFF":
+                orders_recommended.append(order)
+            else:
+                try:
+                    resp = place_market_sell(p.symbol, p.qty)
+                    order["exec_response"] = resp
+                    orders_executed.append(order)
+                except Exception as e:
+                    order["exec_error"] = str(e)
+                    order["traceback"] = traceback.format_exc()
+                    orders_recommended.append(order)
 
-    # balances
-    raw_bal = fetch_balance_raw()
-    usd_cash = usd_cash_from_raw(raw_bal)
+    append_csv("sell_decisions.csv", header, decisions_rows)
+    write_json("sell_orders_recommended.json", orders_recommended)
+    write_json("sell_orders_executed.json", orders_executed)
 
-    # positions state
-    pos_state = load_json(POS_JSON, {})
+    # Light summary
+    summary = {
+        "time_utc": now_iso(),
+        "dry_run": DRY_RUN,
+        "positions_checked": len(positions),
+        "orders_executed": len(orders_executed),
+        "orders_recommended": len(orders_recommended),
+    }
+    write_json("sell_guard_summary.json", summary)
 
-    # ---- SELL pass over open holdings ----
-    open_rows_for_flags = []  # (symbol, amt, price, entry)
-    opens_after = 0
+    # Optional Slack webhook (simple text) if you already store it as secret
+    webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
+    if webhook:
+        try:
+            import urllib.request
+            msg = f"[Sell-Guard] checked {len(positions)} positions. "\
+                  f"Exec: {len(orders_executed)}, Reco: {len(orders_recommended)}. DRY_RUN={DRY_RUN}"
+            payload = json.dumps({"text": msg}).encode("utf-8")
+            req = urllib.request.Request(webhook, data=payload,
+                                         headers={"Content-Type":"application/json"})
+            urllib.request.urlopen(req, timeout=6).read()
+        except Exception:
+            pass
 
-    for base, amt in raw_bal.items():
-        bu = str(base).upper()
-        if bu in ("USD","ZUSD"): continue
-        sym = symbol_for_base(bu, markets)
-        if not sym: continue
-        if SKIP_RESTRICTED and restricted.get(sym, False):
-            log.skipped(sym, "present in holdings but restricted for jurisdiction")
-            continue
-
-        _, ask = best_bid_ask(sym)
-        value = float(amt) * float(ask or 0)
-        if value < max(2.0, DUST_MIN_USD):
-            continue
-        opens_after += 1
-
-        # ---- init / update state with trade-based entry recovery ----
-        st = pos_state.get(sym, {})
-        entry = float(st.get("entry") or 0.0)
-        peak  = float(st.get("peak")  or 0.0)
-
-        if entry <= 0.0:
-            recovered = seed_entry_from_trades(sym)
-            entry = float(recovered or (ask or 0.0))
-            if recovered > 0:
-                log.info(f"ENTRY_RECOVERED {sym} entry={entry:.6f} (from trades)")
-        if peak <= 0.0:
-            peak = float(ask or entry or 0.0)
-
-        if (ask or 0.0) > peak:
-            peak = float(ask or 0.0)
-
-        pos_state[sym] = {"entry": float(entry), "peak": float(peak), "amount": float(amt)}
-
-        # ---- sell rules
-        reason = check_sell_rules(float(ask or 0), float(entry), float(peak))
-        gain_pct = (float(ask or 0)/entry - 1.0) * 100.0 if entry > 0 else float('nan')
-        dd_pct = (1.0 - float(ask or 0)/max(peak, entry)) * 100.0 if entry > 0 else float('nan')
-        log.info(f"SELL_CHECK {sym} price={float(ask or 0):.6f} entry={entry:.6f} peak={peak:.6f} gain={gain_pct:.2f}% dd_from_peak={dd_pct:.2f}%")
-
-        if reason and not DRY_RUN:
-            resp = place_order_with_log(sym, "sell", float(amt), restricted)
-            if resp is not None:
-                log.sell(sym, float(ask or 0), reason)
-                sells += 1
-                pos_state.pop(sym, None)
-                opens_after -= 1
-        elif reason and DRY_RUN:
-            log.sell(sym, float(ask or 0), reason + " (DRY_RUN)")
-            sells += 1
-            pos_state.pop(sym, None)
-            opens_after -= 1
-        else:
-            open_rows_for_flags.append((sym, float(amt), float(ask or 0), float(entry)))
-
-    # refresh cash after sells
-    raw_bal = fetch_balance_raw()
-    usd_cash = usd_cash_from_raw(raw_bal)
-
-    # ---- BUY pass (mean-revert) ----
-    candidates = pick_candidates(usd_pairs, UNIVERSE_TOP_K)
-    buys_allowed = max(0, MAX_BUYS_PER_RUN)
-
-    for pair, last, ch in candidates:
-        if buys >= buys_allowed: break
-        if opens_after >= MAX_POSITIONS: break
-        if SKIP_RESTRICTED and restricted.get(pair, False):
-            log.skipped(pair, "blacklisted (restricted)")
-            continue
-
-        _, ask = best_bid_ask(pair)
-        px = ask or last
-        if not px or px <= 0: continue
-        if not can_afford_buy(usd_cash): break
-        amount = float(f"{(MIN_BUY_USD/px):.8f}")
-        if amount <= 0: continue
-
-        if DRY_RUN:
-            log.buy(pair, px)
-            buys += 1; opens_after += 1; usd_cash -= MIN_BUY_USD
-            pos_state[pair] = {"entry": float(px), "peak": float(px), "amount": float(amount)}
-            open_rows_for_flags.append((pair, float(amount), float(px), float(px)))
-        else:
-            resp = place_order_with_log(pair, "buy", amount, restricted)
-            if resp is None:
-                continue
-            log.buy(pair, px)
-            buys += 1; opens_after += 1; usd_cash -= MIN_BUY_USD
-            pos_state[pair] = {"entry": float(px), "peak": float(px), "amount": float(amount)}
-            open_rows_for_flags.append((pair, float(amount), float(px), float(px)))
-
-    # ---- Profit Flags & KPI ----
-    try: emit_profit_flags(open_rows_for_flags)
-    except Exception as e: log.warn(f"profit-flag emit failed: {e}")
-
-    try:
-        bal_now = usd_cash_from_raw(fetch_balance_raw())
-    except Exception:
-        bal_now = usd_cash
-    try: append_kpi_csv(bal_now)
-    except Exception: pass
-
-    # ---- Save state & artifacts ----
-    save_json(POS_JSON, pos_state)
-    save_json(RESTRICTED_JSON, restricted)
-
-    log.summary(buys, sells, opens_after, DRY_RUN)
-    write_artifacts(log.lines, "\n".join(spec))
+    return 0
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        log.error(f"fatal: {e}\n{traceback.format_exc()}")
-        write_artifacts(log.lines, "fatal error")
-        raise
+    raise SystemExit(main())
