@@ -5,21 +5,13 @@
 Crypto Live — Engine (Kraken)
 
 Features
-- Mean-revert buys (dip ranking)
+- Mean-revert buys (dip ranking on 15m)
 - Exits: TAKE_PROFIT, STOP_LOSS, TRAILING (armed)
-- Restricted-market auto-blacklist (EAccount:Invalid permissions)
+- Restricted-market auto-blacklist (jurisdiction errors)
 - KPI + artifacts in .state/
-- NEW: Profit Flags
-    • Prints lines to run.log when open positions cross gain bands
-    • Writes .state/profit_flags.txt each run with top movers
-- Robust artifact writes (always creates .state files so GitHub artifact step finds them)
-
-Env (via workflow Variables/Secrets)
-  DRY_RUN, MIN_BUY_USD, MAX_POSITIONS, MAX_BUYS_PER_RUN, UNIVERSE_TOP_K,
-  RESERVE_CASH_PCT, ROTATE_WHEN_FULL, ROTATE_WHEN_CASH_SHORT,
-  DUST_MIN_USD, DUST_SKIP_STABLES,
-  TAKE_PROFIT_PCT, STOP_LOSS_PCT, TRAILING_STOP_PCT, TRAILING_ARM_PCT,
-  SKIP_RESTRICTED, KRAKEN_API_KEY, KRAKEN_API_SECRET
+- Profit Flags   -> run.log + .state/profit_flags.txt
+- Artifact hardening (always creates .state files)
+- Entry recovery from trade history if .state is empty
 """
 
 from __future__ import annotations
@@ -56,8 +48,7 @@ class Log:
 log = Log()
 
 # ---------------- env helpers ----------------
-envs = os.getenv
-def env_str(n,d=""): return str(envs(n,d))
+def env_str(n,d=""): return str(os.getenv(n, d))
 def env_bool(n,d="false"): return env_str(n,d).strip().lower() in ("1","true","on","yes","y")
 def env_float(n,d="0"):
     try: return float(env_str(n,d))
@@ -114,17 +105,13 @@ def write_artifacts(lines: List[str], spec: str):
     ensure_artifact_shells()
     try: RUN_LOG.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
     except: pass
-    try:
-        if SPEC_TXT.exists():
-            SPEC_TXT.write_text(spec, encoding="utf-8")
-        else:
-            write_text(SPEC_TXT, spec)
+    try: SPEC_TXT.write_text(spec, encoding="utf-8")
     except: pass
 
 def append_kpi_csv(bal_usd: float):
     ensure_artifact_shells()
-    header="timestamp_utc,bal_usd\n"
-    if not KPI_CSV.exists(): KPI_CSV.write_text(header, encoding="utf-8")
+    if not KPI_CSV.exists():
+        KPI_CSV.write_text("timestamp_utc,bal_usd\n", encoding="utf-8")
     with KPI_CSV.open("a", newline="", encoding="utf-8") as f:
         f.write(f"{dt.datetime.utcnow().isoformat()}+00:00,{bal_usd:.2f}\n")
 
@@ -186,6 +173,7 @@ def place_order_with_log(symbol:str, side:str, amount:float, restricted: Dict[st
     except Exception as e:
         emsg = str(e)
         if "Invalid permissions" in emsg or "restricted for" in emsg or "EAccount" in emsg:
+            # auto-blacklist
             if not restricted.get(symbol):
                 restricted[symbol]=True
                 save_json(RESTRICTED_JSON, restricted)
@@ -231,11 +219,8 @@ def check_sell_rules(price:float, entry:float, peak:float) -> str|None:
 # ---------------- Profit Flags ----------------
 GAIN_BANDS = [10, 25, 50, 100, 200]  # % thresholds to announce
 
-def emit_profit_flags(open_rows: List[Tuple[str,float,float,float]], pos_state: Dict[str,dict]):
-    """
-    open_rows: list of (symbol, amount, price, entry)
-    Writes .state/profit_flags.txt and logs flags for any band crossed.
-    """
+def emit_profit_flags(open_rows: List[Tuple[str,float,float,float]]):
+    """open_rows: (symbol, amount, price, entry)"""
     lines = []
     now = dt.datetime.utcnow().isoformat()+"+00:00"
     lines.append(f"# Profit Flags {now}")
@@ -245,7 +230,6 @@ def emit_profit_flags(open_rows: List[Tuple[str,float,float,float]], pos_state: 
         if entry <= 0 or price <= 0: continue
         gain = (price/entry - 1.0) * 100.0
         ranked.append((gain, sym, price, entry, amt))
-        # log the highest band reached (without spamming every run)
         for band in reversed(GAIN_BANDS):
             if gain >= band:
                 log.profit_flag(sym, gain, band)
@@ -256,6 +240,37 @@ def emit_profit_flags(open_rows: List[Tuple[str,float,float,float]], pos_state: 
         lines.append(f"{sym}  gain=+{gain:.2f}%  price={price:.6f}  entry={entry:.6f}  amt={amt}")
 
     write_text(PROFIT_FLAGS_TXT, "\n".join(lines)+"\n")
+
+# ---------------- Entry recovery from real trades ----------------
+def seed_entry_from_trades(symbol: str) -> float:
+    """
+    Compute a VWAP entry for the current net long position using recent trades.
+    Returns 0.0 if trades cannot be fetched or there is no net long qty.
+    """
+    try:
+        trades = kraken.fetch_my_trades(symbol, limit=200)  # recent window is enough for spot
+    except Exception:
+        return 0.0
+
+    net_qty = 0.0
+    gross_cost = 0.0
+    for t in trades:
+        amt = float(t.get("amount") or 0)           # +buy, -sell
+        price = float(t.get("price") or 0)
+        fee = float((t.get("fee") or {}).get("cost") or 0)
+        if amt > 0:
+            net_qty += amt
+            gross_cost += amt * price + fee
+        elif amt < 0:
+            take = min(abs(amt), max(0.0, net_qty))
+            if net_qty > 0 and gross_cost > 0 and take > 0:
+                avg = gross_cost / net_qty
+                gross_cost -= avg * take
+            net_qty += amt  # amt is negative
+
+    if net_qty > 0 and gross_cost > 0:
+        return gross_cost / net_qty
+    return 0.0
 
 # ---------------- main ----------------
 def main():
@@ -278,7 +293,6 @@ def main():
     usd_pairs = list_usd_pairs(limit=80)
     restricted = load_json(RESTRICTED_JSON, {})
 
-    # pre-filter restricted
     if SKIP_RESTRICTED:
         usd_pairs = [s for s in usd_pairs if not restricted.get(s, False)]
 
@@ -301,26 +315,43 @@ def main():
         if SKIP_RESTRICTED and restricted.get(sym, False):
             log.skipped(sym, "present in holdings but restricted for jurisdiction")
             continue
+
         _, ask = best_bid_ask(sym)
         value = float(amt) * float(ask or 0)
         if value < max(2.0, DUST_MIN_USD):
             continue
         opens_after += 1
 
-        # init / update state
-        entry = pos_state.get(sym, {}).get("entry", float(ask or 0))
-        peak  = pos_state.get(sym, {}).get("peak", float(ask or 0))
-        if float(ask or 0) > peak: peak = float(ask or 0)
+        # ---- init / update state with trade-based entry recovery ----
+        st = pos_state.get(sym, {})
+        entry = float(st.get("entry") or 0.0)
+        peak  = float(st.get("peak")  or 0.0)
+
+        if entry <= 0.0:
+            recovered = seed_entry_from_trades(sym)
+            entry = float(recovered or (ask or 0.0))
+            if recovered > 0:
+                log.info(f"ENTRY_RECOVERED {sym} entry={entry:.6f} (from trades)")
+        if peak <= 0.0:
+            peak = float(ask or entry or 0.0)
+
+        if (ask or 0.0) > peak:
+            peak = float(ask or 0.0)
+
         pos_state[sym] = {"entry": float(entry), "peak": float(peak), "amount": float(amt)}
 
-        # sell rules
+        # ---- sell rules
         reason = check_sell_rules(float(ask or 0), float(entry), float(peak))
+        gain_pct = (float(ask or 0)/entry - 1.0) * 100.0 if entry > 0 else float('nan')
+        dd_pct = (1.0 - float(ask or 0)/max(peak, entry)) * 100.0 if entry > 0 else float('nan')
+        log.info(f"SELL_CHECK {sym} price={float(ask or 0):.6f} entry={entry:.6f} peak={peak:.6f} gain={gain_pct:.2f}% dd_from_peak={dd_pct:.2f}%")
+
         if reason and not DRY_RUN:
             resp = place_order_with_log(sym, "sell", float(amt), restricted)
             if resp is not None:
                 log.sell(sym, float(ask or 0), reason)
                 sells += 1
-                pos_state.pop(sym, None)  # remove after sell
+                pos_state.pop(sym, None)
                 opens_after -= 1
         elif reason and DRY_RUN:
             log.sell(sym, float(ask or 0), reason + " (DRY_RUN)")
@@ -328,7 +359,6 @@ def main():
             pos_state.pop(sym, None)
             opens_after -= 1
         else:
-            # keep for profit-flag reporting
             open_rows_for_flags.append((sym, float(amt), float(ask or 0), float(entry)))
 
     # refresh cash after sells
@@ -368,7 +398,7 @@ def main():
             open_rows_for_flags.append((pair, float(amount), float(px), float(px)))
 
     # ---- Profit Flags & KPI ----
-    try: emit_profit_flags(open_rows_for_flags, pos_state)
+    try: emit_profit_flags(open_rows_for_flags)
     except Exception as e: log.warn(f"profit-flag emit failed: {e}")
 
     try:
@@ -390,6 +420,5 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         log.error(f"fatal: {e}\n{traceback.format_exc()}")
-        # ensure we still leave something for artifacts
         write_artifacts(log.lines, "fatal error")
         raise
