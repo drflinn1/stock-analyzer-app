@@ -1,138 +1,182 @@
-name: Crypto Live Overnight (LIVE, Sept Baseline)
+name: Crypto Live — Overnight (15m DRY-RUN by default)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/15 * * * *"   # every 15 minutes
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: "ON or OFF (overrides default) — OFF = live"
-        required: false
-        default: "OFF"
-      RUN_BOT:
-        description: "ON to run bot (OFF to only render KPI/artifacts)"
-        required: false
+        description: "OFF to trade live; ON for dry run"
+        type: choice
+        required: true
         default: "ON"
+        options: ["ON", "OFF"]
+      RUN_SWITCH:
+        description: "Global on/off (ON runs, OFF skips trading logic)"
+        type: choice
+        required: true
+        default: "ON"
+        options: ["ON", "OFF"]
+      ADVANCED_JSON:
+        description: "Optional advanced config JSON (sizing, caps, etc.)"
+        required: false
+        type: string
+      PROTECT_JSON:
+        description: "Optional guard/protect JSON (TP/SL/TSL, sell rules, etc.)"
+        required: false
+        type: string
 
+# Avoid overlapping runs of this workflow
 concurrency:
-  group: crypto-live
+  group: crypto-live-overnight
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
-  run:
+  live:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
 
     env:
-      # Behavior toggles
-      DRY_RUN: ${{ inputs.DRY_RUN || 'OFF' }}
-      RUN_BOT: ${{ inputs.RUN_BOT || 'ON' }}
+      # ---- Runtime toggles / defaults (vars override these if present) ----
+      DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
+      RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
 
-      # Exchange
-      EXCHANGE: kraken
+      # Bot knobs (repo Variables > Actions > Variables)
+      MIN_BUY_USD:            ${{ vars.MIN_BUY_USD || '10' }}
+      MAX_POSITIONS:          ${{ vars.MAX_POSITIONS || '3' }}
+      MAX_BUYS_PER_RUN:       ${{ vars.MAX_BUYS_PER_RUN || '1' }}
+      UNIVERSE_TOP_K:         ${{ vars.UNIVERSE_TOP_K || '25' }}
+      RESERVE_CASH_PCT:       ${{ vars.RESERVE_CASH_PCT || '5' }}
+      ROTATE_WHEN_FULL:       ${{ vars.ROTATE_WHEN_FULL || 'true' }}
+      ROTATE_WHEN_CASH_SHORT: ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
+      MIN_SELL_USD:           ${{ vars.MIN_SELL_USD || '10' }}
+      DUST_MIN_USD:           ${{ vars.DUST_MIN_USD || '2' }}
+      DUST_SKIP_STABLES:      ${{ vars.DUST_SKIP_STABLES || 'true' }}
 
-      # Repo variables (safe wideners)
-      MIN_BUY_USD:       ${{ vars.MIN_BUY_USD || '18' }}
-      MAX_POSITIONS:     ${{ vars.MAX_POSITIONS || '3' }}
-      MAX_BUYS_PER_RUN:  ${{ vars.MAX_BUYS_PER_RUN || '2' }}
-      UNIVERSE_TOP_K:    ${{ vars.UNIVERSE_TOP_K || '40' }}
-      RESERVE_CASH_PCT:  ${{ vars.RESERVE_CASH_PCT || '15' }}
-      ROTATE_WHEN_FULL:        ${{ vars.ROTATE_WHEN_FULL || 'true' }}
-      ROTATE_WHEN_CASH_SHORT:  ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
-      DUST_MIN_USD:      ${{ vars.DUST_MIN_USD || '2' }}
-      DUST_SKIP_STABLES: ${{ vars.DUST_SKIP_STABLES || 'true' }}
+      # Optional JSON blobs from dispatch inputs (stringified)
+      ADVANCED_JSON: ${{ inputs.ADVANCED_JSON || '' }}
+      PROTECT_JSON:  ${{ inputs.PROTECT_JSON  || '' }}
 
-      # Exit rules
-      TAKE_PROFIT_PCT:   ${{ vars.TAKE_PROFIT_PCT || '3' }}
-      STOP_LOSS_PCT:     ${{ vars.STOP_LOSS_PCT || '5' }}
-      TRAILING_STOP_PCT: ${{ vars.TRAILING_STOP_PCT || '2' }}
-      TRAILING_ARM_PCT:  ${{ vars.TRAILING_ARM_PCT || '1.5' }}
-
-      # Restricted markets
-      SKIP_RESTRICTED:   ${{ vars.SKIP_RESTRICTED || 'true' }}
-
-      # Kraken secrets
-      KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-
-      PYTHONUNBUFFERED: "1"
+      # Where the bot writes state & charts
+      STATE_DIR: ".state"
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Ensure .state/ exists (explicit & idempotent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$STATE_DIR"
+          # Provide a harmless sentinel so the artifact never ends up empty
+          echo "created: $(date -Iseconds)" > "$STATE_DIR/ARTIFACT_SENTINEL.txt"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install deps (requirements.txt if present, else minimal safe set)
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
-          pip install ccxt pandas pyyaml matplotlib
-
-      - name: Sanity check (no secret values shown)
-        run: |
-          python - << 'PY'
-          import os
-          echo = lambda k: print(f"{k} =", os.getenv(k, ""))
-          print("Have KRAKEN_API_KEY:", bool(os.getenv("KRAKEN_API_KEY")))
-          print("Have KRAKEN_API_SECRET:", bool(os.getenv("KRAKEN_API_SECRET")))
-          for k in [
-            "DRY_RUN","RUN_BOT","MIN_BUY_USD","MAX_POSITIONS","MAX_BUYS_PER_RUN",
-            "UNIVERSE_TOP_K","RESERVE_CASH_PCT","ROTATE_WHEN_FULL","ROTATE_WHEN_CASH_SHORT",
-            "DUST_MIN_USD","DUST_SKIP_STABLES","TAKE_PROFIT_PCT","STOP_LOSS_PCT",
-            "TRAILING_STOP_PCT","TRAILING_ARM_PCT","SKIP_RESTRICTED"
-          ]:
-              echo(k)
-          PY
-
-      - name: Run Crypto Engine
-        if: env.RUN_BOT == 'ON'
-        run: |
-          mkdir -p .state
-          python main.py
-
-      - name: Make KPI chart (optional)
-        run: |
-          if [ -f tools/make_kpi_chart.py ]; then
-            python tools/make_kpi_chart.py --column bal_usd || true
+          set -euo pipefail
+          if [[ -f requirements.txt ]]; then
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+          else
+            python -m pip install --upgrade pip
+            # Minimal deps used across your repo & KPI chart step
+            pip install pyyaml matplotlib pandas requests
           fi
 
-      - name: Ensure artifact folder
-        run: mkdir -p .state
+      # ---- Run the bot (your main entry) ----
+      - name: Run trading bot
+        id: run_bot
+        shell: bash
+        env:
+          # Secrets must be defined in repo Settings → Secrets and variables → Actions → Secrets
+          KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          # Optionally Slack or email secrets if your code reads them directly
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          echo "DRY_RUN=${DRY_RUN}"
+          echo "RUN_SWITCH=${RUN_SWITCH}"
 
-      - name: Upload artifacts
+          # If you gate execution on RUN_SWITCH inside Python, great—otherwise short-circuit here:
+          if [[ "${RUN_SWITCH}" != "ON" ]]; then
+            echo "RUN_SWITCH is OFF → skip trading logic."
+            echo "skip" > "${STATE_DIR}/run_skipped.txt"
+            exit 0
+          fi
+
+          # Always log a run header into .state/ for post-run inspection
+          {
+            echo "=== Crypto Live Run ==="
+            echo "started: $(date -Iseconds)"
+            echo "DRY_RUN=${DRY_RUN}"
+            echo "ADVANCED_JSON length: ${#ADVANCED_JSON}"
+            echo "PROTECT_JSON length: ${#PROTECT_JSON}"
+          } | tee "${STATE_DIR}/run_header.txt"
+
+          # Your entry-point; keep as-is for your repo
+          # (If your file resides elsewhere, adjust the path accordingly.)
+          python main.py
+
+          echo "completed: $(date -Iseconds)" | tee -a "${STATE_DIR}/run_header.txt"
+
+      # ---- Optional: generate KPI chart if your script exists ----
+      - name: Generate KPI chart (optional)
+        if: always() && hashFiles('tools/make_kpi_chart.py') != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Generating KPI chart (if CSV present)…"
+          # The script should read .state/kpi_history.csv and write .state/kpi_chart.png
+          python tools/make_kpi_chart.py || echo "KPI chart generation skipped/failed harmlessly."
+
+      # ──────────────────────────────────────────────────────────────
+      # ✅ Safe Artifact Upload (explicit .state/ creation + "always" upload)
+      # ──────────────────────────────────────────────────────────────
+      - name: Upload .state artifacts (always, even on failure)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: crypto-live-overnight-${{ github.run_number }}
-          path: .state/*
+          name: state-${{ github.workflow }}-${{ github.run_id }}
+          path: |
+            .state/**
+            .state/*
+            .state
           if-no-files-found: warn
+          retention-days: 7
+          compression-level: 6
 
-      - name: Slack notify (optional)
-        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
+      # (Optional) Upload a slim run-report as a separate artifact
+      - name: Upload run report (optional)
+        if: always() && hashFiles('.state/run_header.txt') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-report-${{ github.run_id }}
+          path: .state/run_header.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+      # ──────────────────────────────────────────────────────────────
+      # (Optional) Trade alerts step — disabled by default
+      # Enable by flipping `if: ${{ false }}` to `if: ${{ env.SLACK_WEBHOOK_URL != '' }}`
+      # ──────────────────────────────────────────────────────────────
+      - name: (Optional) Send Slack summary
+        if: ${{ false }}
+        shell: bash
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          python - << 'PY'
-          import json, os, pathlib, sys
-          def read(p):
-              try: return pathlib.Path(p).read_text(encoding="utf-8")
-              except: return ""
-          def read_lines(p):
-              try: return pathlib.Path(p).read_text(encoding="utf-8").splitlines()
-              except: return []
-          flags = read_lines(".state/profit_flags.txt")
-          top = flags[1] if len(flags) > 1 else "(none)"
-          runlog = read_lines(".state/run.log")
-          summary = runlog[-1] if runlog else ""
-          payload = json.dumps({"text": f"OVERNIGHT STATUS=${{ job.status }}\nTop mover: {top}\n{summary}"})
-          import urllib.request
-          req = urllib.request.Request(os.environ["SLACK_WEBHOOK_URL"], data=payload.encode(), headers={"Content-Type":"application/json"})
-          try:
-              urllib.request.urlopen(req, timeout=10)
-          except Exception as e:
-              print("Slack post failed:", e, file=sys.stderr)
-          PY
+          set -euo pipefail
+          test -n "${SLACK_WEBHOOK_URL:-}" || { echo "No webhook; skipping."; exit 0; }
+          msg="*Crypto Live — Overnight* finished run ${{ github.run_number }} (DRY_RUN=${DRY_RUN})"
+          payload=$(jq -n --arg text "$msg" '{text:$text}')
+          curl -sS -X POST -H 'Content-type: application/json' --data "${payload}" "${SLACK_WEBHOOK_URL}" || true
