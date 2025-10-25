@@ -2,7 +2,7 @@ name: Crypto Live — Overnight (15m DRY-RUN by default)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       DRY_RUN:
@@ -26,7 +26,6 @@ on:
         required: false
         type: string
 
-# Avoid overlapping runs of this workflow
 concurrency:
   group: crypto-live-overnight
   cancel-in-progress: false
@@ -39,11 +38,8 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # ---- Runtime toggles / defaults (vars override these if present) ----
       DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
       RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
-
-      # Bot knobs (repo Variables > Actions > Variables)
       MIN_BUY_USD:            ${{ vars.MIN_BUY_USD || '10' }}
       MAX_POSITIONS:          ${{ vars.MAX_POSITIONS || '3' }}
       MAX_BUYS_PER_RUN:       ${{ vars.MAX_BUYS_PER_RUN || '1' }}
@@ -54,24 +50,19 @@ jobs:
       MIN_SELL_USD:           ${{ vars.MIN_SELL_USD || '10' }}
       DUST_MIN_USD:           ${{ vars.DUST_MIN_USD || '2' }}
       DUST_SKIP_STABLES:      ${{ vars.DUST_SKIP_STABLES || 'true' }}
-
-      # Optional JSON blobs from dispatch inputs (stringified)
       ADVANCED_JSON: ${{ inputs.ADVANCED_JSON || '' }}
       PROTECT_JSON:  ${{ inputs.PROTECT_JSON  || '' }}
-
-      # Where the bot writes state & charts
       STATE_DIR: ".state"
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Ensure .state/ exists (explicit & idempotent)
+      - name: Ensure .state/ exists + sentinel
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$STATE_DIR"
-          # Provide a harmless sentinel so the artifact never ends up empty
           echo "created: $(date -Iseconds)" > "$STATE_DIR/ARTIFACT_SENTINEL.txt"
 
       - name: Set up Python
@@ -79,42 +70,35 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (requirements.txt if present, else minimal safe set)
+      - name: Install deps (requirements.txt if present, else minimal)
         shell: bash
         run: |
           set -euo pipefail
+          python -m pip install --upgrade pip
           if [[ -f requirements.txt ]]; then
-            python -m pip install --upgrade pip
             pip install -r requirements.txt
           else
-            python -m pip install --upgrade pip
-            # Minimal deps used across your repo & KPI chart step
             pip install pyyaml matplotlib pandas requests
           fi
 
-      # ---- Run the bot (your main entry) ----
       - name: Run trading bot
         id: run_bot
         shell: bash
         env:
-          # Secrets must be defined in repo Settings → Secrets and variables → Actions → Secrets
           KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          # Optionally Slack or email secrets if your code reads them directly
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           set -euo pipefail
           echo "DRY_RUN=${DRY_RUN}"
           echo "RUN_SWITCH=${RUN_SWITCH}"
 
-          # If you gate execution on RUN_SWITCH inside Python, great—otherwise short-circuit here:
           if [[ "${RUN_SWITCH}" != "ON" ]]; then
             echo "RUN_SWITCH is OFF → skip trading logic."
             echo "skip" > "${STATE_DIR}/run_skipped.txt"
             exit 0
           fi
 
-          # Always log a run header into .state/ for post-run inspection
           {
             echo "=== Crypto Live Run ==="
             echo "started: $(date -Iseconds)"
@@ -123,39 +107,43 @@ jobs:
             echo "PROTECT_JSON length: ${#PROTECT_JSON}"
           } | tee "${STATE_DIR}/run_header.txt"
 
-          # Your entry-point; keep as-is for your repo
-          # (If your file resides elsewhere, adjust the path accordingly.)
           python main.py
 
           echo "completed: $(date -Iseconds)" | tee -a "${STATE_DIR}/run_header.txt"
 
-      # ---- Optional: generate KPI chart if your script exists ----
       - name: Generate KPI chart (optional)
         if: always() && hashFiles('tools/make_kpi_chart.py') != ''
         shell: bash
         run: |
           set -euo pipefail
-          echo "Generating KPI chart (if CSV present)…"
-          # The script should read .state/kpi_history.csv and write .state/kpi_chart.png
-          python tools/make_kpi_chart.py || echo "KPI chart generation skipped/failed harmlessly."
+          python tools/make_kpi_chart.py || echo "KPI chart generation skipped/failed."
 
-      # ──────────────────────────────────────────────────────────────
-      # ✅ Safe Artifact Upload (explicit .state/ creation + "always" upload)
-      # ──────────────────────────────────────────────────────────────
-      - name: Upload .state artifacts (always, even on failure)
+      # -------- Fix: prove files exist and upload via absolute path ----------
+      - name: Debug: list .state before upload
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "Workspace: ${GITHUB_WORKSPACE}"
+          ls -la
+          if [[ -d ".state" ]]; then
+            echo "Contents of .state:"
+            find .state -maxdepth 3 -type f -printf "%p (%s bytes)\n" || true
+          else
+            echo ".state directory is missing."
+          fi
+
+      - name: Upload .state artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: state-${{ github.workflow }}-${{ github.run_id }}
-          path: |
-            .state/**
-            .state/*
-            .state
+          name: state-${{ github.run_id }}
+          # Use absolute workspace path to avoid any glob/relpath edge cases
+          path: ${{ github.workspace }}/.state
           if-no-files-found: warn
           retention-days: 7
           compression-level: 6
 
-      # (Optional) Upload a slim run-report as a separate artifact
       - name: Upload run report (optional)
         if: always() && hashFiles('.state/run_header.txt') != ''
         uses: actions/upload-artifact@v4
@@ -165,10 +153,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # ──────────────────────────────────────────────────────────────
-      # (Optional) Trade alerts step — disabled by default
-      # Enable by flipping `if: ${{ false }}` to `if: ${{ env.SLACK_WEBHOOK_URL != '' }}`
-      # ──────────────────────────────────────────────────────────────
       - name: (Optional) Send Slack summary
         if: ${{ false }}
         shell: bash
