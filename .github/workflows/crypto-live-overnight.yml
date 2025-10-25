@@ -1,4 +1,4 @@
-name: Crypto Live — Overnight (15m DRY-RUN by default)
+name: Crypto Live - Overnight (15m DRY-RUN by default)
 
 on:
   schedule:
@@ -40,6 +40,7 @@ jobs:
     env:
       DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
       RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
+
       MIN_BUY_USD:            ${{ vars.MIN_BUY_USD || '10' }}
       MAX_POSITIONS:          ${{ vars.MAX_POSITIONS || '3' }}
       MAX_BUYS_PER_RUN:       ${{ vars.MAX_BUYS_PER_RUN || '1' }}
@@ -50,15 +51,17 @@ jobs:
       MIN_SELL_USD:           ${{ vars.MIN_SELL_USD || '10' }}
       DUST_MIN_USD:           ${{ vars.DUST_MIN_USD || '2' }}
       DUST_SKIP_STABLES:      ${{ vars.DUST_SKIP_STABLES || 'true' }}
+
       ADVANCED_JSON: ${{ inputs.ADVANCED_JSON || '' }}
       PROTECT_JSON:  ${{ inputs.PROTECT_JSON  || '' }}
+
       STATE_DIR: ".state"
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Ensure .state/ exists + sentinel
+      - name: Ensure .state exists and add sentinel
         shell: bash
         run: |
           set -euo pipefail
@@ -70,7 +73,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (requirements.txt if present, else minimal)
+      - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
@@ -94,7 +97,7 @@ jobs:
           echo "RUN_SWITCH=${RUN_SWITCH}"
 
           if [[ "${RUN_SWITCH}" != "ON" ]]; then
-            echo "RUN_SWITCH is OFF → skip trading logic."
+            echo "RUN_SWITCH is OFF -> skip trading logic."
             echo "skip" > "${STATE_DIR}/run_skipped.txt"
             exit 0
           fi
@@ -118,8 +121,8 @@ jobs:
           set -euo pipefail
           python tools/make_kpi_chart.py || echo "KPI chart generation skipped/failed."
 
-      # -------- Fix: prove files exist and upload via absolute path ----------
-      - name: Debug: list .state before upload
+      # Debug listing before artifact upload (helps if something goes missing)
+      - name: Debug - list .state
         if: always()
         shell: bash
         run: |
@@ -138,7 +141,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
-          # Use absolute workspace path to avoid any glob/relpath edge cases
           path: ${{ github.workspace }}/.state
           if-no-files-found: warn
           retention-days: 7
@@ -160,7 +162,10 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           set -euo pipefail
-          test -n "${SLACK_WEBHOOK_URL:-}" || { echo "No webhook; skipping."; exit 0; }
-          msg="*Crypto Live — Overnight* finished run ${{ github.run_number }} (DRY_RUN=${DRY_RUN})"
-          payload=$(jq -n --arg text "$msg" '{text:$text}')
+          if [[ -z "${SLACK_WEBHOOK_URL:-}" ]]; then
+            echo "No webhook; skipping."
+            exit 0
+          fi
+          msg="Crypto Live - Overnight finished run ${{ github.run_number }} (DRY_RUN=${DRY_RUN})"
+          payload=$(printf '{"text":"%s"}' "$msg")
           curl -sS -X POST -H 'Content-type: application/json' --data "${payload}" "${SLACK_WEBHOOK_URL}" || true
