@@ -41,7 +41,6 @@ jobs:
       DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
       RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
 
-      # Bot knobs (override via Actions > Variables)
       MIN_BUY_USD:            ${{ vars.MIN_BUY_USD || '10' }}
       MAX_POSITIONS:          ${{ vars.MAX_POSITIONS || '3' }}
       MAX_BUYS_PER_RUN:       ${{ vars.MAX_BUYS_PER_RUN || '1' }}
@@ -53,27 +52,23 @@ jobs:
       DUST_MIN_USD:           ${{ vars.DUST_MIN_USD || '2' }}
       DUST_SKIP_STABLES:      ${{ vars.DUST_SKIP_STABLES || 'true' }}
 
-      # Optional JSON blobs
       ADVANCED_JSON: ${{ inputs.ADVANCED_JSON || '' }}
       PROTECT_JSON:  ${{ inputs.PROTECT_JSON  || '' }}
 
-      # Default state dir (most repos use this)
       STATE_DIR: ".state"
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Ensure .state exists (repo root) and ../.state (parent) with sentinels
+      - name: Ensure .state exists (both levels)
         shell: bash
         run: |
           set -euo pipefail
-          # Repo-root .state
           mkdir -p ".state"
-          echo "created at repo root: $(date -Iseconds)" > ".state/ARTIFACT_SENTINEL.txt"
-          # Parent-level .state (some projects write here)
           mkdir -p "../.state"
-          echo "created at parent: $(date -Iseconds)" > "../.state/ARTIFACT_SENTINEL.txt"
+          echo "sentinel: $(date -Iseconds)" > ".state/ARTIFACT_SENTINEL.txt"
+          echo "sentinel: $(date -Iseconds)" > "../.state/ARTIFACT_SENTINEL.txt"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -118,7 +113,6 @@ jobs:
           } | tee "${STATE_DIR}/run_header.txt"
 
           python main.py
-
           echo "completed: $(date -Iseconds)" | tee -a "${STATE_DIR}/run_header.txt"
 
       - name: Generate KPI chart (optional)
@@ -128,38 +122,45 @@ jobs:
           set -euo pipefail
           python tools/make_kpi_chart.py || echo "KPI chart generation skipped/failed."
 
-      - name: Debug - locate and list .state dirs
+      - name: Debug - locate .state folders
         if: always()
         shell: bash
         run: |
           set -euxo pipefail
           echo "WORKSPACE=${GITHUB_WORKSPACE}"
-          echo "Searching for .state directories under /home/runner/work ..."
           find /home/runner/work -maxdepth 3 -type d -name ".state" -print || true
-          echo "Listing repo-root .state (if present):"
-          ( test -d ".state" && find .state -maxdepth 3 -type f -printf "%p (%s bytes)\n" ) || echo "repo-root .state missing"
-          echo "Listing parent .state (if present):"
-          ( test -d "../.state" && find ../.state -maxdepth 3 -type f -printf "%p (%s bytes)\n" ) || echo "parent .state missing"
+          echo "Repo .state files:"
+          ( test -d ".state" && find .state -maxdepth 2 -type f ) || echo "none"
+          echo "Parent .state files:"
+          ( test -d "../.state" && find ../.state -maxdepth 2 -type f ) || echo "none"
 
-      - name: Upload .state artifacts (always)
+      - name: Merge .state folders to one safe upload dir
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p safe_state
+          if [[ -d ".state" ]]; then cp -r .state/* safe_state/ 2>/dev/null || true; fi
+          if [[ -d "../.state" ]]; then cp -r ../.state/* safe_state/ 2>/dev/null || true; fi
+          echo "safe_state contents:"
+          find safe_state -type f -printf "%p (%s bytes)\n" || true
+
+      - name: Upload merged .state artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
-          # Upload from BOTH locations; if one is empty, the other will satisfy the artifact
-          path: |
-            ${{ github.workspace }}/.state
-            ${{ github.workspace }}/../.state
+          path: safe_state
           if-no-files-found: warn
           retention-days: 7
           compression-level: 6
 
       - name: Upload run report (optional)
-        if: always() && hashFiles('.state/run_header.txt') != ''
+        if: always() && hashFiles('safe_state/run_header.txt') != ''
         uses: actions/upload-artifact@v4
         with:
           name: run-report-${{ github.run_id }}
-          path: .state/run_header.txt
+          path: safe_state/run_header.txt
           if-no-files-found: warn
           retention-days: 7
 
