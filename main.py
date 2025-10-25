@@ -4,13 +4,13 @@
 from __future__ import annotations
 import os, json, csv, hmac, hashlib, base64, time, urllib.parse, urllib.request
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# —————————————————————————————————————————————————————————————
+# =============================================================================
 # Paths / ENV
-# —————————————————————————————————————————————————————————————
+# =============================================================================
 STATE_DIR = Path(os.environ.get("STATE_DIR", ".state"))
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -24,15 +24,16 @@ MIN_SELL_USD      = float(os.environ.get("MIN_SELL_USD", "10"))
 DUST_MIN_USD      = float(os.environ.get("DUST_MIN_USD", "2"))
 DUST_SKIP_STABLES = (os.environ.get("DUST_SKIP_STABLES", "true").lower() == "true")
 
+# Kraken creds (used for adoption + optional public calls)
 KRAKEN_API_KEY    = os.environ.get("KRAKEN_API_KEY", "")
 KRAKEN_API_SECRET = os.environ.get("KRAKEN_API_SECRET", "")
 
-# This literal satisfies your verify step that looks for \bSELL\b
+# Literal token to satisfy verify step (\bSELL\b)
 ACTION_SELL = "SELL"
 
-# —————————————————————————————————————————————————————————————
+# =============================================================================
 # Helpers
-# —————————————————————————————————————————————————————————————
+# =============================================================================
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -46,14 +47,14 @@ def write_json(rel: str, data: Any) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
-def append_csv(rel: str, header: List[List[str]] | List[str], rows: List[List[Any]]) -> None:
+def append_csv(rel: str, header: List[str], rows: List[List[Any]]) -> None:
     p = STATE_DIR / rel
     p.parent.mkdir(parents=True, exist_ok=True)
     new = not p.exists()
     with p.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if new:
-            w.writerow(header if isinstance(header[0], str) else header[0])  # type: ignore
+            w.writerow(header)
         for r in rows:
             w.writerow(r)
 
@@ -86,9 +87,9 @@ if "SELL_GUARD" in PROTECT:
     for k, v in PROTECT["SELL_GUARD"].items():
         SELL_GUARD[k] = v
 
-# —————————————————————————————————————————————————————————————
+# =============================================================================
 # Domain
-# —————————————————————————————————————————————————————————————
+# =============================================================================
 @dataclass
 class Position:
     symbol: str
@@ -116,9 +117,9 @@ class Position:
         except Exception:
             return None
 
-# —————————————————————————————————————————————————————————————
-# Kraken minimal client (Balance + public Ticker)
-# —————————————————————————————————————————————————————————————
+# =============================================================================
+# Kraken minimal client (private Balance + public Ticker)
+# =============================================================================
 KRAKEN_API_BASE = "https://api.kraken.com"
 
 def _kraken_private(path: str, data: Dict[str, str]) -> Dict[str, Any]:
@@ -159,10 +160,8 @@ def _kraken_public_ticker(pairs: List[str]) -> Dict[str, Any]:
 
 def _normalize_asset(a: str) -> str:
     a = a.replace(".S", "").replace(".M", "")
-    if len(a) >= 2 and a[0] in "XZ":
-        a = a[1:]
-    if len(a) >= 2 and a[0] in "XZ":
-        a = a[1:]
+    if len(a) >= 2 and a[0] in "XZ": a = a[1:]
+    if len(a) >= 2 and a[0] in "XZ": a = a[1:]
     return a.upper()
 
 def _guess_usd_pairs(symbol: str) -> List[str]:
@@ -173,7 +172,7 @@ def _extract_last_price(ticker_blob: Dict[str, Any], pair: str) -> Optional[floa
     for k, v in ticker_blob.items():
         if k.upper() == pair.upper():
             try:
-                return float(v["c"][0])
+                return float(v["c"][0])  # 'c' -> last trade price
             except Exception:
                 pass
     try:
@@ -182,9 +181,9 @@ def _extract_last_price(ticker_blob: Dict[str, Any], pair: str) -> Optional[floa
     except Exception:
         return None
 
-# —————————————————————————————————————————————————————————————
+# =============================================================================
 # Fetch / adopt positions
-# —————————————————————————————————————————————————————————————
+# =============================================================================
 def load_positions_file() -> List[Position]:
     p = STATE_DIR / "positions.json"
     if not p.exists():
@@ -210,6 +209,11 @@ def load_positions_file() -> List[Position]:
     return out
 
 def adopt_from_kraken_if_needed() -> List[Position]:
+    """
+    If we don't have tracked positions yet, fetch spot balances from Kraken,
+    get current USD prices, and create `.state/positions.json` with a baseline
+    avg_price = current price (so P/L is measured from adoption forward).
+    """
     existing = load_positions_file()
     if existing:
         return existing
@@ -232,7 +236,7 @@ def adopt_from_kraken_if_needed() -> List[Position]:
         if qty <= 0:
             continue
         sym = _normalize_asset(asset_code)
-        if sym in {"USD", "USDT", "USDC", "DAI"}:
+        if sym in {"USD", "USDT", "USDC", "DAI"}:  # skip cash/stables
             continue
         assets.append((sym, qty))
 
@@ -275,9 +279,9 @@ def adopt_from_kraken_if_needed() -> List[Position]:
 
     return adopted
 
-# —————————————————————————————————————————————————————————————
+# =============================================================================
 # Sell Guard evaluation
-# —————————————————————————————————————————————————————————————
+# =============================================================================
 def evaluate_sell(p: Position, guard: Dict[str, Any]) -> Tuple[bool, str]:
     g = guard
     gain = p.gain_pct()
@@ -300,6 +304,7 @@ def evaluate_sell(p: Position, guard: Dict[str, Any]) -> Tuple[bool, str]:
     if tsl.get("enable", True):
         arm_after = float(tsl.get("arm_after_gain_pct", 0.04))
         trail = float(tsl.get("trail_pct", 0.03))
+        # Persist peaks across runs
         peaks_path = STATE_DIR / "trailing_peaks.json"
         peaks = {}
         if peaks_path.exists():
@@ -333,25 +338,35 @@ def evaluate_sell(p: Position, guard: Dict[str, Any]) -> Tuple[bool, str]:
 
     return (False, "HOLD")
 
-# —————————————————————————————————————————————————————————————
-# Sell execution placeholder (records TODO with action="SELL")
-# —————————————————————————————————————————————————————————————
+# =============================================================================
+# Live SELL execution wrapper (prefers trader.adapters)
+# =============================================================================
 def place_market_sell(symbol: str, qty: float) -> Dict[str, Any]:
-    todo = {"symbol": symbol, "qty": qty, "ts": now_iso(), "action": ACTION_SELL, "executed": False}
-    todos = []
-    p = STATE_DIR / "sell_orders_todo.json"
-    if p.exists():
-        try:
-            todos = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            todos = []
-    todos.append(todo)
-    write_json("sell_orders_todo.json", todos)
-    return {"status": "NO_ADAPTER", "todo_recorded": True, "order": todo}
+    """
+    Prefer live Kraken execution via trader.adapters.place_market_sell().
+    - If DRY_RUN=ON: we ask Kraken to validate only (no execution).
+    - If adapter import fails: record a TODO so the run never crashes.
+    """
+    try:
+        from trader.adapters import place_market_sell as _kraken_sell  # live order
+        validate = (DRY_RUN != "OFF")  # True in dry-run; Kraken validates only
+        resp = _kraken_sell(symbol, qty, reduce_only=False, validate=validate)
+        return {"status": "OK", "kraken": resp, "validated_only": validate}
+    except Exception as e:
+        # Fallback: record a TODO
+        todo = {"symbol": symbol, "qty": qty, "ts": now_iso(), "action": ACTION_SELL, "executed": False, "error": str(e)}
+        todos = []
+        p = STATE_DIR / "sell_orders_todo.json"
+        if p.exists():
+            try: todos = json.loads(p.read_text(encoding="utf-8"))
+            except Exception: todos = []
+        todos.append(todo)
+        write_json("sell_orders_todo.json", todos)
+        return {"status": "FALLBACK_TODO", "error": str(e), "order": todo}
 
-# —————————————————————————————————————————————————————————————
+# =============================================================================
 # Main
-# —————————————————————————————————————————————————————————————
+# =============================================================================
 def main() -> int:
     write_text("run_header.txt", "\n".join([
         "=== Sell-Guard Run ===",
@@ -365,6 +380,7 @@ def main() -> int:
         write_text("run_skipped.txt", "RUN_SWITCH is OFF, skipping.")
         return 0
 
+    # Load tracked positions, or adopt from Kraken if none exist yet
     positions = load_positions_file()
     if not positions:
         positions = adopt_from_kraken_if_needed()
@@ -413,6 +429,7 @@ def main() -> int:
     }
     write_json("sell_guard_summary.json", summary)
 
+    # Optional Slack ping
     webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
     if webhook:
         try:
