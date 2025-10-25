@@ -41,6 +41,7 @@ jobs:
       DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
       RUN_SWITCH: ${{ inputs.RUN_SWITCH || 'ON' }}
 
+      # Bot knobs (override via Actions > Variables)
       MIN_BUY_USD:            ${{ vars.MIN_BUY_USD || '10' }}
       MAX_POSITIONS:          ${{ vars.MAX_POSITIONS || '3' }}
       MAX_BUYS_PER_RUN:       ${{ vars.MAX_BUYS_PER_RUN || '1' }}
@@ -52,21 +53,27 @@ jobs:
       DUST_MIN_USD:           ${{ vars.DUST_MIN_USD || '2' }}
       DUST_SKIP_STABLES:      ${{ vars.DUST_SKIP_STABLES || 'true' }}
 
+      # Optional JSON blobs
       ADVANCED_JSON: ${{ inputs.ADVANCED_JSON || '' }}
       PROTECT_JSON:  ${{ inputs.PROTECT_JSON  || '' }}
 
+      # Default state dir (most repos use this)
       STATE_DIR: ".state"
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Ensure .state exists and add sentinel
+      - name: Ensure .state exists (repo root) and ../.state (parent) with sentinels
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$STATE_DIR"
-          echo "created: $(date -Iseconds)" > "$STATE_DIR/ARTIFACT_SENTINEL.txt"
+          # Repo-root .state
+          mkdir -p ".state"
+          echo "created at repo root: $(date -Iseconds)" > ".state/ARTIFACT_SENTINEL.txt"
+          # Parent-level .state (some projects write here)
+          mkdir -p "../.state"
+          echo "created at parent: $(date -Iseconds)" > "../.state/ARTIFACT_SENTINEL.txt"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -121,27 +128,28 @@ jobs:
           set -euo pipefail
           python tools/make_kpi_chart.py || echo "KPI chart generation skipped/failed."
 
-      # Debug listing before artifact upload (helps if something goes missing)
-      - name: Debug - list .state
+      - name: Debug - locate and list .state dirs
         if: always()
         shell: bash
         run: |
           set -euxo pipefail
-          echo "Workspace: ${GITHUB_WORKSPACE}"
-          ls -la
-          if [[ -d ".state" ]]; then
-            echo "Contents of .state:"
-            find .state -maxdepth 3 -type f -printf "%p (%s bytes)\n" || true
-          else
-            echo ".state directory is missing."
-          fi
+          echo "WORKSPACE=${GITHUB_WORKSPACE}"
+          echo "Searching for .state directories under /home/runner/work ..."
+          find /home/runner/work -maxdepth 3 -type d -name ".state" -print || true
+          echo "Listing repo-root .state (if present):"
+          ( test -d ".state" && find .state -maxdepth 3 -type f -printf "%p (%s bytes)\n" ) || echo "repo-root .state missing"
+          echo "Listing parent .state (if present):"
+          ( test -d "../.state" && find ../.state -maxdepth 3 -type f -printf "%p (%s bytes)\n" ) || echo "parent .state missing"
 
       - name: Upload .state artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
-          path: ${{ github.workspace }}/.state
+          # Upload from BOTH locations; if one is empty, the other will satisfy the artifact
+          path: |
+            ${{ github.workspace }}/.state
+            ${{ github.workspace }}/../.state
           if-no-files-found: warn
           retention-days: 7
           compression-level: 6
