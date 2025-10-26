@@ -1,5 +1,5 @@
 # trader/adapters.py
-# Kraken SELL adapter (market order). Minimal, dependency-free.
+# Kraken SELL (and validate) adapter – dependency-free, stdlib only.
 
 from __future__ import annotations
 import os, time, json, hmac, hashlib, base64, urllib.parse, urllib.request
@@ -9,7 +9,9 @@ KRAKEN_API_BASE = "https://api.kraken.com"
 API_KEY    = os.environ.get("KRAKEN_API_KEY", "")
 API_SECRET = os.environ.get("KRAKEN_API_SECRET", "")
 
-class KrakenError(RuntimeError): ...
+class KrakenError(RuntimeError):
+    ...
+
 def _require_keys():
     if not API_KEY or not API_SECRET:
         raise KrakenError("Missing KRAKEN_API_KEY or KRAKEN_API_SECRET")
@@ -61,7 +63,6 @@ def _resolve_pair(symbol: str) -> Dict[str, Any]:
     s = symbol.upper()
     candidates = ",".join([f"{s}USD", f"{s}USDT", f"X{s}ZUSD", f"{s}USD.P"])
     res = _public("AssetPairs", {"pair": candidates})
-    # Prefer altname ending with USD, else any
     best = None
     for _, v in res.items():
         alt = v.get("altname","").upper()
@@ -74,7 +75,6 @@ def _resolve_pair(symbol: str) -> Dict[str, Any]:
     return best
 
 def _format_volume(symbol: str, qty: float, pair_info: Dict[str, Any]) -> str:
-    """Respect lot decimals when formatting volume."""
     lot_dec = int(pair_info.get("lot_decimals", 8))
     fmt = "{:0." + str(lot_dec) + "f}"
     return fmt.format(qty)
@@ -82,7 +82,7 @@ def _format_volume(symbol: str, qty: float, pair_info: Dict[str, Any]) -> str:
 def get_open_positions() -> list:
     """
     Optional helper if your bot wants live balances.
-    Returns a lightweight list [{symbol, qty}] for spot assets (non-stables).
+    Returns [{symbol, qty}] for non-stable spot balances.
     """
     _require_keys()
     balances = _private("Balance", {})
@@ -94,34 +94,23 @@ def get_open_positions() -> list:
             continue
         if qty <= 0: continue
         sym = _normalize_asset(asset_code)
-        if sym in {"USD","USDT","USDC","DAI"}:  # skip cash/stables
+        if sym in {"USD","USDT","USDC","DAI"}:
             continue
         out.append({"symbol": sym, "qty": qty})
     return out
 
 def place_market_sell(symbol: str, qty: float, reduce_only: bool = False, validate: bool = False) -> Dict[str, Any]:
     """
-    Place a live MARKET SELL on Kraken.
-    - symbol: base asset symbol (e.g., 'ETH')
-    - qty:    quantity of base asset to sell
-    - reduce_only: sets oflags=reduce-only (optional)
-    - validate: if True, Kraken validates but does not execute (good for testing)
-
-    Returns Kraken 'descr' / 'txid' payload.
+    Place a MARKET SELL on Kraken. If validate=True, Kraken validates only.
+    Returns Kraken 'descr'/'txid' payload.
     """
     _require_keys()
     info = _resolve_pair(symbol)
     pair = info.get("altname") or next(iter(info.values())).get("altname")
     volume = _format_volume(symbol, qty, info)
-    data = {
-        "pair": pair,
-        "type": "sell",
-        "ordertype": "market",
-        "volume": volume,
-    }
+    data = {"pair": pair, "type": "sell", "ordertype": "market", "volume": volume}
     oflags = []
     if reduce_only: oflags.append("reduce-only")
     if oflags: data["oflags"] = ",".join(oflags)
     if validate: data["validate"] = "true"
-
     return _private("AddOrder", data)
