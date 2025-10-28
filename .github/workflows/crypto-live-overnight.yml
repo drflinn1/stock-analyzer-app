@@ -8,7 +8,7 @@ on:
         required: true
         default: "ON"
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
+    - cron: "*/15 * * * *"
 
 permissions:
   contents: read
@@ -34,9 +34,8 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # IMPORTANT: if you want schedules LIVE, set OFF; if you want schedules DRY, set ON.
+      # If you want schedules LIVE, set OFF. If you want schedules DRY, set ON.
       DRY_RUN: ${{ inputs.DRY_RUN || 'OFF' }}
-
       KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
@@ -66,9 +65,12 @@ jobs:
           pip install ccxt pandas pyyaml matplotlib
 
       - name: Create .state directory
-        run: mkdir -p .state
+        run: |
+          mkdir -p .state
+          # ensure directory is never empty so artifact always uploads
+          echo "state" > .state/.keep
 
-      # NEW: restore previous run's state so entries/high-water persist
+      # Restore last run's state (first time will 'not found' — that's OK)
       - name: Restore previous state
         uses: actions/download-artifact@v4
         with:
@@ -85,12 +87,12 @@ jobs:
           python main.py --loop-once
           echo "=== END LOOP ==="
 
-      # NEW: upload (overwrite) latest state for the next run
+      # Upload for the next run (use the directory, not a wildcard)
       - name: Upload state artifacts (rolling)
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: state_latest
-          path: .state/*
+          path: .state
           if-no-files-found: warn
           retention-days: 7
