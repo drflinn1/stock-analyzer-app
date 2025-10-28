@@ -32,7 +32,7 @@ jobs:
 
     env:
       # Map dispatch input (if any) → DRY_RUN; scheduled runs default to ON for safety
-      DRY_RUN: ${{ inputs.DRY_RUN || 'OFF' }}
+      DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
 
       # ===== Required for private API (set in Settings → Secrets and variables → Secrets) =====
       KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
