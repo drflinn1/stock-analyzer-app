@@ -17,29 +17,28 @@ env:
   PYTHONUNBUFFERED: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
-  # Bot knobs (from repo Variables, with sane defaults)
+  # Bot knobs (Variables control; safe defaults)
   MIN_BUY_USD:              ${{ vars.MIN_BUY_USD || '10' }}
   MAX_POSITIONS:            ${{ vars.MAX_POSITIONS || '3' }}
-  MAX_BUYS_PER_RUN:         ${{ vars.MAX_BUYS_PER_RUN || '0' }}  # ← TEMP: halt new buys tonight
+  MAX_BUYS_PER_RUN:         ${{ vars.MAX_BUYS_PER_RUN || '2' }}
   UNIVERSE_TOP_K:           ${{ vars.UNIVERSE_TOP_K || '25' }}
   RESERVE_CASH_PCT:         ${{ vars.RESERVE_CASH_PCT || '5' }}
   DUST_MIN_USD:             ${{ vars.DUST_MIN_USD || '2' }}
   ROTATE_WHEN_FULL:         ${{ vars.ROTATE_WHEN_FULL || 'true' }}
   ROTATE_WHEN_CASH_SHORT:   ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
 
-  # Sell Guard (defaults; Variables can override)
-  TAKE_PROFIT_PCT:          ${{ vars.TAKE_PROFIT_PCT || '12' }}
-  TRAIL_PCT:                ${{ vars.TRAIL_PCT || '4' }}         # ← TEMP: a bit tighter so it actually trims
-  STOP_LOSS_PCT:            ${{ vars.STOP_LOSS_PCT || '10' }}
+  # Sell Guard
+  TAKE_PROFIT_PCT:          ${{ vars.TAKE_PROFIT_PCT || '6' }}
+  TRAIL_PCT:                ${{ vars.TRAIL_PCT || '2' }}
+  STOP_LOSS_PCT:            ${{ vars.STOP_LOSS_PCT || '-2' }}
   MIN_SELL_USD:             ${{ vars.MIN_SELL_USD || '10' }}
 
 jobs:
   run:
     runs-on: ubuntu-latest
     env:
-      # Schedules are LIVE until you flip OFF/ON here.
+      # Manual runs honor your selection; schedules use the fallback after ||
       DRY_RUN: ${{ inputs.DRY_RUN || 'OFF' }}
-
       KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
@@ -68,17 +67,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt pandas pyyaml matplotlib
 
-      - name: Create .state directory
+      - name: Ensure .state directory
         run: |
           mkdir -p .state
           echo "keep" > .state/.keep
 
-      - name: Restore previous state (ok if first time)
-        uses: actions/download-artifact@v4
+      # ✅ Restore the most recent .state from previous runs (rolling cache)
+      - name: Restore .state cache (rolling)
+        uses: actions/cache/restore@v4
         with:
-          name: state_latest
           path: .state
-        continue-on-error: true
+          key: state-v1-${{ github.run_id }}
+          restore-keys: |
+            state-v1-
 
       - name: Warm snapshots (balances/positions/buy_plan)
         run: python main.py --warm-only
@@ -89,11 +90,19 @@ jobs:
           python main.py --loop-once
           echo "=== END LOOP ==="
 
-      - name: Upload state artifacts (rolling)
+      # ✅ Save the updated .state so the next run can restore it
+      - name: Save .state cache (rolling)
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: state-v1-${{ github.run_id }}
+
+      # (Optional) Upload .state so you can download it from the UI
+      - name: Upload .state as artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: state_latest
+          name: state_${{ github.run_number }}
           path: .state
           if-no-files-found: warn
           retention-days: 7
