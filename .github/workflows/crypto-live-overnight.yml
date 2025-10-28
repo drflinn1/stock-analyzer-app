@@ -16,26 +16,30 @@ permissions:
 env:
   PYTHONUNBUFFERED: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  MIN_BUY_USD:         ${{ vars.MIN_BUY_USD || '10' }}
-  MAX_POSITIONS:       ${{ vars.MAX_POSITIONS || '3' }}
-  MAX_BUYS_PER_RUN:    ${{ vars.MAX_BUYS_PER_RUN || '1' }}
-  UNIVERSE_TOP_K:      ${{ vars.UNIVERSE_TOP_K || '25' }}
-  RESERVE_CASH_PCT:    ${{ vars.RESERVE_CASH_PCT || '5' }}
-  DUST_MIN_USD:        ${{ vars.DUST_MIN_USD || '2' }}
-  ROTATE_WHEN_FULL:    ${{ vars.ROTATE_WHEN_FULL || 'true' }}
-  ROTATE_WHEN_CASH_SHORT: ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
-  TAKE_PROFIT_PCT:     ${{ vars.TAKE_PROFIT_PCT || '12' }}
-  TRAIL_PCT:           ${{ vars.TRAIL_PCT || '8' }}
-  STOP_LOSS_PCT:       ${{ vars.STOP_LOSS_PCT || '10' }}
-  MIN_SELL_USD:        ${{ vars.MIN_SELL_USD || '10' }}
+
+  # Bot knobs (from repo Variables, with sane defaults)
+  MIN_BUY_USD:              ${{ vars.MIN_BUY_USD || '10' }}
+  MAX_POSITIONS:            ${{ vars.MAX_POSITIONS || '3' }}
+  MAX_BUYS_PER_RUN:         ${{ vars.MAX_BUYS_PER_RUN || '0' }}  # ← TEMP: halt new buys tonight
+  UNIVERSE_TOP_K:           ${{ vars.UNIVERSE_TOP_K || '25' }}
+  RESERVE_CASH_PCT:         ${{ vars.RESERVE_CASH_PCT || '5' }}
+  DUST_MIN_USD:             ${{ vars.DUST_MIN_USD || '2' }}
+  ROTATE_WHEN_FULL:         ${{ vars.ROTATE_WHEN_FULL || 'true' }}
+  ROTATE_WHEN_CASH_SHORT:   ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
+
+  # Sell Guard (defaults; Variables can override)
+  TAKE_PROFIT_PCT:          ${{ vars.TAKE_PROFIT_PCT || '12' }}
+  TRAIL_PCT:                ${{ vars.TRAIL_PCT || '4' }}         # ← TEMP: a bit tighter so it actually trims
+  STOP_LOSS_PCT:            ${{ vars.STOP_LOSS_PCT || '10' }}
+  MIN_SELL_USD:             ${{ vars.MIN_SELL_USD || '10' }}
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     env:
-      # If you want schedules LIVE, set OFF. If you want schedules DRY, set ON.
+      # Schedules are LIVE until you flip OFF/ON here.
       DRY_RUN: ${{ inputs.DRY_RUN || 'OFF' }}
+
       KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
@@ -49,7 +53,7 @@ jobs:
           [ -z "${KRAKEN_API_KEY}" ]    && echo "❌ Missing secret: KRAKEN_API_KEY" && missing=1
           [ -z "${KRAKEN_API_SECRET}" ] && echo "❌ Missing secret: KRAKEN_API_SECRET" && missing=1
           if [ $missing -eq 1 ] && [ "${DRY_RUN}" = "OFF" ]; then
-            echo "You set DRY_RUN=OFF but private API secrets are missing. Failing fast."
+            echo "DRY_RUN=OFF but private API secrets are missing. Failing fast."
             exit 1
           fi
           echo "Secrets check complete."
@@ -67,11 +71,9 @@ jobs:
       - name: Create .state directory
         run: |
           mkdir -p .state
-          # ensure directory is never empty so artifact always uploads
-          echo "state" > .state/.keep
+          echo "keep" > .state/.keep
 
-      # Restore last run's state (first time will 'not found' — that's OK)
-      - name: Restore previous state
+      - name: Restore previous state (ok if first time)
         uses: actions/download-artifact@v4
         with:
           name: state_latest
@@ -87,7 +89,6 @@ jobs:
           python main.py --loop-once
           echo "=== END LOOP ==="
 
-      # Upload for the next run (use the directory, not a wildcard)
       - name: Upload state artifacts (rolling)
         uses: actions/upload-artifact@v4
         if: always()
