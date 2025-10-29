@@ -208,12 +208,16 @@ def main():
     trade_loop_once()
 
 if __name__ == "__main__":
+    # Run your primary bot logic
     main()
-# At end of main.py
-from tools.momentum_spike import main as act_on_spikes
-print("\n=== Running Momentum Spike Scan ===")
-act_on_spikes()
 
-from tools.auto_sell_guard import run_cool_off_guard
-print("\n=== Running Auto-Sell Cool-Off Guard ===")
-run_cool_off_guard()
+    # === Post-run utilities (SAFE, no orders) ==========================
+    # 1) Momentum Spike scan (scan-only; saves .state/spike_candidates.*)
+    from tools.momentum_spike import main as act_on_spikes
+    print("\n=== Running Momentum Spike Scan ===")
+    act_on_spikes()
+
+    # 2) Auto-Sell cool-off guard (safe; saves .state/auto_sell_guard.json)
+    from tools.auto_sell_guard import run_cool_off_guard
+    print("\n=== Running Auto-Sell Cool-Off Guard ===")
+    run_cool_off_guard()
