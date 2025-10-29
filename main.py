@@ -1,242 +1,293 @@
 #!/usr/bin/env python3
-import os, json, sys, pathlib, logging
+# -*- coding: utf-8 -*-
+
+"""
+Main runner for Crypto Live — builds a BUY PLAN from momentum spike candidates,
+respects cash/caps, and persists state. Safe in DRY-RUN and live.
+
+What this file does:
+1) Read config from environment (Github Variables / Secrets)
+2) Connect to Kraken via ccxt (if keys available) and fetch balances
+3) Discover positions (lightweight; uses .state if no API)
+4) Build BUY PLAN from .state/spike_candidates.json
+5) Persist plan & highs for downstream trade loop
+6) (At EOF) run momentum spike scan + auto-sell cool-off guard (safe utilities)
+
+This version includes:
+- Robust cash detector (USD / ZUSD; free/total; multiple ccxt layouts)
+- Clear BUY DEBUG logs so you can see exactly why entries are/aren’t planned
+"""
+
+import os
+import sys
+import json
+import time
+import logging
+import pathlib
 from typing import Dict, List
-import ccxt
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("crypto-live")
+# Optional: ccxt available in workflow
+try:
+    import ccxt  # type: ignore
+except Exception:
+    ccxt = None  # still safe; we can run in DRY-RUN using cached state
 
+
+# ------------------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("main")
+
+
+# ------------------------------------------------------------------------------
+# Paths & helpers
+# ------------------------------------------------------------------------------
 STATE_DIR = pathlib.Path(".state")
-BAL_FILE = STATE_DIR / "balances.json"
-POS_FILE = STATE_DIR / "positions.json"
-BUY_PLAN_FILE = STATE_DIR / "buy_plan.json"
-ENTRY_FILE = STATE_DIR / "entries.json"
-HIGHWATER_FILE = STATE_DIR / "high_water.json"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-def ensure_state_dir():
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+ENTRY_FILE = STATE_DIR / "buy_plan.json"
+HIGHWATER_FILE = STATE_DIR / "highwater.json"
+BAL_FILE = STATE_DIR / "balance.json"
+POSITIONS_FILE = STATE_DIR / "positions.json"
+SPIKE_JSON = STATE_DIR / "spike_candidates.json"
 
-def read_json(p: pathlib.Path, default):
+
+def write_json(path: pathlib.Path, obj):
     try:
-        return json.loads(p.read_text())
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("write_json failed for %s: %r", str(path), e)
+
+
+def read_json(path: pathlib.Path, default):
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log.warning("read_json failed for %s: %r", str(path), e)
+    return default
+
+
+# ------------------------------------------------------------------------------
+# Config (from GitHub Variables / Secrets)
+# ------------------------------------------------------------------------------
+def env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    try:
+        return float(v) if v is not None else default
     except Exception:
         return default
 
-def write_json(p: pathlib.Path, data):
-    p.write_text(json.dumps(data, indent=2, sort_keys=True))
 
-def ffloat(x, d=0.0):
-    try: return float(x)
-    except Exception: return d
-
-def fint(x, d=0):
-    try: return int(float(x))
-    except Exception: return d
-
-def envb(name, default):
+def env_int(name: str, default: int) -> int:
     v = os.getenv(name)
-    return (str(v).lower() in ("1","true","yes","on")) if v is not None else default
-
-# ---- knobs
-DRY_RUN = os.getenv("DRY_RUN","ON").upper()
-MIN_BUY_USD = ffloat(os.getenv("MIN_BUY_USD","10"),10)
-MAX_POSITIONS = fint(os.getenv("MAX_POSITIONS","3"),3)
-MAX_BUYS_PER_RUN = fint(os.getenv("MAX_BUYS_PER_RUN","0"),0)      # temp: pause buys
-UNIVERSE_TOP_K = fint(os.getenv("UNIVERSE_TOP_K","25"),25)
-RESERVE_CASH_PCT = ffloat(os.getenv("RESERVE_CASH_PCT","5"),5)
-DUST_MIN_USD = ffloat(os.getenv("DUST_MIN_USD","2"),2)
-ROTATE_WHEN_FULL = envb("ROTATE_WHEN_FULL", True)
-ROTATE_WHEN_CASH_SHORT = envb("ROTATE_WHEN_CASH_SHORT", True)
-
-TAKE_PROFIT_PCT = ffloat(os.getenv("TAKE_PROFIT_PCT","12"),12)
-TRAIL_PCT = ffloat(os.getenv("TRAIL_PCT","4"),4)                  # temp: a bit tighter
-STOP_LOSS_PCT = ffloat(os.getenv("STOP_LOSS_PCT","10"),10)
-MIN_SELL_USD = ffloat(os.getenv("MIN_SELL_USD","10"),10)
-
-KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY","")
-KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET","")
-
-def connects_private(): return bool(KRAKEN_API_KEY and KRAKEN_API_SECRET)
-def ex_kraken():
-    return ccxt.kraken({"apiKey":KRAKEN_API_KEY,"secret":KRAKEN_API_SECRET,"enableRateLimit":True})
-
-def usd_from_balance(bal: Dict) -> float:
-    free = (bal or {}).get("free", {})
-    return ffloat(free.get("USD",0)) + ffloat(free.get("ZUSD",0))
-
-def fetch_bal_pos(ex):
-    bal = ex.fetch_balance()
-    tickers = ex.fetch_tickers()
-    prices = {}
-    for sym, t in tickers.items():
-        if sym.endswith("/USD"):
-            prices[sym.split("/")[0]] = ffloat(t.get("last") or t.get("close") or 0.0)
-    positions = []
-    for coin, amt in bal.get("free",{}).items():
-        amount = ffloat(amt,0)
-        if amount <= 0: continue
-        if coin.upper() in ("USD","ZUSD","USDT","USDC"): continue
-        px = prices.get(coin.upper(),0.0)
-        est = amount*px if px>0 else 0.0
-        positions.append({"asset":coin.upper(),"amount":amount,"est_usd":round(est,2),"px_used":px})
-    positions.sort(key=lambda x:x["est_usd"], reverse=True)
-    return bal, positions
-
-def symbol_for_asset(ex, asset): 
-    sym=f"{asset}/USD"
-    m = ex.markets or ex.load_markets()
-    return sym if sym in m else ""
-
-def place_market_sell_all(ex, sym, qty):
-    if DRY_RUN=="ON": 
-        log.info(f"[DRY] SELL {sym} qty={qty}")
-        return {"dry":True}
-    return ex.create_market_sell_order(sym, qty)
-
-def place_market_buy(ex, sym, qty):
-    if DRY_RUN=="ON": 
-        log.info(f"[DRY] BUY  {sym} qty={qty}")
-        return {"dry":True}
-    return ex.create_market_buy_order(sym, qty)
-
-def sell_guard_decision(last_px, entry_px, high_px):
-    if last_px<=0 or entry_px<=0: return ""
-    pnl = (last_px-entry_px)/entry_px*100.0
-    if pnl >= TAKE_PROFIT_PCT: return "TAKE_PROFIT"
-    if high_px>0:
-        drop = (high_px-last_px)/high_px*100.0
-        if drop >= TRAIL_PCT: return "TRAIL"
-    if pnl <= -STOP_LOSS_PCT: return "STOP_LOSS"
-    return ""
-
-def warm_snapshots():
-    ensure_state_dir()
-    entries = read_json(ENTRY_FILE, {})
-    highs   = read_json(HIGHWATER_FILE, {})
-    if connects_private():
-        try:
-            ex = ex_kraken()
-            bal, positions = fetch_bal_pos(ex)
-            write_json(BAL_FILE, bal)
-            write_json(POS_FILE, {"positions":positions})
-            usd = usd_from_balance(bal)
-
-            # --- SEED ENTRIES/HIGHS ONCE if empty (so guard can sell)
-            if not entries:
-                for p in positions:
-                    asset = p["asset"]
-                    px = p["px_used"]
-                    qty = p["amount"]
-                    if px>0 and qty>0:
-                        entries[asset] = {"avg_entry": px, "qty": qty}
-                        highs[asset] = px
-                log.info(f"Seeded entries for {len(entries)} assets from current holdings.")
-
-            # minimal buy plan tonight (buys paused via MAX_BUYS_PER_RUN=0)
-            write_json(BUY_PLAN_FILE, {"buy_plan": []})
-            write_json(ENTRY_FILE, entries)
-            write_json(HIGHWATER_FILE, highs)
-
-            log.info(f"Warm snapshot done. USD={usd:.2f}, positions={len(positions)}, buy_plan=0")
-            return
-        except Exception as e:
-            log.warning(f"Warm snapshot (private) failed: {e}")
-
-    # fallback
-    write_json(BAL_FILE, {"free":{"USD":0}})
-    write_json(POS_FILE, {"positions":[]})
-    write_json(BUY_PLAN_FILE, {"buy_plan":[]})
-    write_json(ENTRY_FILE, entries or {})
-    write_json(HIGHWATER_FILE, highs or {})
-    log.info("Warm snapshot (public-only fallback) written.")
-
-def trade_loop_once():
-    ensure_state_dir()
-    entries = read_json(ENTRY_FILE, {})
-    highs   = read_json(HIGHWATER_FILE, {})
-
-    ex = ex_kraken()
     try:
-        bal, positions = fetch_bal_pos(ex)
+        return int(v) if v is not None else default
+    except Exception:
+        return default
+
+
+def env_str(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return v if v is not None else default
+
+
+DRY_RUN = env_str("DRY_RUN", "ON").upper()  # "ON" for simulation, "OFF" for live
+RUN_SWITCH = env_str("RUN_SWITCH", "ON").upper()
+
+EXCHANGE = env_str("EXCHANGE", "kraken").lower()
+
+MIN_BUY_USD = env_float("MIN_BUY_USD", 10.0)
+RESERVE_CASH_PCT = env_float("RESERVE_CASH_PCT", 0.0)
+
+MAX_POSITIONS = env_int("MAX_POSITIONS", 4)
+MAX_BUYS_PER_RUN = env_int("MAX_BUYS_PER_RUN", 1)
+
+UNIVERSE_TOP_K = env_int("UNIVERSE_TOP_K", 35)  # used by scanner; here for logs
+
+
+# ------------------------------------------------------------------------------
+# Exchange wiring
+# ------------------------------------------------------------------------------
+def make_exchange():
+    """Create ccxt exchange if possible (keys optional in DRY-RUN)."""
+    if ccxt is None:
+        return None
+
+    key = os.getenv("KRAKEN_API_KEY") or os.getenv("API_KEY") or ""
+    secret = os.getenv("KRAKEN_API_SECRET") or os.getenv("API_SECRET") or ""
+
+    params = {
+        "enableRateLimit": True,
+        "options": {"adjustForTimeDifference": True},
+    }
+    if key and secret:
+        params.update({"apiKey": key, "secret": secret})
+
+    try:
+        if EXCHANGE == "kraken":
+            return ccxt.kraken(params)
+        # fallback — default to kraken if unknown
+        return ccxt.kraken(params)
     except Exception as e:
-        log.error(f"Could not fetch balances/positions: {e}")
-        bal, positions = {}, []
-    usd = usd_from_balance(bal) if bal else 0.0
-    write_json(BAL_FILE, bal or {"free":{"USD":usd}})
-    write_json(POS_FILE, {"positions":positions})
-    log.info(f"USD cash: {usd:.2f} | positions: {len(positions)}")
+        log.warning("make_exchange: failed to init ccxt: %r", e)
+        return None
 
-    # ---- SELL PHASE
-    for p in positions:
-        asset = p["asset"]; amt = ffloat(p["amount"],0); est = ffloat(p["est_usd"],0)
-        if amt<=0 or est<MIN_SELL_USD: 
-            continue
-        sym = symbol_for_asset(ex, asset)
-        if not sym: 
-            continue
-        last = ffloat(ex.fetch_ticker(sym).get("last"),0)
-        ent  = ffloat(entries.get(asset,{}).get("avg_entry",0),0)
-        high = max(ffloat(highs.get(asset,0),0), last)
-        highs[asset] = high
-        decision = sell_guard_decision(last, ent, high)
-        if decision:
-            log.info(f"[SELL-GUARD] {asset} {decision} | last={last:.6f} entry={ent:.6f} high={high:.6f}")
+
+def safe_fetch_balance(ex) -> Dict:
+    """Fetch balance via ccxt; fall back to cached .state on error."""
+    if ex is None:
+        return read_json(BAL_FILE, {})
+    try:
+        bal = ex.fetch_balance()
+        write_json(BAL_FILE, bal)
+        return bal
+    except Exception as e:
+        log.warning("fetch_balance failed: %r — using cached .state/balance.json", e)
+        return read_json(BAL_FILE, {})
+
+
+def robust_cash_from_balance(balance: Dict) -> float:
+    """
+    Robustly detect spendable USD on Kraken/ccxt.
+
+    Handles:
+      - balance['free']['USD'] / ['ZUSD']
+      - balance['USD']['free'] / ['total']
+      - top-level numeric USD/ZUSD
+    Also tries USDT/USDC as a last resort (some users fund in stables).
+    """
+    quote_candidates = ("USD", "ZUSD", "USDT", "USDC")
+
+    # ccxt unified: balance['free']['USD']
+    try:
+        free = balance.get("free", {})
+        for q in quote_candidates:
+            if q in free and float(free[q]) > 0:
+                v = float(free[q])
+                log.info("CASH DETECT — using free[%s]=%.2f", q, v)
+                return v
+    except Exception:
+        pass
+
+    # per-asset dicts: balance['USD'] -> {'free': x, 'total': y}
+    try:
+        for q in quote_candidates:
+            if q in balance and isinstance(balance[q], dict):
+                v = balance[q].get("free")
+                if v is None:
+                    v = balance[q].get("total")
+                if v is not None and float(v) > 0:
+                    v = float(v)
+                    log.info("CASH DETECT — using balance['%s'].free/total=%.2f", q, v)
+                    return v
+    except Exception:
+        pass
+
+    # top-level numeric
+    for q in ("USD", "ZUSD"):
+        try:
+            v = balance.get(q)
+            if isinstance(v, (int, float)) and float(v) > 0:
+                v = float(v)
+                log.info("CASH DETECT — using top-level %s=%.2f", q, v)
+                return v
+        except Exception:
+            pass
+
+    # nothing found
+    return 0.0
+
+
+def discover_positions(ex) -> List[str]:
+    """Very light positions snapshot; if API not available, use cached state."""
+    # If you have a positions file maintained elsewhere, read it:
+    snap = read_json(POSITIONS_FILE, [])
+    if isinstance(snap, list) and snap:
+        return [str(x) for x in snap]
+
+    # Otherwise try exchange — Kraken spot balances -> held assets
+    if ex is None:
+        return []
+    try:
+        bal = ex.fetch_balance()
+        held = []
+        # record assets with non-zero 'total' or 'free' that are not fiat USD/ZUSD
+        for k, v in (bal.get("total") or {}).items():
             try:
-                res = place_market_sell_all(ex, sym, amt)
-                log.info(f"Placed SELL {sym} qty={amt} result={res}")
-                entries.pop(asset, None)
-                highs.pop(asset, None)
-            except Exception as se:
-                log.error(f"SELL failed for {sym}: {se}")
+                amt = float(v or 0)
+                if amt > 0 and k not in ("USD", "ZUSD"):
+                    held.append(f"{k}/USD" if "/USD" not in k and "/USDT" not in k else k)
+            except Exception:
+                continue
+        write_json(POSITIONS_FILE, held)
+        return held
+    except Exception:
+        return []
 
-   # ----- BUY PHASE (active; builds entries from spike candidates)
-# This block reads .state/spike_candidates.json, respects caps/cash,
-# and fills `entries` so the trade loop can place buys.
 
-# ensure required lists exist
-entries = locals().get("entries", [])
-highs = locals().get("highs", {})
+# ------------------------------------------------------------------------------
+# BUY PLAN builder from spike candidates
+# ------------------------------------------------------------------------------
+def build_buy_plan(cash: float, positions: List[str]) -> List[Dict]:
+    """
+    Build entries from .state/spike_candidates.json while respecting caps/cash.
+    """
+    entries: List[Dict] = []
+    spike_payload = read_json(SPIKE_JSON, {})
+    candidates = spike_payload.get("candidates", []) if isinstance(spike_payload, dict) else []
 
-try:
-    import json, pathlib
+    # Sort strongest first
+    def _pct(x):
+        try:
+            return float(x.get("pct_24h") or 0)
+        except Exception:
+            return 0.0
 
-    state_dir = pathlib.Path(".state")
-    cand_json = state_dir / "spike_candidates.json"
-    spike = []
-    if cand_json.exists():
-        with open(cand_json, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-            spike = payload.get("candidates", [])
+    def _vol(x):
+        try:
+            return float(x.get("vol_usd_24h") or 0)
+        except Exception:
+            return 0.0
 
-    # Pull runtime knobs (fallbacks are conservative)
-    cash              = float(locals().get("cash", 0.0))
-    MIN_BUY_USD       = float(locals().get("MIN_BUY_USD", 10))
-    RESERVE_CASH_PCT  = float(locals().get("RESERVE_CASH_PCT", 0))
-    MAX_POSITIONS     = int(locals().get("MAX_POSITIONS", 4))
-    MAX_BUYS_PER_RUN  = int(locals().get("MAX_BUYS_PER_RUN", 1))
-    positions         = list(locals().get("positions", []))
+    candidates = sorted(candidates, key=lambda r: (_pct(r), _vol(r)), reverse=True)
 
-    # Compute simple reserve (on free cash; safe)
     reserve_cash = cash * (RESERVE_CASH_PCT / 100.0)
-    avail_cash   = max(0.0, cash - reserve_cash)
+    avail_cash = max(0.0, cash - reserve_cash)
 
     log.info(
-        "BUY DEBUG — cash=$%.2f reserve=%s%% avail=$%.2f min_buy=$%.2f max_pos=%d cur_pos=%d max_buys=%d",
-        cash, RESERVE_CASH_PCT, avail_cash, MIN_BUY_USD, MAX_POSITIONS, len(positions), MAX_BUYS_PER_RUN
+        "BUY DEBUG — cash=$%.2f reserve=%.1f%% avail=$%.2f min_buy=$%.2f max_pos=%d cur_pos=%d max_buys=%d",
+        cash,
+        RESERVE_CASH_PCT,
+        avail_cash,
+        MIN_BUY_USD,
+        MAX_POSITIONS,
+        len(positions),
+        MAX_BUYS_PER_RUN,
     )
 
-    # Sort candidates: highest pct_24h first, then volume
-    def _pct(x): 
-        try:    return float(x.get("pct_24h") or 0)
-        except: return 0.0
-    def _vol(x):
-        try:    return float(x.get("vol_usd_24h") or 0)
-        except: return 0.0
+    if not candidates:
+        log.info("BUY DEBUG — no scanner candidates (.state/spike_candidates.json empty)")
+        return entries
 
-    spike = sorted(spike, key=lambda r: (_pct(r), _vol(r)), reverse=True)
+    log.info("BUY DEBUG — %d scanner candidates (top 10 below):", len(candidates))
+    for i, row in enumerate(candidates[:10], 1):
+        sym = (row.get("symbol") or "?").strip()
+        pct = row.get("pct_24h")
+        vol = row.get("vol_usd_24h")
+        above = row.get("above_ema")
+        log.info("  #%02d  %-12s  pct_24h=%s  vol_usd=%s  above_ema=%s", i, sym, str(pct), str(vol), str(above))
 
+    # Build entries
     buys_added = 0
-    for row in spike:
+    for row in candidates:
         if buys_added >= MAX_BUYS_PER_RUN:
             break
         if len(positions) + buys_added >= MAX_POSITIONS:
@@ -252,9 +303,8 @@ try:
         if sym in positions:
             continue
 
-        above_ema = row.get("above_ema")
-        if above_ema is False:
-            pass  # allow but deprioritize
+        # Prefer above EMA if provided (non-blocking)
+        # above_ema = row.get("above_ema")
 
         entries.append({"symbol": sym, "usd": round(MIN_BUY_USD, 2)})
         buys_added += 1
@@ -262,37 +312,70 @@ try:
         log.info("BUY PLAN — added %s for $%.2f (avail now $%.2f)", sym, MIN_BUY_USD, avail_cash)
 
     log.info("BUY PLAN — planned buys: %d", buys_added)
+    return entries
 
-except Exception as e:
-    log.warning("BUY PHASE — failed to build entries: %r", e)
 
-# Persist plans & highs
-write_json(ENTRY_FILE, entries)
-write_json(HIGHWATER_FILE, highs)
+# ------------------------------------------------------------------------------
+# Highwater structure (safe placeholder)
+# ------------------------------------------------------------------------------
+def load_highs() -> Dict:
+    highs = read_json(HIGHWATER_FILE, {})
+    if not isinstance(highs, dict):
+        highs = {}
+    return highs
 
+
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
 def main():
-    args = sys.argv[1:]
-    warm_only = "--warm-only" in args
-    loop_once = "--loop-once" in args
-    log.info("DRY_RUN=%s | MIN_BUY_USD=%.2f | MAX_POSITIONS=%d | MAX_BUYS_PER_RUN=%d | "
-             "TAKE_PROFIT_PCT=%.2f | TRAIL_PCT=%.2f | STOP_LOSS_PCT=%.2f",
-             DRY_RUN, MIN_BUY_USD, MAX_POSITIONS, MAX_BUYS_PER_RUN,
-             TAKE_PROFIT_PCT, TRAIL_PCT, STOP_LOSS_PCT)
-    warm_snapshots()
-    if warm_only and not loop_once: return
-    trade_loop_once()
+    log.info("=== START LOOP ===")
 
+    if RUN_SWITCH != "ON":
+        log.info("RUN_SWITCH is OFF — exiting early (no trading).")
+        return
+
+    # Connect exchange (ok if None in DRY-RUN; we can use cached balance)
+    ex = make_exchange()
+
+    # Fetch balance and detect cash robustly
+    bal = safe_fetch_balance(ex)
+    cash = robust_cash_from_balance(bal)
+
+    # Discover positions (lightweight)
+    positions = discover_positions(ex)
+
+    # Build BUY PLAN from spikes
+    entries = build_buy_plan(cash=cash, positions=positions)
+
+    # Persist plan & highs for downstream steps
+    highs = load_highs()
+    write_json(ENTRY_FILE, entries)
+    write_json(HIGHWATER_FILE, highs)
+
+    log.info("Saved buy plan to %s (entries=%d)", str(ENTRY_FILE), len(entries))
+    log.info("=== END LOOP ===")
+
+
+# ------------------------------------------------------------------------------
+# EOF utilities — safe add-ons you already use
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Run your primary bot logic
     main()
 
     # === Post-run utilities (SAFE, no orders) ==========================
     # 1) Momentum Spike scan (scan-only; saves .state/spike_candidates.*)
-    from tools.momentum_spike import main as act_on_spikes
-    print("\n=== Running Momentum Spike Scan ===")
-    act_on_spikes()
+    try:
+        from tools.momentum_spike import main as act_on_spikes  # type: ignore
+        print("\n=== Running Momentum Spike Scan ===")
+        act_on_spikes()
+    except Exception as e:
+        log.warning("Momentum Spike Scan failed: %r", e)
 
     # 2) Auto-Sell cool-off guard (safe; saves .state/auto_sell_guard.json)
-    from tools.auto_sell_guard import run_cool_off_guard
-    print("\n=== Running Auto-Sell Cool-Off Guard ===")
-    run_cool_off_guard()
+    try:
+        from tools.auto_sell_guard import run_cool_off_guard  # type: ignore
+        print("\n=== Running Auto-Sell Cool-Off Guard ===")
+        run_cool_off_guard()
+    except Exception as e:
+        log.warning("Auto-Sell Cool-Off Guard failed: %r", e)
