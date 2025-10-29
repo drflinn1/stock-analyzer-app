@@ -44,15 +44,26 @@ jobs:
 
       - name: Ensure .state exists
         run: mkdir -p .state
+      - name: Ensure .state exists
+        run: mkdir -p .state
 
       - name: Warm snapshots (skip safe_runner removed)
-        run: echo "Skipping warm-up: safe_runner.py not found"
+        shell: bash
+        run: |
+          echo "Skipping warm-up: safe_runner.py not found"
 
       - name: Run trading loop
         env:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        shell: bash
         run: |
+          echo "==== MODE CHECK ===="
+          echo "EXCHANGE=${EXCHANGE}"
+          echo "RUN_SWITCH=${RUN_SWITCH}"
+          echo "DRY_RUN=${DRY_RUN}"
+          python main.py
+
           echo "==== MODE CHECK ===="
           echo "EXCHANGE=${EXCHANGE}"
           echo "RUN_SWITCH=${RUN_SWITCH}"
