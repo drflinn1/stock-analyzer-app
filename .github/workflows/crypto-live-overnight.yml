@@ -12,7 +12,6 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
-    # UI input overrides repo vars; safe default = ON
     env:
       EXCHANGE: ${{ vars.EXCHANGE || 'kraken' }}
       RUN_SWITCH: ${{ vars.RUN_SWITCH || 'ON' }}
@@ -46,7 +45,7 @@ jobs:
       - name: Ensure .state exists
         run: mkdir -p .state
 
-      - name: "Warm snapshots (skip: safe_runner removed)"
+      - name: Warm snapshots (skip safe_runner removed)
         run: echo "Skipping warm-up: safe_runner.py not found"
 
       - name: Run trading loop
