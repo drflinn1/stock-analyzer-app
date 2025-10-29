@@ -214,6 +214,6 @@ from tools.momentum_spike import main as act_on_spikes
 print("\n=== Running Momentum Spike Scan ===")
 act_on_spikes()
 
-from trader.auto_sell_guard import run_cool_off_guard
+from tools.auto_sell_guard import run_cool_off_guard
 print("\n=== Running Auto-Sell Cool-Off Guard ===")
 run_cool_off_guard()
