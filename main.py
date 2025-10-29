@@ -44,6 +44,21 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 
+# --- Mode flags ------------------------------------------------------------
+def env_str(name, default=""):
+    import os
+    return (os.getenv(name, default) or "").strip()
+
+RUN_SWITCH = env_str("RUN_SWITCH", "ON").upper()   # UI input: ON for simulation, OFF for live
+VAR_DRY_RUN = env_str("DRY_RUN", "ON").upper()     # repo variable fallback
+# UI takes precedence: OFF means go LIVE (i.e., DRY_RUN = OFF)
+DRY_RUN = "OFF" if RUN_SWITCH == "OFF" else VAR_DRY_RUN
+
+log.info(
+    f"MODE — DRY_RUN={DRY_RUN}  (RUN_SWITCH={RUN_SWITCH}, VAR.DRY_RUN={VAR_DRY_RUN})"
+)
+
+
 # ------------------------------------------------------------------------------
 # Paths & helpers
 # ------------------------------------------------------------------------------
