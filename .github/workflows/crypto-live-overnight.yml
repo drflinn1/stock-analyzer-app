@@ -1,89 +1,118 @@
-name: Crypto Live — Overnight (15m DRY-RUN by default)
+name: Crypto Live — Overnight (15m)
 
 on:
+  # Every 15 minutes
+  schedule:
+    - cron: "*/15 * * * *"
   workflow_dispatch:
-    inputs:
-      live_toggle:
-        description: "ON for simulation, OFF for live trading"
-        required: true
-        default: "ON"
+
+env:
+  # --- Global toggles (repo Variables override these) ---
+  DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}            # ON for simulation, OFF for live
+  RUN_SWITCH: ${{ vars.RUN_SWITCH || 'ON' }}      # ON enables the bot to act, OFF = skip trading logic
+  # --- Broker (Kraken) ---
+  KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+  KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+  # --- Risk / sizing knobs (use repo Variables to change) ---
+  MIN_BUY_USD: ${{ vars.MIN_BUY_USD || '10' }}
+  MAX_POSITIONS: ${{ vars.MAX_POSITIONS || '3' }}
+  MAX_BUYS_PER_RUN: ${{ vars.MAX_BUYS_PER_RUN || '2' }}
+  UNIVERSE_TOP_K: ${{ vars.UNIVERSE_TOP_K || '25' }}
+  RESERVE_CASH_PCT: ${{ vars.RESERVE_CASH_PCT || '5' }}
+  ROTATE_WHEN_FULL: ${{ vars.ROTATE_WHEN_FULL || 'true' }}
+  ROTATE_WHEN_CASH_SHORT: ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
+  MIN_SELL_USD: ${{ vars.MIN_SELL_USD || '10' }}
+  DUST_MIN_USD: ${{ vars.DUST_MIN_USD || '2' }}
+  DUST_SKIP_STABLES: ${{ vars.DUST_SKIP_STABLES || 'true' }}
+  # --- Optional JSON knobs ---
+  ADVANCED_JSON: ${{ vars.ADVANCED_JSON || '' }}
+  PROTECT_JSON:  ${{ vars.PROTECT_JSON  || '' }}
+  # --- Notifications (optional) ---
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL || '' }}
+  # Where to find the real engine (defaults to your existing module)
+  ENTRYPOINT: ${{ vars.ENTRYPOINT || 'trader/crypto_engine.py' }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crypto-live-overnight-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
 
     steps:
-      - name: Set up job
-        run: echo "Starting…"
-
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install deps (fast path)
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          # optional: matplotlib for KPI charts etc.
-          pip install matplotlib
-
-      # ---------- state cache (safe & optional) ----------
-      - name: Restore state cache (rolling)
-        uses: actions/cache@v4
-        with:
-          path: .state
-          # keep a rolling cache per-month to avoid growth
-          key: state-linux-${{ runner.os }}-${{ runner.arch }}-${{ github.ref_name }}-${{ hashFiles('.github/workflows/crypto-live-overnight.yml') }}
-          restore-keys: |
-            state-linux-${{ runner.os }}-${{ runner.arch }}-${{ github.ref_name }}-
+          set -e
+          if [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+          else
+            python -m pip install --upgrade pip
+            # Minimal set many bots of ours need
+            pip install ccxt pandas numpy pyyaml requests matplotlib
+          fi
 
       - name: Ensure .state exists
         run: mkdir -p .state
 
-      # ---------- (safe-runner was removed, so just log) ----------
       - name: Warm snapshots (skip: safe_runner removed)
         run: echo "Skipping warm-up: safe_runner.py not found"
 
-      # ---------- MAIN RUN ----------
+      # ----------- MAIN RUN -----------
       - name: Run trading loop
+        id: trade
         env:
-          # Broker secrets
-          KRAKEN_API_KEY:     ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}
-          # UI toggle and repo variable (both passed to Python)
-          RUN_SWITCH:         ${{ inputs.live_toggle || 'ON' }}   # ON=simulate, OFF=live
-          DRY_RUN:            ${{ vars.DRY_RUN     || 'ON' }}     # repo variable fallback
+          # propagate GITHUB context for filenames
+          GIT_REF_NAME: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
+          set -e
+          echo "== BOT START =="
+          echo "DRY_RUN=${DRY_RUN} RUN_SWITCH=${RUN_SWITCH}"
+          echo "ENTRYPOINT=${ENTRYPOINT}"
+
+          # Record a handy run-stamp for artifacts
+          STAMP="state-linux-${{ runner.os }}-${{ runner.arch }}-${GIT_REF_NAME}-${RUN_ID}-${RUN_ATTEMPT}"
+          echo "STAMP=${STAMP}" | tee .state/stamp.txt
+
+          # Always execute via our wrapper main.py to keep behavior consistent
           python -u main.py
 
-      # ---------- Debug: show .state content (first lines) ----------
-      - name: Debug state content (short)
-        run: |
-          echo "== .state listing =="
-          ls -alh .state || true
-          for f in .state/*.json .state/*.csv .state/*.txt; do
-            [ -f "$f" ] && echo "--- $f (head) ---" && head -n 25 "$f";
-          done
-
-      # ---------- Upload optional artifacts ----------
-      - name: Upload .state as artifact
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: .state-${{ github.run_id }}
-          path: .state
+          name: state-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .state/**
+            kpi_history.csv
+            positions.json
+            sell_guard_summary.json
+          if-no-files-found: warn
 
-      # ---------- Re-save cache ----------
-      - name: Save state cache (rolling)
+      - name: Job summary
         if: always()
-        uses: actions/cache@v4
-        with:
-          path: .state
-          key: state-linux-${{ runner.os }}-${{ runner.arch }}-${{ github.ref_name }}-${{ hashFiles('.github/workflows/crypto-live-overnight.yml') }}
-          restore-keys: |
-            state-linux-${{ runner.os }}-${{ runner.arch }}-${{ github.ref_name }}-
+        run: |
+          echo "### Crypto Live — Overnight (15m)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- DRY_RUN: ${DRY_RUN}" >> $GITHUB_STEP_SUMMARY
+          echo "- RUN_SWITCH: ${RUN_SWITCH}" >> $GITHUB_STEP_SUMMARY
+          echo "- ENTRYPOINT: ${ENTRYPOINT}" >> $GITHUB_STEP_SUMMARY
+          if [ -f ".state/run_summary.md" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            cat .state/run_summary.md >> $GITHUB_STEP_SUMMARY
+          fi
