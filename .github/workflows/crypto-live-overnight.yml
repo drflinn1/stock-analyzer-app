@@ -1,4 +1,4 @@
-name: Crypto Live — Overnight (15m DRY-RUN by default)
+name: Crypto Live - Overnight (15m DRY-RUN by default)
 
 on:
   workflow_dispatch:
@@ -46,9 +46,8 @@ jobs:
       - name: Ensure .state exists
         run: mkdir -p .state
 
-      - name: Warm snapshots (skip: safe_runner removed)
-        run: |
-          echo "Skipping warm-up: safe_runner.py not found"
+      - name: "Warm snapshots (skip: safe_runner removed)"
+        run: echo "Skipping warm-up: safe_runner.py not found"
 
       - name: Run trading loop
         env:
