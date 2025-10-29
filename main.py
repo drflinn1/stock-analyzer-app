@@ -189,15 +189,13 @@ def trade_loop_once():
             except Exception as se:
                 log.error(f"SELL failed for {sym}: {se}")
 
-    # ----- BUY PHASE (active; builds entries from spike candidates)
+   # ----- BUY PHASE (active; builds entries from spike candidates)
 # This block reads .state/spike_candidates.json, respects caps/cash,
 # and fills `entries` so the trade loop can place buys.
 
-# ensure entries list exists
-try:
-    entries
-except NameError:
-    entries = []
+# ensure required lists exist
+entries = locals().get("entries", [])
+highs = locals().get("highs", {})
 
 try:
     import json, pathlib
@@ -218,7 +216,7 @@ try:
     MAX_BUYS_PER_RUN  = int(locals().get("MAX_BUYS_PER_RUN", 1))
     positions         = list(locals().get("positions", []))
 
-    # Compute simple reserve (on free cash; safe).
+    # Compute simple reserve (on free cash; safe)
     reserve_cash = cash * (RESERVE_CASH_PCT / 100.0)
     avail_cash   = max(0.0, cash - reserve_cash)
 
@@ -251,17 +249,13 @@ try:
         sym = (row.get("symbol") or "").strip()
         if not sym:
             continue
-        # Don’t double-enter existing holdings
         if sym in positions:
             continue
 
-        # Optional momentum sanity: prefer above EMA if present
         above_ema = row.get("above_ema")
         if above_ema is False:
-            # keep it permissive; just deprioritize (we already sorted)
-            pass
+            pass  # allow but deprioritize
 
-        # Add a USD-sized entry; trade loop will execute it.
         entries.append({"symbol": sym, "usd": round(MIN_BUY_USD, 2)})
         buys_added += 1
         avail_cash -= MIN_BUY_USD
@@ -272,10 +266,9 @@ try:
 except Exception as e:
     log.warning("BUY PHASE — failed to build entries: %r", e)
 
-# Persist plans & highs as before
+# Persist plans & highs
 write_json(ENTRY_FILE, entries)
 write_json(HIGHWATER_FILE, highs)
-
 
 def main():
     args = sys.argv[1:]
