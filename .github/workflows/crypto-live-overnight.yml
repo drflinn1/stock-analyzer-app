@@ -3,106 +3,81 @@ name: Crypto Live — Overnight (15m DRY-RUN by default)
 on:
   workflow_dispatch:
     inputs:
-      DRY_RUN:
-        description: "ON for simulation, OFF for live trading"
+      DRY_RUN_INPUT:
+        description: 'ON for simulation, OFF for live trading'
         required: true
-        default: "ON"
-  schedule:
-    - cron: "*/15 * * * *"
-
-permissions:
-  contents: read
-
-env:
-  PYTHONUNBUFFERED: "1"
-  PIP_DISABLE_PIP_VERSION_CHECK: "1"
-
-  # Bot knobs (Variables control; safe defaults)
-  MIN_BUY_USD:              ${{ vars.MIN_BUY_USD || '10' }}
-  MAX_POSITIONS:            ${{ vars.MAX_POSITIONS || '3' }}
-  MAX_BUYS_PER_RUN:         ${{ vars.MAX_BUYS_PER_RUN || '2' }}
-  UNIVERSE_TOP_K:           ${{ vars.UNIVERSE_TOP_K || '25' }}
-  RESERVE_CASH_PCT:         ${{ vars.RESERVE_CASH_PCT || '5' }}
-  DUST_MIN_USD:             ${{ vars.DUST_MIN_USD || '2' }}
-  ROTATE_WHEN_FULL:         ${{ vars.ROTATE_WHEN_FULL || 'true' }}
-  ROTATE_WHEN_CASH_SHORT:   ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
-
-  # Sell Guard
-  TAKE_PROFIT_PCT:          ${{ vars.TAKE_PROFIT_PCT || '6' }}
-  TRAIL_PCT:                ${{ vars.TRAIL_PCT || '2' }}
-  STOP_LOSS_PCT:            ${{ vars.STOP_LOSS_PCT || '-2' }}
-  MIN_SELL_USD:             ${{ vars.MIN_SELL_USD || '10' }}
+        default: 'ON'
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
+    # Make the input take precedence, then repo vars, then a safe default.
     env:
-      # Manual runs honor your selection; schedules use the fallback after ||
-      DRY_RUN: ${{ inputs.DRY_RUN || 'OFF' }}
-      KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+      EXCHANGE: ${{ vars.EXCHANGE || 'kraken' }}
+      RUN_SWITCH: ${{ vars.RUN_SWITCH || 'ON' }}
+      DRY_RUN: ${{ github.event.inputs.DRY_RUN_INPUT || vars.DRY_RUN || 'ON' }}
+
+      # (all your other vars continue to come from repo Variables at runtime)
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Sanity check for secrets
-        run: |
-          missing=0
-          [ -z "${KRAKEN_API_KEY}" ]    && echo "❌ Missing secret: KRAKEN_API_KEY" && missing=1
-          [ -z "${KRAKEN_API_SECRET}" ] && echo "❌ Missing secret: KRAKEN_API_SECRET" && missing=1
-          if [ $missing -eq 1 ] && [ "${DRY_RUN}" = "OFF" ]; then
-            echo "DRY_RUN=OFF but private API secrets are missing. Failing fast."
-            exit 1
-          fi
-          echo "Secrets check complete."
-
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          pip install ccxt pandas pyyaml matplotlib
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install ccxt pandas numpy pyyaml matplotlib
+          fi
 
-      - name: Ensure .state directory
-        run: |
-          mkdir -p .state
-          echo "keep" > .state/.keep
-
-      # ✅ Restore the most recent .state from previous runs (rolling cache)
-      - name: Restore .state cache (rolling)
-        uses: actions/cache/restore@v4
+      - name: Restore state cache (rolling)
+        uses: actions/cache@v4
         with:
           path: .state
-          key: state-v1-${{ github.run_id }}
+          key: state-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
-            state-v1-
+            state-${{ runner.os }}-
+
+      - name: Ensure .state exists
+        run: mkdir -p .state
 
       - name: Warm snapshots (balances/positions/buy_plan)
-        run: python main.py --warm-only
+        run: python safe_runner.py --warm-only
 
       - name: Run trading loop
+        env:
+          # exchange secrets
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
-          echo "=== START LOOP ==="
-          python main.py --loop-once
-          echo "=== END LOOP ==="
+          echo "==== MODE CHECK ===="
+          echo "EXCHANGE=${EXCHANGE}"
+          echo "RUN_SWITCH=${RUN_SWITCH}"
+          echo "DRY_RUN=${DRY_RUN}   <-- this is what main.py will see"
+          echo "===================="
+          python main.py
 
-      # ✅ Save the updated .state so the next run can restore it
-      - name: Save .state cache (rolling)
-        uses: actions/cache/save@v4
-        with:
-          path: .state
-          key: state-v1-${{ github.run_id }}
-
-      # (Optional) Upload .state so you can download it from the UI
-      - name: Upload .state as artifact
-        uses: actions/upload-artifact@v4
+      - name: Debug .state contents (after run)
         if: always()
+        run: |
+          echo "== .state listing =="
+          ls -la .state || true
+          echo "== buy_plan.json =="
+          test -f .state/buy_plan.json && cat .state/buy_plan.json || echo "(missing)"
+          echo "== spike_candidates.json =="
+          test -f .state/spike_candidates.json && head -200 .state/spike_candidates.json || echo "(missing)"
+
+      - name: Upload .state as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: state_${{ github.run_number }}
-          path: .state
+          name: state
+          path: .state/**
           if-no-files-found: warn
-          retention-days: 7
