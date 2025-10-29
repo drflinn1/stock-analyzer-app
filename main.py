@@ -210,7 +210,7 @@ def main():
 if __name__ == "__main__":
     main()
 # At end of main.py
-from trader.momentum_spike import act_on_spikes
+from tools.momentum_spike import main as act_on_spikes
 print("\n=== Running Momentum Spike Scan ===")
 act_on_spikes()
 
