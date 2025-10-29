@@ -189,53 +189,93 @@ def trade_loop_once():
             except Exception as se:
                 log.error(f"SELL failed for {sym}: {se}")
 
-    # ---- BUY PHASE (paused tonight by MAX_BUYS_PER_RUN=0)
-    # (kept for completeness; plan remains empty so no buys)
-# DEBUG — Buy gate instrumentation (safe, read-only)
+    # ----- BUY PHASE (active; builds entries from spike candidates)
+# This block reads .state/spike_candidates.json, respects caps/cash,
+# and fills `entries` so the trade loop can place buys.
+
+# ensure entries list exists
+try:
+    entries
+except NameError:
+    entries = []
+
 try:
     import json, pathlib
+
     state_dir = pathlib.Path(".state")
     cand_json = state_dir / "spike_candidates.json"
-    debug_cands = []
+    spike = []
     if cand_json.exists():
         with open(cand_json, "r", encoding="utf-8") as f:
             payload = json.load(f)
-            debug_cands = payload.get("candidates", [])
+            spike = payload.get("candidates", [])
 
-    # Gracefully handle undefined vars if buy loop skipped
-    cash = locals().get("cash", 0)
-    positions = locals().get("positions", [])
-    MIN_BUY_USD = locals().get("MIN_BUY_USD", 0)
-    RESERVE_CASH_PCT = locals().get("RESERVE_CASH_PCT", 0)
-    MAX_POSITIONS = locals().get("MAX_POSITIONS", 0)
-    MAX_BUYS_PER_RUN = locals().get("MAX_BUYS_PER_RUN", 0)
+    # Pull runtime knobs (fallbacks are conservative)
+    cash              = float(locals().get("cash", 0.0))
+    MIN_BUY_USD       = float(locals().get("MIN_BUY_USD", 10))
+    RESERVE_CASH_PCT  = float(locals().get("RESERVE_CASH_PCT", 0))
+    MAX_POSITIONS     = int(locals().get("MAX_POSITIONS", 4))
+    MAX_BUYS_PER_RUN  = int(locals().get("MAX_BUYS_PER_RUN", 1))
+    positions         = list(locals().get("positions", []))
+
+    # Compute simple reserve (on free cash; safe).
+    reserve_cash = cash * (RESERVE_CASH_PCT / 100.0)
+    avail_cash   = max(0.0, cash - reserve_cash)
 
     log.info(
-        "BUY DEBUG — cash=$%.2f  reserve=%s%%  min_buy=$%s  max_positions=%s  cur_positions=%s  max_buys=%s",
-        float(cash),
-        str(RESERVE_CASH_PCT),
-        str(MIN_BUY_USD),
-        str(MAX_POSITIONS),
-        str(len(positions)),
-        str(MAX_BUYS_PER_RUN),
+        "BUY DEBUG — cash=$%.2f reserve=%s%% avail=$%.2f min_buy=$%.2f max_pos=%d cur_pos=%d max_buys=%d",
+        cash, RESERVE_CASH_PCT, avail_cash, MIN_BUY_USD, MAX_POSITIONS, len(positions), MAX_BUYS_PER_RUN
     )
 
-    if not debug_cands:
-        log.info("BUY DEBUG — no scanner candidates (.state/spike_candidates.json empty)")
-    else:
-        log.info("BUY DEBUG — %d scanner candidates (top 10 below):", len(debug_cands))
-        for i, row in enumerate(debug_cands[:10], 1):
-            sym = row.get("symbol", "?")
-            pct = row.get("pct_24h")
-            vol = row.get("vol_usd_24h")
-            above = row.get("above_ema")
-            log.info("  #%02d  %-12s  pct_24h=%6s  vol_usd=%s  above_ema=%s",
-                     i, sym, str(pct), str(vol), str(above))
-except Exception as e:
-    log.warning("BUY DEBUG — instrumentation failed: %r", e)
+    # Sort candidates: highest pct_24h first, then volume
+    def _pct(x): 
+        try:    return float(x.get("pct_24h") or 0)
+        except: return 0.0
+    def _vol(x):
+        try:    return float(x.get("vol_usd_24h") or 0)
+        except: return 0.0
 
-    write_json(ENTRY_FILE, entries)
-    write_json(HIGHWATER_FILE, highs)
+    spike = sorted(spike, key=lambda r: (_pct(r), _vol(r)), reverse=True)
+
+    buys_added = 0
+    for row in spike:
+        if buys_added >= MAX_BUYS_PER_RUN:
+            break
+        if len(positions) + buys_added >= MAX_POSITIONS:
+            log.info("BUY PLAN — hit MAX_POSITIONS cap")
+            break
+        if avail_cash < MIN_BUY_USD:
+            log.info("BUY PLAN — insufficient avail_cash (%.2f < %.2f)", avail_cash, MIN_BUY_USD)
+            break
+
+        sym = (row.get("symbol") or "").strip()
+        if not sym:
+            continue
+        # Don’t double-enter existing holdings
+        if sym in positions:
+            continue
+
+        # Optional momentum sanity: prefer above EMA if present
+        above_ema = row.get("above_ema")
+        if above_ema is False:
+            # keep it permissive; just deprioritize (we already sorted)
+            pass
+
+        # Add a USD-sized entry; trade loop will execute it.
+        entries.append({"symbol": sym, "usd": round(MIN_BUY_USD, 2)})
+        buys_added += 1
+        avail_cash -= MIN_BUY_USD
+        log.info("BUY PLAN — added %s for $%.2f (avail now $%.2f)", sym, MIN_BUY_USD, avail_cash)
+
+    log.info("BUY PLAN — planned buys: %d", buys_added)
+
+except Exception as e:
+    log.warning("BUY PHASE — failed to build entries: %r", e)
+
+# Persist plans & highs as before
+write_json(ENTRY_FILE, entries)
+write_json(HIGHWATER_FILE, highs)
+
 
 def main():
     args = sys.argv[1:]
