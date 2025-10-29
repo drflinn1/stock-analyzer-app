@@ -202,6 +202,14 @@ try:
             payload = json.load(f)
             debug_cands = payload.get("candidates", [])
 
+    # Gracefully handle undefined vars if buy loop skipped
+    cash = locals().get("cash", 0)
+    positions = locals().get("positions", [])
+    MIN_BUY_USD = locals().get("MIN_BUY_USD", 0)
+    RESERVE_CASH_PCT = locals().get("RESERVE_CASH_PCT", 0)
+    MAX_POSITIONS = locals().get("MAX_POSITIONS", 0)
+    MAX_BUYS_PER_RUN = locals().get("MAX_BUYS_PER_RUN", 0)
+
     log.info(
         "BUY DEBUG — cash=$%.2f  reserve=%s%%  min_buy=$%s  max_positions=%s  cur_positions=%s  max_buys=%s",
         float(cash),
@@ -225,6 +233,7 @@ try:
                      i, sym, str(pct), str(vol), str(above))
 except Exception as e:
     log.warning("BUY DEBUG — instrumentation failed: %r", e)
+
     write_json(ENTRY_FILE, entries)
     write_json(HIGHWATER_FILE, highs)
 
