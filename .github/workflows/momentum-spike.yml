@@ -1,0 +1,84 @@
+name: Momentum Spike — Scan (Dry-Run)
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_24h_pct:
+        description: "Override: MIN_24H_PCT (e.g., 25)"
+        required: false
+        default: ""
+      min_base_vol_usd:
+        description: "Override: MIN_BASE_VOL_USD (e.g., 25000)"
+        required: false
+        default: ""
+      ema_window:
+        description: "Override: EMA_WINDOW (e.g., 20)"
+        required: false
+        default: ""
+      max_results:
+        description: "Override: MAX_RESULTS (e.g., 10)"
+        required: false
+        default: ""
+      top_k_precheck:
+        description: "Override: TOP_K_PRECHECK (e.g., 40)"
+        required: false
+        default: ""
+      quotes:
+        description: "Override: QUOTES (comma list, e.g., USD,USDT,USDC)"
+        required: false
+        default: ""
+  schedule:
+    # Every 30 minutes
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: momentum-spike-scan
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt pandas
+
+      - name: Run Momentum Spike (scan-only)
+        env:
+          # Prefer repository Variables; fall back to safe defaults.
+          MIN_24H_PCT:        ${{ inputs.min_24h_pct || vars.MIN_24H_PCT || '25' }}
+          MIN_BASE_VOL_USD:   ${{ inputs.min_base_vol_usd || vars.MIN_BASE_VOL_USD || '25000' }}
+          EMA_WINDOW:         ${{ inputs.ema_window || vars.EMA_WINDOW || '20' }}
+          MAX_RESULTS:        ${{ inputs.max_results || vars.MAX_RESULTS || '10' }}
+          TOP_K_PRECHECK:     ${{ inputs.top_k_precheck || vars.TOP_K_PRECHECK || '40' }}
+          EXCLUDE_STABLES:    ${{ vars.EXCLUDE_STABLES || 'true' }}
+          EXCLUDE_LEVERAGED:  ${{ vars.EXCLUDE_LEVERAGED || 'true' }}
+          QUOTES:             ${{ inputs.quotes || vars.QUOTES || 'USD,USDT,USDC' }}
+        run: |
+          python tools/momentum_spike.py
+        continue-on-error: false
+
+      - name: Upload spike artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike_candidates
+          path: |
+            .state/spike_candidates.csv
+            .state/spike_candidates.json
+          if-no-files-found: warn
+          retention-days: 7
