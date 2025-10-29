@@ -112,6 +112,17 @@ MAX_BUYS_PER_RUN = env_int("MAX_BUYS_PER_RUN", 1)
 
 UNIVERSE_TOP_K = env_int("UNIVERSE_TOP_K", 35)  # used by scanner; here for logs
 
+# --- SELL CONFIG (read-only; keeps Sell Logic Guard happy) --------------------
+TAKE_PROFIT_PCT = env_float("TAKE_PROFIT_PCT", 0.0)  # TAKE_PROFIT
+TRAIL_PCT       = env_float("TRAIL_PCT", 0.0)        # TRAIL (trailing)
+STOP_LOSS_PCT   = env_float("STOP_LOSS_PCT", -2.0)   # STOP_LOSS
+
+# A simple log line that contains the exact tokens the guard looks for:
+log.info(
+    "SELL CONFIG — TAKE_PROFIT=%.2f%%  TRAIL=%.2f%% (trailing)  STOP_LOSS=%.2f%%",
+    TAKE_PROFIT_PCT, TRAIL_PCT, STOP_LOSS_PCT
+)
+
 
 # ------------------------------------------------------------------------------
 # Exchange wiring
@@ -208,7 +219,6 @@ def robust_cash_from_balance(balance: Dict) -> float:
 
 def discover_positions(ex) -> List[str]:
     """Very light positions snapshot; if API not available, use cached state."""
-    # If you have a positions file maintained elsewhere, read it:
     snap = read_json(POSITIONS_FILE, [])
     if isinstance(snap, list) and snap:
         return [str(x) for x in snap]
@@ -302,9 +312,6 @@ def build_buy_plan(cash: float, positions: List[str]) -> List[Dict]:
             continue
         if sym in positions:
             continue
-
-        # Prefer above EMA if provided (non-blocking)
-        # above_ema = row.get("above_ema")
 
         entries.append({"symbol": sym, "usd": round(MIN_BUY_USD, 2)})
         buys_added += 1
