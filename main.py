@@ -191,7 +191,40 @@ def trade_loop_once():
 
     # ---- BUY PHASE (paused tonight by MAX_BUYS_PER_RUN=0)
     # (kept for completeness; plan remains empty so no buys)
+# DEBUG — Buy gate instrumentation (safe, read-only)
+try:
+    import json, pathlib
+    state_dir = pathlib.Path(".state")
+    cand_json = state_dir / "spike_candidates.json"
+    debug_cands = []
+    if cand_json.exists():
+        with open(cand_json, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+            debug_cands = payload.get("candidates", [])
 
+    log.info(
+        "BUY DEBUG — cash=$%.2f  reserve=%s%%  min_buy=$%s  max_positions=%s  cur_positions=%s  max_buys=%s",
+        float(cash),
+        str(RESERVE_CASH_PCT),
+        str(MIN_BUY_USD),
+        str(MAX_POSITIONS),
+        str(len(positions)),
+        str(MAX_BUYS_PER_RUN),
+    )
+
+    if not debug_cands:
+        log.info("BUY DEBUG — no scanner candidates (.state/spike_candidates.json empty)")
+    else:
+        log.info("BUY DEBUG — %d scanner candidates (top 10 below):", len(debug_cands))
+        for i, row in enumerate(debug_cands[:10], 1):
+            sym = row.get("symbol", "?")
+            pct = row.get("pct_24h")
+            vol = row.get("vol_usd_24h")
+            above = row.get("above_ema")
+            log.info("  #%02d  %-12s  pct_24h=%6s  vol_usd=%s  above_ema=%s",
+                     i, sym, str(pct), str(vol), str(above))
+except Exception as e:
+    log.warning("BUY DEBUG — instrumentation failed: %r", e)
     write_json(ENTRY_FILE, entries)
     write_json(HIGHWATER_FILE, highs)
 
