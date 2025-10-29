@@ -1,19 +1,18 @@
-name: Crypto Live — Overnight (15m)
+name: Crypto Live - Overnight (15m)
 
 on:
-  # Every 15 minutes
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
 
 env:
-  # --- Global toggles (repo Variables override these) ---
+  # --- Global toggles (Variables can override) ---
   DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}            # ON for simulation, OFF for live
-  RUN_SWITCH: ${{ vars.RUN_SWITCH || 'ON' }}      # ON enables the bot to act, OFF = skip trading logic
+  RUN_SWITCH: ${{ vars.RUN_SWITCH || 'ON' }}      # ON to run logic, OFF to skip
   # --- Broker (Kraken) ---
   KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
   KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-  # --- Risk / sizing knobs (use repo Variables to change) ---
+  # --- Risk / sizing knobs ---
   MIN_BUY_USD: ${{ vars.MIN_BUY_USD || '10' }}
   MAX_POSITIONS: ${{ vars.MAX_POSITIONS || '3' }}
   MAX_BUYS_PER_RUN: ${{ vars.MAX_BUYS_PER_RUN || '2' }}
@@ -26,10 +25,10 @@ env:
   DUST_SKIP_STABLES: ${{ vars.DUST_SKIP_STABLES || 'true' }}
   # --- Optional JSON knobs ---
   ADVANCED_JSON: ${{ vars.ADVANCED_JSON || '' }}
-  PROTECT_JSON:  ${{ vars.PROTECT_JSON  || '' }}
+  PROTECT_JSON: ${{ vars.PROTECT_JSON || '' }}
   # --- Notifications (optional) ---
   SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL || '' }}
-  # Where to find the real engine (defaults to your existing module)
+  # Entry script for your engine
   ENTRYPOINT: ${{ vars.ENTRYPOINT || 'trader/crypto_engine.py' }}
 
 permissions:
@@ -53,29 +52,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (fast path)
+      - name: Install dependencies
         run: |
           set -e
+          python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
-            python -m pip install --upgrade pip
             pip install -r requirements.txt
           else
-            python -m pip install --upgrade pip
-            # Minimal set many bots of ours need
             pip install ccxt pandas numpy pyyaml requests matplotlib
           fi
 
       - name: Ensure .state exists
         run: mkdir -p .state
 
-      - name: Warm snapshots (skip: safe_runner removed)
-        run: echo "Skipping warm-up: safe_runner.py not found"
+      - name: Warm snapshots (not used)
+        run: echo "Skipping warm-up step"
 
-      # ----------- MAIN RUN -----------
       - name: Run trading loop
         id: trade
         env:
-          # propagate GITHUB context for filenames
           GIT_REF_NAME: ${{ github.ref_name }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
@@ -84,12 +79,7 @@ jobs:
           echo "== BOT START =="
           echo "DRY_RUN=${DRY_RUN} RUN_SWITCH=${RUN_SWITCH}"
           echo "ENTRYPOINT=${ENTRYPOINT}"
-
-          # Record a handy run-stamp for artifacts
-          STAMP="state-linux-${{ runner.os }}-${{ runner.arch }}-${GIT_REF_NAME}-${RUN_ID}-${RUN_ATTEMPT}"
-          echo "STAMP=${STAMP}" | tee .state/stamp.txt
-
-          # Always execute via our wrapper main.py to keep behavior consistent
+          echo "STAMP=linux-${{ runner.os }}-${{ runner.arch }}-${GIT_REF_NAME}-${RUN_ID}-${RUN_ATTEMPT}" > .state/stamp.txt
           python -u main.py
 
       - name: Upload artifacts
@@ -107,12 +97,14 @@ jobs:
       - name: Job summary
         if: always()
         run: |
-          echo "### Crypto Live — Overnight (15m)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- DRY_RUN: ${DRY_RUN}" >> $GITHUB_STEP_SUMMARY
-          echo "- RUN_SWITCH: ${RUN_SWITCH}" >> $GITHUB_STEP_SUMMARY
-          echo "- ENTRYPOINT: ${ENTRYPOINT}" >> $GITHUB_STEP_SUMMARY
-          if [ -f ".state/run_summary.md" ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            cat .state/run_summary.md >> $GITHUB_STEP_SUMMARY
-          fi
+          {
+            echo "### Crypto Live - Overnight (15m)";
+            echo "";
+            echo "- DRY_RUN: ${DRY_RUN}";
+            echo "- RUN_SWITCH: ${RUN_SWITCH}";
+            echo "- ENTRYPOINT: ${ENTRYPOINT}";
+            if [ -f ".state/run_summary.md" ]; then
+              echo "";
+              cat .state/run_summary.md;
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
