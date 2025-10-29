@@ -12,13 +12,11 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
-    # Make the input take precedence, then repo vars, then a safe default.
+    # UI input overrides repo vars; safe default = ON
     env:
       EXCHANGE: ${{ vars.EXCHANGE || 'kraken' }}
       RUN_SWITCH: ${{ vars.RUN_SWITCH || 'ON' }}
       DRY_RUN: ${{ github.event.inputs.DRY_RUN_INPUT || vars.DRY_RUN || 'ON' }}
-
-      # (all your other vars continue to come from repo Variables at runtime)
 
     steps:
       - name: Checkout
@@ -48,19 +46,19 @@ jobs:
       - name: Ensure .state exists
         run: mkdir -p .state
 
-      - name: Warm snapshots (balances/positions/buy_plan)
-        run: python safe_runner.py --warm-only
+      - name: Warm snapshots (skip: safe_runner removed)
+        run: |
+          echo "Skipping warm-up: safe_runner.py not found"
 
       - name: Run trading loop
         env:
-          # exchange secrets
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           echo "==== MODE CHECK ===="
           echo "EXCHANGE=${EXCHANGE}"
           echo "RUN_SWITCH=${RUN_SWITCH}"
-          echo "DRY_RUN=${DRY_RUN}   <-- this is what main.py will see"
+          echo "DRY_RUN=${DRY_RUN}"
           echo "===================="
           python main.py
 
