@@ -1,90 +1,89 @@
-name: Crypto Live - Overnight (15m DRY-RUN by default)
+name: Crypto Live — Overnight (15m DRY-RUN by default)
 
 on:
   workflow_dispatch:
     inputs:
-      DRY_RUN_INPUT:
-        description: 'ON for simulation, OFF for live trading'
+      live_toggle:
+        description: "ON for simulation, OFF for live trading"
         required: true
-        default: 'ON'
+        default: "ON"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
-    env:
-      EXCHANGE: ${{ vars.EXCHANGE || 'kraken' }}
-      RUN_SWITCH: ${{ vars.RUN_SWITCH || 'ON' }}
-      DRY_RUN: ${{ github.event.inputs.DRY_RUN_INPUT || vars.DRY_RUN || 'ON' }}
+    timeout-minutes: 25
 
     steps:
+      - name: Set up job
+        run: echo "Starting…"
+
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install ccxt pandas numpy pyyaml matplotlib
-          fi
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # optional: matplotlib for KPI charts etc.
+          pip install matplotlib
 
+      # ---------- state cache (safe & optional) ----------
       - name: Restore state cache (rolling)
         uses: actions/cache@v4
         with:
           path: .state
-          key: state-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+          # keep a rolling cache per-month to avoid growth
+          key: state-linux-${{ runner.os }}-${{ runner.arch }}-${{ github.ref_name }}-${{ hashFiles('.github/workflows/crypto-live-overnight.yml') }}
           restore-keys: |
-            state-${{ runner.os }}-
+            state-linux-${{ runner.os }}-${{ runner.arch }}-${{ github.ref_name }}-
 
       - name: Ensure .state exists
         run: mkdir -p .state
-      - name: Ensure .state exists
-        run: mkdir -p .state
 
-      - name: Warm snapshots (skip safe_runner removed)
-        shell: bash
-        run: |
-          echo "Skipping warm-up: safe_runner.py not found"
+      # ---------- (safe-runner was removed, so just log) ----------
+      - name: Warm snapshots (skip: safe_runner removed)
+        run: echo "Skipping warm-up: safe_runner.py not found"
 
+      # ---------- MAIN RUN ----------
       - name: Run trading loop
         env:
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-        shell: bash
+          # Broker secrets
+          KRAKEN_API_KEY:     ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}
+          # UI toggle and repo variable (both passed to Python)
+          RUN_SWITCH:         ${{ inputs.live_toggle || 'ON' }}   # ON=simulate, OFF=live
+          DRY_RUN:            ${{ vars.DRY_RUN     || 'ON' }}     # repo variable fallback
         run: |
-          echo "==== MODE CHECK ===="
-          echo "EXCHANGE=${EXCHANGE}"
-          echo "RUN_SWITCH=${RUN_SWITCH}"
-          echo "DRY_RUN=${DRY_RUN}"
-          python main.py
+          python -u main.py
 
-          echo "==== MODE CHECK ===="
-          echo "EXCHANGE=${EXCHANGE}"
-          echo "RUN_SWITCH=${RUN_SWITCH}"
-          echo "DRY_RUN=${DRY_RUN}"
-          echo "===================="
-          python main.py
-
-      - name: Debug .state contents (after run)
-        if: always()
+      # ---------- Debug: show .state content (first lines) ----------
+      - name: Debug state content (short)
         run: |
           echo "== .state listing =="
-          ls -la .state || true
-          echo "== buy_plan.json =="
-          test -f .state/buy_plan.json && cat .state/buy_plan.json || echo "(missing)"
-          echo "== spike_candidates.json =="
-          test -f .state/spike_candidates.json && head -200 .state/spike_candidates.json || echo "(missing)"
+          ls -alh .state || true
+          for f in .state/*.json .state/*.csv .state/*.txt; do
+            [ -f "$f" ] && echo "--- $f (head) ---" && head -n 25 "$f";
+          done
 
+      # ---------- Upload optional artifacts ----------
       - name: Upload .state as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: state
-          path: .state/**
-          if-no-files-found: warn
+          name: .state-${{ github.run_id }}
+          path: .state
+
+      # ---------- Re-save cache ----------
+      - name: Save state cache (rolling)
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: .state
+          key: state-linux-${{ runner.os }}-${{ runner.arch }}-${{ github.ref_name }}-${{ hashFiles('.github/workflows/crypto-live-overnight.yml') }}
+          restore-keys: |
+            state-linux-${{ runner.os }}-${{ runner.arch }}-${{ github.ref_name }}-
