@@ -41,19 +41,15 @@ jobs:
 
       - name: Pre-check market hours (ET)
         id: hours
-        shell: bash
         run: |
-          cat > check_market.py <<PYCODE
-import os, datetime, pytz
-et = pytz.timezone("America/New_York")
-now_et = datetime.datetime.now(et)
-open_t = datetime.datetime.strptime(os.getenv("MARKET_OPEN_ET","09:32"), "%H:%M").time()
-close_t = datetime.datetime.strptime(os.getenv("MARKET_CLOSE_ET","15:58"), "%H:%M").time()
-is_open = (now_et.weekday() < 5) and (open_t <= now_et.time() <= close_t)
-print(f"now_et={now_et}, is_open={is_open}")
-with open("market_open.flag","w") as f:
-    f.write("1" if is_open else "0")
-PYCODE
+          echo "import os, datetime, pytz" > check_market.py
+          echo "et = pytz.timezone('America/New_York')" >> check_market.py
+          echo "now_et = datetime.datetime.now(et)" >> check_market.py
+          echo "open_t = datetime.datetime.strptime(os.getenv('MARKET_OPEN_ET','09:32'), '%H:%M').time()" >> check_market.py
+          echo "close_t = datetime.datetime.strptime(os.getenv('MARKET_CLOSE_ET','15:58'), '%H:%M').time()" >> check_market.py
+          echo "is_open = (now_et.weekday() < 5) and (open_t <= now_et.time() <= close_t)" >> check_market.py
+          echo "print(f'now_et={now_et}, is_open={is_open}')" >> check_market.py
+          echo "with open('market_open.flag','w') as f: f.write('1' if is_open else '0')" >> check_market.py
           python check_market.py
 
       - name: Abort if market closed
