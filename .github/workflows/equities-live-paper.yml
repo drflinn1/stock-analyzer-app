@@ -43,7 +43,7 @@ jobs:
         id: hours
         shell: bash
         run: |
-          cat > check_market.py <<'PYCODE'
+          cat > check_market.py <<PYCODE
 import os, datetime, pytz
 et = pytz.timezone("America/New_York")
 now_et = datetime.datetime.now(et)
