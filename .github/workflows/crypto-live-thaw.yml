@@ -1,0 +1,76 @@
+name: Crypto Live — THAW (Max 1 Buy, Momentum Pulse, 15m)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          pip install pyyaml matplotlib
+
+      - name: Run bot (THAW)
+        env:
+          # --- Exchange keys ---
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
+          # --- Live/sim switch ---
+          DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}  # flip to OFF when you’re ready
+
+          # --- Re-open buys gently ---
+          MAX_BUYS_PER_RUN: "1"
+          MAX_POSITIONS: ${{ vars.MAX_POSITIONS || '3' }}
+          MIN_BUY_USD: ${{ vars.MIN_BUY_USD || '10' }}
+          RESERVE_CASH_PCT: ${{ vars.RESERVE_CASH_PCT || '5' }}
+
+          # --- Momentum Pulse filter (feature-gated) ---
+          MOMENTUM_PULSE_ENABLE: "true"
+          MOMENTUM_RSI_MIN: ${{ vars.MOMENTUM_RSI_MIN || '55' }}
+          MOMENTUM_EMA_WINDOW: ${{ vars.MOMENTUM_EMA_WINDOW || '20' }}
+          MOMENTUM_PRICE_ABOVE_EMA: ${{ vars.MOMENTUM_PRICE_ABOVE_EMA || 'true' }}
+
+          # --- Sell-guard stays ON ---
+          MIN_SELL_USD: ${{ vars.MIN_SELL_USD || '10' }}
+          DUST_MIN_USD: ${{ vars.DUST_MIN_USD || '2' }}
+          DUST_SKIP_STABLES: ${{ vars.DUST_SKIP_STABLES || 'true' }}
+
+          # --- Discovery / universe ---
+          UNIVERSE_TOP_K: ${{ vars.UNIVERSE_TOP_K || '25' }}
+
+          # --- Logging / artifacts ---
+          KPI_ENABLE: ${{ vars.KPI_ENABLE || 'true' }}
+          ARTIFACTS_ENABLE: ${{ vars.ARTIFACTS_ENABLE || 'true' }}
+
+        run: |
+          python -V
+          python main.py
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thaw-run
+          path: |
+            .state/**
+            kpi_history.csv
+            sell_guard_summary.json
+            positions.json
+            logs/**
+          if-no-files-found: ignore
