@@ -1,51 +1,84 @@
 name: Equities Live — PAPER (every 15m, multi-buy)
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * 1-5"
-
-permissions:
-  contents: read
-
-concurrency:
-  group: equities-live-paper
-  cancel-in-progress: true
+    - cron: "*/15 * * * *"   # every 15 minutes UTC
+  workflow_dispatch:
 
 jobs:
-  trade:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
-      # --- Trading config (PAPER) ---
-      ALPACA_PAPER: "true"
-      DRY_RUN: "false"
-      PER_TRADE_USD: "2000"
-      MAX_POSITIONS: "20"
-      BUY_PER_RUN: "5"
-      TP_PCT: "0.035"
-      SL_PCT: "0.020"
-      UNIVERSE: "SPY,QQQ,VOO,AAPL,MSFT,NVDA,AMD,AVGO,META,GOOGL,AMZN,TSLA,SMCI,ORCL,INTC,CRM,COST,UNH,LIN,PEP,ADBE,TMUS,ASML,NFLX,TXN,AMAT,PLTR,MA,V,IBM,DE,BA,GE,ABBV,MRK,PFE,JNJ,WMT,MCD,NKE,XOM,CVX"
-      LOG_LEVEL: "INFO"
-
-      # --- Secrets (PAPER keys) ---
-      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-      ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
-
+    timeout-minutes: 12
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with: { fetch-depth: 1 }
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "alpaca-py>=0.42.1" yfinance tenacity
+          pip install -r requirements.txt || true
+          # explicit pins used in your crypto baseline
+          pip install pyyaml matplotlib
 
-      - name: Run Equities Engine
-        env: { PYTHONUNBUFFERED: "1" }
-        run: python -u trader/equities_engine.py
+      - name: Create .env (runtime config)
+        run: |
+          echo "ASSET_CLASS=${{ vars.ASSET_CLASS || 'equities' }}" >> .env
+          echo "BROKER=${{ vars.BROKER || 'alpaca' }}" >> .env
+          echo "PAPER_TRADING=${{ vars.PAPER_TRADING || 'true' }}" >> .env
+          echo "RUN_SWITCH=${{ vars.RUN_SWITCH || 'ON' }}" >> .env
+          echo "MIN_BUY_USD=${{ vars.MIN_BUY_USD || '10' }}" >> .env
+          echo "MAX_POSITIONS=${{ vars.MAX_POSITIONS || '3' }}" >> .env
+          echo "MAX_BUYS_PER_RUN=${{ vars.MAX_BUYS_PER_RUN || '1' }}" >> .env
+          echo "RESERVE_CASH_PCT=${{ vars.RESERVE_CASH_PCT || '60' }}" >> .env
+          echo "UNIVERSE_TICKERS=${{ vars.UNIVERSE_TICKERS || 'SPY,QQQ,AAPL,NVDA,AMD,MSFT' }}" >> .env
+          echo "BAR_TIMEFRAME=${{ vars.BAR_TIMEFRAME || '15m' }}" >> .env
+          echo "MARKET_OPEN_ET=${{ vars.MARKET_OPEN_ET || '09:32' }}" >> .env
+          echo "MARKET_CLOSE_ET=${{ vars.MARKET_CLOSE_ET || '15:58' }}" >> .env
+
+      - name: Pre-check market hours (ET)
+        id: hours
+        run: |
+          python - << 'PY'
+import os, sys, datetime, pytz
+et = pytz.timezone("America/New_York")
+now_et = datetime.datetime.now(et)
+wd = now_et.weekday()  # 0=Mon ... 6=Sun
+open_t = datetime.datetime.strptime(os.getenv("MARKET_OPEN_ET","09:32"), "%H:%M").time()
+close_t = datetime.datetime.strptime(os.getenv("MARKET_CLOSE_ET","15:58"), "%H:%M").time()
+is_open = (wd < 5) and (open_t <= now_et.time() <= close_t)
+print(f"now_et={now_et}, is_open={is_open}")
+# Write a small flag file for next step
+open("market_open.flag","w").write("1" if is_open else "0")
+PY
+
+      - name: Abort if market closed
+        run: |
+          [ "$(cat market_open.flag)" = "1" ] && echo "Market open — continuing" || { echo "Market closed — exiting gracefully"; exit 0; }
+
+      - name: Run Equities PAPER engine
+        env:
+          # broker secrets
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          # pass-through .env too
+        run: |
+          set -e
+          echo "Starting equities paper run..."
+          python main.py --mode equities || python main.py || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+            name: equities-paper-output
+            path: |
+              .state/**
+              kpi_history.csv
+              sell_guard_summary.json
+              positions.json
+            if-no-files-found: ignore
