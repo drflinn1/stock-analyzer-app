@@ -22,7 +22,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
-          pip install pyyaml matplotlib
+          pip install pyyaml matplotlib pytz
 
       - name: Create .env (runtime config)
         run: |
@@ -41,16 +41,10 @@ jobs:
 
       - name: Pre-check market hours (ET)
         id: hours
+        shell: bash
         run: |
-          python - <<'PY'
-import os, datetime
-from datetime import time
-try:
-    import pytz
-except ImportError:
-    import subprocess; subprocess.run(["pip","install","pytz"],check=True)
-    import pytz
-
+          cat > check_market.py <<'PYCODE'
+import os, datetime, pytz
 et = pytz.timezone("America/New_York")
 now_et = datetime.datetime.now(et)
 open_t = datetime.datetime.strptime(os.getenv("MARKET_OPEN_ET","09:32"), "%H:%M").time()
@@ -59,7 +53,8 @@ is_open = (now_et.weekday() < 5) and (open_t <= now_et.time() <= close_t)
 print(f"now_et={now_et}, is_open={is_open}")
 with open("market_open.flag","w") as f:
     f.write("1" if is_open else "0")
-PY
+PYCODE
+          python check_market.py
 
       - name: Abort if market closed
         run: |
@@ -75,7 +70,6 @@ PY
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         run: |
-          set -e
           echo "Starting equities paper run..."
           python main.py --mode equities || python main.py || true
 
