@@ -1,0 +1,79 @@
+name: Crypto Live — Week-1 Tight-Guard (SELL-Only, 15m)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes UTC
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          # Fallback minimal pins (in case requirements.txt is light)
+          pip install pyyaml matplotlib
+
+      - name: Run bot (SELL-only window)
+        env:
+          # --- Exchange keys (from repo Secrets) ---
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
+          # --- Global safety switch ---
+          DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}   # set to OFF for live sells
+
+          # --- Tight-Guard freeze (no new buys) ---
+          MAX_BUYS_PER_RUN: "0"
+          MAX_POSITIONS: ${{ vars.MAX_POSITIONS || '3' }}
+          MIN_BUY_USD: ${{ vars.MIN_BUY_USD || '10' }}
+
+          # --- Sell-guard knobs (keep your current values if already set) ---
+          MIN_SELL_USD: ${{ vars.MIN_SELL_USD || '10' }}
+          DUST_MIN_USD: ${{ vars.DUST_MIN_USD || '2' }}
+          DUST_SKIP_STABLES: ${{ vars.DUST_SKIP_STABLES || 'true' }}
+
+          # --- Discovery / universe (read-only during freeze) ---
+          UNIVERSE_TOP_K: ${{ vars.UNIVERSE_TOP_K || '25' }}
+
+          # --- Rotation safeguards (shouldn’t fire while buys are frozen) ---
+          ROTATE_WHEN_FULL: ${{ vars.ROTATE_WHEN_FULL || 'true' }}
+          ROTATE_WHEN_CASH_SHORT: ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
+
+          # --- Explicit SELL-only flag (ignored by older code, harmless) ---
+          SELL_ONLY_WINDOW: "true"
+          SELL_ONLY_LABEL: "Week-1 Tight-Guard (48–72h)"
+
+          # --- Logging / artifacts ---
+          KPI_ENABLE: ${{ vars.KPI_ENABLE || 'true' }}
+          ARTIFACTS_ENABLE: ${{ vars.ARTIFACTS_ENABLE || 'true' }}
+
+        run: |
+          python -V
+          # Your entrypoint; adjust if your repo uses another path:
+          python main.py
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tight-guard-run
+          path: |
+            .state/**
+            kpi_history.csv
+            sell_guard_summary.json
+            positions.json
+            logs/**
+          if-no-files-found: ignore
