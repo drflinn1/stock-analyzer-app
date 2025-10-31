@@ -1,370 +1,170 @@
-# tools/momentum_spike.py
-# -----------------------------------------------------------------------------
-# Momentum Spike Scanner (SCAN-ONLY, SAFE MODE)
-#
-# What it does
-#   • Scans Kraken symbols quoted in USD/USDT/USDC
-#   • Ranks by 24h % change and filters by min 24h % and min USD volume
-#   • (Lightweight) EMA check on shortlisted symbols to avoid pure wicks
-#   • Saves results to .state/spike_candidates.csv and prints a summary
-#
-# What it does NOT do
-#   • It does NOT place orders. This module is scan-only by design.
-#
-# Env/Vars you can set (all optional; safe defaults provided)
-#   MIN_24H_PCT           default: 25        (trigger threshold)
-#   MIN_BASE_VOL_USD      default: 25000     (liquidity floor)
-#   EMA_WINDOW            default: 20        (bars on 15m)
-#   MAX_RESULTS           default: 10        (how many to keep)
-#   TOP_K_PRECHECK        default: 40        (how many symbols get EMA check)
-#   EXCLUDE_STABLES       default: true      (filter stablecoin bases)
-#   EXCLUDE_LEVERAGED     default: true      (filter tokens like 3L/3S, UP/DOWN)
-#   QUOTES                default: USD,USDT,USDC
-#
-# Output
-#   .state/spike_candidates.csv with columns:
-#     symbol,last,pct_24h,vol_usd_24h,ema_window,last_close,ema,above_ema,ts
-#
-# Dependencies
-#   pip install ccxt pandas
-# -----------------------------------------------------------------------------
+#!/usr/bin/env python3
+# Read-only Momentum Spike Scanner (Kraken via ccxt)
+# - Safe: public data only, no API keys needed
+# - Robust env parsing: strips inline comments and commas
+# - Outputs: .state/spike_candidates.csv (ranked)
 
-from __future__ import annotations
 import os
 import sys
-import time
-import math
-import json
-import pathlib
-from typing import Dict, Any, List, Tuple
+import csv
+import logging
+from typing import List, Dict, Tuple
 
-# Graceful import if ccxt/pandas aren't present (the workflow should install them)
+# ---------- Logging ----------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("spike")
+
+# ---------- Helpers ----------
+def parse_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default))
+    raw = raw.split("#", 1)[0].replace(",", "").strip()  # strip comments/commas
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+def parse_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    raw = raw.split("#", 1)[0].replace(",", "").strip()
+    try:
+        return int(float(raw))
+    except Exception:
+        return int(default)
+
+def parse_str_list_env(name: str, default_csv: str) -> List[str]:
+    raw = os.getenv(name, default_csv)
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
+
+# ---------- Env / knobs (robust) ----------
+MIN_24H_PCT         = parse_float_env("MIN_24H_PCT", 0.0)        # % change gate
+MIN_BASE_VOL_USD    = parse_float_env("MIN_BASE_VOL_USD", 25000) # approx USD vol
+EMA_WINDOW          = parse_int_env  ("MOMENTUM_EMA_WINDOW", 10) # small for spikes
+MAX_CANDIDATES      = parse_int_env  ("MAX_CANDIDATES", 10)
+QUOTE_WHITELIST     = parse_str_list_env("QUOTE_WHITELIST", "USD,USDT")
+OHLCV_TIMEFRAME     = os.getenv("OHLCV_TIMEFRAME", "15m")
+MAX_MARKETS         = parse_int_env("MAX_MARKETS", 500)
+
+OUTPUT_DIR          = os.getenv("OUTPUT_DIR", ".state")
+OUTPUT_FILE         = os.path.join(OUTPUT_DIR, "spike_candidates.csv")
+
+# ---------- 3rd party ----------
 try:
-    import ccxt  # type: ignore
+    import ccxt
 except Exception as e:
-    ccxt = None  # noqa
+    print("Missing dependency: ccxt. Add 'ccxt' to requirements.txt", file=sys.stderr)
+    raise
 
-try:
-    import pandas as pd  # type: ignore
-except Exception:
-    pd = None  # noqa
+# ---------- TA ----------
+def ema(values: List[float], window: int) -> List[float]:
+    if window <= 1 or not values:
+        return values[:]
+    k = 2 / (window + 1)
+    out = []
+    prev = None
+    for v in values:
+        prev = v if prev is None else (v * k + prev * (1 - k))
+        out.append(prev)
+    return out
 
+# ---------- Data fetch ----------
+def load_universe_kraken(exchange) -> List[str]:
+    markets = exchange.load_markets()
+    pairs = []
+    for m in markets.values():
+        if not m.get("active", True):
+            continue
+        base = (m.get("base") or "").upper()
+        quote = (m.get("quote") or "").upper()
+        if not base or not quote:
+            continue
+        if quote not in QUOTE_WHITELIST:
+            continue
+        pairs.append(f"{base}/{quote}")
+        if len(pairs) >= MAX_MARKETS:
+            break
+    return sorted(set(pairs))
 
-# ------------------------------ helpers -------------------------------------
-
-
-def _get_env(name: str, default: str) -> str:
-    val = os.getenv(name)
-    return str(val).strip() if val not in (None, "") else str(default)
-
-
-def _get_bool(name: str, default: bool) -> bool:
-    raw = _get_env(name, "true" if default else "false").lower()
-    return raw in ("1", "true", "yes", "y", "on")
-
-
-def _get_int(name: str, default: int) -> int:
-    try:
-        return int(float(_get_env(name, str(default))))
-    except Exception:
-        return default
-
-
-def _get_float(name: str, default: float) -> float:
-    try:
-        return float(_get_env(name, str(default)))
-    except Exception:
-        return default
-
-
-def _ensure_state_dir() -> pathlib.Path:
-    p = pathlib.Path(".state")
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-def _safe_symbol(symbol: str) -> bool:
-    """Quick sanity: exclude extremely long or odd symbols."""
-    return 2 <= len(symbol) <= 25 and "/" in symbol
-
-
-# ------------------------------ config --------------------------------------
-
-
-MIN_24H_PCT = _get_float("MIN_24H_PCT", 25.0)
-MIN_BASE_VOL_USD = _get_float("MIN_BASE_VOL_USD", 25_000.0)
-EMA_WINDOW = _get_int("EMA_WINDOW", 20)
-MAX_RESULTS = _get_int("MAX_RESULTS", 10)
-TOP_K_PRECHECK = _get_int("TOP_K_PRECHECK", 40)
-EXCLUDE_STABLES = _get_bool("EXCLUDE_STABLES", True)
-EXCLUDE_LEVERAGED = _get_bool("EXCLUDE_LEVERAGED", True)
-
-# Comma list of acceptable quotes
-QUOTES = [q.strip().upper() for q in _get_env("QUOTES", "USD,USDT,USDC").split(",") if q.strip()]
-
-STABLE_BASES = {
-    "USDT", "USDC", "DAI", "EUR", "GBP", "USD", "BUSD", "TUSD", "FDUSD", "PYUSD"
-}
-LEV_TOK_PATTERNS = ("3L", "3S", "5L", "5S", "UP", "DOWN", "BULL", "BEAR")
-
-TIMEFRAME = "15m"   # EMA timeframe
-EMA_MIN_BARS = max(EMA_WINDOW + 2, 30)  # fetch enough bars for a stable EMA
-
-
-# ------------------------------ core logic ----------------------------------
-
-
-def _build_exchange():
-    if ccxt is None:
-        raise RuntimeError(
-            "ccxt is not installed. Make sure your workflow installs 'ccxt'."
-        )
-    ex = ccxt.kraken({"enableRateLimit": True})
-    return ex
-
-
-def _is_lev_token(symbol: str) -> bool:
-    base = symbol.split("/")[0].upper()
-    return any(tag in base for tag in LEV_TOK_PATTERNS)
-
-
-def _want_symbol(symbol: str) -> bool:
-    if not _safe_symbol(symbol):
-        return False
-    base, quote = symbol.split("/")
-    quote = quote.upper()
-    base = base.upper()
-
-    if quote not in QUOTES:
-        return False
-    if EXCLUDE_STABLES and base in STABLE_BASES:
-        return False
-    if EXCLUDE_LEVERAGED and _is_lev_token(symbol):
-        return False
-    return True
-
-
-def _usd_volume_from_ticker(tkr: Dict[str, Any], quote: str) -> float:
+def fetch_24h(exchange, pairs: List[str]) -> Dict[str, Tuple[float, float, float]]:
     """
-    Try to derive 24h USD (or quote-USD) volume.
-    Priority: quoteVolume if quote ~ USD; else baseVolume*last as approximation.
+    Returns map: pair -> (pct24, baseVol, lastPrice)
     """
-    last = float(tkr.get("last") or tkr.get("close") or 0.0)
-    base_vol = float(tkr.get("baseVolume") or 0.0)
-    quote_vol = float(tkr.get("quoteVolume") or 0.0)
+    out = {}
+    tickers = exchange.fetch_tickers(pairs)
+    for p, t in tickers.items():
+        pct = t.get("percentage") or 0.0
+        bvol = t.get("baseVolume") or 0.0
+        last = t.get("last") or t.get("close") or 0.0
+        out[p] = (float(pct), float(bvol), float(last))
+    return out
 
-    if quote in ("USD", "USDT", "USDC") and quote_vol:
-        return float(quote_vol)
-
-    if base_vol and last:
-        return float(base_vol * last)
-
-    # Fallback if nothing is available
-    return 0.0
-
-
-def _pct_from_ticker(tkr: Dict[str, Any]) -> float:
-    pct = tkr.get("percentage")
-    if pct is None:
-        # derive percentage from change/last if present
-        change = tkr.get("change")
-        last = tkr.get("last") or tkr.get("close")
-        if change is not None and last:
-            try:
-                pct = (float(change) / float(last)) * 100.0
-            except Exception:
-                pct = None
-    return float(pct) if pct is not None else float("nan")
-
-
-def _ema(series: List[float], window: int) -> float:
-    if pd is None:
-        # lightweight EMA if pandas not present
-        k = 2 / (window + 1)
-        ema_val = series[0]
-        for x in series[1:]:
-            ema_val = x * k + ema_val * (1 - k)
-        return float(ema_val)
-    s = pd.Series(series, dtype=float)
-    return float(s.ewm(span=window, adjust=False).mean().iloc[-1])
-
-
-def _fetch_ohlcv_close(ex, symbol: str, timeframe: str, limit: int) -> List[float]:
+def fetch_ohlcv_close(exchange, pair: str, limit: int) -> List[float]:
     try:
-        ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if not ohlcv:
-            return []
-        closes = [float(x[4]) for x in ohlcv if len(x) >= 5]
-        return closes
-    except Exception:
+        ohlcv = exchange.fetch_ohlcv(pair, timeframe=OHLCV_TIMEFRAME, limit=limit)
+        return [row[4] for row in ohlcv if row and len(row) >= 5]
+    except Exception as e:
+        log.debug("OHLCV fetch failed for %s: %s", pair, str(e))
         return []
 
+# ---------- Scoring ----------
+def score_pair(exchange, pair: str, pct24: float, base_vol: float, last: float) -> Tuple[float, Dict[str, float]]:
+    usd_vol = base_vol * (last or 0.0)
+    if pct24 < MIN_24H_PCT:
+        return -1e9, {}
+    if usd_vol < MIN_BASE_VOL_USD:
+        return -1e9, {}
 
-def scan() -> Tuple[pd.DataFrame | None, List[Dict[str, Any]]]:
-    ex = _build_exchange()
-    ex.load_markets()
+    closes = fetch_ohlcv_close(exchange, pair, limit=max(EMA_WINDOW * 3, 60))
+    if len(closes) < EMA_WINDOW + 5:
+        return -1e9, {}
 
-    # 1) Pull tickers in one batch
-    tickers = ex.fetch_tickers()
+    e = ema(closes, EMA_WINDOW)
+    slope = (e[-1] - e[-5]) / max(e[-5], 1e-8)
 
-    # 2) Filter to USD-ish quotes & sane bases
-    rows: List[Tuple[str, float, float, float]] = []  # symbol, last, pct, vol_usd
+    # Simple spike score: % change + capped volume contribution + EMA slope boost
+    score = (pct24) + (min(usd_vol, 1_000_000) / 200_000.0) + (slope * 50)
+    return score, {"pct24": pct24, "usd_vol": usd_vol, "ema_slope": slope}
 
-    for sym, tkr in tickers.items():
-        if not _want_symbol(sym):
-            continue
-        try:
-            base, quote = sym.split("/")
-            pct = _pct_from_ticker(tkr)
-            if math.isnan(pct):
-                continue
-            last = float(tkr.get("last") or tkr.get("close") or 0.0)
-            if last <= 0:
-                continue
-            vol_usd = _usd_volume_from_ticker(tkr, quote.upper())
-            rows.append((sym, last, pct, vol_usd))
-        except Exception:
-            # keep scanning even if a symbol is messy
-            continue
-
-    if not rows:
-        print("SUMMARY: MomentumSpike — 0 symbols passed basic parsing.")
-        return None, []
-
-    # 3) Primary filters
-    filtered = [
-        (s, last, pct, v)
-        for (s, last, pct, v) in rows
-        if pct >= MIN_24H_PCT and v >= MIN_BASE_VOL_USD
-    ]
-
-    # Sort by pct desc first (for shortlist)
-    filtered.sort(key=lambda r: (r[2], r[3]), reverse=True)
-
-    # 4) EMA check on the top-K short list to avoid pure wicks
-    shortlist = filtered[: max(TOP_K_PRECHECK, MAX_RESULTS)]
-    enriched: List[Dict[str, Any]] = []
-
-    for s, last, pct, v in shortlist:
-        closes = _fetch_ohlcv_close(ex, s, TIMEFRAME, EMA_MIN_BARS)
-        if len(closes) < EMA_WINDOW + 2:
-            # skip EMA gate if we can't fetch enough bars; keep but mark as unknown
-            ema_val = float("nan")
-            last_close = last
-            above = None
-        else:
-            last_close = float(closes[-1])
-            ema_val = _ema(closes, EMA_WINDOW)
-            above = last_close > ema_val and (closes[-1] - closes[-2] >= 0)
-
-        enriched.append(
-            {
-                "symbol": s,
-                "last": round(float(last), 8),
-                "pct_24h": round(float(pct), 4),
-                "vol_usd_24h": round(float(v), 2),
-                "ema_window": int(EMA_WINDOW),
-                "last_close": round(float(last_close), 8),
-                "ema": (round(float(ema_val), 8) if not math.isnan(ema_val) else None),
-                "above_ema": (bool(above) if above is not None else None),
-                "ts": int(time.time()),
-            }
-        )
-
-        # small pause to be gentle with rate limits
-        time.sleep(0.15)
-
-    # 5) Final pick: prefer above_ema True, then pct desc, then volume
-    def _rank_key(x: Dict[str, Any]):
-        return (
-            1 if x.get("above_ema") is True else 0,
-            x.get("pct_24h", 0.0),
-            x.get("vol_usd_24h", 0.0),
-        )
-
-    enriched.sort(key=_rank_key, reverse=True)
-    final = enriched[:MAX_RESULTS]
-
-    # 6) Save & summarize
-    state_dir = _ensure_state_dir()
-    out_csv = state_dir / "spike_candidates.csv"
-
-    if pd is not None:
-        df = pd.DataFrame(final)
-        df.to_csv(out_csv, index=False)
-    else:
-        # minimal CSV writer if pandas isn't available
-        import csv
-
-        with open(out_csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "symbol",
-                    "last",
-                    "pct_24h",
-                    "vol_usd_24h",
-                    "ema_window",
-                    "last_close",
-                    "ema",
-                    "above_ema",
-                    "ts",
-                ],
-            )
-            w.writeheader()
-            for row in final:
-                w.writerow(row)
-        df = None  # type: ignore
-
-    # Pretty console summary
-    print(
-        f"SUMMARY: MomentumSpike — found {len(final)} candidates "
-        f"(min %: {MIN_24H_PCT}, min vol: ${int(MIN_BASE_VOL_USD):,}, "
-        f"EMA:{EMA_WINDOW}@{TIMEFRAME})."
-    )
-    for i, row in enumerate(final, 1):
-        flag = "↑" if row.get("above_ema") else "·"
-        print(
-            f"  {i:>2}. {row['symbol']:>10}  "
-            f"{flag}  {row['pct_24h']:>7.2f}%  "
-            f"vol ${int(row['vol_usd_24h']):>10,}  "
-            f"last {row['last']}"
-        )
-
-    print(f"ARTIFACT: wrote {out_csv}")
-
-    # Also drop a tiny JSON summary for other steps if needed
-    summary_json = {
-        "count": len(final),
-        "min_24h_pct": MIN_24H_PCT,
-        "min_base_vol_usd": MIN_BASE_VOL_USD,
-        "ema_window": EMA_WINDOW,
-        "timeframe": TIMEFRAME,
-        "candidates": final,
-    }
-    with open(state_dir / "spike_candidates.json", "w", encoding="utf-8") as f:
-        json.dump(summary_json, f, indent=2)
-
-    return df, final
-
-
+# ---------- Main ----------
 def main():
-    try:
-        scan()
-    except Exception as e:
-        # Never crash the workflow — log and continue.
-        print("ERROR: momentum_spike scan failed:", repr(e))
-        # Still make empty artifacts so downstream steps don't break
-        _ensure_state_dir()
-        empty = pathlib.Path(".state") / "spike_candidates.csv"
-        if not empty.exists():
-            with open(empty, "w", encoding="utf-8") as f:
-                f.write("symbol,last,pct_24h,vol_usd_24h,ema_window,last_close,ema,above_ema,ts\n")
-        with open(pathlib.Path(".state") / "spike_candidates.json", "w", encoding="utf-8") as f:
-            json.dump({"count": 0, "candidates": []}, f, indent=2)
-        # Non-zero exit would fail the job — keep it zero.
-        return
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    log.info(
+        "MomentumSpike — scanning Kraken | min%%: %.1f | min vol: $%,.0f | EMA:%d@%s",
+        MIN_24H_PCT, MIN_BASE_VOL_USD, EMA_WINDOW, OHLCV_TIMEFRAME
+    )
+
+    exchange = ccxt.kraken({"enableRateLimit": True, "options": {"fetchOHLCVWarning": False}})
+    universe = load_universe_kraken(exchange)
+    log.info("Universe size: %d (quotes: %s)", len(universe), ",".join(QUOTE_WHITELIST))
+
+    tick = fetch_24h(exchange, universe)
+
+    ranked: List[Tuple[float, str, Dict[str, float]]] = []
+    for pair in universe:
+        pct24, base_vol, last = tick.get(pair, (0.0, 0.0, 0.0))
+        score, details = score_pair(exchange, pair, pct24, base_vol, last)
+        if score > -1e8:
+            ranked.append((score, pair, details))
+
+    ranked.sort(reverse=True, key=lambda x: x[0])
+    top = ranked[:MAX_CANDIDATES]
+
+    # Write CSV artifact
+    with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["pair", "score", "pct24", "usd_vol", "ema_slope"])
+        for score, pair, d in top:
+            w.writerow([pair, f"{score:.3f}", f"{d['pct24']:.2f}", f"{d['usd_vol']:.0f}", f"{d['ema_slope']:.4f}"])
+
+    # Console summary (like your previous logs)
+    print(f"SUMMARY: MomentumSpike — found {len(top)} candidates (min %: {MIN_24H_PCT}, min vol: ${int(MIN_BASE_VOL_USD):,}, EMA:{EMA_WINDOW}@{OHLCV_TIMEFRAME}).")
+    for i, (score, pair, d) in enumerate(top, start=1):
+        print(f"{i:2d}. {pair:10s} ↑  {d['pct24']:6.2f}%  vol $ {int(d['usd_vol']):,}  last  {''}")
+    print(f"ARTIFACT: wrote {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
