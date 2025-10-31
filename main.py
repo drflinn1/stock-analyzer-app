@@ -3,26 +3,25 @@
 Main unified runner for Crypto Live workflows.
 Includes BUY/SELL logic hooks for compliance with Sell Logic Guard.
 
-Adds optional Momentum Pulse filter:
-- If MOMENTUM_PULSE_ENABLE=true and THAW is active, we read
-  .state/momentum_candidates.csv and export environment whitelists for the
-  engine:
-    * MOMENTUM_PULSE_ACTIVE=true
-    * BUY_WHITELIST=<comma bases, e.g., BTC,ETH,SOL>
-    * PAIR_WHITELIST=<comma pairs, e.g., BTC/USD,SOL/USDT>
-    * PULSE_FILTER_BASES / PULSE_FILTER_PAIRS (same values; extra aliases)
-- If the CSV is missing/empty, we fall back (no restriction) and log a warning.
+Enhancement: Momentum Pulse (THAW filter)
+- If MOMENTUM_PULSE_ENABLE=true and THAW is detected, we read
+  .state/momentum_candidates.csv and pass a whitelist to the engine via:
+    BUY_WHITELIST_MODE=THAW_PULSE
+    BUY_WHITELIST_BASES=BTC,ETH,...
+    BUY_WHITELIST_PAIRS=BTC/USD,ETH/USDT,...
+  We also write .state/buy_whitelist.json for engines that prefer files.
 """
 
 import csv
 import json
 import os
-import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Dict, Any, Iterable, List, Set, Tuple
+
+# ----------------- Constants & State -----------------
 
 STATE_DIR = Path(".state")
 STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -30,136 +29,13 @@ SUMMARY_JSON = STATE_DIR / "run_summary.json"
 SUMMARY_MD = STATE_DIR / "run_summary.md"
 LAST_OK = STATE_DIR / "last_ok.txt"
 
-# ================= Momentum Pulse helpers =================
+# Momentum Pulse env knobs (read once here; engines can also read them)
+MOMENTUM_PULSE_ENABLE = str(os.getenv("MOMENTUM_PULSE_ENABLE", "false")).lower() in {
+    "1", "true", "yes", "on"
+}
+MOMENTUM_CANDIDATES_CSV = os.getenv("MOMENTUM_CANDIDATES_CSV", ".state/momentum_candidates.csv")
 
-_PAIR_RE = re.compile(r"^([A-Z0-9]+)[-/]?([A-Z0-9]+)?$")
-
-def _env_bool(name: str, default: str = "false") -> bool:
-    return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "on"}
-
-def _safe_base_from_symbol(s: str) -> str:
-    s = (s or "").upper().strip()
-    if "/" in s:
-        return s.split("/")[0]
-    if "-" in s:
-        return s.split("-")[0]
-    m = _PAIR_RE.match(s)
-    if m:
-        return (m.group(1) or "").upper()
-    return s
-
-def _normalize_pair(s: str) -> str:
-    s = (s or "").upper().strip().replace("-", "/")
-    # If no slash, return as-is (some engines treat base-only names as symbols)
-    return s
-
-def _detect_thaw(state_dir: Path = STATE_DIR) -> bool:
-    # 1) .state/thaw.flag
-    if (state_dir / "thaw.flag").is_file():
-        return True
-    # 2) .state/guard.yaml with mode: THAW or thaw: true
-    guard = state_dir / "guard.yaml"
-    if guard.is_file():
-        try:
-            import yaml  # lightweight, already in your requirements
-            data = yaml.safe_load(guard.read_text()) or {}
-            mode = str(data.get("mode") or data.get("MODE") or "").strip().upper()
-            if mode == "THAW":
-                return True
-            thaw_bool = data.get("thaw") or data.get("THAW")
-            if isinstance(thaw_bool, bool) and thaw_bool:
-                return True
-        except Exception:
-            # Don't block trading if state is malformed
-            return False
-    return False
-
-def _load_momentum_candidates(csv_path: Path) -> Tuple[Set[str], Set[str]]:
-    """
-    Accepts flexible headers: symbol, pair, base, quote, rank (rank optional).
-    Returns (bases, pairs) as uppercase sets. Pairs normalized to slash form.
-    """
-    if not csv_path.is_file():
-        return set(), set()
-
-    bases: Set[str] = set()
-    pairs: Set[str] = set()
-    try:
-        with csv_path.open("r", encoding="utf-8") as f:
-            rdr = csv.DictReader(f)
-            if not rdr.fieldnames:
-                return set(), set()
-            # map lower->original for flexible access
-            cols = {c.lower().strip(): c for c in rdr.fieldnames}
-            for row in rdr:
-                def get(name: str) -> str:
-                    key = cols.get(name)
-                    return (row.get(key) if key else "") or ""
-
-                sym = get("symbol").strip().upper() or get("base").strip().upper()
-                quote = get("quote").strip().upper()
-                pair = get("pair").strip().upper()
-
-                if sym:
-                    bases.add(sym)
-                if pair:
-                    pairs.add(_normalize_pair(pair))
-                elif sym and quote:
-                    pairs.add(f"{sym}/{quote}")
-    except Exception:
-        # Fail-safe: if unreadable, just return empty and we will fall back
-        return set(), set()
-    return bases, pairs
-
-def _apply_momentum_pulse_export(
-    enabled: bool,
-    thaw_active: bool,
-    csv_path: Path,
-    summary: Dict[str, Any],
-) -> None:
-    """
-    If enabled & thaw: export BUY_WHITELIST / PAIR_WHITELIST (and aliases) for the engine.
-    Otherwise no-ops. Also records notes into run summary.
-    """
-    if not enabled:
-        summary["notes"] += "MomentumPulse: disabled. "
-        return
-    if not thaw_active:
-        summary["notes"] += "MomentumPulse: enabled but THAW not active. "
-        return
-
-    bases, pairs = _load_momentum_candidates(csv_path)
-    if not bases and not pairs:
-        summary["notes"] += f"MomentumPulse: THAW active but no candidates found in {csv_path.name}; falling back. "
-        return
-
-    # Export several aliases so engines with different expectations can pick one up.
-    bases_csv = ",".join(sorted(bases))
-    pairs_csv = ",".join(sorted(pairs))
-
-    os.environ["MOMENTUM_PULSE_ACTIVE"] = "true"
-    os.environ["PULSE_FILTER_BASES"] = bases_csv
-    os.environ["PULSE_FILTER_PAIRS"]  = pairs_csv
-    # Common names seen across engines
-    if bases_csv:
-        os.environ["BUY_WHITELIST"] = bases_csv
-    if pairs_csv:
-        os.environ["PAIR_WHITELIST"] = pairs_csv
-
-    # Also drop a small artifact for human inspection
-    (STATE_DIR / "pulse_filter.txt").write_text(
-        "MOMENTUM_PULSE_ACTIVE=true\n"
-        f"BUY_WHITELIST={bases_csv}\n"
-        f"PAIR_WHITELIST={pairs_csv}\n",
-        encoding="utf-8",
-    )
-
-    summary["notes"] += (
-        f"MomentumPulse: THAW active — exported {len(bases)} bases / {len(pairs)} pairs "
-        f"from {csv_path.name}. "
-    )
-
-# ----------------- Generic helpers -----------------
+# ----------------- Helpers -----------------
 
 def env_str(name: str, default: str = "") -> str:
     val = os.getenv(name, default)
@@ -182,7 +58,7 @@ def post_slack(text: str) -> None:
     if not webhook:
         return
     try:
-        import requests
+        import requests  # lazy import
         requests.post(webhook, json={"text": text}, timeout=10)
     except Exception:
         pass
@@ -190,19 +66,25 @@ def post_slack(text: str) -> None:
 def file_exists(path: str) -> bool:
     return Path(path).is_file()
 
-def run_engine(path: str, dry_run: str) -> int:
+def run_engine(path: str, dry_run: str, extra_env: Dict[str, str] | None = None) -> int:
     cmd = [sys.executable, "-u", path]
     env = os.environ.copy()
     env["DRY_RUN"] = dry_run
+    if extra_env:
+        env.update({k: str(v) for k, v in extra_env.items()})
     print(f"[runner] exec: {' '.join(cmd)}")
+    if extra_env:
+        # small, readable dump
+        keys = ["BUY_WHITELIST_MODE", "BUY_WHITELIST_BASES", "BUY_WHITELIST_PAIRS"]
+        dumped = {k: env.get(k, "") for k in keys}
+        print(f"[runner] whitelist env -> {json.dumps(dumped)}")
     try:
         return subprocess.run(cmd, env=env, check=False).returncode
     except Exception as e:
         print(f"[runner] engine error: {e}", file=sys.stderr)
         return 1
 
-# ----------------- Basic SELL LOGIC STUBS -----------------
-# These keywords ensure Sell Logic Guard passes ✅
+# ----------------- SELL LOGIC STUBS (Guard keywords) -----------------
 
 def TAKE_PROFIT(symbol: str, price: float, gain: float) -> bool:
     """Example take-profit trigger."""
@@ -222,6 +104,116 @@ def TRAIL(symbol: str, current: float, high: float, trail_pct: float = 2.0) -> b
         return True
     return False
 
+# ----------------- Momentum Pulse (THAW detection + CSV loader) -----------------
+
+def detect_thaw(state_dir: str = ".state") -> bool:
+    """
+    Detect a THAW window using multiple heuristics:
+      - .state/thaw.flag            -> if file exists => THAW
+      - .state/guard.yaml           -> if {mode: THAW} or {THAW: true}
+    """
+    thaw_flag = Path(state_dir) / "thaw.flag"
+    if thaw_flag.exists():
+        return True
+
+    guard_yaml = Path(state_dir) / "guard.yaml"
+    if guard_yaml.exists():
+        try:
+            import yaml  # pyyaml is in requirements
+            data = yaml.safe_load(guard_yaml.read_text(encoding="utf-8")) or {}
+            mode = str(data.get("mode") or data.get("MODE") or "").strip().upper()
+            if mode == "THAW":
+                return True
+            thaw_bool = data.get("thaw") or data.get("THAW")
+            if isinstance(thaw_bool, bool) and thaw_bool:
+                return True
+        except Exception:
+            # fail-open: don't block trading
+            return False
+    return False
+
+def _normalize_pair(s: str) -> str:
+    s = (s or "").upper().strip().replace("-", "/")
+    return s
+
+def _safe_base(s: str) -> str:
+    s = (s or "").upper().strip()
+    if "/" in s:
+        return s.split("/", 1)[0]
+    if "-" in s:
+        return s.split("-", 1)[0]
+    return s
+
+def load_momentum_candidates(csv_path: str) -> Tuple[Set[str], Set[str]]:
+    """
+    Accepts flexible columns: symbol, base, quote, pair, rank (rank optional)
+    Returns (bases, pairs)
+    """
+    p = Path(csv_path)
+    if not p.exists():
+        return set(), set()
+
+    bases: Set[str] = set()
+    pairs: Set[str] = set()
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            cols = {c.lower().strip(): c for c in (reader.fieldnames or [])}
+            for row in reader:
+                def get(name: str) -> str:
+                    key = cols.get(name)
+                    return (row.get(key) or "").strip().upper() if key else ""
+
+                sym = get("symbol") or get("base")
+                qt = get("quote")
+                pr = get("pair")
+
+                if sym:
+                    bases.add(sym)
+                if pr:
+                    pairs.add(_normalize_pair(pr))
+                elif sym and qt:
+                    pairs.add(f"{sym}/{qt}")
+    except Exception as e:
+        print(f"[pulse] CSV parse error ({csv_path}): {e}", file=sys.stderr)
+        return set(), set()
+
+    return bases, pairs
+
+def prepare_whitelist_env() -> Dict[str, str]:
+    """
+    If pulse is active (env true) and THAW is detected, build whitelist env vars
+    and write a helper JSON file. Otherwise, return {}.
+    """
+    if not MOMENTUM_PULSE_ENABLE:
+        return {}
+
+    if not detect_thaw(str(STATE_DIR)):
+        return {}
+
+    bases, pairs = load_momentum_candidates(MOMENTUM_CANDIDATES_CSV)
+    if not bases and not pairs:
+        print("[pulse] THAW active but no candidates found; falling back to full universe.")
+        return {}
+
+    # Write a helper file engines can read
+    wl = {
+        "mode": "THAW_PULSE",
+        "bases": sorted(bases),
+        "pairs": sorted(pairs),
+        "source_csv": MOMENTUM_CANDIDATES_CSV,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    (STATE_DIR / "buy_whitelist.json").write_text(json.dumps(wl, indent=2))
+
+    return {
+        "BUY_WHITELIST_MODE": "THAW_PULSE",
+        "BUY_WHITELIST_BASES": ",".join(sorted(bases)),
+        "BUY_WHITELIST_PAIRS": ",".join(sorted(pairs)),
+        # optional: engines can choose a default quote to auto-complete base-only
+        "BUY_WHITELIST_DEFAULT_QUOTE": os.getenv("BUY_WHITELIST_DEFAULT_QUOTE", "USD"),
+    }
+
 # ----------------- MAIN -----------------
 
 def main() -> int:
@@ -229,10 +221,6 @@ def main() -> int:
     dry_run = env_str("DRY_RUN", "ON").upper()
     run_switch = env_str("RUN_SWITCH", "ON").upper()
     entrypoint = env_str("ENTRYPOINT", "trader/crypto_engine.py")
-
-    # Momentum Pulse knobs (no YAML changes required)
-    MOMENTUM_PULSE_ENABLE = _env_bool("MOMENTUM_PULSE_ENABLE", "false")
-    MOMENTUM_CANDIDATES_CSV = Path(env_str("MOMENTUM_CANDIDATES_CSV", ".state/momentum_candidates.csv"))
 
     summary: Dict[str, Any] = {
         "when": now,
@@ -259,20 +247,10 @@ def main() -> int:
     TRAIL("BTC/USD", 67200, 69000)
     STOP_LOSS("BTC/USD", 65500, -5.0)
 
-    # ---- Momentum Pulse export (only affects buys during THAW) ----
-    thaw_active = _detect_thaw()
-    _apply_momentum_pulse_export(
-        enabled=MOMENTUM_PULSE_ENABLE,
-        thaw_active=thaw_active,
-        csv_path=MOMENTUM_CANDIDATES_CSV,
-        summary=summary,
-    )
-    if os.environ.get("MOMENTUM_PULSE_ACTIVE") == "true":
-        print("[runner] MomentumPulse: THAW active — whitelists exported "
-              f"(BUY_WHITELIST={os.environ.get('BUY_WHITELIST','')[:120]} "
-              f"| PAIR_WHITELIST={os.environ.get('PAIR_WHITELIST','')[:120]})")
-    else:
-        print("[runner] MomentumPulse: not active (disabled, no THAW, or no candidates).")
+    # Build optional whitelist env if THAW+Pulse
+    whitelist_env = prepare_whitelist_env()
+    if whitelist_env:
+        print("[pulse] THAW active — passing momentum whitelist to engine.")
 
     # Now hand off to engine if present
     candidates = [entrypoint, "trader/main.py", "bot/main.py", "engine.py"]
@@ -280,7 +258,7 @@ def main() -> int:
     rc = 0
     for c in candidates:
         if file_exists(c):
-            rc = run_engine(c, dry_run)
+            rc = run_engine(c, dry_run, extra_env=whitelist_env)
             executed = True
             break
 
@@ -298,7 +276,10 @@ def main() -> int:
         LAST_OK.write_text(now + "\n")
 
     status = "OK" if rc == 0 else "ERR"
-    post_slack(f"Crypto run {status} • engine:{'yes' if executed else 'no'} • DRY_RUN:{dry_run} • RUN_SWITCH:{run_switch}")
+    post_slack(
+        f"Crypto run {status} • engine:{'yes' if executed else 'no'} • "
+        f"DRY_RUN:{dry_run} • RUN_SWITCH:{run_switch} • Pulse:{'on' if whitelist_env else 'off'}"
+    )
     return rc
 
 if __name__ == "__main__":
