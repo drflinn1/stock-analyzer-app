@@ -1,0 +1,191 @@
+name: Momentum Spike — Collector (Dry-Run, 15m)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes UTC
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt pandas numpy pytz ta
+
+      - name: Run Momentum Spike Collector (DRY)
+        env:
+          # ---- Tunables (safe defaults; override via Variables if you like) ----
+          MIN_24H_PCT: ${{ vars.MIN_24H_PCT || '25' }}            # minimum 24h % change
+          MIN_BASE_VOL_USD: ${{ vars.MIN_BASE_VOL_USD || '25000' }}# minimum 24h USD volume
+          MOMENTUM_RSI_MIN: ${{ vars.MOMENTUM_RSI_MIN || '55' }}   # RSI lower bound
+          MOMENTUM_RSI_MAX: ${{ vars.MOMENTUM_RSI_MAX || '80' }}   # RSI upper bound cap (avoid overcooked)
+          EMA_WINDOW: ${{ vars.MOMENTUM_EMA_WINDOW || '20' }}      # EMA window for slope
+          MAX_CANDIDATES: ${{ vars.MAX_CANDIDATES || '10' }}       # top N to output
+          EXCLUDE_TICKERS: ${{ vars.EXCLUDE_TICKERS || '' }}       # comma list e.g. HONEY,KOBAN,ICNT,ZEREBRO
+          SIM_BUY_USD: ${{ vars.SIM_BUY_USD || '10' }}             # simulated entry size (no orders placed)
+          BASE_QUOTE: ${{ vars.BASE_QUOTE || 'USD' }}              # only scan pairs against this quote
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > spike_scan.py << 'PY'
+          import os, sys, time, math, json
+          import pandas as pd
+          import numpy as np
+          import ccxt
+          from datetime import datetime, timezone
+          from ta.momentum import RSIIndicator
+          from ta.trend import EMAIndicator
+
+          MIN_24H_PCT = float(os.getenv("MIN_24H_PCT","25"))
+          MIN_BASE_VOL_USD = float(os.getenv("MIN_BASE_VOL_USD","25000"))
+          MOMENTUM_RSI_MIN = float(os.getenv("MOMENTUM_RSI_MIN","55"))
+          MOMENTUM_RSI_MAX = float(os.getenv("MOMENTUM_RSI_MAX","80"))
+          EMA_WINDOW = int(os.getenv("EMA_WINDOW","20"))
+          MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES","10"))
+          EXCLUDE = [s.strip().upper() for s in os.getenv("EXCLUDE_TICKERS","").split(",") if s.strip()]
+          SIM_BUY_USD = float(os.getenv("SIM_BUY_USD","10"))
+          BASE_QUOTE = os.getenv("BASE_QUOTE","USD").upper()
+
+          ex = ccxt.kraken()
+          ex.load_markets()
+
+          # Helper: list of symbols like "HONEY/USD"
+          symbols = [s for s in ex.symbols if s.endswith("/"+BASE_QUOTE)]
+          # Drop dark/derivatives/specials
+          symbols = [s for s in symbols if ":" not in s and ".d" not in s.lower()]
+
+          # Pull 24h tickers
+          tick = ex.fetch_tickers(symbols)
+          rows = []
+          for sym, t in tick.items():
+            base = sym.split("/")[0].upper()
+            if base in EXCLUDE: 
+              continue
+            # Kraken 'info' may have 24h stats, else use last/percentage
+            last = t.get('last') or t.get('close') or t.get('ask') or t.get('bid')
+            pct = t.get('percentage')
+            quote_vol = t.get('quoteVolume')
+            if last is None or pct is None or quote_vol is None:
+              continue
+            try:
+              pct = float(pct)
+              vol_usd = float(quote_vol)
+            except Exception:
+              continue
+            rows.append({"symbol": sym, "base": base, "price": float(last), "pct_24h": pct, "vol_usd_24h": vol_usd})
+          df = pd.DataFrame(rows)
+          if df.empty:
+            print("No tickers found.")
+            pd.DataFrame().to_csv("momentum_candidates.csv", index=False)
+            json.dump([], open("simulated_buys.json","w"))
+            sys.exit(0)
+
+          # Primary prefilter: large movers with real volume
+          df = df[(df["pct_24h"] >= MIN_24H_PCT) & (df["vol_usd_24h"] >= MIN_BASE_VOL_USD)].copy()
+          if df.empty:
+            print("No symbols pass pct/volume gates.")
+            df.to_csv("momentum_candidates.csv", index=False)
+            json.dump([], open("simulated_buys.json","w"))
+            sys.exit(0)
+
+          # Pull short OHLCV for EMA slope + RSI
+          def get_slope(x):
+            # simple slope of last N EMA points (positive = uptrend)
+            if len(x) < 2: return 0.0
+            return x[-1] - x[0]
+
+          judged = []
+          for _, r in df.iterrows():
+            sym = r["symbol"]
+            try:
+              ohlcv = ex.fetch_ohlcv(sym, timeframe="15m", limit=max(EMA_WINDOW*4, 60))
+            except Exception as e:
+              # fallback to 1h if 15m not available
+              try:
+                ohlcv = ex.fetch_ohlcv(sym, timeframe="1h", limit=max(EMA_WINDOW*4, 60))
+              except Exception as e2:
+                continue
+            closes = pd.Series([c[4] for c in ohlcv])
+            if closes.size < EMA_WINDOW + 5: 
+              continue
+            ema = EMAIndicator(close=closes, window=EMA_WINDOW).ema_indicator().dropna()
+            rsi = RSIIndicator(close=closes, window=14).rsi().dropna()
+            if ema.size < 3 or rsi.size < 1:
+              continue
+            ema_slope = get_slope(ema.tail(5).values)  # slope over last 5 points
+            rsi_last = float(rsi.iloc[-1])
+            momentum_ok = (ema_slope > 0) and (MOMENTUM_RSI_MIN <= rsi_last <= MOMENTUM_RSI_MAX)
+            judged.append({
+              **r.to_dict(),
+              "ema_slope_last5": float(ema_slope),
+              "rsi": rsi_last,
+              "momentum_ok": momentum_ok,
+            })
+
+          jf = pd.DataFrame(judged)
+          if jf.empty:
+            print("No symbols with positive EMA slope & RSI band.")
+            jf.to_csv("momentum_candidates.csv", index=False)
+            json.dump([], open("simulated_buys.json","w"))
+            sys.exit(0)
+
+          jf = jf[jf["momentum_ok"]].copy()
+          if jf.empty:
+            print("No symbols pass momentum filter.")
+            jf.to_csv("momentum_candidates.csv", index=False)
+            json.dump([], open("simulated_buys.json","w"))
+            sys.exit(0)
+
+          # Rank: highest pct then volume then slope
+          jf["rank_score"] = jf["pct_24h"]*1.0 + (jf["vol_usd_24h"]/1e6)*5.0 + jf["ema_slope_last5"]*100.0
+          jf.sort_values(["rank_score","pct_24h","vol_usd_24h"], ascending=[False,False,False], inplace=True)
+          top = jf.head(MAX_CANDIDATES).copy()
+
+          # Simulate tiny buys (no orders) for analysis
+          sims = []
+          for _, r in top.iterrows():
+            price = max(1e-12, float(r["price"]))
+            qty = SIM_BUY_USD / price
+            sims.append({
+              "symbol": r["symbol"],
+              "base": r["base"],
+              "price": price,
+              "sim_buy_usd": SIM_BUY_USD,
+              "sim_qty": qty,
+              "pct_24h": float(r["pct_24h"]),
+              "vol_usd_24h": float(r["vol_usd_24h"]),
+              "rsi": float(r["rsi"]),
+              "ema_slope_last5": float(r["ema_slope_last5"]),
+              "timestamp_utc": datetime.now(timezone.utc).isoformat()
+            })
+
+          top.to_csv("momentum_candidates.csv", index=False)
+          with open("simulated_buys.json","w") as f:
+            json.dump(sims, f, indent=2)
+          print(f"Candidates: {len(top)}  → saved momentum_candidates.csv + simulated_buys.json")
+          PY
+
+          python spike_scan.py
+          echo "Done."
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: momentum-spike-output
+          path: |
+            momentum_candidates.csv
+            simulated_buys.json
+          if-no-files-found: ignore
