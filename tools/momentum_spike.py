@@ -115,8 +115,10 @@ def score_pair(exchange, pair: str, pct24: float, base_vol: float, last: float) 
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    log.info("MomentumSpike — min%%: %.1f | min vol: $%,.0f | EMA:%d@%s",
-             MIN_24H_PCT, MIN_BASE_VOL_USD, EMA_WINDOW, OHLCV_TIMEFRAME)
+  log.info(
+    f"MomentumSpike — min%: {MIN_24H_PCT:.1f} | min vol: ${MIN_BASE_VOL_USD:,.0f} | EMA:{EMA_WINDOW}@{OHLCV_TIMEFRAME}"
+)
+
     exchange = ccxt.kraken({"enableRateLimit": True, "options": {"fetchOHLCVWarning": False}})
     universe = load_universe_kraken(exchange)
     log.info("Universe: %d pairs (quotes: %s)", len(universe), ",".join(QUOTE_WHITELIST))
