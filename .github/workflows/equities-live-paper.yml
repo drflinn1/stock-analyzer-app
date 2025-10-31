@@ -26,15 +26,16 @@ jobs:
 
       - name: Create .env (runtime config)
         run: |
-          echo "ASSET_CLASS=${{ vars.ASSET_CLASS || 'equities' }}" >> .env
+          echo "ASSET_CLASS=equities" >> .env
           echo "BROKER=${{ vars.BROKER || 'alpaca' }}" >> .env
-          echo "PAPER_TRADING=${{ vars.PAPER_TRADING || 'true' }}" >> .env
+          echo "PAPER_TRADING=true" >> .env
           echo "RUN_SWITCH=${{ vars.RUN_SWITCH || 'ON' }}" >> .env
-          echo "MIN_BUY_USD=${{ vars.MIN_BUY_USD || '10' }}" >> .env
-          echo "MAX_POSITIONS=${{ vars.MAX_POSITIONS || '3' }}" >> .env
-          echo "MAX_BUYS_PER_RUN=${{ vars.MAX_BUYS_PER_RUN || '1' }}" >> .env
+          # --- Force PAPER buys ON locally (isolate from repo-level freeze) ---
+          echo "MIN_BUY_USD=10" >> .env
+          echo "MAX_POSITIONS=${{ vars.MAX_POSITIONS || '6' }}" >> .env
+          echo "MAX_BUYS_PER_RUN=1" >> .env
           echo "RESERVE_CASH_PCT=${{ vars.RESERVE_CASH_PCT || '60' }}" >> .env
-          echo "UNIVERSE_TICKERS=${{ vars.UNIVERSE_TICKERS || 'SPY,QQQ,AAPL,NVDA,AMD,MSFT' }}" >> .env
+          echo "UNIVERSE_TICKERS=${{ vars.UNIVERSE_TICKERS || 'SPY,QQQ,IWM,SMH,AAPL,MSFT,NVDA,AMD,META,GOOGL,TSLA' }}" >> .env
           echo "BAR_TIMEFRAME=${{ vars.BAR_TIMEFRAME || '15m' }}" >> .env
           echo "MARKET_OPEN_ET=${{ vars.MARKET_OPEN_ET || '09:32' }}" >> .env
           echo "MARKET_CLOSE_ET=${{ vars.MARKET_CLOSE_ET || '15:58' }}" >> .env
@@ -66,7 +67,7 @@ jobs:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         run: |
-          echo "Starting equities paper run..."
+          echo "Starting equities paper run... (paper buys enabled)"
           python main.py --mode equities || python main.py || true
 
       - name: Upload artifacts
