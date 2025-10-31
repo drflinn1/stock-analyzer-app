@@ -1,141 +1,68 @@
-# momentum_pulse.py
-import os
-import re
-import yaml
+#!/usr/bin/env python3
+# (same code I gave—safe to paste over)
+# --- start ---
+from __future__ import annotations
+import csv, os
+from pathlib import Path
 from typing import Iterable, List, Set, Tuple
 
-# --- Public API --------------------------------------------------------------
+_HEADERS = {"symbol", "base", "ticker", "pair"}
 
-def detect_thaw(state_dir: str = ".state") -> bool:
-    """
-    Detect a THAW window using multiple heuristics so we work with your existing
-    guards without breaking older states.
-    - .state/thaw.flag            -> if file exists => THAW
-    - .state/guard.yaml           -> if {mode: THAW} or {THAW: true}
-    """
-    thaw_flag = os.path.join(state_dir, "thaw.flag")
-    if os.path.exists(thaw_flag):
-        return True
+def _candidate_csv_path() -> Tuple[Path, str]:
+    env_path = os.getenv("MOMENTUM_CSV_PATH", "").strip()
+    if env_path:
+        p = Path(env_path)
+        if p.exists():
+            return p, p.name
+    for p in (Path("momentum_candidates.csv"), Path(".state") / "momentum_candidates.csv"):
+        if p.exists():
+            return p, p.name
+    return Path("momentum_candidates.csv"), "momentum_candidates.csv"
 
-    guard_yaml = os.path.join(state_dir, "guard.yaml")
-    if os.path.exists(guard_yaml):
-        try:
-            with open(guard_yaml, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
-            # Accept a few shapes
-            mode = str(data.get("mode") or data.get("MODE") or "").strip().upper()
-            if mode == "THAW":
-                return True
-            thaw_bool = data.get("thaw") or data.get("THAW")
-            if isinstance(thaw_bool, bool) and thaw_bool:
-                return True
-        except Exception:
-            # Don't block trading if state is malformed
-            return False
-    return False
+def _read_candidates(csv_path: Path) -> Set[str]:
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return set()
+    with csv_path.open("r", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return set()
+    first = [c.strip() for c in rows[0]]
+    header_lc = [c.lower() for c in first]
+    has_header = any(h in _HEADERS for h in header_lc)
+    start_idx = 1 if has_header else 0
+    col_idx = 0
+    if has_header:
+        for i, name in enumerate(header_lc):
+            if name in _HEADERS:
+                col_idx = i; break
+    symbols: Set[str] = set()
+    for r in rows[start_idx:]:
+        if not r: continue
+        sym = r[col_idx].strip().upper()
+        if sym: symbols.add(sym)
+    return symbols
 
-
-def load_momentum_candidates(csv_path: str) -> Tuple[Set[str], Set[str]]:
-    """
-    Load candidate symbols from CSV. We accept flexible column names:
-      - symbol, pair, base, quote, rank (rank optional)
-    Output is two sets:
-      bases:  {"BTC", "ETH", ...}
-      pairs:  {"BTC/USD", "ETH/USD", "SOL/USDT", ...}  (normalized with slash)
-    """
-    if not os.path.exists(csv_path):
-        return set(), set()
-
+def _min_count() -> int:
     try:
-        import csv
-        bases: Set[str] = set()
-        pairs: Set[str] = set()
-        with open(csv_path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            # Normalize fieldnames
-            cols = {c.lower().strip(): c for c in (reader.fieldnames or [])}
-            for row in reader:
-                def get(name: str):
-                    key = cols.get(name)
-                    return (row.get(key) if key else None)
-
-                sym = (get("symbol") or get("base") or "").strip().upper()
-                quote = (get("quote") or "").strip().upper()
-                pair = (get("pair") or "").strip().upper()
-
-                if sym:
-                    bases.add(sym)
-                if pair:
-                    pairs.add(normalize_pair(pair))
-                elif sym and quote:
-                    pairs.add(f"{sym}/{quote}")
-        return bases, pairs
+        return max(1, int(os.getenv("MOMENTUM_MIN_COUNT", "1")))
     except Exception:
-        # On any parse issue, fail safe (no filter)
-        return set(), set()
+        return 1
 
+def maybe_filter_universe(all_symbols: Iterable[str]) -> List[str]:
+    all_list = [s.upper() for s in all_symbols]
+    csv_path, label = _candidate_csv_path()
+    candidates = _read_candidates(csv_path)
+    min_needed = _min_count()
+    if candidates and len(candidates) >= min_needed:
+        filtered = [s for s in all_list if s in candidates]
+        if filtered:
+            print(f"MomentumPulse: THAW active — filtered universe ({len(filtered)}/{len(all_list)}) using {label}")
+            return filtered
+    print("MomentumPulse: THAW inactive — CSV missing/empty; using full universe (no blocks).")
+    return all_list
 
-def filter_universe_for_thaw(
-    universe: Iterable[str],
-    pulse_enabled: bool,
-    csv_path: str,
-    logger=None,
-) -> List[str]:
-    """
-    If pulse is enabled *and* we're currently in THAW, restrict the buy universe
-    to the CSV candidates. Otherwise, return the original universe.
-
-    `universe` may contain base symbols (BTC, ETH) or pairs (BTC/USD, ETH-USDT).
-    We try to match either.
-    """
-    if not pulse_enabled:
-        return list(universe)
-
-    in_thaw = detect_thaw()
-    if not in_thaw:
-        return list(universe)
-
-    bases, pairs = load_momentum_candidates(csv_path)
-    if not bases and not pairs:
-        if logger:
-            logger.warning(
-                "MOMENTUM_PULSE_ENABLE is true, THAW detected, but no candidates found in %s — falling back to full universe.",
-                csv_path,
-            )
-        return list(universe)
-
-    keep: List[str] = []
-    for u in universe:
-        ub = safe_base_from_symbol(u)
-        up = normalize_pair(u)
-        if ub in bases or up in pairs:
-            keep.append(u)
-
-    if logger:
-        logger.info(
-            "MomentumPulse: THAW active — filtered universe from %d → %d using %s",
-            len(list(universe)), len(keep), os.path.basename(csv_path)
-        )
-    return keep if keep else list(universe)
-
-# --- Internals ---------------------------------------------------------------
-
-_pair_re = re.compile(r"^([A-Z0-9]+)[-/]?([A-Z0-9]+)?$")
-
-def safe_base_from_symbol(s: str) -> str:
-    s = (s or "").upper().strip()
-    if "/" in s:
-        return s.split("/")[0]
-    if "-" in s:
-        return s.split("-")[0]
-    m = _pair_re.match(s)
-    if m:
-        return m.group(1)
-    return s
-
-def normalize_pair(s: str) -> str:
-    s = (s or "").upper().strip().replace("-", "/")
-    if "/" not in s:
-        return s
-    base, quote = s.split("/", 1)
-    return f"{base}/{quote}"
+if __name__ == "__main__":
+    demo_all = ["BTC","ETH","SOL","ADA","DOGE"]
+    out = maybe_filter_universe(demo_all)
+    print("Universe:", out)
+# --- end ---
