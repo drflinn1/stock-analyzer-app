@@ -58,7 +58,7 @@ jobs:
           python - << 'PY'
           import os, sys, yaml, re
 
-          def env(k, d): 
+          def env(k, d):
             v = os.getenv(k)
             return v if v not in (None, "") else d
 
@@ -88,7 +88,6 @@ jobs:
           parsed_from_file = False
           if os.path.isfile(gf):
             try:
-              # Read and sanitize: normalize newlines, strip BOM, replace smart quotes/dashes, remove tabs and control chars
               raw = open(gf, "rb").read()
               text = raw.decode("utf-8-sig", errors="ignore")
               text = text.replace("\r\n","\n").replace("\r","\n")
@@ -102,7 +101,6 @@ jobs:
               text = re.sub(r"[\u0000-\u0008\u000b\u000c\u000e-\u001f]", "", text)
 
               y = yaml.safe_load(text) or {}
-              # Deep merge y into config
               def deep(dst, src):
                 for k,v in (src or {}).items():
                   if isinstance(v, dict) and isinstance(dst.get(k), dict):
@@ -168,6 +166,19 @@ jobs:
           echo "ROTATE_WHEN_FULL=${{ steps.guards.outputs.ROTATE_WHEN_FULL }}  ROTATE_WHEN_CASH_SHORT=${{ steps.guards.outputs.ROTATE_WHEN_CASH_SHORT }}"
           echo "--------------------"
 
+      # NEW: ensure THAW flag if scanner CSV exists so MomentumPulse activates
+      - name: Wire Momentum THAW (auto-flag if CSV present)
+        shell: bash
+        run: |
+          mkdir -p "${STATE_DIR}"
+          CSV_PATH=".state/spike_candidates.csv"
+          if [[ -s "$CSV_PATH" ]]; then
+            echo "Found $CSV_PATH (non-empty). Enabling THAW via ${STATE_DIR}/thaw.flag"
+            : > "${STATE_DIR}/thaw.flag"
+          else
+            echo "No $CSV_PATH found or empty. THAW will remain inactive unless momentum_candidates.csv exists."
+          fi
+
       - name: Run bot (DRY-RUN safe)
         env:
           RUN_SWITCH: ${{ steps.guards.outputs.RUN_SWITCH }}
@@ -186,11 +197,15 @@ jobs:
           STATE_DIR: ${{ env.STATE_DIR }}
           POSITIONS_JSON: ${{ env.POSITIONS_JSON }}
           KPI_CSV: ${{ env.KPI_CSV }}
+          # --- Momentum Pulse / THAW ---
+          MOMENTUM_CSV_PATH: .state/spike_candidates.csv
+          MOMENTUM_MIN_COUNT: "1"
+          MOMENTUM_PULSE_ENABLE: "true"
         shell: bash
         run: |
           if [[ -f "main.py" ]]; then
             echo "Starting python main.py (exchange=${EXCHANGE}, DRY_RUN=$DRY_RUN)"
-            python main.py --mode crypto --exchange "${EXCHANGE}" || true
+            python -u main.py --mode crypto --exchange "${EXCHANGE}" || true
           else
             echo "warning: main.py not found at repo root. Skipping run step."
           fi
