@@ -4,13 +4,29 @@ Main unified runner for Crypto Live workflows.
 Includes BUY/SELL logic hooks for compliance with Sell Logic Guard.
 
 Enhancement: Momentum Pulse (THAW filter)
-- If MOMENTUM_PULSE_ENABLE=true and THAW is detected, we read
-  .state/momentum_candidates.csv and pass a whitelist to the engine via:
-    BUY_WHITELIST_MODE=THAW_PULSE
-    BUY_WHITELIST_BASES=BTC,ETH,...
-    BUY_WHITELIST_PAIRS=BTC/USD,ETH/USDT,...
-  We also write .state/buy_whitelist.json for engines that prefer files.
+- If THAW is detected (via .state/thaw.flag or .state/guard.yaml),
+  and a momentum CSV exists, we:
+    1) Log a verification line like:
+       "MomentumPulse: THAW active — filtered universe (N/M) using momentum_candidates.csv"
+       (M is best-effort if we know the universe; otherwise N)
+    2) Pass a whitelist to the engine via env:
+         BUY_WHITELIST_MODE=THAW_PULSE
+         BUY_WHITELIST_BASES=BTC,ETH,...
+         BUY_WHITELIST_PAIRS=BTC/USD,ETH/USDT,...
+    3) Write .state/buy_whitelist.json for engines that prefer files.
+
+Compatible envs
+---------------
+NEW:
+  MOMENTUM_CSV_PATH      : path to momentum CSV (ex: .state/spike_candidates.csv)
+  MOMENTUM_MIN_COUNT     : minimum symbols for THAW activation (default 1)
+
+LEGACY:
+  MOMENTUM_PULSE_ENABLE  : "true"/"on" to enable (default false)
+  MOMENTUM_CANDIDATES_CSV: path to CSV (default .state/momentum_candidates.csv)
 """
+
+from __future__ import annotations
 
 import csv
 import json
@@ -29,11 +45,16 @@ SUMMARY_JSON = STATE_DIR / "run_summary.json"
 SUMMARY_MD = STATE_DIR / "run_summary.md"
 LAST_OK = STATE_DIR / "last_ok.txt"
 
-# Momentum Pulse env knobs (read once here; engines can also read them)
-MOMENTUM_PULSE_ENABLE = str(os.getenv("MOMENTUM_PULSE_ENABLE", "false")).lower() in {
-    "1", "true", "yes", "on"
-}
+# Legacy knobs (still supported)
+MOMENTUM_PULSE_ENABLE = str(os.getenv("MOMENTUM_PULSE_ENABLE", "false")).lower() in {"1", "true", "yes", "on"}
 MOMENTUM_CANDIDATES_CSV = os.getenv("MOMENTUM_CANDIDATES_CSV", ".state/momentum_candidates.csv")
+
+# New knobs (preferred)
+MOMENTUM_CSV_PATH = os.getenv("MOMENTUM_CSV_PATH", "").strip()
+try:
+    MOMENTUM_MIN_COUNT = max(1, int(os.getenv("MOMENTUM_MIN_COUNT", "1")))
+except Exception:
+    MOMENTUM_MIN_COUNT = 1
 
 # ----------------- Helpers -----------------
 
@@ -104,7 +125,7 @@ def TRAIL(symbol: str, current: float, high: float, trail_pct: float = 2.0) -> b
         return True
     return False
 
-# ----------------- Momentum Pulse (THAW detection + CSV loader) -----------------
+# ----------------- THAW detection -----------------
 
 def detect_thaw(state_dir: str = ".state") -> bool:
     """
@@ -132,76 +153,131 @@ def detect_thaw(state_dir: str = ".state") -> bool:
             return False
     return False
 
-def _normalize_pair(s: str) -> str:
-    s = (s or "").upper().strip().replace("-", "/")
-    return s
+# ----------------- Momentum CSV utils -----------------
 
-def _safe_base(s: str) -> str:
-    s = (s or "").upper().strip()
-    if "/" in s:
-        return s.split("/", 1)[0]
-    if "-" in s:
-        return s.split("-", 1)[0]
-    return s
-
-def load_momentum_candidates(csv_path: str) -> Tuple[Set[str], Set[str]]:
+def _candidate_csv_and_label() -> Tuple[Path, str]:
     """
-    Accepts flexible columns: symbol, base, quote, pair, rank (rank optional)
-    Returns (bases, pairs)
+    Preferred priority:
+      1) MOMENTUM_CSV_PATH (if exists)
+      2) MOMENTUM_CANDIDATES_CSV (legacy)
+      3) ./momentum_candidates.csv
+      4) ./.state/momentum_candidates.csv
+    Returns (path, label_for_log)
     """
-    p = Path(csv_path)
-    if not p.exists():
-        return set(), set()
+    # 1) Explicit new env
+    if MOMENTUM_CSV_PATH:
+        p = Path(MOMENTUM_CSV_PATH)
+        if p.exists():
+            return p, p.name
 
-    bases: Set[str] = set()
-    pairs: Set[str] = set()
+    # 2) Legacy env
+    if MOMENTUM_CANDIDATES_CSV:
+        p = Path(MOMENTUM_CANDIDATES_CSV)
+        if p.exists():
+            return p, p.name
+
+    # 3) & 4) Defaults
+    for p in (Path("momentum_candidates.csv"), Path(".state") / "momentum_candidates.csv"):
+        if p.exists():
+            return p, p.name
+
+    # nothing found -> default label to the new env name for clarity
+    return Path(MOMENTUM_CSV_PATH or "momentum_candidates.csv"), \
+           (Path(MOMENTUM_CSV_PATH).name if MOMENTUM_CSV_PATH else "momentum_candidates.csv")
+
+def _read_candidates(csv_path: Path) -> Set[str]:
+    """
+    Accepts flexible CSV:
+      - header: symbol/base/ticker/pair/quote
+      - headerless: single column of symbols
+    Only the first matching column is used.
+    """
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return set()
+
     try:
-        with p.open("r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            cols = {c.lower().strip(): c for c in (reader.fieldnames or [])}
-            for row in reader:
-                def get(name: str) -> str:
-                    key = cols.get(name)
-                    return (row.get(key) or "").strip().upper() if key else ""
+        with csv_path.open("r", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+    except Exception:
+        return set()
 
-                sym = get("symbol") or get("base")
-                qt = get("quote")
-                pr = get("pair")
+    if not rows:
+        return set()
 
-                if sym:
-                    bases.add(sym)
-                if pr:
-                    pairs.add(_normalize_pair(pr))
-                elif sym and qt:
-                    pairs.add(f"{sym}/{qt}")
-    except Exception as e:
-        print(f"[pulse] CSV parse error ({csv_path}): {e}", file=sys.stderr)
-        return set(), set()
+    headers = [c.strip().lower() for c in rows[0]]
+    known = {"symbol", "base", "ticker", "pair"}
+    has_header = any(h in known for h in headers)
+    start = 1 if has_header else 0
+    col_idx = 0
+    if has_header:
+        for i, h in enumerate(headers):
+            if h in known:
+                col_idx = i
+                break
 
-    return bases, pairs
+    out: Set[str] = set()
+    for r in rows[start:]:
+        if not r:
+            continue
+        v = (r[col_idx] or "").strip().upper()
+        if v:
+            # Normalize pairs to BASE/QUOTE; collect just BASE for counting
+            if "/" in v or "-" in v:
+                v = v.replace("-", "/")
+                v = v.split("/", 1)[0]
+            out.add(v)
+    return out
 
-def prepare_whitelist_env() -> Dict[str, str]:
+def _log_thaw_status(all_symbols_count: int | None = None) -> Tuple[Set[str], str]:
     """
-    If pulse is active (env true) and THAW is detected, build whitelist env vars
+    Emit the verification line users expect.
+    Returns (bases_set, label) so caller can also build whitelist.
+    """
+    csv_path, label = _candidate_csv_and_label()
+    bases = _read_candidates(csv_path)
+    if bases and len(bases) >= MOMENTUM_MIN_COUNT:
+        N = len(bases)
+        M = all_symbols_count if isinstance(all_symbols_count, int) and all_symbols_count > 0 else N
+        print(f"MomentumPulse: THAW active — filtered universe ({N}/{M}) using {label}")
+    else:
+        print("MomentumPulse: THAW inactive — CSV missing/empty; using full universe (no blocks).")
+    return bases, label
+
+# ----------------- Whitelist prep -----------------
+
+def prepare_whitelist_env(all_symbols_count: int | None = None) -> Dict[str, str]:
+    """
+    If THAW is detected and the momentum CSV passes min-count, build whitelist env vars
     and write a helper JSON file. Otherwise, return {}.
+    This function also prints the THAW verification log line.
     """
-    if not MOMENTUM_PULSE_ENABLE:
+    # NEW style: always try to emit status line when THAW is detected
+    thaw_on = detect_thaw(str(STATE_DIR))
+
+    # Respect legacy “enable” flag if user is relying on it.
+    # If it's explicitly false AND no MOMENTUM_CSV_PATH exists, treat as disabled.
+    legacy_enabled = MOMENTUM_PULSE_ENABLE or bool(MOMENTUM_CSV_PATH)
+
+    if not thaw_on or not legacy_enabled:
+        # Still provide the "inactive" log for visibility
+        _log_thaw_status(all_symbols_count=None)
         return {}
 
-    if not detect_thaw(str(STATE_DIR)):
+    bases, label = _log_thaw_status(all_symbols_count=all_symbols_count)
+    if not bases or len(bases) < MOMENTUM_MIN_COUNT:
+        # No usable candidates
         return {}
 
-    bases, pairs = load_momentum_candidates(MOMENTUM_CANDIDATES_CSV)
-    if not bases and not pairs:
-        print("[pulse] THAW active but no candidates found; falling back to full universe.")
-        return {}
+    # Build pairs (BASE/QUOTE) using optional default quote for base-only rows
+    default_quote = os.getenv("BUY_WHITELIST_DEFAULT_QUOTE", "USD").upper()
+    pairs = sorted({f"{b}/{default_quote}" for b in bases})
 
-    # Write a helper file engines can read
+    # Write helper JSON
     wl = {
         "mode": "THAW_PULSE",
         "bases": sorted(bases),
-        "pairs": sorted(pairs),
-        "source_csv": MOMENTUM_CANDIDATES_CSV,
+        "pairs": pairs,
+        "source_csv": str(_candidate_csv_and_label()[0]),
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     (STATE_DIR / "buy_whitelist.json").write_text(json.dumps(wl, indent=2))
@@ -209,9 +285,8 @@ def prepare_whitelist_env() -> Dict[str, str]:
     return {
         "BUY_WHITELIST_MODE": "THAW_PULSE",
         "BUY_WHITELIST_BASES": ",".join(sorted(bases)),
-        "BUY_WHITELIST_PAIRS": ",".join(sorted(pairs)),
-        # optional: engines can choose a default quote to auto-complete base-only
-        "BUY_WHITELIST_DEFAULT_QUOTE": os.getenv("BUY_WHITELIST_DEFAULT_QUOTE", "USD"),
+        "BUY_WHITELIST_PAIRS": ",".join(pairs),
+        "BUY_WHITELIST_DEFAULT_QUOTE": default_quote,
     }
 
 # ----------------- MAIN -----------------
@@ -247,8 +322,9 @@ def main() -> int:
     TRAIL("BTC/USD", 67200, 69000)
     STOP_LOSS("BTC/USD", 65500, -5.0)
 
-    # Build optional whitelist env if THAW+Pulse
-    whitelist_env = prepare_whitelist_env()
+    # We don't know the full discovery universe size here (engine discovers it),
+    # so we pass None; the THAW log will print (N/N) as a conservative proxy.
+    whitelist_env = prepare_whitelist_env(all_symbols_count=None)
     if whitelist_env:
         print("[pulse] THAW active — passing momentum whitelist to engine.")
 
