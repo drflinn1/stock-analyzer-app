@@ -21,17 +21,32 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 12
-    permissions:
-      contents: read
-      actions: read
-      id-token: write
     concurrency:
       group: crypto-hourly-rotation
       cancel-in-progress: true
+    permissions:
+      contents: write   # <-- needed to commit .state back
+      actions: read
+      id-token: write
 
     steps:
-      - name: Checkout
+      - name: Checkout repository (main)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -------- PERSIST STATE: pull previous .state from repo (if present) --------
+      - name: Restore previous .state from repo
+        shell: bash
+        run: |
+          ls -la || true
+          if [ -d ".state" ]; then
+            echo "Previous .state exists in repo."
+          else
+            echo "No .state folder yet. Creating…"
+            mkdir -p .state
+          fi
+          ls -la .state || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -42,7 +57,7 @@ jobs:
         env:
           # strategy/env vars
           DRY_RUN:             ${{ inputs.DRY_RUN   || vars.DRY_RUN   || 'ON' }}
-          UNIVERSE:            ${{ inputs.UNIVERSE  || vars.UNIVERSE  || 'BTC,ETH,SOL' }}
+          UNIVERSE:            ${{ inputs.UNIVERSE  || vars.UNIVERSE  || '' }}
           MIN_BUY_USD:         ${{ inputs.MIN_BUY_USD || vars.MIN_BUY_USD || '25' }}
           FEE_BPS:             ${{ vars.FEE_BPS             || '10' }}
           RISK_ON:             ${{ vars.RISK_ON             || '1' }}
@@ -54,14 +69,35 @@ jobs:
           AUTO_MIN_BASE_VOL_USD:     ${{ vars.AUTO_MIN_BASE_VOL_USD  || '25000' }}
           AUTO_EXCLUDE:              ${{ vars.AUTO_EXCLUDE           || 'USDT,USDC,EUR,DAI,FDUSD' }}
 
-          # *** inject Kraken secrets into env ***
+          # Kraken secrets (fallback to legacy names if present)
           KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY    || secrets.CRYPTO_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || secrets.CRYPTO_API_SECRET }}
         run: |
           python -V
           python main.py
-          echo "---- .state/run_summary.md ----" || true
+          echo "---- run_summary.md ----" || true
           cat .state/run_summary.md || true
+
+      # -------- PERSIST STATE: commit updated .state back to repo --------
+      - name: Commit updated .state back to repo
+        if: always()
+        shell: bash
+        env:
+          GIT_AUTHOR_NAME: "rotation-bot"
+          GIT_AUTHOR_EMAIL: "rotation-bot@users.noreply.github.com"
+          GIT_COMMITTER_NAME: "rotation-bot"
+          GIT_COMMITTER_EMAIL: "rotation-bot@users.noreply.github.com"
+        run: |
+          set -e
+          git status --porcelain
+          if ! git diff --quiet -- .state; then
+            echo "Changes in .state detected. Committing…"
+            git add .state
+            git commit -m "state: update .state (auto)"
+            git push
+          else
+            echo "No changes in .state to commit."
+          fi
 
       - name: Upload artifacts (.state)
         if: always()
