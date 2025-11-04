@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-Crypto — Hourly 1-Coin Rotation (LIVE-ready)
-Enforces exactly one open position via .state/position.json and auto-sells by:
-- SL_PCT (default 1% drawdown)
-- TP_PCT (default 5% take profit)
-- ROTATE_MINUTES timer + ROTATE_MIN_GAIN_PCT threshold (default 60 min +3%)
+Crypto — Hourly 1-Coin Rotation (LIVE-ready, fixed)
+- One open position enforced via .state/position.json
+- Exits: SL (1%), TP (5%), Timer (60m & gain < +3%) by default
+- ALWAYS writes .state/run_summary.json/.md
+- Uses a minimal built-in Kraken REST client (stdlib only)
 
-It ALWAYS writes .state/run_summary.json/.md so artifacts/commits exist every run.
-LIVE mode uses a minimal built-in Kraken REST client (standard library only).
+FIX: remove 'oflags: viqc' so we submit BASE volume, not quote-currency amount.
 """
 
 from __future__ import annotations
-import os, json, time, math, datetime as dt
+import os, json, time, datetime as dt
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional
 
 # ------------------------------- Paths ---------------------------------
 STATE = Path(".state"); STATE.mkdir(parents=True, exist_ok=True)
@@ -95,7 +94,6 @@ def read_csv_first_symbol(csv_path: Path) -> Optional[str]:
         if not csv_path.exists(): return None
         rows = csv_path.read_text().strip().splitlines()
         if not rows: return None
-        # Try headered CSV: symbol,quote,rank,...
         hdr = rows[0].lower().replace(" ", "")
         start = 1 if ("symbol" in hdr or "," in hdr) else 0
         for line in rows[start:]:
@@ -107,30 +105,19 @@ def read_csv_first_symbol(csv_path: Path) -> Optional[str]:
     return None
 
 def normalize_pair(sym: str) -> str:
-    """
-    Accepts 'ANON', 'ANON/USD', 'ANONUSD' -> returns 'ANONUSD'
-    """
     s = sym.upper().replace("-", "").replace("/", "")
     if s.endswith("USD"): return s
     return s + "USD"
 
 def select_top_candidate() -> str:
-    """
-    Priority:
-    1) .state/momentum_candidates.csv (first symbol)
-    2) .state/spike_candidates.csv (first symbol)
-    3) ENV UNIVERSE_PICK
-    """
     for name in ("momentum_candidates.csv", "spike_candidates.csv"):
         sym = read_csv_first_symbol(STATE / name)
         if sym: return normalize_pair(sym)
     up = env_str("UNIVERSE_PICK", "").strip()
     if up: return normalize_pair(up)
-    # Failsafe: skip run if no candidate
     raise RuntimeError("No candidate found (candidates CSV and UNIVERSE_PICK empty).")
 
 # -------------------------- Kraken REST client -------------------------
-# Uses stdlib only; enough to market buy/sell and fetch last price.
 import base64, hashlib, hmac, urllib.parse, urllib.request
 
 API_BASE = "https://api.kraken.com"
@@ -148,7 +135,6 @@ def _private_request(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
     data = dict(data)
     data["nonce"] = str(int(time.time() * 1000))
     postdata = urllib.parse.urlencode(data)
-    # Kraken signature: base64( HMAC_SHA512( base64_decode(secret), path + SHA256(nonce+postdata) ) )
     sha = hashlib.sha256((data["nonce"] + postdata).encode()).digest()
     msg = path.encode() + sha
     sig = hmac.new(base64.b64decode(KRAKEN_API_SECRET), msg, hashlib.sha512).digest()
@@ -163,7 +149,6 @@ def _private_request(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
         return json.loads(resp.read().decode())
 
 def kraken_last_price(pair: str) -> float:
-    # GET /0/public/Ticker?pair=PAIR
     url = f"{API_BASE}/0/public/Ticker?pair={pair}"
     data = _http_get(url)
     if data.get("error"):
@@ -171,51 +156,33 @@ def kraken_last_price(pair: str) -> float:
     result = data.get("result", {})
     if not result:
         raise RuntimeError("Ticker empty result")
-    # Take the first object's 'c'[0] (last trade price)
     first = next(iter(result.values()))
     price = float(first["c"][0])
     return price
 
-def kraken_balances() -> Dict[str, float]:
-    out = _private_request("/0/private/Balance", {})
-    if out.get("error"):
-        raise RuntimeError(f"Balance error: {out['error']}")
-    # e.g., {"result": {"ZUSD":"116.0","ANON":"51.0184", ...}}
-    res = out.get("result", {})
-    # convert to floats
-    return {k: float(v) for k, v in res.items()}
-
 def _volume_round(qty: float) -> float:
-    # Conservative rounding to 8 dp, strip tiny dust
     q = float(f"{qty:.8f}")
     return 0.0 if q < 1e-8 else q
 
-def kraken_add_order_market(pair: str, side: str, volume: float) -> Dict[str, Any]:
+def kraken_add_order_market(pair: str, side: str, volume_base: float) -> Dict[str, Any]:
     """
     side: 'buy' or 'sell'
     ordertype: 'market'
-    volume: base units (not USD)
+    volume_base: BASE units (e.g., AERO units) — NO 'viqc' here
     """
     payload = {
         "pair": pair,
         "type": side,
         "ordertype": "market",
-        "volume": f"{_volume_round(volume):.8f}",
-        "oflags": "viqc",   # volume in quote currency calc, let Kraken convert if possible
+        "volume": f"{_volume_round(volume_base):.8f}",
     }
-    out = _private_request("/0/private/AddOrder", payload)
-    return out
+    return _private_request("/0/private/AddOrder", payload)
 
 # -------------------------- Live buy/sell API --------------------------
 def get_last_price(symbol: str) -> float:
-    # symbol like 'ANONUSD'
     return kraken_last_price(symbol)
 
 def live_buy(symbol: str, usd_amount: float) -> Dict[str, Any]:
-    """
-    Market BUY using usd_amount of USD. Converts to base qty using last price.
-    Returns: {'symbol','qty','avg_price','txid'}
-    """
     price = kraken_last_price(symbol)
     if price <= 0:
         raise RuntimeError(f"Bad price for {symbol}: {price}")
@@ -227,9 +194,7 @@ def live_buy(symbol: str, usd_amount: float) -> Dict[str, Any]:
     err = res.get("error", [])
     if err:
         raise RuntimeError(f"KRAKEN BUY error: {err}")
-    desc = res.get("result", {}).get("descr", {})
     txs  = res.get("result", {}).get("txid", [])
-    # We don't have avg fill back; use price used for qty calc as proxy
     return {"symbol": symbol, "qty": qty, "avg_price": price, "txid": txs[0] if txs else None, "raw": res}
 
 def live_sell(symbol: str, qty: float) -> Dict[str, Any]:
@@ -240,14 +205,12 @@ def live_sell(symbol: str, qty: float) -> Dict[str, Any]:
     err = res.get("error", [])
     if err:
         raise RuntimeError(f"KRAKEN SELL error: {err}")
-    txs  = res.get("result", {}).get("txid", [])
-    # We can capture last price as a proxy again
     price = kraken_last_price(symbol)
+    txs  = res.get("result", {}).get("txid", [])
     return {"symbol": symbol, "qty": qty, "avg_price": price, "txid": txs[0] if txs else None, "raw": res}
 
 # ------------------------------ Main logic ------------------------------
 def main() -> None:
-    # Config
     dry_run        = env_str("DRY_RUN","OFF").upper() != "OFF"
     run_switch     = env_str("RUN_SWITCH","ON").upper() == "ON"
     usd_per_buy    = env_float("BUY_USD", 25.0)
@@ -257,7 +220,6 @@ def main() -> None:
     rotate_minutes = env_int("ROTATE_MINUTES", 60)
     rotate_gain    = env_float("ROTATE_MIN_GAIN_PCT", 3.0)
 
-    # Start summary
     write_summary("start", {
         "dry_run": dry_run,
         "run_switch": run_switch,
@@ -271,11 +233,10 @@ def main() -> None:
         write_summary("SKIP", {"reason":"RUN_SWITCH=OFF"})
         return
 
-    # ---------------- If holding, evaluate exits ----------------
+    # If holding, evaluate exits
     if have_open_position():
         pos = load_position()
         if not pos:
-            # Corrupt state; clear to be safe
             clear_position()
             write_summary("WARN", {"reason":"position.json unreadable; cleared"})
             return
@@ -283,7 +244,7 @@ def main() -> None:
         sym = pos["symbol"]; qty = float(pos["qty"])
         entry = float(pos["entry_price"]); opened = float(pos["opened_at"])
         price = get_last_price(sym)
-        change = pct_change(entry, price)
+        change = ((price - entry) / entry * 100.0) if entry > 0 else 0.0
         minutes = (time.time() - opened) / 60.0
 
         decision, reason = "hold", ""
@@ -309,17 +270,15 @@ def main() -> None:
                     clear_position()
                 except Exception as e:
                     write_summary("LIVE SELL ERROR", {"symbol": sym, "qty": qty, "exception": repr(e)})
-                    # keep position.json so next run tries again
         else:
             write_summary("HOLD", {"symbol": sym, "qty": qty, "price": price, "change_pct": change, "minutes_open": minutes})
         return
 
-    # ---------------- Not holding: enforce cap, then BUY ---------------
+    # Not holding: enforce cap, then BUY
     if max_positions <= 0:
         write_summary("SKIP", {"reason":"MAX_POSITIONS<=0"})
         return
     if max_positions == 1 and POS_FILE.exists():
-        # extra belt-and-suspenders
         write_summary("SKIP", {"reason":"position.json present; MAX_POSITIONS=1"})
         return
 
