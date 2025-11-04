@@ -38,8 +38,9 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run Hourly Rotation (DRY-RUN safe)
+      - name: Run Hourly Rotation (DRY-RUN safe / LIVE if DRY_RUN=OFF)
         env:
+          # strategy/env vars
           DRY_RUN:             ${{ inputs.DRY_RUN   || vars.DRY_RUN   || 'ON' }}
           UNIVERSE:            ${{ inputs.UNIVERSE  || vars.UNIVERSE  || 'BTC,ETH,SOL' }}
           MIN_BUY_USD:         ${{ inputs.MIN_BUY_USD || vars.MIN_BUY_USD || '25' }}
@@ -48,10 +49,18 @@ jobs:
           RISK_THRESH_BTC_60M: ${{ vars.RISK_THRESH_BTC_60M || '-0.005' }}
           QUOTE:               ${{ vars.QUOTE               || 'USD' }}
           STATE_DIR: .state
+          AUTO_UNIVERSE:             ${{ vars.AUTO_UNIVERSE          || '1' }}
+          AUTO_UNIVERSE_TOP_K:       ${{ vars.AUTO_UNIVERSE_TOP_K    || '30' }}
+          AUTO_MIN_BASE_VOL_USD:     ${{ vars.AUTO_MIN_BASE_VOL_USD  || '25000' }}
+          AUTO_EXCLUDE:              ${{ vars.AUTO_EXCLUDE           || 'USDT,USDC,EUR,DAI,FDUSD' }}
+
+          # *** inject Kraken secrets into env ***
+          KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY    || secrets.CRYPTO_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || secrets.CRYPTO_API_SECRET }}
         run: |
           python -V
           python main.py
-          echo "---- .state/run_summary.md ----"
+          echo "---- .state/run_summary.md ----" || true
           cat .state/run_summary.md || true
 
       - name: Upload artifacts (.state)
