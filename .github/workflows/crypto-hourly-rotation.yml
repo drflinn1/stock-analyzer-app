@@ -1,4 +1,4 @@
-name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, defensive)
+name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
@@ -35,17 +35,21 @@ jobs:
             pip install -r requirements.txt || true
           fi
 
-      # --- PRE-FLIGHT: ensure .state exists and write a heartbeat summary ---
+      # --- PRE-FLIGHT: guarantee .state + heartbeat so artifacts/commit always have something ---
       - name: Preflight heartbeat (.state)
+        shell: bash
         run: |
+          set -e
           mkdir -p .state
-          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          cat > .state/run_summary.json <<'JSON'
-          {"status":"preflight","note":"main.py not yet executed","details":{}}
-          JSON
-          printf "**Preflight:** created by workflow before main.py runs at %s\n" "$NOW" > .state/run_summary.md
+          date -u +"%Y-%m-%dT%H:%M:%SZ" | tee .state/keep.txt >/dev/null
+          echo '{"status":"preflight","note":"before main.py"}' > .state/run_summary.json
+          echo "**Preflight:** created before main.py" > .state/run_summary.md
+          echo "HEARTBEAT-WRITE OK"
+          echo "TREE (preflight):"
+          ls -la .state || true
 
       - name: Run strategy (DRY-RUN is OFF when repo Variable DRY_RUN=OFF)
+        shell: bash
         env:
           # --- Secrets ---
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
@@ -66,21 +70,30 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           echo "[Env] DRY_RUN=${DRY_RUN} RUN_SWITCH=${RUN_SWITCH} MAX_POSITIONS=${MAX_POSITIONS}"
-          echo "[Env] BUY_USD=${BUY_USD} TP=${TP_PCT}% SL=${SL_PCT}% ROTATE=${ROTATE_MINUTES}m MIN_GAIN=${ROTATE_MIN_GAIN_PCT}%"
-          ls -la .
-          python --version
-          # Run the strategy (must be present at repo root)
-          python -u main.py || echo "[WARN] main.py exited non-zero; post-steps will still push heartbeat/error."
+          python -u main.py || echo "[WARN] main.py exited non-zero"
 
-      # --- ALWAYS push .state (heartbeat, errors, or real summaries/position) ---
-      - name: Commit & push .state to repo
+      # --- POST-FLIGHT: append a line so we KNOW files exist even if script didn't write any ---
+      - name: Postflight touch (.state)
+        shell: bash
         if: always()
         run: |
           mkdir -p .state
-          # If main.py didn't update the heartbeat, leave it; if it did, we'll commit the real files.
+          echo "**Postflight:** job finished $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> .state/run_summary.md
+          if [ ! -f .state/run_summary.json ]; then
+            echo '{"status":"postflight-only"}' > .state/run_summary.json
+          fi
+          echo "TREE (postflight):"
+          ls -la .state || true
+
+      - name: Commit & push .state to repo (verbose)
+        if: always()
+        shell: bash
+        run: |
+          echo "TREE (pre-commit):"
+          ls -la .state || true
           git config user.name  "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
-          git add .state/*.json .state/*.md .state/*.csv 2>/dev/null || true
+          git add .state/*.json .state/*.md .state/*.csv .state/keep.txt 2>/dev/null || true
           if ! git diff --cached --quiet; then
             git commit -m "state: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             git push
@@ -89,7 +102,7 @@ jobs:
             echo "No .state updates to commit."
           fi
 
-      - name: Upload .state as artifact (convenience)
+      - name: Upload .state as artifact (always has keep.txt)
         if: always()
         uses: actions/upload-artifact@v4
         with:
