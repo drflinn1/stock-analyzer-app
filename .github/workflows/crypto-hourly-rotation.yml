@@ -2,7 +2,7 @@ name: Crypto — Hourly 1-Coin Rotation
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15m
+    - cron: "*/15 * * * *"   # every 15 minutes
   workflow_dispatch:
     inputs:
       DRY_RUN:
@@ -13,18 +13,37 @@ on:
         description: "Comma symbols (BTC,ETH,SOL,...)"
         required: false
       MIN_BUY_USD:
-        description: "Ticket size in USD"
+        description: "Ticket size (USD)"
         required: false
         default: "25"
 
 jobs:
+  verify-rotation-logic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure hourly-rotation exits present in main.py
+        run: |
+          set -e
+          python - <<'PY'
+import sys, re, pathlib
+code = pathlib.Path("main.py").read_text(encoding="utf-8", errors="ignore")
+patterns = [
+  r"STOP_-1%",        # hard stop
+  r"TP_\+5%",         # take profit
+  r"FAIL_<\+3%@60m",  # 60m underperformance exit
+]
+missing = [p for p in patterns if re.search(p, code) is None]
+if missing:
+    print("Missing rotation patterns:", missing)
+    sys.exit(1)
+print("Rotation sell logic patterns detected OK.")
+PY
+
   run:
     runs-on: ubuntu-latest
+    needs: verify-rotation-logic
     timeout-minutes: 12
-    permissions:
-      contents: read
-      actions: read
-      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -47,7 +66,7 @@ jobs:
         run: |
           python -V
           python main.py
-          echo "---- run_summary.md ----"
+          echo "---- .state/run_summary.md ----"
           cat .state/run_summary.md || true
 
       - name: Upload artifacts (.state)
