@@ -1,4 +1,4 @@
-name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
+name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive v2 FINAL)
 
 on:
   schedule:
@@ -54,7 +54,6 @@ jobs:
           # --- Secrets ---
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-
           # --- Variables ---
           DRY_RUN: ${{ vars.DRY_RUN || 'OFF' }}                  # OFF = LIVE
           RUN_SWITCH: ${{ vars.RUN_SWITCH || 'ON' }}
@@ -69,7 +68,7 @@ jobs:
           UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK || '' }}
           PYTHONUNBUFFERED: "1"
         run: |
-          echo "[Env] DRY_RUN=${DRY_RUN} RUN_SWITCH=${RUN_SWITCH} MAX_POSITIONS=${MAX_POSITIONS}"
+          echo "[Env] DRY_RUN=${DRY_RUN} RUN_SWITCH=${RUN_SWITCH} MAX_POSITIONS=${MAX_POSITIONS} BUY_USD=${BUY_USD}"
           python -u main.py || echo "[WARN] main.py exited non-zero"
 
       # --- POST-FLIGHT: append a line so we KNOW files exist even if script didn't write any ---
@@ -84,6 +83,10 @@ jobs:
           fi
           echo "TREE (postflight):"
           ls -la .state || true
+          echo "---- run_summary.md ----"
+          sed -n '1,200p' .state/run_summary.md || true
+          echo "---- run_summary.json ----"
+          sed -n '1,200p' .state/run_summary.json || true
 
       - name: Commit & push .state to repo (verbose)
         if: always()
@@ -93,7 +96,7 @@ jobs:
           ls -la .state || true
           git config user.name  "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
-          git add .state/*.json .state/*.md .state/*.csv .state/keep.txt 2>/dev/null || true
+          git add -A .state || true         # <— stage everything under .state
           if ! git diff --cached --quiet; then
             git commit -m "state: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             git push
@@ -102,10 +105,11 @@ jobs:
             echo "No .state updates to commit."
           fi
 
-      - name: Upload .state as artifact (always has keep.txt)
+      - name: Upload .state as artifact (explicit glob)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state
-          path: .state
+          path: ./.state/**         # <— reliable glob
           if-no-files-found: warn
+          retention-days: 7
