@@ -40,13 +40,13 @@ jobs:
 
       - name: Run Hourly Rotation (DRY-RUN safe)
         env:
-          DRY_RUN: ${{ inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}
-          UNIVERSE: ${{ inputs.UNIVERSE || vars.UNIVERSE || 'BTC,ETH,SOL' }}
-          MIN_BUY_USD: ${{ inputs.MIN_BUY_USD || vars.MIN_BUY_USD || '25' }}
-          FEE_BPS: ${{ vars.FEE_BPS || '10' }}
-          RISK_ON: ${{ vars.RISK_ON || '1' }}
+          DRY_RUN:             ${{ inputs.DRY_RUN   || vars.DRY_RUN   || 'ON' }}
+          UNIVERSE:            ${{ inputs.UNIVERSE  || vars.UNIVERSE  || 'BTC,ETH,SOL' }}
+          MIN_BUY_USD:         ${{ inputs.MIN_BUY_USD || vars.MIN_BUY_USD || '25' }}
+          FEE_BPS:             ${{ vars.FEE_BPS             || '10' }}
+          RISK_ON:             ${{ vars.RISK_ON             || '1' }}
           RISK_THRESH_BTC_60M: ${{ vars.RISK_THRESH_BTC_60M || '-0.005' }}
-          QUOTE: ${{ vars.QUOTE || 'USD' }}
+          QUOTE:               ${{ vars.QUOTE               || 'USD' }}
           STATE_DIR: .state
         run: |
           python -V
