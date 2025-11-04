@@ -1,108 +1,106 @@
-name: Crypto — Hourly 1-Coin Rotation
+name: Crypto — Hourly 1-Coin Rotation (LIVE-ready)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes
+    - cron: "0 * * * *"   # hourly (UTC)
   workflow_dispatch:
-    inputs:
-      DRY_RUN:
-        description: "ON = simulate, OFF = live"
-        required: false
-        default: "ON"
-      UNIVERSE:
-        description: "Comma symbols (BTC,ETH,SOL,...)"
-        required: false
-      MIN_BUY_USD:
-        description: "Ticket size (USD)"
-        required: false
-        default: "25"
+
+# Needed so the job can push .state files back to the repo
+permissions:
+  contents: write
+
+concurrency:
+  group: crypto-hourly-rotation
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 12
-    concurrency:
-      group: crypto-hourly-rotation
-      cancel-in-progress: true
-    permissions:
-      contents: write   # <-- needed to commit .state back
-      actions: read
-      id-token: write
 
     steps:
-      - name: Checkout repository (main)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-
-      # -------- PERSIST STATE: pull previous .state from repo (if present) --------
-      - name: Restore previous .state from repo
-        shell: bash
-        run: |
-          ls -la || true
-          if [ -d ".state" ]; then
-            echo "Previous .state exists in repo."
-          else
-            echo "No .state folder yet. Creating…"
-            mkdir -p .state
-          fi
-          ls -la .state || true
+          fetch-depth: 0   # allow commits/pushes
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Run Hourly Rotation (DRY-RUN safe / LIVE if DRY_RUN=OFF)
-        env:
-          # strategy/env vars
-          DRY_RUN:             ${{ inputs.DRY_RUN   || vars.DRY_RUN   || 'ON' }}
-          UNIVERSE:            ${{ inputs.UNIVERSE  || vars.UNIVERSE  || '' }}
-          MIN_BUY_USD:         ${{ inputs.MIN_BUY_USD || vars.MIN_BUY_USD || '25' }}
-          FEE_BPS:             ${{ vars.FEE_BPS             || '10' }}
-          RISK_ON:             ${{ vars.RISK_ON             || '1' }}
-          RISK_THRESH_BTC_60M: ${{ vars.RISK_THRESH_BTC_60M || '-0.005' }}
-          QUOTE:               ${{ vars.QUOTE               || 'USD' }}
-          STATE_DIR: .state
-          AUTO_UNIVERSE:             ${{ vars.AUTO_UNIVERSE          || '1' }}
-          AUTO_UNIVERSE_TOP_K:       ${{ vars.AUTO_UNIVERSE_TOP_K    || '30' }}
-          AUTO_MIN_BASE_VOL_USD:     ${{ vars.AUTO_MIN_BASE_VOL_USD  || '25000' }}
-          AUTO_EXCLUDE:              ${{ vars.AUTO_EXCLUDE           || 'USDT,USDC,EUR,DAI,FDUSD' }}
-
-          # Kraken secrets (fallback to legacy names if present)
-          KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY    || secrets.CRYPTO_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || secrets.CRYPTO_API_SECRET }}
+      - name: Install dependencies
         run: |
-          python -V
-          python main.py
-          echo "---- run_summary.md ----" || true
-          cat .state/run_summary.md || true
-
-      # -------- PERSIST STATE: commit updated .state back to repo --------
-      - name: Commit updated .state back to repo
-        if: always()
-        shell: bash
-        env:
-          GIT_AUTHOR_NAME: "rotation-bot"
-          GIT_AUTHOR_EMAIL: "rotation-bot@users.noreply.github.com"
-          GIT_COMMITTER_NAME: "rotation-bot"
-          GIT_COMMITTER_EMAIL: "rotation-bot@users.noreply.github.com"
-        run: |
-          set -e
-          git status --porcelain
-          if ! git diff --quiet -- .state; then
-            echo "Changes in .state detected. Committing…"
-            git add .state
-            git commit -m "state: update .state (auto)"
-            git push
-          else
-            echo "No changes in .state to commit."
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt || true
           fi
 
-      - name: Upload artifacts (.state)
+      - name: Run strategy (DRY-RUN is OFF when repo Variable DRY_RUN=OFF)
+        env:
+          # --- Secrets (must exist under: Settings → Secrets and variables → Actions → Secrets) ---
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
+          # --- Repo Variables (Settings → Secrets and variables → Actions → Variables) ---
+          # Core toggles
+          DRY_RUN: ${{ vars.DRY_RUN || 'OFF' }}            # OFF = LIVE
+          RUN_SWITCH: ${{ vars.RUN_SWITCH || 'ON' }}
+
+          # Position & sizing
+          MAX_POSITIONS: ${{ vars.MAX_POSITIONS || '1' }}
+          MAX_BUYS_PER_RUN: ${{ vars.MAX_BUYS_PER_RUN || '1' }}
+          BUY_USD: ${{ vars.BUY_USD || '25' }}
+
+          # Exits / rotation
+          TP_PCT: ${{ vars.TP_PCT || '5' }}
+          SL_PCT: ${{ vars.SL_PCT || '1' }}
+          ROTATE_MINUTES: ${{ vars.ROTATE_MINUTES || '60' }}
+          ROTATE_MIN_GAIN_PCT: ${{ vars.ROTATE_MIN_GAIN_PCT || '3' }}
+
+          # Discovery / ranking (optional; keep your existing values)
+          UNIVERSE_TOP_K: ${{ vars.UNIVERSE_TOP_K || '25' }}
+          # Temporary manual pick fallback (optional)
+          UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK || '' }}
+
+        run: |
+          echo "[Mode] DRY_RUN=${DRY_RUN}"
+          python -u main.py
+
+      # Always create/push .state artifacts (run summaries every run; position.json only when holding)
+      - name: Commit & push .state to repo
+        if: always()
+        run: |
+          if [ -d ".state" ]; then
+            # ensure we at least ship summaries each run
+            if [ ! -f ".state/run_summary.json" ]; then
+              echo '{}' > .state/run_summary.json
+            fi
+            if [ ! -f ".state/run_summary.md" ]; then
+              echo "**No summary generated by script.**" > .state/run_summary.md
+            fi
+
+            git config user.name  "github-actions"
+            git config user.email "github-actions@users.noreply.github.com"
+
+            # Stage only .state changes (json/md/csv)
+            git add .state/*.json .state/*.md .state/*.csv 2>/dev/null || true
+
+            if ! git diff --cached --quiet; then
+              git commit -m "state: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+              git push
+              echo "Pushed .state artifacts."
+            else
+              echo "No .state updates to commit."
+            fi
+          else
+            echo "No .state directory; nothing to commit."
+          fi
+
+      - name: Upload .state as artifact (convenience)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hourly-rotation-state
-          path: .state/
+          name: state
+          path: .state
           if-no-files-found: warn
