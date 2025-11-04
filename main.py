@@ -5,7 +5,6 @@ Main unified runner — Hourly 1-Coin Rotation (Auto-Universe, LIVE-ready)
 - Auto discovers Kraken USD spot pairs (filters by 24h USD volume)
 - Ranks by 60-minute return; trades top 1
 - Exits: STOP_-1%  |  TP_+5%  |  FAIL_<+3%@60m (after 60m)
-- After any SELL: immediate re-rank & rotate (risk-aware)
 - DRY_RUN safe by default; when DRY_RUN=OFF it will place real Kraken market orders
 
 Secrets required for live:
@@ -18,7 +17,7 @@ import urllib.parse, urllib.request
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 # ---------- Env helpers ----------
 def env_str(name: str, default: str) -> str:
@@ -58,6 +57,9 @@ STOP_PCT, TP_PCT, MIN_1H_PCT = -0.01, 0.05, 0.03
 
 RISK_ON = env_int("RISK_ON", 1) == 1
 RISK_THRESH_BTC_60M = env_float("RISK_THRESH_BTC_60M", -0.005)
+
+# Tiny price floor to avoid crazy quantities
+MIN_ACCEPTABLE_PRICE_USD = env_float("MIN_ACCEPTABLE_PRICE_USD", 0.001)
 
 # ---------- Types ----------
 @dataclass
@@ -163,6 +165,9 @@ def build_universe() -> List[str]:
 def rank_top(cands: List[str]) -> Optional[str]:
     best=None; br=-9e9
     for s in cands:
+        px = last_price(s)
+        if px is None or px < MIN_ACCEPTABLE_PRICE_USD:  # skip ultra-micro prices
+            continue
         r=ret_60m(s)
         if r is None: continue
         if r>br: br=r; best=s
@@ -188,13 +193,11 @@ def _kr_sign(uri_path: str, data: Dict[str,str]) -> str:
     message = (str(data["nonce"]) + urllib.parse.urlencode(data)).encode()
     sha256 = hashlib.sha256(message).digest()
     mac = hmac.new(base64.b64decode(API_SECRET), uri_path.encode() + sha256, hashlib.sha512)
-    sigdigest = base64.b64encode(mac.digest()).decode()
-    return sigdigest, postdata
+    return base64.b64encode(mac.digest()).decode(), postdata
 
 def kr_private(endpoint: str, data: Dict[str,str]) -> dict:
     url = f"https://api.kraken.com/0/private/{endpoint}"
-    uri_path = f"/0/private/{endpoint}"
-    sig, post = _kr_sign(uri_path, data)
+    sig, post = _kr_sign(f"/0/private/{endpoint}", data)
     headers = {
         "API-Key": API_KEY,
         "API-Sign": sig,
@@ -204,27 +207,30 @@ def kr_private(endpoint: str, data: Dict[str,str]) -> dict:
     return http_json(url, data=post, headers=headers)
 
 def add_order_market(symbol: str, side: str, usd_amount: float, price_hint: Optional[float]) -> dict:
-    # Kraken wants volume in BASE units; convert using price_hint
+    """
+    Send a MARKET order with volume in **BASE units** (Kraken default).
+    """
     if price_hint is None or price_hint <= 0:
         price_hint = last_price(symbol) or 0
     if price_hint <= 0:
         return {"error":["EAPI:price_unavailable"]}
 
+    # base size from USD ticket; round to 6 dp (typical)
     base_qty = max(0.0, usd_amount / price_hint)
-    # round base amount to 6 dp (many pairs allow 6+)
     base_qty = float(f"{base_qty:.6f}")
+    if base_qty <= 0:
+        return {"error":["EAPI:invalid_volume"]}
+
     pair = kr_pair(symbol, QUOTE)
     data = {
         "nonce": str(int(time.time() * 1000)),
         "ordertype": "market",
-        "type": side,           # buy or sell
+        "type": side,           # "buy" or "sell"
         "pair": pair,
-        "volume": str(base_qty),
-        "oflags": "viqc",       # volume in quote currency calc (helps with fees); Kraken accepts on market orders
+        "volume": str(base_qty) # BASE units (no viqc)
     }
     try:
-        resp = kr_private("AddOrder", data)
-        return resp
+        return kr_private("AddOrder", data)
     except Exception as e:
         return {"error":[f"EXC:{e}"]}
 
@@ -271,7 +277,7 @@ def log_line(ts, event, sym, price, note, pos):
         if new: w.writerow(["ts","event","symbol","price","pos_symbol","entry_px","unrealized_pct","note"])
         chg=""
         if pos and price: chg=f"{pct(pos.entry_px, price):.4%}"
-        w.writerow([ts.isoformat(), event, sym, f"{price:.6f}", pos.symbol if pos else "", f"{pos.entry_px if pos else 0:.6f}", chg, note])
+        w.writerow([ts.isoformat(), event, sym, f"{price:.6f}" if price else "", pos.symbol if pos else "", f"{pos.entry_px if pos else 0:.6f}", chg, note])
 
 def write_summary(d: Dict):
     SUMMARY_JSON.write_text(json.dumps(d, indent=2))
