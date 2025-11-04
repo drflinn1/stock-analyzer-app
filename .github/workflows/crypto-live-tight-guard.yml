@@ -1,79 +1,116 @@
-name: Crypto Live — Week-1 Tight-Guard (SELL-Only, 15m)
+name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive v2)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes UTC
+    - cron: "0 * * * *"   # hourly UTC
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: crypto-hourly-rotation
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 14
+    timeout-minutes: 12
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
-          # Fallback minimal pins (in case requirements.txt is light)
-          pip install pyyaml matplotlib
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt || true
+          fi
 
-      - name: Run bot (SELL-only window)
+      # --- PRE-FLIGHT: guarantee .state + heartbeat so artifacts/commit always have something ---
+      - name: Preflight heartbeat (.state)
+        shell: bash
+        run: |
+          set -e
+          mkdir -p .state
+          date -u +"%Y-%m-%dT%H:%M:%SZ" | tee .state/keep.txt >/dev/null
+          echo '{"status":"preflight","note":"before main.py"}' > .state/run_summary.json
+          echo "**Preflight:** created before main.py" > .state/run_summary.md
+          echo "HEARTBEAT-WRITE OK"
+          echo "TREE (preflight):"
+          ls -la .state || true
+
+      - name: Run strategy (DRY-RUN is OFF when repo Variable DRY_RUN=OFF)
+        shell: bash
         env:
-          # --- Exchange keys (from repo Secrets) ---
+          # --- Secrets ---
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-          # --- Global safety switch ---
-          DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}   # set to OFF for live sells
-
-          # --- Tight-Guard freeze (no new buys) ---
-          MAX_BUYS_PER_RUN: "0"
-          MAX_POSITIONS: ${{ vars.MAX_POSITIONS || '3' }}
-          MIN_BUY_USD: ${{ vars.MIN_BUY_USD || '10' }}
-
-          # --- Sell-guard knobs (keep your current values if already set) ---
-          MIN_SELL_USD: ${{ vars.MIN_SELL_USD || '10' }}
-          DUST_MIN_USD: ${{ vars.DUST_MIN_USD || '2' }}
-          DUST_SKIP_STABLES: ${{ vars.DUST_SKIP_STABLES || 'true' }}
-
-          # --- Discovery / universe (read-only during freeze) ---
+          # --- Variables ---
+          DRY_RUN: ${{ vars.DRY_RUN || 'OFF' }}                  # OFF = LIVE
+          RUN_SWITCH: ${{ vars.RUN_SWITCH || 'ON' }}
+          MAX_POSITIONS: ${{ vars.MAX_POSITIONS || '1' }}
+          MAX_BUYS_PER_RUN: ${{ vars.MAX_BUYS_PER_RUN || '1' }}
+          BUY_USD: ${{ vars.BUY_USD || '25' }}
+          TP_PCT: ${{ vars.TP_PCT || '5' }}
+          SL_PCT: ${{ vars.SL_PCT || '1' }}
+          ROTATE_MINUTES: ${{ vars.ROTATE_MINUTES || '60' }}
+          ROTATE_MIN_GAIN_PCT: ${{ vars.ROTATE_MIN_GAIN_PCT || '3' }}
           UNIVERSE_TOP_K: ${{ vars.UNIVERSE_TOP_K || '25' }}
-
-          # --- Rotation safeguards (shouldn’t fire while buys are frozen) ---
-          ROTATE_WHEN_FULL: ${{ vars.ROTATE_WHEN_FULL || 'true' }}
-          ROTATE_WHEN_CASH_SHORT: ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
-
-          # --- Explicit SELL-only flag (ignored by older code, harmless) ---
-          SELL_ONLY_WINDOW: "true"
-          SELL_ONLY_LABEL: "Week-1 Tight-Guard (48–72h)"
-
-          # --- Logging / artifacts ---
-          KPI_ENABLE: ${{ vars.KPI_ENABLE || 'true' }}
-          ARTIFACTS_ENABLE: ${{ vars.ARTIFACTS_ENABLE || 'true' }}
-
+          UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK || '' }}
+          PYTHONUNBUFFERED: "1"
         run: |
-          python -V
-          # Your entrypoint; adjust if your repo uses another path:
-          python main.py
+          echo "[Env] DRY_RUN=${DRY_RUN} RUN_SWITCH=${RUN_SWITCH} MAX_POSITIONS=${MAX_POSITIONS}"
+          python -u main.py || echo "[WARN] main.py exited non-zero"
 
-      - name: Upload artifacts
+      # --- POST-FLIGHT: append a line so we KNOW files exist even if script didn't write any ---
+      - name: Postflight touch (.state)
+        shell: bash
+        if: always()
+        run: |
+          mkdir -p .state
+          echo "**Postflight:** job finished $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> .state/run_summary.md
+          if [ ! -f .state/run_summary.json ]; then
+            echo '{"status":"postflight-only"}' > .state/run_summary.json
+          fi
+          echo "TREE (postflight):"
+          ls -la .state || true
+          echo "---- run_summary.md ----"
+          sed -n '1,200p' .state/run_summary.md || true
+          echo "---- run_summary.json ----"
+          sed -n '1,200p' .state/run_summary.json || true
+
+      - name: Commit & push .state to repo (verbose)
+        if: always()
+        shell: bash
+        run: |
+          echo "TREE (pre-commit):"
+          ls -la .state || true
+          git config user.name  "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add .state/*.json .state/*.md .state/*.csv .state/keep.txt 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "state: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            git push
+            echo "Pushed .state artifacts."
+          else
+            echo "No .state updates to commit."
+          fi
+
+      - name: Upload .state as artifact (always has keep.txt)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tight-guard-run
-          path: |
-            .state/**
-            kpi_history.csv
-            sell_guard_summary.json
-            positions.json
-            logs/**
-          if-no-files-found: ignore
+          name: state
+          path: ./.state/**    # <- explicit glob from workspace root
+          if-no-files-found: warn
+          retention-days: 7
