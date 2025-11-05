@@ -2,7 +2,7 @@ name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # run hourly (UTC)
+    - cron: "0 * * * *"   # every hour UTC
   workflow_dispatch:
 
 jobs:
@@ -24,17 +24,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
 
-      # --- Run your bot (uses repo Variables/Secrets as your code already does) ---
+      # --- Run your bot ---
       - name: Run crypto bot
         env:
           PYTHONUNBUFFERED: "1"
         run: |
           python main.py
 
-      # --- Always write a summary, even if the bot step failed ---
+      # --- Always create .state + summary files ---
       - name: Write run summary
         if: always()
         run: |
+          mkdir -p .state
           python - << 'PY'
           from pathlib import Path
           import json, datetime as dt
@@ -95,7 +96,7 @@ jobs:
           print(f"Wrote {summary_json} and {summary_md}")
           PY
 
-      # --- Upload .state AFTER the summary is written ---
+      # --- Upload .state AFTER the summary exists ---
       - name: Upload .state as artifact
         if: always()
         uses: actions/upload-artifact@v4
