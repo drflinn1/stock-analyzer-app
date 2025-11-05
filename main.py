@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Crypto — Hourly 1-Coin Rotation (LIVE-ready, fixed)
+Crypto — Hourly 1-Coin Rotation (LIVE-ready, guarded)
 - One open position enforced via .state/position.json
-- Exits: SL (1%), TP (5%), Timer (60m & gain < +3%) by default
+- Exits: SL (default 1%), TP (default 5%), Timer (60m & gain < +3%)
 - ALWAYS writes .state/run_summary.json/.md
-- Uses a minimal built-in Kraken REST client (stdlib only)
+- Minimal Kraken REST client (stdlib only)
 
-FIX: remove 'oflags: viqc' so we submit BASE volume, not quote-currency amount.
+Adds:
+- Sanity clamps on envs (no negative SL, etc.)
+- Buy-guard: prevents a new BUY if a recent buy occurred within BUY_GUARD_MINUTES (default 5)
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ STATE = Path(".state"); STATE.mkdir(parents=True, exist_ok=True)
 POS_FILE = STATE / "position.json"
 SUMMARY_JSON = STATE / "run_summary.json"
 SUMMARY_MD   = STATE / "run_summary.md"
+LAST_BUY_TS  = STATE / "last_buy_at.txt"   # stores epoch seconds of last live/dry buy
 
 # ------------------------------ Env utils ------------------------------
 def env_str(k: str, default: str = "") -> str:
@@ -32,6 +35,14 @@ def env_int(k: str, default: int = 0) -> int:
 def env_float(k: str, default: float = 0.0) -> float:
     try: return float(env_str(k, str(default)).strip())
     except: return default
+
+def clamp(v: float, lo: float, hi: float, default: float) -> float:
+    try:
+        if v < lo or v > hi or not (v == v):  # NaN check v==v
+            return default
+        return v
+    except Exception:
+        return default
 
 def now_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -87,6 +98,18 @@ def clear_position() -> None:
 def pct_change(from_price: float, to_price: float) -> float:
     if from_price <= 0: return 0.0
     return (to_price - from_price) / from_price * 100.0
+
+def record_last_buy_now() -> None:
+    LAST_BUY_TS.write_text(str(int(time.time())))
+
+def minutes_since_last_buy() -> Optional[float]:
+    if not LAST_BUY_TS.exists():
+        return None
+    try:
+        ts = int(LAST_BUY_TS.read_text().strip() or "0")
+        return (time.time() - ts) / 60.0
+    except Exception:
+        return None
 
 # ------------------------ Candidate selection --------------------------
 def read_csv_first_symbol(csv_path: Path) -> Optional[str]:
@@ -168,7 +191,7 @@ def kraken_add_order_market(pair: str, side: str, volume_base: float) -> Dict[st
     """
     side: 'buy' or 'sell'
     ordertype: 'market'
-    volume_base: BASE units (e.g., AERO units) — NO 'viqc' here
+    volume_base: BASE units (e.g., AERO units)
     """
     payload = {
         "pair": pair,
@@ -211,22 +234,34 @@ def live_sell(symbol: str, qty: float) -> Dict[str, Any]:
 
 # ------------------------------ Main logic ------------------------------
 def main() -> None:
-    dry_run        = env_str("DRY_RUN","OFF").upper() != "OFF"
-    run_switch     = env_str("RUN_SWITCH","ON").upper() == "ON"
-    usd_per_buy    = env_float("BUY_USD", 25.0)
-    max_positions  = env_int("MAX_POSITIONS", 1)
-    tp_pct         = env_float("TP_PCT", 5.0)
-    sl_pct         = env_float("SL_PCT", 1.0)
-    rotate_minutes = env_int("ROTATE_MINUTES", 60)
-    rotate_gain    = env_float("ROTATE_MIN_GAIN_PCT", 3.0)
+    # Raw envs
+    raw_dry_run        = env_str("DRY_RUN","OFF").upper()
+    run_switch         = env_str("RUN_SWITCH","ON").upper() == "ON"
+    usd_per_buy        = env_float("BUY_USD", 25.0)
+    max_positions      = env_int("MAX_POSITIONS", 1)
+    tp_pct_raw         = env_float("TP_PCT", 5.0)
+    sl_pct_raw         = env_float("SL_PCT", 1.0)
+    rotate_minutes_raw = env_int("ROTATE_MINUTES", 60)
+    rotate_gain_raw    = env_float("ROTATE_MIN_GAIN_PCT", 3.0)
+    buy_guard_min      = env_int("BUY_GUARD_MINUTES", 5)  # optional guard
+
+    # Sanity clamps
+    tp_pct         = clamp(tp_pct_raw, 0.1, 100.0, 5.0)
+    sl_pct         = clamp(sl_pct_raw, 0.1, 50.0, 1.0)
+    rotate_minutes = int(clamp(float(rotate_minutes_raw), 5.0, 480.0, 60.0))
+    rotate_gain    = clamp(rotate_gain_raw, 0.0, 20.0, 3.0)
+    dry_run        = (raw_dry_run != "OFF")
 
     write_summary("start", {
         "dry_run": dry_run,
         "run_switch": run_switch,
         "max_positions": max_positions,
         "buy_usd": usd_per_buy,
-        "tp_pct": tp_pct, "sl_pct": sl_pct,
-        "rotate_minutes": rotate_minutes, "rotate_gain_pct": rotate_gain
+        "tp_pct": {"raw": tp_pct_raw, "sanitized": tp_pct},
+        "sl_pct": {"raw": sl_pct_raw, "sanitized": sl_pct},
+        "rotate_minutes": {"raw": rotate_minutes_raw, "sanitized": rotate_minutes},
+        "rotate_gain_pct": {"raw": rotate_gain_raw, "sanitized": rotate_gain},
+        "buy_guard_minutes": buy_guard_min
     })
 
     if not run_switch:
@@ -274,12 +309,18 @@ def main() -> None:
             write_summary("HOLD", {"symbol": sym, "qty": qty, "price": price, "change_pct": change, "minutes_open": minutes})
         return
 
-    # Not holding: enforce cap, then BUY
+    # Not holding: enforce caps / guards, then BUY
     if max_positions <= 0:
         write_summary("SKIP", {"reason":"MAX_POSITIONS<=0"})
         return
     if max_positions == 1 and POS_FILE.exists():
         write_summary("SKIP", {"reason":"position.json present; MAX_POSITIONS=1"})
+        return
+
+    # Buy-guard: avoid rapid-fire rebuy after manual reruns / timing races
+    since = minutes_since_last_buy()
+    if since is not None and since < max(1, buy_guard_min):
+        write_summary("SKIP", {"reason": f"Buy guard: last buy {since:.1f}m ago < {buy_guard_min}m"})
         return
 
     # Choose candidate
@@ -296,10 +337,12 @@ def main() -> None:
             qty = (usd_per_buy / price) if price > 0 else 0.0
             qty = float(f"{qty:.8f}")
             save_position(pick, qty, price)
+            record_last_buy_now()
             write_summary("DRY BUY", {"symbol": pick, "qty": qty, "entry_price": price})
         else:
             res = live_buy(pick, usd_per_buy)
             save_position(res["symbol"], float(res["qty"]), float(res["avg_price"]))
+            record_last_buy_now()
             write_summary("LIVE BUY OK", {
                 "symbol": res["symbol"], "qty": res["qty"],
                 "avg_price": res["avg_price"], "txid": res.get("txid")
