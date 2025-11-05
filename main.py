@@ -9,6 +9,11 @@ Crypto — Hourly 1-Coin Rotation (LIVE-ready, desync-safe)
 Adds DESYNC handling:
 - If a SELL fails with 'EOrder:Insufficient funds' we clear position.json
   and continue to BUY in the same run.
+
+Enhancements (logging-only, identical trade behavior):
+- Every summary now shows Universe mode (AUTO/FIXED),
+  Active symbol (if any), Next candidate on BUY,
+  and the explicit rotation trigger on SELL.
 """
 
 from __future__ import annotations
@@ -48,18 +53,43 @@ def _load_json(p: Path) -> Optional[Any]:
         return json.loads(p.read_text())
     return None
 
-def write_summary(status: str, details: Dict[str, Any]) -> None:
+def universe_line() -> str:
+    pick = env_str("UNIVERSE_PICK", "").strip().upper()
+    if pick:
+        return f"**Universe:** FIXED ({pick})"
+    return  "**Universe:** AUTO (UNIVERSE_PICK not set)"
+
+def write_summary(status: str, details: Dict[str, Any],
+                  active_symbol: Optional[str] = None,
+                  next_candidate: Optional[str] = None,
+                  trigger: Optional[str] = None) -> None:
+    """Writes both JSON and Markdown. Trading behavior is unchanged."""
     payload = {
         "when": now_iso(),
         "mode": "LIVE" if env_str("DRY_RUN","OFF").upper() == "OFF" else "DRY_RUN",
         "status": status,
+        "universe": "FIXED" if env_str("UNIVERSE_PICK","").strip() else "AUTO",
         **details
     }
+    if active_symbol:  payload["active_symbol"] = active_symbol
+    if next_candidate: payload["next_candidate"] = next_candidate
+    if trigger:        payload["rotation_trigger"] = trigger
+
     _save_json(SUMMARY_JSON, payload)
+
     lines = [
         f"**When:** {payload['when']}",
         f"**Mode:** {payload['mode']}",
         f"**Status:** {status}",
+        universe_line(),
+    ]
+    if active_symbol:
+        lines.append(f"**Active symbol:** {active_symbol}")
+    if next_candidate:
+        lines.append(f"**Next candidate chosen:** {next_candidate}")
+    if trigger:
+        lines.append(f"**Rotation trigger:** {trigger}")
+    lines += [
         "",
         "```json",
         json.dumps(details, indent=2),
@@ -215,6 +245,8 @@ def main() -> None:
     rotate_minutes = max(1,    abs(env_int("ROTATE_MINUTES", 60)))
     rotate_gain    = max(0.01, abs(env_float("ROTATE_MIN_GAIN_PCT", 3.0)))
 
+    # Initial banner
+    active_sym_banner = load_position().get("symbol") if have_open_position() else None
     write_summary("start", {
         "dry_run": dry_run,
         "run_switch": run_switch,
@@ -222,10 +254,10 @@ def main() -> None:
         "buy_usd": usd_per_buy,
         "tp_pct": tp_pct, "sl_pct": sl_pct,
         "rotate_minutes": rotate_minutes, "rotate_gain_pct": rotate_gain
-    })
+    }, active_symbol=active_sym_banner)
 
     if not run_switch:
-        write_summary("SKIP", {"reason":"RUN_SWITCH=OFF"})
+        write_summary("SKIP", {"reason":"RUN_SWITCH=OFF"}, active_symbol=active_sym_banner)
         return
 
     # --------------------- If holding, evaluate exits ---------------------
@@ -253,7 +285,8 @@ def main() -> None:
 
             if decision == "sell":
                 if dry_run:
-                    write_summary("DRY SELL", {"symbol": sym, "qty": qty, "price": price, "reason": reason})
+                    write_summary("DRY SELL", {"symbol": sym, "qty": qty, "price": price, "reason": reason},
+                                  active_symbol=sym, trigger=reason)
                     clear_position()
                     proceed_to_buy = True
                 else:
@@ -263,7 +296,7 @@ def main() -> None:
                             "symbol": res["symbol"], "qty": res["qty"],
                             "avg_price": res["avg_price"], "txid": res.get("txid"),
                             "reason": reason
-                        })
+                        }, active_symbol=sym, trigger=reason)
                         clear_position()
                         proceed_to_buy = True
                     except Exception as e:
@@ -274,13 +307,16 @@ def main() -> None:
                             write_summary("DESYNC CLEAR", {
                                 "symbol": sym, "qty": qty, "exception": msg,
                                 "note": "Kraken shows no coins; cleared stale position.json"
-                            })
+                            }, active_symbol=sym, trigger="desync-clear-after-sell-error")
                             proceed_to_buy = True
                         else:
-                            write_summary("LIVE SELL ERROR", {"symbol": sym, "qty": qty, "exception": msg})
+                            write_summary("LIVE SELL ERROR", {"symbol": sym, "qty": qty, "exception": msg},
+                                          active_symbol=sym, trigger=reason or "sell-error")
                             return
             else:
-                write_summary("HOLD", {"symbol": sym, "qty": qty, "price": price, "change_pct": change, "minutes_open": minutes})
+                write_summary("HOLD", {"symbol": sym, "qty": qty, "price": price,
+                                       "change_pct": change, "minutes_open": minutes},
+                              active_symbol=sym)
                 return
     else:
         proceed_to_buy = True
@@ -311,17 +347,19 @@ def main() -> None:
             qty = (usd_per_buy / price) if price > 0 else 0.0
             qty = float(f"{qty:.8f}")
             save_position(pick, qty, price)
-            write_summary("DRY BUY", {"symbol": pick, "qty": qty, "entry_price": price})
+            write_summary("DRY BUY", {"symbol": pick, "qty": qty, "entry_price": price},
+                          next_candidate=pick)
         else:
             res = live_buy(pick, usd_per_buy)
             save_position(res["symbol"], float(res["qty"]), float(res["avg_price"]))
             write_summary("LIVE BUY OK", {
                 "symbol": res["symbol"], "qty": res["qty"],
                 "avg_price": res["avg_price"], "txid": res.get("txid")
-            })
+            }, next_candidate=pick)
     except Exception as e:
         write_summary("LIVE BUY ERROR" if not dry_run else "DRY BUY ERROR",
-                      {"symbol": pick, "exception": repr(e)})
+                      {"symbol": pick, "exception": repr(e)},
+                      next_candidate=pick)
 
 # -----------------------------------------------------------------------
 if __name__ == "__main__":
