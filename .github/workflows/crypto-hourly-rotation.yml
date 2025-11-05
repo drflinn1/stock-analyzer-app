@@ -1,9 +1,13 @@
-name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
+name: Crypto — 1-Coin Rotation (LIVE-ready, ultra-defensive, 15m)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # every hour UTC
+    - cron: "*/15 * * * *"   # every 15 minutes UTC
   workflow_dispatch:
+
+concurrency:
+  group: crypto-rotation
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -37,7 +41,7 @@ jobs:
           mkdir -p .state
 
           WHEN="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-          echo "## Crypto — Hourly 1-Coin Rotation" > .state/run_summary.md
+          echo "## Crypto — 1-Coin Rotation (15m)" > .state/run_summary.md
           echo "" >> .state/run_summary.md
           echo "**When:** ${WHEN}" >> .state/run_summary.md
 
@@ -66,6 +70,7 @@ jobs:
           echo "**RUN_SWITCH:** ${RUN_SWITCH}" >> .state/run_summary.md
           echo "**MAX_POSITIONS:** ${MAX_POS}" >> .state/run_summary.md
 
+          # Hard enforcement: rotation requires AUTO-universe
           if [[ "${MAX_POS}" == "1" && -n "${PICK}" ]]; then
             echo "::error title=Configuration blocked::MAX_POSITIONS==1 (rotation mode) but UNIVERSE_PICK='${PICK}'. Clear UNIVERSE_PICK for auto-universe rotation."
             jq '.status="blocked" | .blocked=true | .reason="MAX_POSITIONS==1 but UNIVERSE_PICK set"' .state/run_summary.json > .state/tmp.json 2>/dev/null || true
@@ -114,7 +119,6 @@ jobs:
           [[ -s .state/run_summary.md ]] || echo "Placeholder summary" > .state/run_summary.md
           [[ -s .state/run_summary.json ]] || echo '{"status":"placeholder"}' > .state/run_summary.json
 
-      # --- FIX: explicit include of dot-folders ---
       - name: Upload .state artifacts
         if: always()
         uses: actions/upload-artifact@v4
