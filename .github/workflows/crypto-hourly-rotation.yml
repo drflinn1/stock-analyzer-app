@@ -2,19 +2,23 @@ name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
-    - cron: "0 * * * *"           # every hour
+    - cron: "0 * * * *"          # every hour at :00 UTC
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    concurrency:
+      group: crypto-hourly-rotation
+      cancel-in-progress: false
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,61 +30,57 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
 
-      - name: Seed candidates if missing
-        shell: bash
+      # Guarantee .state exists so artifact upload never warns
+      - name: Ensure .state dir exists
         run: |
           mkdir -p .state
-          if [ ! -f ".state/momentum_candidates.csv" ]; then
-            echo "${CANDIDATE_FALLBACK:-HONEYUSD}" > .state/momentum_candidates.csv
-            echo "Seeded .state/momentum_candidates.csv"
-          fi
+          [ -f ".state/.keep" ] || echo "keep" > .state/.keep
 
       - name: Run crypto bot
         env:
-          PYTHONUNBUFFERED: "1"
-          RUN_SWITCH: ${{ vars.RUN_SWITCH }}
-          DRY_RUN: ${{ vars.DRY_RUN }}
-          BUY_USD: ${{ vars.BUY_USD }}
-          MAX_POSITIONS: ${{ vars.MAX_POSITIONS }}
-          MAX_BUYS_PER_RUN: ${{ vars.MAX_BUYS_PER_RUN }}
-          TP_PCT: ${{ vars.TAKE_PROFIT_PCT }}
-          SL_PCT: ${{ vars.STOP_LOSS_PCT }}
-          ROTATE_MINUTES: ${{ vars.ROTATE_MINUTES }}
-          ROTATE_MIN_GAIN_PCT: ${{ vars.ROTATE_MIN_GAIN_PCT }}
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-        run: |
-          python -u main.py
+          # ---- mode & sizing ----
+          DRY_RUN:               ${{ vars.DRY_RUN }}
+          RUN_SWITCH:            ${{ vars.RUN_SWITCH }}
+          BUY_USD:               ${{ vars.BUY_USD }}
+          MAX_POSITIONS:         ${{ vars.MAX_POSITIONS }}
 
-      - name: Persist .state to repo
-        shell: bash
-        run: |
-          git config --global user.email "bot@users.noreply.github.com"
-          git config --global user.name  "ci-bot"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git add -f .state/run_summary.json .state/run_summary.md .state/position.json .state/*candidates.csv || true
-          if git diff --cached --quiet; then
-            echo "No .state changes to commit."
-          else
-            git commit -m "chore(.state): update state (position & summary) [skip ci]"
-            git push
-          fi
+          # ---- exits / rotation ----
+          STOP_LOSS_PCT:         ${{ vars.STOP_LOSS_PCT }}
+          TAKE_PROFIT_PCT:       ${{ vars.TAKE_PROFIT_PCT }}
+          ROTATE_MINUTES:        ${{ vars.ROTATE_MINUTES }}
+          ROTATE_MIN_GAIN_PCT:   ${{ vars.ROTATE_MIN_GAIN_PCT }}
 
-      - name: Debug list .state
-        shell: bash
+          # ---- exchange secrets ----
+          KRAKEN_API_KEY:        ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET:     ${{ secrets.KRAKEN_API_SECRET }}
+        run: |
+          python main.py
+
+      # Commit .state (position + summary) back so next run can HOLD or SELL correctly
+      - name: Persist .state back to repo (position & summary)
+        if: always()
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "bot"
+          git add -A .state
+          git diff --cached --name-only
+          git commit -m "chore(.state): update state (position & summary) [skip ci]" || echo "No .state changes to commit"
+          git push
+
+      - name: Debug: list .state
+        if: always()
         run: |
           echo "Listing .state contents:"
           ls -la .state || true
-          if [ -f ".state/run_summary.json" ]; then
-            echo "---- .state/run_summary.json ----"
-            cat .state/run_summary.json
-          fi
+          echo "---- run_summary.json (if present) ----"
+          cat .state/run_summary.json 2>/dev/null || true
 
+      # Simpler path (no glob) so the action always finds the folder
       - name: Upload .state as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state
-          path: ./.state/**
+          path: .state
           if-no-files-found: warn
           retention-days: 7
