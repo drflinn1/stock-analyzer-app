@@ -3,7 +3,7 @@ name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 * * * *"   # hourly, on the hour (UTC)
+    - cron: "0 * * * *"   # hourly (UTC)
 
 permissions:
   contents: write
@@ -46,6 +46,7 @@ jobs:
           python main.py || true
           echo $? > .state/last_exit_code.txt
 
+      # --- Fix: force-add .state even if ignored; commit only when there are staged changes
       - name: Persist .state back to repo
         if: always()
         shell: bash
@@ -53,10 +54,18 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config user.email "actions@github.com"
           git config user.name "bot"
-          git add -A .state
-          # commit only if there is something staged
+
+          # Make sure directory exists
+          mkdir -p .state
+
+          # Force-add .state (overrides .gitignore)
+          git add -f .state || true
+          git add -f .state/* 2>/dev/null || true
+          git add -f .state/.* 2>/dev/null || true
+
+          # Commit only if something is staged
           if ! git diff --cached --quiet; then
-            git commit -m "chore(.state): update state (position and summary) [skip ci]"
+            git commit -m "chore(.state): update state (position & summary) [skip ci]"
             git push
           else
             echo "No .state changes to commit"
@@ -75,11 +84,12 @@ jobs:
           echo "---- position.json ----"
           [ -f .state/position.json ] && cat .state/position.json || true
 
+      # --- Fix: upload the folder directly (no glob) so it always finds files
       - name: Upload .state as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state
-          path: ./.state/**
+          path: .state
           if-no-files-found: warn
           retention-days: 7
