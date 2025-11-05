@@ -1,16 +1,9 @@
-name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive v2 FINAL)
+name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # hourly UTC
+    - cron: "0 * * * *"   # run hourly (UTC)
   workflow_dispatch:
-
-permissions:
-  contents: write
-
-concurrency:
-  group: crypto-hourly-rotation
-  cancel-in-progress: false
 
 jobs:
   run:
@@ -20,8 +13,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -31,85 +22,85 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt || true
-          fi
+          pip install -r requirements.txt || true
 
-      # --- PRE-FLIGHT: guarantee .state + heartbeat so artifacts/commit always have something ---
-      - name: Preflight heartbeat (.state)
-        shell: bash
-        run: |
-          set -e
-          mkdir -p .state
-          date -u +"%Y-%m-%dT%H:%M:%SZ" | tee .state/keep.txt >/dev/null
-          echo '{"status":"preflight","note":"before main.py"}' > .state/run_summary.json
-          echo "**Preflight:** created before main.py" > .state/run_summary.md
-          echo "HEARTBEAT-WRITE OK"
-          echo "TREE (preflight):"
-          ls -la .state || true
-
-      - name: Run strategy (DRY-RUN is OFF when repo Variable DRY_RUN=OFF)
-        shell: bash
+      # --- Run your bot (uses repo Variables/Secrets as your code already does) ---
+      - name: Run crypto bot
         env:
-          # --- Secrets ---
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          # --- Variables ---
-          DRY_RUN: ${{ vars.DRY_RUN || 'OFF' }}                  # OFF = LIVE
-          RUN_SWITCH: ${{ vars.RUN_SWITCH || 'ON' }}
-          MAX_POSITIONS: ${{ vars.MAX_POSITIONS || '1' }}
-          MAX_BUYS_PER_RUN: ${{ vars.MAX_BUYS_PER_RUN || '1' }}
-          BUY_USD: ${{ vars.BUY_USD || '25' }}
-          TP_PCT: ${{ vars.TP_PCT || '5' }}
-          SL_PCT: ${{ vars.SL_PCT || '1' }}
-          ROTATE_MINUTES: ${{ vars.ROTATE_MINUTES || '60' }}
-          ROTATE_MIN_GAIN_PCT: ${{ vars.ROTATE_MIN_GAIN_PCT || '3' }}
-          UNIVERSE_TOP_K: ${{ vars.UNIVERSE_TOP_K || '25' }}
-          UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK || '' }}
           PYTHONUNBUFFERED: "1"
         run: |
-          echo "[Env] DRY_RUN=${DRY_RUN} RUN_SWITCH=${RUN_SWITCH} MAX_POSITIONS=${MAX_POSITIONS} BUY_USD=${BUY_USD}"
-          python -u main.py || echo "[WARN] main.py exited non-zero"
+          python main.py
 
-      # --- POST-FLIGHT: append a line so we KNOW files exist even if script didn't write any ---
-      - name: Postflight touch (.state)
-        shell: bash
+      # --- Always write a summary, even if the bot step failed ---
+      - name: Write run summary
         if: always()
         run: |
-          mkdir -p .state
-          echo "**Postflight:** job finished $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> .state/run_summary.md
-          if [ ! -f .state/run_summary.json ]; then
-            echo '{"status":"postflight-only"}' > .state/run_summary.json
-          fi
-          echo "TREE (postflight):"
-          ls -la .state || true
-          echo "---- run_summary.md ----"
-          sed -n '1,200p' .state/run_summary.md || true
-          echo "---- run_summary.json ----"
-          sed -n '1,200p' .state/run_summary.json || true
+          python - << 'PY'
+          from pathlib import Path
+          import json, datetime as dt
 
-      - name: Commit & push .state to repo (verbose)
-        if: always()
-        shell: bash
-        run: |
-          echo "TREE (pre-commit):"
-          ls -la .state || true
-          git config user.name  "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
-          git add -A .state || true         # <— stage everything under .state
-          if ! git diff --cached --quiet; then
-            git commit -m "state: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            git push
-            echo "Pushed .state artifacts."
-          else
-            echo "No .state updates to commit."
-          fi
+          STATE = Path(".state")
+          STATE.mkdir(parents=True, exist_ok=True)
 
-      - name: Upload .state as artifact (explicit glob)
+          pos_file = STATE / "position.json"
+          summary_json = STATE / "run_summary.json"
+          summary_md   = STATE / "run_summary.md"
+
+          now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+          summary = {
+              "when": now,
+              "status": "FLAT",
+              "note": "No open position",
+              "position": None,
+          }
+
+          if pos_file.exists():
+              try:
+                  pos = json.loads(pos_file.read_text() or "{}")
+                  summary["status"] = "HOLD"
+                  summary["note"] = "Tracking current position"
+                  summary["position"] = {
+                      "symbol": pos.get("symbol"),
+                      "qty": pos.get("qty"),
+                      "entry_price": pos.get("entry_price"),
+                      "since": pos.get("since"),
+                      "last_price": pos.get("last_price"),
+                      "change_pct": pos.get("change_pct"),
+                  }
+              except Exception as e:
+                  summary["status"] = "UNKNOWN"
+                  summary["note"] = f"position.json parse error: {e}"
+
+          summary_json.write_text(json.dumps(summary, indent=2))
+
+          lines = [
+              f"**When:** {summary['when']}",
+              f"**Status:** {summary['status']}",
+              f"**Note:** {summary['note']}",
+          ]
+          if summary["position"]:
+              p = summary["position"]
+              lines += [
+                  "",
+                  "### Position",
+                  f"- **Symbol:** {p.get('symbol')}",
+                  f"- **Qty:** {p.get('qty')}",
+                  f"- **Entry:** {p.get('entry_price')}",
+                  f"- **Last Price:** {p.get('last_price')}",
+                  f"- **Change %:** {p.get('change_pct')}",
+                  f"- **Since:** {p.get('since')}",
+              ]
+          summary_md.write_text("\n".join(lines))
+          print(f"Wrote {summary_json} and {summary_md}")
+          PY
+
+      # --- Upload .state AFTER the summary is written ---
+      - name: Upload .state as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state
-          path: ./.state/**         # <— reliable glob
+          path: ./.state/**          # picks up run_summary.* and any position files
           if-no-files-found: warn
           retention-days: 7
