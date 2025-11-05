@@ -1,24 +1,29 @@
 name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
-  schedule:
-    - cron: "0 * * * *"          # every hour at :00 UTC
+  # Run manually any time
   workflow_dispatch:
+  # Run every hour on the hour (UTC)
+  schedule:
+    - cron: "0 * * * *"
+
+permissions:
+  contents: write   # allow commits back to the repo
+
+concurrency:
+  group: crypto-hourly-rotation
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 12
-    concurrency:
-      group: crypto-hourly-rotation
-      cancel-in-progress: false
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -28,58 +33,50 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
 
-      # Guarantee .state exists so artifact upload never warns
-      - name: Ensure .state dir exists
-        run: |
-          mkdir -p .state
-          [ -f ".state/.keep" ] || echo "keep" > .state/.keep
+      - name: Ensure .state dir
+        run: mkdir -p .state
 
       - name: Run crypto bot
         env:
-          # ---- mode & sizing ----
-          DRY_RUN:               ${{ vars.DRY_RUN }}
-          RUN_SWITCH:            ${{ vars.RUN_SWITCH }}
-          BUY_USD:               ${{ vars.BUY_USD }}
-          MAX_POSITIONS:         ${{ vars.MAX_POSITIONS }}
-
-          # ---- exits / rotation ----
-          STOP_LOSS_PCT:         ${{ vars.STOP_LOSS_PCT }}
-          TAKE_PROFIT_PCT:       ${{ vars.TAKE_PROFIT_PCT }}
-          ROTATE_MINUTES:        ${{ vars.ROTATE_MINUTES }}
-          ROTATE_MIN_GAIN_PCT:   ${{ vars.ROTATE_MIN_GAIN_PCT }}
-
-          # ---- exchange secrets ----
-          KRAKEN_API_KEY:        ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET:     ${{ secrets.KRAKEN_API_SECRET }}
+          PYTHONUNBUFFERED: "1"
+          # Secrets/Variables are pulled in automatically by Actions
         run: |
           python main.py
+          echo "exit=$?" > .state/last_exit.tmp
 
+      # ---- Persist state to the repo (position.json + run_summary.* etc.) ----
       - name: Persist .state back to repo (position & summary)
         if: always()
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config user.email "actions@github.com"
           git config user.name "bot"
           git add -A .state
-          git diff --cached --name-only
+          git diff --cached --name-only || true
           git commit -m "chore(.state): update state (position & summary) [skip ci]" || echo "No .state changes to commit"
           git push
 
-      - name: Debug list .state
+      # ---- Quick debug so you can see exactly what's in .state in the job log ----
+      - name: Debug: list .state
         if: always()
-        shell: bash
         run: |
           echo "Listing .state contents:"
           ls -la .state || true
           echo "---- run_summary.json (if present) ----"
-          cat .state/run_summary.json 2>/dev/null || true
+          cat .state/run_summary.json || true
+          echo "---- run_summary.md (if present) ----"
+          cat .state/run_summary.md || true
+          echo "---- position.json (if present) ----"
+          cat .state/position.json || true
 
+      # ---- Upload .state as an artifact (optional but handy) ----
       - name: Upload .state as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state
-          path: .state
+          path: ./.state/**
           if-no-files-found: warn
           retention-days: 7
