@@ -2,8 +2,11 @@ name: Crypto — Spike Scan (build .state/spike_candidates.csv)
 
 on:
   schedule:
-    - cron: "5,20,35,50 * * * *"   # every 15m, staggered from :00
+    - cron: "5,20,35,50 * * * *"   # every 15m
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 concurrency:
   group: scanner-spike
@@ -25,28 +28,14 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
+        run: python -m pip install --upgrade pip
 
       - name: Run spike scan
         env:
           MIN_24H_PCT:   ${{ vars.MIN_24H_PCT   || 10 }}
           MIN_USD_VOL:   ${{ vars.MIN_USD_VOL   || 5000 }}
           TOP_K_SPIKES:  ${{ vars.TOP_K_SPIKES  || 8 }}
-        run: |
-          python scanners/spike_scan.py
-
-      - name: Upload artifact (optional)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: spike-candidates
-          path: |
-            .state/spike_candidates.csv
-            ./.state/spike_candidates.csv
-          include-hidden-files: true
-          if-no-files-found: warn
-          retention-days: 7
+        run: python scanners/spike_scan.py
 
       - name: Commit and push updated .state/spike_candidates.csv
         run: |
