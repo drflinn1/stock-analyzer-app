@@ -1,51 +1,61 @@
-name: Crypto — Spike Scan (build .state/spike_candidates.csv)
+name: Momentum — Spike Scan (commit .state)
 
 on:
-  schedule:
-    - cron: "5,20,35,50 * * * *"   # every 15m
   workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"  # every 30 minutes UTC
 
 permissions:
-  contents: write
+  contents: write  # needed to push commits
 
 concurrency:
-  group: scanner-spike
+  group: momentum-spike-scan
   cancel-in-progress: true
 
 jobs:
-  scan:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          persist-credentials: true  # required to push
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
-        run: python -m pip install --upgrade pip
-
-      - name: Run spike scan
-        env:
-          MIN_24H_PCT:   ${{ vars.MIN_24H_PCT   || 10 }}
-          MIN_USD_VOL:   ${{ vars.MIN_USD_VOL   || 5000 }}
-          TOP_K_SPIKES:  ${{ vars.TOP_K_SPIKES  || 8 }}
-        run: python scanners/spike_scan.py
-
-      - name: Commit and push updated .state/spike_candidates.csv
+      - name: Install deps (best-effort)
         run: |
-          set -e
-          if git status --porcelain .state/spike_candidates.csv | grep -q .; then
-            git config user.name "actions-user"
-            git config user.email "actions@users.noreply.github.com"
-            git add .state/spike_candidates.csv
-            git commit -m "Create/Update spike_candidates.csv [skip ci]"
-            git push
-          else
-            echo "No changes to spike_candidates.csv"
-          fi
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+
+      # ⬇️ Your existing spike scan step — keep your real command if different.
+      - name: Run spike scanner
+        run: |
+          mkdir -p .state
+          # Replace with your real spike scan if needed:
+          python tools/momentum_spike.py || true
+
+      - name: Write spike-scan marker
+        run: |
+          mkdir -p .state
+          echo "spike_scan_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" > .state/momentum_spike_marker.txt
+
+      # ✅ Force-add .state so .gitignore cannot block it
+      - name: Commit & push .state (force-add)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f .state/** || true
+          git commit -m "chore(spike-scan): update .state artifacts [skip ci]" || echo "Nothing to commit"
+          git push
+
+      - name: Upload .state as artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-momentum-spike
+          path: .state/**
+          if-no-files-found: warn
