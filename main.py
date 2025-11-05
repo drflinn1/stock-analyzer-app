@@ -13,13 +13,14 @@ Adds DESYNC handling:
 Enhancements (logging-only, identical trade behavior):
 - Every summary now shows Universe mode (AUTO/FIXED),
   Active symbol (if any), Next candidate on BUY,
-  and the explicit rotation trigger on SELL.
+  the explicit rotation trigger on SELL,
+  and a Candidate audit (top 5 rows from momentum_candidates.csv if present).
 """
 
 from __future__ import annotations
 import os, json, time, datetime as dt
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 # ------------------------------- Paths ---------------------------------
 STATE = Path(".state"); STATE.mkdir(parents=True, exist_ok=True)
@@ -59,11 +60,32 @@ def universe_line() -> str:
         return f"**Universe:** FIXED ({pick})"
     return  "**Universe:** AUTO (UNIVERSE_PICK not set)"
 
+# ---- Candidate audit (top 5 from momentum_candidates.csv if present) ---
+def read_csv_symbols(csv_path: Path, limit: int = 5) -> List[str]:
+    out: List[str] = []
+    try:
+        if not csv_path.exists(): return out
+        rows = csv_path.read_text().strip().splitlines()
+        if not rows: return out
+        hdr = rows[0].lower().replace(" ", "")
+        start = 1 if ("symbol" in hdr or "," in hdr) else 0
+        for line in rows[start:]:
+            if not line.strip(): continue
+            sym = line.split(",")[0].strip()
+            if sym:
+                out.append(sym)
+                if len(out) >= limit: break
+    except Exception:
+        return out
+    return out
+
 def write_summary(status: str, details: Dict[str, Any],
                   active_symbol: Optional[str] = None,
                   next_candidate: Optional[str] = None,
                   trigger: Optional[str] = None) -> None:
     """Writes both JSON and Markdown. Trading behavior is unchanged."""
+    candidate_audit = read_csv_symbols(STATE / "momentum_candidates.csv", limit=5)
+
     payload = {
         "when": now_iso(),
         "mode": "LIVE" if env_str("DRY_RUN","OFF").upper() == "OFF" else "DRY_RUN",
@@ -74,6 +96,7 @@ def write_summary(status: str, details: Dict[str, Any],
     if active_symbol:  payload["active_symbol"] = active_symbol
     if next_candidate: payload["next_candidate"] = next_candidate
     if trigger:        payload["rotation_trigger"] = trigger
+    if candidate_audit: payload["candidate_audit"] = candidate_audit
 
     _save_json(SUMMARY_JSON, payload)
 
@@ -89,6 +112,15 @@ def write_summary(status: str, details: Dict[str, Any],
         lines.append(f"**Next candidate chosen:** {next_candidate}")
     if trigger:
         lines.append(f"**Rotation trigger:** {trigger}")
+    if candidate_audit:
+        lines += [
+            "",
+            "**Candidate audit (top of momentum_candidates.csv):**",
+            "",
+            "```",
+            *candidate_audit,
+            "```",
+        ]
     lines += [
         "",
         "```json",
@@ -142,6 +174,7 @@ def normalize_pair(sym: str) -> str:
     return s + "USD"
 
 def select_top_candidate() -> str:
+    # Prefer momentum list; fall back to spike list; then UNIVERSE_PICK.
     for name in ("momentum_candidates.csv", "spike_candidates.csv"):
         sym = read_csv_first_symbol(STATE / name)
         if sym: return normalize_pair(sym)
