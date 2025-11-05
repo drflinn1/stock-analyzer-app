@@ -56,7 +56,6 @@ jobs:
         run: |
           python main.py
 
-      # Commit .state (position + summary) back so next run can HOLD or SELL correctly
       - name: Persist .state back to repo (position & summary)
         if: always()
         run: |
@@ -67,15 +66,15 @@ jobs:
           git commit -m "chore(.state): update state (position & summary) [skip ci]" || echo "No .state changes to commit"
           git push
 
-      - name: Debug: list .state
+      - name: Debug list .state
         if: always()
+        shell: bash
         run: |
           echo "Listing .state contents:"
           ls -la .state || true
           echo "---- run_summary.json (if present) ----"
           cat .state/run_summary.json 2>/dev/null || true
 
-      # Simpler path (no glob) so the action always finds the folder
       - name: Upload .state as artifact
         if: always()
         uses: actions/upload-artifact@v4
