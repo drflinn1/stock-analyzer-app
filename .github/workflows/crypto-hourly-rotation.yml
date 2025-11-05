@@ -2,22 +2,22 @@ name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # every hour UTC
+    - cron: "0 * * * *"         # every hour
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 12
-    permissions:
-      contents: write   # needed to commit .state back to the repo
 
     steps:
+      # --- Checkout repo (full history so we can commit .state) ---
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
+      # --- Python toolchain ---
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -26,60 +26,77 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # If you don't have a requirements.txt this will no-op
           pip install -r requirements.txt || true
 
-      # Runs your bot; it writes .state/run_summary.* and position.json itself
+      # --- Seed candidates if missing (so a first buy can happen) ---
+      - name: Seed candidates if missing
+        shell: bash
+        run: |
+          mkdir -p .state
+          if [ ! -f ".state/momentum_candidates.csv" ]; then
+            echo "${CANDIDATE_FALLBACK:-HONEYUSD}" > .state/momentum_candidates.csv
+            echo "Created .state/momentum_candidates.csv with fallback candidate."
+          else
+            echo ".state/momentum_candidates.csv already exists."
+          fi
+
+      # --- Run the bot (main.py writes .state/run_summary.json/.md, position.json) ---
       - name: Run crypto bot
         env:
           PYTHONUNBUFFERED: "1"
-
-          # --- REQUIRED SECRETS ---
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-
-          # --- OPTIONAL VARIABLES ---
-          DRY_RUN: ${{ vars.DRY_RUN }}
+          # Safety switch & mode
           RUN_SWITCH: ${{ vars.RUN_SWITCH }}
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          # Sizing/limits
           BUY_USD: ${{ vars.BUY_USD }}
           MAX_POSITIONS: ${{ vars.MAX_POSITIONS }}
-          TP_PCT: ${{ vars.TP_PCT }}
-          SL_PCT: ${{ vars.SL_PCT }}
+          MAX_BUYS_PER_RUN: ${{ vars.MAX_BUYS_PER_RUN }}
+          # Exits & rotation
+          TP_PCT: ${{ vars.TAKE_PROFIT_PCT }}
+          SL_PCT: ${{ vars.STOP_LOSS_PCT }}
           ROTATE_MINUTES: ${{ vars.ROTATE_MINUTES }}
           ROTATE_MIN_GAIN_PCT: ${{ vars.ROTATE_MIN_GAIN_PCT }}
-          UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK }}
+          # Kraken creds
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
-          python main.py
+          python -u main.py
 
-      # Force-persist .state so the next run sees position.json and HOLDs
+      # --- Persist .state back into the repo (forced add in case .gitignore) ---
       - name: Persist .state to repo
-        if: always()
+        shell: bash
         run: |
-          set -e
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f .state || true         # <-- force add even if .gitignore excludes it
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(state): update .state (position & summaries) [skip ci]"
-            git push
-          else
+          git config --global user.email "bot@users.noreply.github.com"
+          git config --global user.name  "ci-bot"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          # Force-add only what we care about
+          git add -f .state/run_summary.json .state/run_summary.md .state/position.json .state/*candidates.csv || true
+
+          if git diff --cached --quiet; then
             echo "No .state changes to commit."
+          else
+            git commit -m "chore(.state): update state (position & summary) [skip ci]"
+            git push
           fi
 
-      # Helpful: see exactly what's in .state each run
-      - name: Debug list state
-        if: always()
+      # --- Quick debug listing (shows you exactly what’s in .state) ---
+      - name: Debug: list .state
+        shell: bash
         run: |
           echo "Listing .state contents:"
           ls -la .state || true
-          echo "Preview run_summary.md (if present):"
-          [ -f .state/run_summary.md ] && sed -n '1,80p' .state/run_summary.md || echo "run_summary.md not found"
+          echo "---- run_summary.json (if present) ----"
+          test -f .state/run_summary.json && cat .state/run_summary.json || true
+          echo "--------------------------------------"
 
-      # Upload .state as artifact (reliable path)
+      # --- Upload .state as artifact (glob fixes the previous warning) ---
       - name: Upload .state as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state
-          path: .state
+          path: ./.state/**              # <- reliable glob
           if-no-files-found: warn
           retention-days: 7
