@@ -32,7 +32,7 @@ jobs:
           python main.py
 
       # Show what's in .state so we can see the summary files in logs
-      - name: Debug: list .state
+      - name: Debug list state
         if: always()
         run: |
           echo "Listing .state contents (if any):"
