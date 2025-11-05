@@ -1,27 +1,18 @@
 name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "0 * * * *"   # hourly (UTC)
-
-permissions:
-  contents: write
-
-concurrency:
-  group: crypto-hourly-rotation
-  cancel-in-progress: false
+    - cron: "0 * * * *"  # hourly at :00 UTC
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -29,67 +20,134 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
+        run: |
+            python -m pip install --upgrade pip
+            # Your repo requirements (best-effort; non-fatal if file missing)
+            pip install -r requirements.txt || true
+            # Safety: make sure common libs used by the runner exist
+            pip install pyyaml matplotlib || true
+
+      # ---------------------------------------------------------
+      # Preflight: enforce rotation+auto-universe and GUARANTEE
+      # a .state/ summary so artifacts always upload.
+      # ---------------------------------------------------------
+      - name: Preflight (enforce rotation + write summary)
+        id: preflight
         shell: bash
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
-
-      - name: Ensure .state dir
-        shell: bash
-        run: mkdir -p .state
-
-      - name: Run crypto bot
-        shell: bash
-        env:
-          PYTHONUNBUFFERED: "1"
-        run: |
-          python main.py || true
-          echo $? > .state/last_exit_code.txt
-
-      # --- Fix: force-add .state even if ignored; commit only when there are staged changes
-      - name: Persist .state back to repo
-        if: always()
-        shell: bash
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git config user.email "actions@github.com"
-          git config user.name "bot"
-
-          # Make sure directory exists
+          set -e
           mkdir -p .state
 
-          # Force-add .state (overrides .gitignore)
-          git add -f .state || true
-          git add -f .state/* 2>/dev/null || true
-          git add -f .state/.* 2>/dev/null || true
+          WHEN="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          {
+            echo "## Crypto — Hourly 1-Coin Rotation"
+            echo ""
+            echo "**When:** ${WHEN}"
+            echo "**Runner:** GitHub Actions"
+          } > .state/run_summary.md
 
-          # Commit only if something is staged
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(.state): update state (position & summary) [skip ci]"
-            git push
+          # Tiny JSON scaffold (will be overwritten by your main later if it writes its own)
+          cat > .state/run_summary.json <<'JSON'
+          {
+            "status": "preflight",
+            "blocked": false
+          }
+          JSON
+
+          # Read important vars (defaults are conservative)
+          MAX_POS="${{ vars.MAX_POSITIONS }}"
+          PICK="${{ vars.UNIVERSE_PICK }}"
+          DRY="${{ vars.DRY_RUN }}"
+          RUN_SWITCH="${{ vars.RUN_SWITCH }}"
+
+          # Normalize empties
+          MAX_POS="${MAX_POS:-1}"
+          DRY="${DRY:-ON}"
+          RUN_SWITCH="${RUN_SWITCH:-ON}"
+
+          if [[ -z "$PICK" ]]; then
+            echo "Universe mode: AUTO (UNIVERSE_PICK not set)"
+            echo "" >> .state/run_summary.md
+            echo "**Universe:** AUTO (UNIVERSE_PICK not set)" >> .state/run_summary.md
           else
-            echo "No .state changes to commit"
+            echo "Universe mode: FIXED (UNIVERSE_PICK=${PICK})"
+            echo "" >> .state/run_summary.md
+            echo "**Universe:** FIXED (${PICK})" >> .state/run_summary.md
           fi
 
-      - name: Debug list .state
+          echo "" >> .state/run_summary.md
+          echo "**DRY_RUN:** ${DRY}" >> .state/run_summary.md
+          echo "**RUN_SWITCH:** ${RUN_SWITCH}" >> .state/run_summary.md
+          echo "**MAX_POSITIONS:** ${MAX_POS}" >> .state/run_summary.md
+
+          # Hard enforcement:
+          # If we're in 1-coin rotation mode but someone pinned UNIVERSE_PICK,
+          # block the run early with a clear error and leave artifacts.
+          if [[ "${MAX_POS}" == "1" && -n "${PICK}" ]]; then
+            echo "::error title=Configuration blocked::MAX_POSITIONS==1 (rotation mode) but UNIVERSE_PICK is set to '${PICK}'. Clear UNIVERSE_PICK to enable auto-universe rotation."
+            # Update JSON so it’s obvious in the artifact
+            jq '.status="blocked" | .blocked=true | .reason="MAX_POSITIONS==1 but UNIVERSE_PICK is set"' .state/run_summary.json > .state/tmp.json 2>/dev/null || true
+            mv .state/tmp.json .state/run_summary.json 2>/dev/null || true
+            exit 22
+          fi
+
+      - name: Debug .state
         if: always()
-        shell: bash
         run: |
           echo "Listing .state contents:"
           ls -la .state || true
-          echo "---- run_summary.json ----"
-          [ -f .state/run_summary.json ] && cat .state/run_summary.json || true
-          echo "---- run_summary.md ----"
-          [ -f .state/run_summary.md ] && cat .state/run_summary.md || true
-          echo "---- position.json ----"
-          [ -f .state/position.json ] && cat .state/position.json || true
 
-      # --- Fix: upload the folder directly (no glob) so it always finds files
+      # -------------------
+      # Run your main script
+      # -------------------
+      - name: Run main.py
+        if: ${{ success() }}  # only if preflight passed
+        env:
+          # Vars
+          RUN_SWITCH: ${{ vars.RUN_SWITCH }}
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          MAX_POSITIONS: ${{ vars.MAX_POSITIONS }}
+          UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK }}
+          UNIVERSE_TOP_K: ${{ vars.UNIVERSE_TOP_K }}
+          BUY_USD: ${{ vars.BUY_USD }}
+          RESERVE_CASH_PCT: ${{ vars.RESERVE_CASH_PCT }}
+          SELL_STOP_PCT: ${{ vars.SELL_STOP_PCT }}
+          SELL_TAKE_PROFIT_PCT: ${{ vars.SELL_TAKE_PROFIT_PCT }}
+          SELL_1H_MIN_GAIN_PCT: ${{ vars.SELL_1H_MIN_GAIN_PCT }}
+          # Secrets
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          set -e
+          python -V
+          echo "Starting main.py…"
+          python main.py
+
+      # If main.py didn’t write a markdown summary for any reason,
+      # create a minimal one so artifacts still upload.
+      - name: Finalize summary (ensure .state/run_summary.md exists)
+        if: always()
+        run: |
+          mkdir -p .state
+          if [[ ! -s ".state/run_summary.md" ]]; then
+            echo "No summary generated by main.py — writing a minimal placeholder." | tee .state/run_summary.md
+          fi
+          # Also ensure a tiny JSON exists for debugging
+          if [[ ! -s ".state/run_summary.json" ]]; then
+            echo '{"status":"postrun","note":"main.py did not emit run_summary.json"}' > .state/run_summary.json
+          fi
+
       - name: Upload .state as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: state
-          path: .state
+          name: state-artifacts
+          path: ./.state/**
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 14
+
+      - name: Post-Job Cleanup
+        if: always()
+        run: |
+          git config --global --unset-all safe.directory || true
