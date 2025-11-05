@@ -1,8 +1,8 @@
-name: Crypto — Momentum Scan (build momentum_candidates.csv)
+name: Crypto — Spike Scan (build spike_candidates.csv)
 
 on:
   schedule:
-    - cron: "55 * * * *"   # hourly, 5 minutes before rotation job
+    - cron: "5,20,35,50 * * * *"   # every 15m, staggered from :00
   workflow_dispatch:
 
 jobs:
@@ -25,21 +25,23 @@ jobs:
           python -m pip install --upgrade pip
           # stdlib-only script; no deps required
 
-      - name: Run momentum scan
+      - name: Run spike scan
         env:
-          UNIVERSE_TOP_K: ${{ vars.UNIVERSE_TOP_K || 12 }}
+          MIN_24H_PCT: ${{ vars.MIN_24H_PCT || 10 }}     # require >= this 24h % change
+          MIN_USD_VOL: ${{ vars.MIN_USD_VOL || 5000 }}   # rough liquidity floor (USD)
+          TOP_K_SPIKES: ${{ vars.TOP_K_SPIKES || 8 }}
         run: |
-          python scanners/momentum_scan.py
+          python scanners/spike_scan.py
 
-      - name: Commit and push updated .state/momentum_candidates.csv
+      - name: Commit and push updated .state/spike_candidates.csv
         run: |
           set -e
-          if git status --porcelain .state/momentum_candidates.csv | grep -q .; then
+          if git status --porcelain .state/spike_candidates.csv | grep -q .; then
             git config user.name "actions-user"
             git config user.email "actions@users.noreply.github.com"
-            git add .state/momentum_candidates.csv
-            git commit -m "Create/Update momentum_candidates.csv [skip ci]"
+            git add .state/spike_candidates.csv
+            git commit -m "Create/Update spike_candidates.csv [skip ci]"
             git push
           else
-            echo "No changes to momentum_candidates.csv"
+            echo "No changes to spike_candidates.csv"
           fi
