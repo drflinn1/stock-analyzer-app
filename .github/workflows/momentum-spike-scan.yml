@@ -1,4 +1,4 @@
-name: Momentum — Spike Scan (commit .state)
+name: Momentum — Spike Scan (commit .state, promote spikes)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     - cron: "*/30 * * * *"  # every 30 minutes UTC
 
 permissions:
-  contents: write  # needed to push commits
+  contents: write
 
 concurrency:
   group: momentum-spike-scan
@@ -20,7 +20,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          persist-credentials: true  # required to push
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,11 +32,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
 
-      # ⬇️ Your existing spike scan step — keep your real command if different.
       - name: Run spike scanner
         run: |
           mkdir -p .state
-          # Replace with your real spike scan if needed:
           python tools/momentum_spike.py || true
 
       - name: Write spike-scan marker
@@ -44,13 +42,22 @@ jobs:
           mkdir -p .state
           echo "spike_scan_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" > .state/momentum_spike_marker.txt
 
-      # ✅ Force-add .state so .gitignore cannot block it
+      # Promote spikes to the list consumed by the rotation
+      - name: Promote spike candidates to momentum list (if present)
+        run: |
+          if [ -s ".state/spike_candidates.csv" ]; then
+            awk 'NR==1 || !seen[$0]++' .state/spike_candidates.csv > .state/momentum_candidates.csv
+            echo "Spikes promoted to .state/momentum_candidates.csv"
+          else
+            echo "No spike_candidates.csv to promote (skipping)"
+          fi
+
       - name: Commit & push .state (force-add)
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f .state/** || true
-          git commit -m "chore(spike-scan): update .state artifacts [skip ci]" || echo "Nothing to commit"
+          git commit -m "chore(spike-scan): update & promote spikes -> momentum [skip ci]" || echo "Nothing to commit"
           git push
 
       - name: Upload .state as artifact (optional)
