@@ -1,9 +1,11 @@
-**When:** 2025-11-05T16:20:54Z
+**When:** 2025-11-05T17:14:53Z
 **Mode:** LIVE
-**Status:** SKIP
+**Status:** LIVE SELL ERROR
 
 ```json
 {
-  "reason": "RUN_SWITCH=OFF"
+  "symbol": "HONEYUSD",
+  "qty": 2045.82651391,
+  "exception": "RuntimeError(\"KRAKEN SELL error: ['EOrder:Insufficient funds']\")"
 }
 ```

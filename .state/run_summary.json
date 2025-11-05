@@ -1,6 +1,8 @@
 {
-  "when": "2025-11-05T16:20:54Z",
+  "when": "2025-11-05T17:14:53Z",
   "mode": "LIVE",
-  "status": "SKIP",
-  "reason": "RUN_SWITCH=OFF"
+  "status": "LIVE SELL ERROR",
+  "symbol": "HONEYUSD",
+  "qty": 2045.82651391,
+  "exception": "RuntimeError(\"KRAKEN SELL error: ['EOrder:Insufficient funds']\")"
 }
