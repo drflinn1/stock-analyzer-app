@@ -1,50 +1,69 @@
 #!/usr/bin/env python3
+"""
+Always-write run summary for Crypto workflows.
+
+- Writes both .state/run_summary.json and .state/run_summary.md
+- Never touches trading logic; it only *reads* .state/position.json if present.
+"""
+
 from pathlib import Path
-import json, datetime as dt
+import json
+import datetime as dt
 
 STATE = Path(".state")
-STATE.mkdir(exist_ok=True)
+STATE.mkdir(parents=True, exist_ok=True)
+
 pos_file = STATE / "position.json"
 summary_json = STATE / "run_summary.json"
 summary_md   = STATE / "run_summary.md"
 
 now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-data = {"when": now, "status": "FLAT", "note": "No open position", "position": None}
+summary = {
+    "when": now,
+    "status": "FLAT",
+    "note": "No open position",
+    "position": None,
+}
 
 if pos_file.exists():
     try:
         pos = json.loads(pos_file.read_text())
-        data["status"] = "HOLD"
-        data["note"]   = "Tracking current position"
-        data["position"] = {
+        summary["status"] = "HOLD"
+        summary["note"] = "Tracking current position"
+        summary["position"] = {
             "symbol": pos.get("symbol"),
             "qty": pos.get("qty"),
             "entry_price": pos.get("entry_price"),
             "since": pos.get("since"),
+            "last_price": pos.get("last_price"),
+            "change_pct": pos.get("change_pct"),
         }
     except Exception as e:
-        data["status"] = "UNKNOWN"
-        data["note"]   = f"position.json parse error: {e}"
+        summary["status"] = "UNKNOWN"
+        summary["note"] = f"position.json parse error: {e}"
 
-# write JSON
-summary_json.write_text(json.dumps(data, indent=2))
+# Write JSON
+summary_json.write_text(json.dumps(summary, indent=2))
 
-# write Markdown
+# Write Markdown
 lines = [
-    f"**When:** {data['when']}",
-    f"**Status:** {data['status']}",
-    f"**Note:** {data['note']}",
+    f"**When:** {summary['when']}",
+    f"**Status:** {summary['status']}",
+    f"**Note:** {summary['note']}",
 ]
-if data["position"]:
-    p = data["position"]
+if summary["position"]:
+    p = summary["position"]
     lines += [
         "",
         "### Position",
         f"- **Symbol:** {p.get('symbol')}",
         f"- **Qty:** {p.get('qty')}",
         f"- **Entry:** {p.get('entry_price')}",
+        f"- **Last Price:** {p.get('last_price')}",
+        f"- **Change %:** {p.get('change_pct')}",
         f"- **Since:** {p.get('since')}",
     ]
+
 summary_md.write_text("\n".join(lines))
 print(f"Wrote {summary_json} and {summary_md}")
