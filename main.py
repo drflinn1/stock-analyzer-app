@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Crypto — Hourly 1-Coin Rotation (LIVE-ready, guarded)
-- One open position enforced via .state/position.json
-- Exits: SL (default 1%), TP (default 5%), Timer (60m & gain < +3%)
+Crypto — Hourly 1-Coin Rotation (LIVE-ready, desync-safe)
+- Holds exactly one position via .state/position.json
+- Exits: SL (1%), TP (5%), Timer(60m & gain<+3%) by default
 - ALWAYS writes .state/run_summary.json/.md
-- Minimal Kraken REST client (stdlib only)
+- Kraken REST via stdlib only
 
-Adds:
-- Sanity clamps on envs (no negative SL, etc.)
-- Buy-guard: prevents a new BUY if a recent buy occurred within BUY_GUARD_MINUTES (default 5)
+Adds DESYNC handling:
+- If a SELL fails with 'EOrder:Insufficient funds' we clear position.json
+  and continue to BUY in the same run.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ STATE = Path(".state"); STATE.mkdir(parents=True, exist_ok=True)
 POS_FILE = STATE / "position.json"
 SUMMARY_JSON = STATE / "run_summary.json"
 SUMMARY_MD   = STATE / "run_summary.md"
-LAST_BUY_TS  = STATE / "last_buy_at.txt"   # stores epoch seconds of last live/dry buy
 
 # ------------------------------ Env utils ------------------------------
 def env_str(k: str, default: str = "") -> str:
@@ -35,14 +34,6 @@ def env_int(k: str, default: int = 0) -> int:
 def env_float(k: str, default: float = 0.0) -> float:
     try: return float(env_str(k, str(default)).strip())
     except: return default
-
-def clamp(v: float, lo: float, hi: float, default: float) -> float:
-    try:
-        if v < lo or v > hi or not (v == v):  # NaN check v==v
-            return default
-        return v
-    except Exception:
-        return default
 
 def now_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -98,18 +89,6 @@ def clear_position() -> None:
 def pct_change(from_price: float, to_price: float) -> float:
     if from_price <= 0: return 0.0
     return (to_price - from_price) / from_price * 100.0
-
-def record_last_buy_now() -> None:
-    LAST_BUY_TS.write_text(str(int(time.time())))
-
-def minutes_since_last_buy() -> Optional[float]:
-    if not LAST_BUY_TS.exists():
-        return None
-    try:
-        ts = int(LAST_BUY_TS.read_text().strip() or "0")
-        return (time.time() - ts) / 60.0
-    except Exception:
-        return None
 
 # ------------------------ Candidate selection --------------------------
 def read_csv_first_symbol(csv_path: Path) -> Optional[str]:
@@ -172,27 +151,20 @@ def _private_request(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
         return json.loads(resp.read().decode())
 
 def kraken_last_price(pair: str) -> float:
-    url = f"{API_BASE}/0/public/Ticker?pair={pair}"
-    data = _http_get(url)
+    data = _http_get(f"{API_BASE}/0/public/Ticker?pair={pair}")
     if data.get("error"):
         raise RuntimeError(f"Ticker error: {data['error']}")
     result = data.get("result", {})
     if not result:
         raise RuntimeError("Ticker empty result")
     first = next(iter(result.values()))
-    price = float(first["c"][0])
-    return price
+    return float(first["c"][0])
 
 def _volume_round(qty: float) -> float:
     q = float(f"{qty:.8f}")
     return 0.0 if q < 1e-8 else q
 
 def kraken_add_order_market(pair: str, side: str, volume_base: float) -> Dict[str, Any]:
-    """
-    side: 'buy' or 'sell'
-    ordertype: 'market'
-    volume_base: BASE units (e.g., AERO units)
-    """
     payload = {
         "pair": pair,
         "type": side,
@@ -215,8 +187,7 @@ def live_buy(symbol: str, usd_amount: float) -> Dict[str, Any]:
         raise RuntimeError(f"Calculated qty too small for {symbol} at {price} using ${usd_amount}")
     res = kraken_add_order_market(symbol, "buy", qty)
     err = res.get("error", [])
-    if err:
-        raise RuntimeError(f"KRAKEN BUY error: {err}")
+    if err: raise RuntimeError(f"KRAKEN BUY error: {err}")
     txs  = res.get("result", {}).get("txid", [])
     return {"symbol": symbol, "qty": qty, "avg_price": price, "txid": txs[0] if txs else None, "raw": res}
 
@@ -226,123 +197,124 @@ def live_sell(symbol: str, qty: float) -> Dict[str, Any]:
         raise RuntimeError(f"SELL qty too small for {symbol}")
     res = kraken_add_order_market(symbol, "sell", qty)
     err = res.get("error", [])
-    if err:
-        raise RuntimeError(f"KRAKEN SELL error: {err}")
+    if err: raise RuntimeError(f"KRAKEN SELL error: {err}")
     price = kraken_last_price(symbol)
     txs  = res.get("result", {}).get("txid", [])
     return {"symbol": symbol, "qty": qty, "avg_price": price, "txid": txs[0] if txs else None, "raw": res}
 
 # ------------------------------ Main logic ------------------------------
 def main() -> None:
-    # Raw envs
-    raw_dry_run        = env_str("DRY_RUN","OFF").upper()
-    run_switch         = env_str("RUN_SWITCH","ON").upper() == "ON"
-    usd_per_buy        = env_float("BUY_USD", 25.0)
-    max_positions      = env_int("MAX_POSITIONS", 1)
-    tp_pct_raw         = env_float("TP_PCT", 5.0)
-    sl_pct_raw         = env_float("SL_PCT", 1.0)
-    rotate_minutes_raw = env_int("ROTATE_MINUTES", 60)
-    rotate_gain_raw    = env_float("ROTATE_MIN_GAIN_PCT", 3.0)
-    buy_guard_min      = env_int("BUY_GUARD_MINUTES", 5)  # optional guard
+    dry_run        = env_str("DRY_RUN","OFF").upper() != "OFF"
+    run_switch     = env_str("RUN_SWITCH","ON").upper() == "ON"
+    usd_per_buy    = env_float("BUY_USD", 25.0)
+    max_positions  = env_int("MAX_POSITIONS", 1)
 
-    # Sanity clamps
-    tp_pct         = clamp(tp_pct_raw, 0.1, 100.0, 5.0)
-    sl_pct         = clamp(sl_pct_raw, 0.1, 50.0, 1.0)
-    rotate_minutes = int(clamp(float(rotate_minutes_raw), 5.0, 480.0, 60.0))
-    rotate_gain    = clamp(rotate_gain_raw, 0.0, 20.0, 3.0)
-    dry_run        = (raw_dry_run != "OFF")
+    # Exit config (clamp to sane positive values)
+    tp_pct         = max(0.01, abs(env_float("TAKE_PROFIT_PCT", 5.0)))
+    sl_pct         = max(0.01, abs(env_float("STOP_LOSS_PCT", 1.0)))
+    rotate_minutes = max(1,    abs(env_int("ROTATE_MINUTES", 60)))
+    rotate_gain    = max(0.01, abs(env_float("ROTATE_MIN_GAIN_PCT", 3.0)))
 
     write_summary("start", {
         "dry_run": dry_run,
         "run_switch": run_switch,
         "max_positions": max_positions,
         "buy_usd": usd_per_buy,
-        "tp_pct": {"raw": tp_pct_raw, "sanitized": tp_pct},
-        "sl_pct": {"raw": sl_pct_raw, "sanitized": sl_pct},
-        "rotate_minutes": {"raw": rotate_minutes_raw, "sanitized": rotate_minutes},
-        "rotate_gain_pct": {"raw": rotate_gain_raw, "sanitized": rotate_gain},
-        "buy_guard_minutes": buy_guard_min
+        "tp_pct": tp_pct, "sl_pct": sl_pct,
+        "rotate_minutes": rotate_minutes, "rotate_gain_pct": rotate_gain
     })
 
     if not run_switch:
         write_summary("SKIP", {"reason":"RUN_SWITCH=OFF"})
         return
 
-    # If holding, evaluate exits
+    # --------------------- If holding, evaluate exits ---------------------
+    proceed_to_buy = False
     if have_open_position():
         pos = load_position()
         if not pos:
             clear_position()
             write_summary("WARN", {"reason":"position.json unreadable; cleared"})
-            return
-
-        sym = pos["symbol"]; qty = float(pos["qty"])
-        entry = float(pos["entry_price"]); opened = float(pos["opened_at"])
-        price = get_last_price(sym)
-        change = ((price - entry) / entry * 100.0) if entry > 0 else 0.0
-        minutes = (time.time() - opened) / 60.0
-
-        decision, reason = "hold", ""
-        if change <= -abs(sl_pct):
-            decision, reason = "sell", f"SL hit ({change:.2f}%)"
-        elif change >= abs(tp_pct):
-            decision, reason = "sell", f"TP hit (+{change:.2f}%)"
-        elif minutes >= rotate_minutes and change < abs(rotate_gain):
-            decision, reason = "sell", f"Timer {rotate_minutes}m & gain {change:.2f}% < {rotate_gain}%"
-
-        if decision == "sell":
-            if dry_run:
-                write_summary("DRY SELL", {"symbol": sym, "qty": qty, "price": price, "reason": reason})
-                clear_position()
-            else:
-                try:
-                    res = live_sell(sym, qty)
-                    write_summary("LIVE SELL OK", {
-                        "symbol": res["symbol"], "qty": res["qty"],
-                        "avg_price": res["avg_price"], "txid": res.get("txid"),
-                        "reason": reason
-                    })
-                    clear_position()
-                except Exception as e:
-                    write_summary("LIVE SELL ERROR", {"symbol": sym, "qty": qty, "exception": repr(e)})
+            proceed_to_buy = True
         else:
-            write_summary("HOLD", {"symbol": sym, "qty": qty, "price": price, "change_pct": change, "minutes_open": minutes})
+            sym = pos["symbol"]; qty = float(pos["qty"])
+            entry = float(pos["entry_price"]); opened = float(pos["opened_at"])
+            price = get_last_price(sym)
+            change = pct_change(entry, price)
+            minutes = (time.time() - opened) / 60.0
+
+            decision, reason = "hold", ""
+            if change <= -sl_pct:
+                decision, reason = "sell", f"SL hit ({change:.2f}%)"
+            elif change >= tp_pct:
+                decision, reason = "sell", f"TP hit (+{change:.2f}%)"
+            elif minutes >= rotate_minutes and change < rotate_gain:
+                decision, reason = "sell", f"Timer {rotate_minutes}m & gain {change:.2f}% < {rotate_gain}%"
+
+            if decision == "sell":
+                if dry_run:
+                    write_summary("DRY SELL", {"symbol": sym, "qty": qty, "price": price, "reason": reason})
+                    clear_position()
+                    proceed_to_buy = True
+                else:
+                    try:
+                        res = live_sell(sym, qty)
+                        write_summary("LIVE SELL OK", {
+                            "symbol": res["symbol"], "qty": res["qty"],
+                            "avg_price": res["avg_price"], "txid": res.get("txid"),
+                            "reason": reason
+                        })
+                        clear_position()
+                        proceed_to_buy = True
+                    except Exception as e:
+                        msg = repr(e)
+                        # Desync fix: treat "insufficient funds" as no position -> clear and buy
+                        if "Insufficient funds" in msg:
+                            clear_position()
+                            write_summary("DESYNC CLEAR", {
+                                "symbol": sym, "qty": qty, "exception": msg,
+                                "note": "Kraken shows no coins; cleared stale position.json"
+                            })
+                            proceed_to_buy = True
+                        else:
+                            write_summary("LIVE SELL ERROR", {"symbol": sym, "qty": qty, "exception": msg})
+                            return
+            else:
+                write_summary("HOLD", {"symbol": sym, "qty": qty, "price": price, "change_pct": change, "minutes_open": minutes})
+                return
+    else:
+        proceed_to_buy = True
+
+    # --------------------- Not holding (or cleared): BUY ------------------
+    if not proceed_to_buy:
         return
 
-    # Not holding: enforce caps / guards, then BUY
     if max_positions <= 0:
         write_summary("SKIP", {"reason":"MAX_POSITIONS<=0"})
         return
+
     if max_positions == 1 and POS_FILE.exists():
         write_summary("SKIP", {"reason":"position.json present; MAX_POSITIONS=1"})
         return
 
-    # Buy-guard: avoid rapid-fire rebuy after manual reruns / timing races
-    since = minutes_since_last_buy()
-    if since is not None and since < max(1, buy_guard_min):
-        write_summary("SKIP", {"reason": f"Buy guard: last buy {since:.1f}m ago < {buy_guard_min}m"})
-        return
-
-    # Choose candidate
+    # Candidate
     try:
         pick = select_top_candidate()
     except Exception as e:
         write_summary("SKIP", {"reason": f"No candidate: {e}"})
         return
 
-    # Execute BUY
+    # BUY
     try:
         if dry_run:
             price = get_last_price(pick)
             qty = (usd_per_buy / price) if price > 0 else 0.0
             qty = float(f"{qty:.8f}")
             save_position(pick, qty, price)
-            record_last_buy_now()
             write_summary("DRY BUY", {"symbol": pick, "qty": qty, "entry_price": price})
         else:
             res = live_buy(pick, usd_per_buy)
             save_position(res["symbol"], float(res["qty"]), float(res["avg_price"]))
-            record_last_buy_now()
             write_summary("LIVE BUY OK", {
                 "symbol": res["symbol"], "qty": res["qty"],
                 "avg_price": res["avg_price"], "txid": res.get("txid")
