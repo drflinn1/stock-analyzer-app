@@ -9,10 +9,14 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    permissions:
+      contents: write    # allow committing .state back to repo
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -24,7 +28,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
 
-      # Runs your bot. We explicitly pass Secrets and (optional) Variables.
+      # Runs your bot (it writes .state/run_summary.* and position.json)
       - name: Run crypto bot
         env:
           PYTHONUNBUFFERED: "1"
@@ -33,7 +37,7 @@ jobs:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-          # --- OPTIONAL VARIABLES (empty is fine; main.py has defaults) ---
+          # --- OPTIONAL VARIABLES ---
           DRY_RUN: ${{ vars.DRY_RUN }}
           RUN_SWITCH: ${{ vars.RUN_SWITCH }}
           BUY_USD: ${{ vars.BUY_USD }}
@@ -46,21 +50,36 @@ jobs:
         run: |
           python main.py
 
-      # Show what's in .state so we can see the summary files in logs
+      # Commit .state back to repo so next run sees position.json and holds
+      - name: Persist .state to repo
+        if: always()
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .state || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(state): update .state (position & summaries) [skip ci]"
+            git push
+          else
+            echo "No .state changes to commit."
+          fi
+
+      # Debug listing (optional but helpful)
       - name: Debug list state
         if: always()
         run: |
-          echo "Listing .state contents (if any):"
+          echo "Listing .state contents:"
           ls -la .state || true
           echo "Preview run_summary.md (if present):"
           [ -f .state/run_summary.md ] && sed -n '1,80p' .state/run_summary.md || echo "run_summary.md not found"
 
-      # Upload .state as artifact (includes run_summary.* and position.json if holding)
+      # Upload .state as artifact (simpler, robust path)
       - name: Upload .state as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state
-          path: ./.state/**
+          path: .state
           if-no-files-found: warn
           retention-days: 7
