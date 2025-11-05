@@ -1,13 +1,9 @@
-**When:** 2025-11-05T03:31:21Z
+**When:** 2025-11-05T04:14:21Z
 **Mode:** LIVE
-**Status:** HOLD
+**Status:** SKIP
 
 ```json
 {
-  "symbol": "HONEYUSD",
-  "qty": 2045.82651391,
-  "price": 0.01245,
-  "change_pct": 1.882160392798685,
-  "minutes_open": 2.682813779513041
+  "reason": "RUN_SWITCH=OFF"
 }
 ```
