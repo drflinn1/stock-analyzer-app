@@ -24,84 +24,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
 
-      # --- Run your bot ---
+      # Runs your bot. It writes .state/run_summary.{json,md} itself.
       - name: Run crypto bot
         env:
           PYTHONUNBUFFERED: "1"
         run: |
           python main.py
 
-      # --- Always create .state + summary files ---
-      - name: Write run summary
+      # Show what's in .state so we can see the summary files in logs
+      - name: Debug: list .state
         if: always()
         run: |
-          mkdir -p .state
-          python - << 'PY'
-          from pathlib import Path
-          import json, datetime as dt
+          echo "Listing .state contents (if any):"
+          ls -la .state || true
+          echo "Preview run_summary.md (if present):"
+          [ -f .state/run_summary.md ] && sed -n '1,60p' .state/run_summary.md || echo "run_summary.md not found"
 
-          STATE = Path(".state")
-          STATE.mkdir(parents=True, exist_ok=True)
-
-          pos_file = STATE / "position.json"
-          summary_json = STATE / "run_summary.json"
-          summary_md   = STATE / "run_summary.md"
-
-          now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-
-          summary = {
-              "when": now,
-              "status": "FLAT",
-              "note": "No open position",
-              "position": None,
-          }
-
-          if pos_file.exists():
-              try:
-                  pos = json.loads(pos_file.read_text() or "{}")
-                  summary["status"] = "HOLD"
-                  summary["note"] = "Tracking current position"
-                  summary["position"] = {
-                      "symbol": pos.get("symbol"),
-                      "qty": pos.get("qty"),
-                      "entry_price": pos.get("entry_price"),
-                      "since": pos.get("since"),
-                      "last_price": pos.get("last_price"),
-                      "change_pct": pos.get("change_pct"),
-                  }
-              except Exception as e:
-                  summary["status"] = "UNKNOWN"
-                  summary["note"] = f"position.json parse error: {e}"
-
-          summary_json.write_text(json.dumps(summary, indent=2))
-
-          lines = [
-              f"**When:** {summary['when']}",
-              f"**Status:** {summary['status']}",
-              f"**Note:** {summary['note']}",
-          ]
-          if summary["position"]:
-              p = summary["position"]
-              lines += [
-                  "",
-                  "### Position",
-                  f"- **Symbol:** {p.get('symbol')}",
-                  f"- **Qty:** {p.get('qty')}",
-                  f"- **Entry:** {p.get('entry_price')}",
-                  f"- **Last Price:** {p.get('last_price')}",
-                  f"- **Change %:** {p.get('change_pct')}",
-                  f"- **Since:** {p.get('since')}",
-              ]
-          summary_md.write_text("\n".join(lines))
-          print(f"Wrote {summary_json} and {summary_md}")
-          PY
-
-      # --- Upload .state AFTER the summary exists ---
+      # Upload .state as artifact (includes run_summary.* and position.json if holding)
       - name: Upload .state as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state
-          path: ./.state/**          # picks up run_summary.* and any position files
+          path: ./.state/**
           if-no-files-found: warn
           retention-days: 7
