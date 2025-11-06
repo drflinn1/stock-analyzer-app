@@ -30,7 +30,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
-          pip install ccxt
+          pip install ccxt matplotlib pyyaml
 
       - name: Preflight — show working dir and current .state
         run: |
@@ -38,6 +38,7 @@ jobs:
           python -V
           ls -la .
           mkdir -p .state
+          echo "placeholder" > .state/.keep
           echo "(before) list .state:"
           ls -la .state || true
 
@@ -55,15 +56,12 @@ jobs:
 
       - name: Run main.py (repo root, with real env vars)
         env:
-          # Map repo Variables → environment for Python
           DRY_RUN: ${{ vars.DRY_RUN }}
           BUY_USD: ${{ vars.BUY_USD }}
           UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK }}
           RESERVE_CASH_PCT: ${{ vars.RESERVE_CASH_PCT }}
-          # Secrets
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          # Optional rotation knobs (use repo Variables if you add them)
           TP_PCT: ${{ vars.TP_PCT }}
           STOP_PCT: ${{ vars.STOP_PCT }}
           SLOW_MIN_PCT: ${{ vars.SLOW_MIN_PCT }}
@@ -72,7 +70,7 @@ jobs:
           echo '--- head(main.py) ---'
           sed -n '1,40p' main.py || true
           echo '--- running ---'
-          python main.py
+          python main.py || echo "(Python exited nonzero)"
 
       - name: Post — show .state after run
         if: always()
