@@ -21,6 +21,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Restore last run's .state (positions.json, summaries, markers, etc.)
+      # This is the key fix that prevents repeat buys on each cycle.
+      - name: Restore .state cache
+        id: cache-state
+        uses: actions/cache@v4
+        with:
+          path: .state
+          # new key each run so cache can update; restore-keys let us grab the latest
+          key: state-${{ github.workflow }}-${{ github.ref }}-${{ github.run_id }}
+          restore-keys: |
+            state-${{ github.workflow }}-${{ github.ref }}-
+            state-${{ github.workflow }}-
+            state-
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -35,11 +49,10 @@ jobs:
       - name: Preflight — show working dir and current .state
         run: |
           echo "PWD=$(pwd)"
-          echo "workspace=$GITHUB_WORKSPACE"
           python -V
           ls -la .
           mkdir -p .state
-          echo "placeholder" > .state/.keep
+          [ -f .state/.keep ] || echo "placeholder" > .state/.keep
           echo "(before) list .state:"
           ls -la .state || true
 
@@ -47,8 +60,12 @@ jobs:
         run: |
           echo "DRY_RUN=${{ vars.DRY_RUN }}"
           echo "BUY_USD=${{ vars.BUY_USD }}"
-          echo "UNIVERSE_PICK=${{ vars.UNIVERSE_PICK }}"
+          echo "UNIVERSE_PICK='${{ vars.UNIVERSE_PICK }}'"
           echo "RESERVE_CASH_PCT=${{ vars.RESERVE_CASH_PCT }}"
+          echo "TP_PCT=${{ vars.TP_PCT }}"
+          echo "STOP_PCT=${{ vars.STOP_PCT }}"
+          echo "SLOW_MIN_PCT=${{ vars.SLOW_MIN_PCT }}"
+          echo "WINDOW_MIN=${{ vars.WINDOW_MIN }}"
           if [ -n "${{ secrets.KRAKEN_API_KEY }}" ] && [ -n "${{ secrets.KRAKEN_API_SECRET }}" ]; then
             echo "Secrets: Kraken key/secret are present."
           else
@@ -69,7 +86,7 @@ jobs:
           WINDOW_MIN: ${{ vars.WINDOW_MIN }}
         run: |
           echo '--- head(main.py) ---'
-          sed -n '1,40p' main.py || true
+          sed -n '1,60p' main.py || true
           echo '--- running ---'
           python main.py || echo "(Python exited nonzero)"
 
@@ -79,14 +96,11 @@ jobs:
           echo "(after) list .state:"
           ls -la .state || true
           echo "---- run_summary.md ----"
-          test -f .state/run_summary.md && sed -n '1,120p' .state/run_summary.md || echo "run_summary.md not found"
+          test -f .state/run_summary.md && sed -n '1,140p' .state/run_summary.md || echo "run_summary.md not found"
           echo "---- positions.json ----"
           test -f .state/positions.json && cat .state/positions.json || echo "positions.json not found"
           echo "---- last_ok.txt ----"
           test -f .state/last_ok.txt && cat .state/last_ok.txt || echo "last_ok.txt not found"
-          echo "---- absolute path check ----"
-          realpath .state || true
-          find .state -maxdepth 1 -type f -printf '%p\n' || true
 
       - name: Upload .state (artifact)
         if: always()
@@ -94,7 +108,6 @@ jobs:
         with:
           name: state
           path: |
-            ${{ github.workspace }}/.state/**
-          include-hidden-files: true
+            .state/
           if-no-files-found: warn
           retention-days: 7
