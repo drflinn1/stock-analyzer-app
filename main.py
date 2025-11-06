@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
 """
-main.py — Unified crypto rotation runner (LIVE/DRY-RUN) for Kraken.
+main.py — Crypto 1-coin rotation for Kraken (LIVE/DRY-RUN)
 
-Features:
-- Loads promoted candidates from .state/momentum_candidates.csv (spike scan promotes here)
-- Single-position rotation with:
-    • 1% stop-loss
-    • 5% take-profit
-    • "<3% in 1 hour" rotate-out rule
-    • Cool-down to avoid instant re-buys of the same symbol
-- Always writes .state/run_summary.md and .state/run_summary.json (even on risk-off)
-- LIVE mode: places Kraken market orders via REST (no external libs needed)
-- DRY_RUN mode: simulates orders but updates .state/position.json so behavior is testable
+Rules (unchanged):
+  • 1% stop-loss
+  • 5% take-profit
+  • "< 3% gain after 1 hour" => rotate out
 
-Environment (commonly set via workflow inputs/vars):
-- DRY_RUN: "ON"|"OFF"               (default: "ON")
-- BUY_USD: amount in USD to buy     (default: "10")
-- UNIVERSE_PICK: specific pair to force buy (e.g., "ALCX/USD") (default: "")
-- COOLDOWN_MIN: minutes to avoid re-buying a symbol after exit (default: "60")
+Enhancements:
+  • Always writes run_summary.md/json with rich diagnostics (PnL, prices, entry age, reasons)
+  • Accepts legacy position schemas:
+        - {"symbol","qty","avg_price","entry_ts"}  (ISO)
+        - {"symbol","qty","entry_price","opened_at"} (opened_at = epoch float)
+  • Optional fallback-rotate (disabled by default):
+        If FALLBACK_ROTATE=ON and age >= AGE_FALLBACK_MIN and pnl <= ROTATE_IF_PNL_BELOW
+        and top candidate != current and not in cooldown => rotate
 
-Kraken secrets (for LIVE):
-- KRAKEN_API_KEY
-- KRAKEN_API_SECRET (base64)
+Env:
+  DRY_RUN: "ON"|"OFF"                (default "ON")
+  BUY_USD: float, USD per buy        (default "10")
+  UNIVERSE_PICK: "ALCX/USD" etc      (default "")
+  COOLDOWN_MIN: int minutes          (default "60")
+
+  FALLBACK_ROTATE: "ON"|"OFF"        (default "OFF")
+  AGE_FALLBACK_MIN: int minutes      (default "60")
+  ROTATE_IF_PNL_BELOW: float (frac)  (default "0.0")  # 0% or worse after fallback age
+
+Kraken LIVE:
+  KRAKEN_API_KEY
+  KRAKEN_API_SECRET (base64)
 """
 
 import base64
@@ -29,15 +36,13 @@ import hashlib
 import hmac
 import json
 import os
-import sys
 import time
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
 import csv
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 # ---------- Paths ----------
 STATE = Path(".state")
@@ -46,14 +51,14 @@ POS_FILE = STATE / "position.json"
 SUMMARY_JSON = STATE / "run_summary.json"
 SUMMARY_MD = STATE / "run_summary.md"
 LAST_EXIT = STATE / "last_exit_code.txt"
-RISK_FILE = STATE / "last_risk_signal.txt"      # optional; if exists and says OFF => skip
-COOLDOWN_FILE = STATE / "cooldown.json"         # { "SYMBOL": "2025-11-05T22:00:00Z", ... }
-CANDIDATES = STATE / "momentum_candidates.csv"  # spike scan promotes here
+RISK_FILE = STATE / "last_risk_signal.txt"
+COOLDOWN_FILE = STATE / "cooldown.json"
+CANDIDATES = STATE / "momentum_candidates.csv"
 
-# ---------- Config helpers ----------
+# ---------- Helpers ----------
 def env_str(name: str, default: str = "") -> str:
-    v = os.getenv(name, default)
-    return "" if v is None else str(v)
+    v = os.getenv(name)
+    return default if v is None else str(v)
 
 def env_float(name: str, default: float) -> float:
     try:
@@ -67,23 +72,22 @@ def now_utc() -> datetime:
 def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
-# ---------- Kraken minimal REST client ----------
+# ---------- Kraken minimal client ----------
 KRAKEN_BASE = "https://api.kraken.com"
 
 def _kraken_request(path: str, data: Dict[str, Any], key: str, secret_b64: str) -> Dict[str, Any]:
-    """
-    POST to Kraken REST.
-    """
     url = f"{KRAKEN_BASE}{path}"
     nonce = str(int(time.time() * 1000))
-    post_data = {"nonce": nonce}
-    post_data.update(data)
-    post_bytes = urllib.parse.urlencode(post_data).encode()
+    pdata = {"nonce": nonce}
+    pdata.update(data)
+    enc = urllib.parse.urlencode(pdata)
+    post_bytes = enc.encode()
 
     sha256 = hashlib.sha256((nonce + urllib.parse.urlencode(data)).encode()).digest()
     msg = path.encode() + sha256
     secret = base64.b64decode(secret_b64)
     sig = hmac.new(secret, msg, hashlib.sha512).digest()
+
     headers = {
         "API-Key": key,
         "API-Sign": base64.b64encode(sig),
@@ -92,45 +96,33 @@ def _kraken_request(path: str, data: Dict[str, Any], key: str, secret_b64: str) 
     }
     req = urllib.request.Request(url, data=post_bytes, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=20) as resp:
-        body = resp.read()
-        payload = json.loads(body.decode())
-        return payload
+        return json.loads(resp.read().decode())
 
 def kraken_public_ticker(pair: str) -> Optional[float]:
-    """
-    Returns last price for pair like 'ALCXUSD' or 'ALCX/USD' (slash allowed; we normalize).
-    """
-    kr_pair = pair.replace("/", "").upper()
-    url = f"{KRAKEN_BASE}/0/public/Ticker?pair={urllib.parse.quote(kr_pair)}"
+    pair_ns = pair.replace("/", "").upper()
+    url = f"{KRAKEN_BASE}/0/public/Ticker?pair={urllib.parse.quote(pair_ns)}"
     req = urllib.request.Request(url, headers={"User-Agent": "stock-analyzer-app"})
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.loads(resp.read().decode())
             if data.get("error"):
                 return None
-            result = data.get("result", {})
-            if not result:
+            res = data.get("result", {})
+            if not res:
                 return None
-            # result key can be normalized or mapped; pick first key
-            first_key = next(iter(result.keys()))
-            # 'c' field -> last trade [price, lot volume]
-            last = result[first_key]["c"][0]
+            k = next(iter(res.keys()))
+            last = res[k]["c"][0]
             return float(last)
     except Exception:
         return None
 
-def kraken_place_market(key: str, secret_b64: str, pair: str, side: str, volume: float) -> Tuple[bool, str]:
-    """
-    Place a market order. side in {"buy","sell"}.
-    Returns (ok, txid_or_error).
-    """
-    pair_norm = pair.replace("/", "").upper()
+def kraken_place_market(key: str, secret_b64: str, pair_ns: str, side: str, volume: float) -> Tuple[bool, str]:
     data = {
-        "pair": pair_norm,
+        "pair": pair_ns,
         "type": side,
         "ordertype": "market",
         "volume": f"{volume:.8f}",
-        "oflags": "viqc",  # volume in quote currency conversion if needed
+        "oflags": "viqc",
     }
     try:
         resp = _kraken_request("/0/private/AddOrder", data, key, secret_b64)
@@ -141,7 +133,7 @@ def kraken_place_market(key: str, secret_b64: str, pair: str, side: str, volume:
     except Exception as e:
         return False, f"EXC:{e}"
 
-# ---------- Files ----------
+# ---------- File I/O ----------
 def read_json(path: Path, default: Any) -> Any:
     try:
         return json.loads(path.read_text())
@@ -161,8 +153,8 @@ def load_cooldown() -> Dict[str, str]:
 def save_cooldown(cd: Dict[str, str]) -> None:
     write_json(COOLDOWN_FILE, cd)
 
-def in_cooldown(symbol: str, cd: Dict[str, str]) -> bool:
-    until = cd.get(symbol.upper())
+def in_cooldown(symbol_ns: str, cd: Dict[str, str]) -> bool:
+    until = cd.get(symbol_ns.upper())
     if not until:
         return False
     try:
@@ -170,135 +162,143 @@ def in_cooldown(symbol: str, cd: Dict[str, str]) -> bool:
     except Exception:
         return False
 
-def set_cooldown(symbol: str, minutes: int, cd: Dict[str, str]) -> None:
+def set_cooldown(symbol_ns: str, minutes: int, cd: Dict[str, str]) -> None:
     until = now_utc() + timedelta(minutes=minutes)
-    cd[symbol.upper()] = iso(until).replace("+00:00", "Z")
+    cd[symbol_ns.upper()] = iso(until).replace("+00:00", "Z")
 
 # ---------- Candidates ----------
 def load_candidates(path: Path) -> List[str]:
-    """
-    Reads first column from CSV and returns list of pairs, e.g., ["ALCX/USD", "1INCH/USD", ...]
-    Accepts header names like 'pair', 'symbol' or any first column.
-    """
     if not path.exists():
         return []
     out: List[str] = []
     with path.open(newline="") as f:
-        reader = csv.reader(f)
-        rows = list(reader)
+        r = csv.reader(f)
+        rows = list(r)
         if not rows:
             return out
-        # Detect header if non-symbol-like
-        start_idx = 0
-        if rows and rows[0]:
-            head = rows[0][0].lower()
-            if any(k in head for k in ("pair", "symbol")):
-                start_idx = 1
-        for r in rows[start_idx:]:
-            if not r:
+        start = 0
+        if rows[0] and any(k in rows[0][0].lower() for k in ("pair", "symbol")):
+            start = 1
+        for row in rows[start:]:
+            if not row:
                 continue
-            sym = r[0].strip()
-            if not sym:
+            s = row[0].strip().upper().replace(" ", "")
+            if not s:
                 continue
-            # normalize like "ALCXUSD"
-            sym_norm = sym.replace(" ", "").replace("-", "").upper()
-            # keep slash form for presentation; use no-slash for Kraken endpoints
-            if "/" not in sym_norm and len(sym_norm) > 3:
-                # keep both; we will render "AAA/BBB" in summary, but Kraken uses noslash
-                sym_disp = f"{sym_norm[:-3]}/{sym_norm[-3:]}"
-            else:
-                sym_disp = sym.replace(" ", "").upper()
-            out.append(sym_disp)
-    # de-dup preserving order
-    seen = set()
-    unique = []
+            if "/" not in s and len(s) > 3:
+                s = f"{s[:-3]}/{s[-3:]}"
+            out.append(s)
+    # de-dupe
+    seen, uniq = set(), []
     for s in out:
-        key = s.replace("/", "")
-        if key in seen:
+        k = s.replace("/", "")
+        if k in seen: 
             continue
-        seen.add(key)
-        unique.append(s)
-    return unique
+        seen.add(k)
+        uniq.append(s)
+    return uniq
 
 # ---------- Position ----------
 def load_position() -> Optional[Dict[str, Any]]:
-    return read_json(POS_FILE, None)
+    """
+    Returns normalized position dict:
+      {"symbol":"ALCXUSD","qty":float,"avg_price":float,"entry_ts": ISO str}
+    """
+    raw = read_json(POS_FILE, None)
+    if not raw:
+        return None
+    sym = raw.get("symbol") or raw.get("pair") or ""
+    sym = sym.replace("/", "").upper()
+    qty = float(raw.get("qty", 0) or 0)
+    avg_price = raw.get("avg_price", None)
+    entry_ts = raw.get("entry_ts", None)
+
+    # Legacy compatibility
+    if avg_price is None and "entry_price" in raw:
+        avg_price = float(raw["entry_price"])
+    if not entry_ts and "opened_at" in raw:
+        try:
+            # epoch (float or int) -> ISO
+            entry_ts = iso(datetime.fromtimestamp(float(raw["opened_at"]), tz=timezone.utc))
+        except Exception:
+            entry_ts = None
+
+    if not sym or qty <= 0 or avg_price is None:
+        return None
+    if not entry_ts:
+        entry_ts = iso(now_utc())  # best-effort
+
+    return {"symbol": sym, "qty": float(qty), "avg_price": float(avg_price), "entry_ts": entry_ts}
 
 def save_position(pos: Optional[Dict[str, Any]]) -> None:
     if pos is None:
-        if POS_FILE.exists():
-            POS_FILE.unlink(missing_ok=True)
+        POS_FILE.unlink(missing_ok=True)
     else:
         write_json(POS_FILE, pos)
 
-# ---------- Risk-Off gate (optional) ----------
+# ---------- Risk gate ----------
 def risk_off() -> bool:
     try:
         if not RISK_FILE.exists():
             return False
-        txt = RISK_FILE.read_text().strip().upper()
-        return "OFF" in txt
+        return "OFF" in RISK_FILE.read_text().strip().upper()
     except Exception:
         return False
 
-# ---------- Core logic ----------
-def decide_exit(pos: Dict[str, Any], price_now: float) -> Tuple[bool, str, float]:
-    """
-    Returns (should_exit, reason, gain_pct_signed)
-    """
-    avg = float(pos.get("avg_price", 0.0) or 0.0)
-    if avg <= 0 or price_now <= 0:
-        return False, "no-price", 0.0
-    pnl = (price_now - avg) / avg
-    # Rules
-    if pnl <= -0.01:
-        return True, "STOP_1pct", pnl
-    if pnl >= 0.05:
-        return True, "TAKE_PROFIT_5pct", pnl
-    # 1h rotate if gain < 3%
-    entry_iso = pos.get("entry_ts")
+# ---------- Decision ----------
+def decide_exit(pos: Dict[str, Any], price_now: float, top_candidate_ns: Optional[str], cfg: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+    avg = float(pos["avg_price"])
+    pnl = (price_now - avg) / avg if avg > 0 else 0.0
+
     try:
-        entry_dt = datetime.fromisoformat(entry_iso.replace("Z", "+00:00"))
+        entry_dt = datetime.fromisoformat(pos["entry_ts"].replace("Z", "+00:00"))
     except Exception:
-        entry_dt = now_utc() - timedelta(hours=99)
-    age = (now_utc() - entry_dt).total_seconds()
-    if age >= 3600 and pnl < 0.03:
-        return True, "ROTATE_LT3pct_AFTER_1h", pnl
-    return False, "HOLD", pnl
+        entry_dt = now_utc()
+    age_sec = (now_utc() - entry_dt).total_seconds()
+    age_min = age_sec / 60.0
 
-def pick_next(cands: List[str], cooldown: Dict[str, str]) -> Optional[str]:
-    for sym in cands:
-        key = sym.replace("/", "")
-        if not in_cooldown(key, cooldown):
-            return sym
-    return None
+    # Primary rules
+    if pnl <= -0.01:
+        return True, "STOP_1pct", {"pnl": pnl, "age_min": age_min}
+    if pnl >= 0.05:
+        return True, "TAKE_PROFIT_5pct", {"pnl": pnl, "age_min": age_min}
+    if age_sec >= 3600 and pnl < 0.03:
+        return True, "ROTATE_LT3pct_AFTER_1h", {"pnl": pnl, "age_min": age_min}
 
-def md_header(lines: List[str]) -> None:
-    lines.append(f"**When:** {iso(now_utc())}")
-    lines.append(f"**Mode:** {'DRY_RUN' if env_str('DRY_RUN','ON').upper()!='OFF' else 'LIVE'}")
-    lines.append(f"**Status:** (pending)")
-    lines.append(f"**Universe:** AUTO (UNIVERSE_PICK not set)" if not env_str("UNIVERSE_PICK","") else f"**Universe:** PICK={env_str('UNIVERSE_PICK','')}")
-    lines.append("")
+    # Optional fallback rotation (disabled by default)
+    if cfg["FALLBACK_ROTATE"]:
+        if age_min >= cfg["AGE_FALLBACK_MIN"] and pnl <= cfg["ROTATE_IF_PNL_BELOW"]:
+            if top_candidate_ns and top_candidate_ns != pos["symbol"]:
+                return True, "FALLBACK_ROTATE", {"pnl": pnl, "age_min": age_min}
 
-def write_summary(status: str,
-                  details: Dict[str, Any],
-                  candidates_preview: List[str]) -> None:
-    data = {
-        "when": iso(now_utc()),
-        "status": status,
-        **details
-    }
+    return False, "HOLD", {"pnl": pnl, "age_min": age_min}
+
+# ---------- Summary ----------
+def write_summary(status: str, details: Dict[str, Any], cand_preview: List[str]) -> None:
+    data = {"when": iso(now_utc()), "status": status, **details}
     write_json(SUMMARY_JSON, data)
 
-    lines: List[str] = []
-    md_header(lines)
-    lines[2] = f"**Status:** {status}"
-    if candidates_preview:
+    lines = []
+    lines.append(f"**When:** {data['when']}")
+    lines.append(f"**Mode:** {'DRY_RUN' if details.get('dry_run') else 'LIVE'}")
+    lines.append(f"**Status:** {status}")
+    lines.append(f"**Universe:** {'PICK=' + details['forced'] if details.get('forced') else 'AUTO (UNIVERSE_PICK not set)'}")
+    lines.append("")
+    if cand_preview:
         lines.append("**Candidate audit (top of momentum_candidates.csv):**")
         lines.append("")
         lines.append("```")
-        for s in candidates_preview[:10]:
+        for s in cand_preview[:10]:
             lines.append(s)
+        lines.append("```")
+        lines.append("")
+    # Diagnostics
+    diag = details.get("diagnostics")
+    if diag:
+        lines.append("**Diagnostics:**")
+        lines.append("")
+        lines.append("```json")
+        lines.append(json.dumps(diag, indent=2))
         lines.append("```")
         lines.append("")
     if details.get("last_action_json"):
@@ -306,7 +306,7 @@ def write_summary(status: str,
         lines.append(json.dumps(details["last_action_json"], indent=2))
         lines.append("```")
     write_text(SUMMARY_MD, "\n".join(lines))
-    write_text(LAST_EXIT, "0" if status.endswith("OK") else "1")
+    write_text(LAST_EXIT, "0" if status.endswith("OK") or status.startswith("HOLD") else "1")
 
 # ---------- Runner ----------
 def main() -> int:
@@ -315,88 +315,106 @@ def main() -> int:
     force_pick = env_str("UNIVERSE_PICK", "").strip()
     cooldown_min = int(env_float("COOLDOWN_MIN", 60))
 
-    # Load candidates
+    # Fallback rotate config
+    cfg = {
+        "FALLBACK_ROTATE": env_str("FALLBACK_ROTATE", "OFF").upper() == "ON",
+        "AGE_FALLBACK_MIN": int(env_float("AGE_FALLBACK_MIN", 60)),
+        "ROTATE_IF_PNL_BELOW": env_float("ROTATE_IF_PNL_BELOW", 0.0),
+    }
+
+    # Candidates
     cands = load_candidates(CANDIDATES)
     cand_preview = cands[:]
     if force_pick:
-        # Put forced pick at the top if present; else insert at top
-        f_disp = force_pick.replace(" ", "").upper()
-        if "/" not in f_disp and len(f_disp) > 3:
-            f_disp = f"{f_disp[:-3]}/{f_disp[-3:]}"
-        cands = [f_disp] + [c for c in cands if c.replace("/", "") != f_disp.replace("/", "")]
+        fp = force_pick.replace(" ", "").upper()
+        if "/" not in fp and len(fp) > 3:
+            fp = f"{fp[:-3]}/{fp[-3:]}"
+        cands = [fp] + [c for c in cands if c.replace("/", "") != fp.replace("/", "")]
     cooldown = load_cooldown()
 
-    # Risk off?
+    # Risk-off
     if risk_off():
-        write_summary("RISK_OFF — no trades", {"reason": "risk_off_file"}, cand_preview)
+        write_summary("RISK_OFF — no trades", {"dry_run": dry_run}, cand_preview)
         return 0
 
     api_key = env_str("KRAKEN_API_KEY", "")
     api_secret = env_str("KRAKEN_API_SECRET", "")
 
     pos = load_position()
+    top_candidate_ns = cands[0].replace("/", "") if cands else None
 
     # -------- EXIT PHASE --------
     last_action: Dict[str, Any] = {}
     if pos:
-        sym = pos["symbol"]  # "ALCXUSD"
-        disp = f"{sym[:-3]}/{sym[-3:]}" if "/" not in sym else sym
-        # fetch price
-        px = kraken_public_ticker(sym)
+        sym_ns = pos["symbol"]
+        px = kraken_public_ticker(sym_ns)
+        diag = {
+            "position": pos,
+            "price_now": px,
+            "top_candidate": top_candidate_ns,
+            "cooldown_active": in_cooldown(sym_ns, cooldown),
+            "fallback_rotate_enabled": cfg["FALLBACK_ROTATE"],
+        }
         if px is None:
-            # If public price fails, hold to avoid blind exits
-            write_summary("HOLD (price unavailable)", {"position": pos, "symbol": sym}, cand_preview)
+            write_summary("HOLD (price unavailable)", {"dry_run": dry_run, "diagnostics": diag}, cand_preview)
             return 0
-        should_exit, reason, pnl = decide_exit(pos, px)
+
+        should_exit, reason, metrics = decide_exit(pos, px, top_candidate_ns, cfg)
+        diag.update(metrics)
+
         if should_exit:
-            # SELL
-            qty = float(pos.get("qty", 0.0))
-            ok, tx = (True, "DRY_TX") if dry_run else kraken_place_market(api_key, api_secret, sym, "sell", qty)
+            qty = float(pos["qty"])
+            ok, tx = (True, "DRY_TX") if dry_run else kraken_place_market(api_key, api_secret, sym_ns, "sell", qty)
             last_action = {
                 "action": "SELL",
-                "symbol": sym,
+                "symbol": sym_ns,
                 "qty": qty,
                 "price_now": px,
                 "reason": reason,
-                "pnl_pct": round(pnl * 100, 3),
+                "pnl_pct": round(metrics["pnl"] * 100, 3),
+                "age_min": round(metrics["age_min"], 1),
                 "txid": tx,
                 "ok": ok
             }
-            # set cooldown
-            set_cooldown(sym, cooldown_min, cooldown)
+            set_cooldown(sym_ns, cooldown_min, cooldown)
             save_cooldown(cooldown)
-            # clear position if sell ok
             if ok:
                 save_position(None)
-            status = f"LIVE SELL OK" if not dry_run and ok else ("DRY SELL OK" if dry_run and ok else "SELL ERROR")
-            write_summary(status, {"last_action_json": last_action}, cand_preview)
-            # After a sell we fall through to BUY phase (rotation) if ok
-            pos = load_position()
+            status = f"{'DRY' if dry_run else 'LIVE'} SELL OK" if ok else "SELL ERROR"
+            write_summary(status, {"dry_run": dry_run, "last_action_json": last_action, "diagnostics": diag}, cand_preview)
+            pos = load_position()  # should be None now
+
+        else:
+            write_summary("HOLD (position open)", {"dry_run": dry_run, "diagnostics": diag, "position": pos}, cand_preview)
+            return 0  # hold => stop here (single-position bot)
 
     # -------- BUY PHASE --------
     if pos:
-        # Already holding => nothing to do
-        write_summary("HOLD (position open)", {"position": pos}, cand_preview)
+        write_summary("HOLD (position open)", {"dry_run": dry_run, "position": pos}, cand_preview)
         return 0
 
-    # pick next candidate not in cooldown
-    nxt = pick_next(cands, cooldown)
+    # pick next (not in cooldown)
+    nxt = None
+    for s in cands:
+        ns = s.replace("/", "")
+        if not in_cooldown(ns, cooldown):
+            nxt = s
+            break
     if not nxt:
-        write_summary("NO-CANDIDATE (all cooled down or empty list)", {"cooldown_keys": list(cooldown.keys())}, cand_preview)
+        write_summary("NO-CANDIDATE (all cooled down or none)", {"dry_run": dry_run, "cooldown": list(cooldown.keys())}, cand_preview)
         return 0
 
-    sym_noslash = nxt.replace("/", "")
-    # get price for sizing
-    px = kraken_public_ticker(sym_noslash)
+    nxt_ns = nxt.replace("/", "")
+    px = kraken_public_ticker(nxt_ns)
     if px is None or px <= 0:
-        write_summary("SKIP (no price for candidate)", {"candidate": nxt}, cand_preview)
+        write_summary("SKIP (no price for candidate)", {"dry_run": dry_run, "candidate": nxt}, cand_preview)
         return 0
-    volume = max(buy_usd / px, 0.00000001)
 
-    ok, tx = (True, "DRY_TX") if dry_run else kraken_place_market(api_key, api_secret, sym_noslash, "buy", volume)
+    volume = max(buy_usd / px, 0.00000001)
+    ok, tx = (True, "DRY_TX") if dry_run else kraken_place_market(api_key, api_secret, nxt_ns, "buy", volume)
     last_action = {
         "action": "BUY",
-        "symbol": sym_noslash,
+        "symbol": nxt_ns,
         "qty": volume,
         "avg_price": px,
         "txid": tx,
@@ -404,22 +422,21 @@ def main() -> int:
     }
     if ok:
         pos = {
-            "symbol": sym_noslash,
+            "symbol": nxt_ns,
             "qty": volume,
             "avg_price": px,
             "entry_ts": iso(now_utc()).replace("+00:00", "Z")
         }
         save_position(pos)
 
-    status = f"LIVE BUY OK" if not dry_run and ok else ("DRY BUY OK" if dry_run and ok else "BUY ERROR")
-    write_summary(status, {"last_action_json": last_action, "position": pos}, cand_preview)
+    status = f"{'DRY' if dry_run else 'LIVE'} BUY OK" if ok else "BUY ERROR"
+    write_summary(status, {"dry_run": dry_run, "last_action_json": last_action, "forced": force_pick or "", "position": pos}, cand_preview)
     return 0
 
 # ---------- Entry ----------
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        raise SystemExit(main())
     except Exception as e:
-        # Ensure summary exists even on crash
-        write_summary("FATAL ERROR", {"error": str(e)}, [])
+        write_summary("FATAL ERROR", {"error": str(e), "dry_run": env_str("DRY_RUN","ON").upper()!='OFF'}, [])
         raise
