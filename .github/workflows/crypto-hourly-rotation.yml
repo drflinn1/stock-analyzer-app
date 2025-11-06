@@ -1,4 +1,4 @@
-name: Crypto — 1-Coin Rotation (LIVE-ready, ultra-defensive, 15m)
+name: Crypto - 1-Coin Rotation (LIVE-ready, ultra-defensive, 15m)
 
 on:
   schedule:
@@ -14,11 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
 
-    # 👉 Make the Kraken secrets available to ALL steps in this job
     env:
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-      # normal knobs (from Variables) are fine to keep using:
       DRY_RUN: ${{ vars.DRY_RUN }}
       BUY_USD: ${{ vars.BUY_USD }}
 
@@ -41,21 +39,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pytz
 
-      - name: [preflight] persist .state + write summary
+      - name: preflight - persist .state and write summary
         run: |
           set -e
           mkdir -p .state
-          echo "listing .state:"
           ls -la .state || true
-          # small note so we always have at least one file to upload
           date +"%F %T %Z" > .state/_note.txt
-          printf "mode: %s; universe: AUTO (UNIVERSE_PICK not set)\n" "${DRY_RUN:-}" >> .state/_note.txt
+          echo "mode=${DRY_RUN:-}; universe=AUTO (UNIVERSE_PICK not set)" >> .state/_note.txt
 
       - name: Sanity check Kraken keys (same env as trade)
         run: |
           python - <<'PY'
           import os, time, hmac, hashlib, base64, requests
-          # quick private /0/private/Balance call
           key = os.getenv("KRAKEN_API_KEY","")
           sec = os.getenv("KRAKEN_API_SECRET","")
           assert key and sec, "Missing KRAKEN_API_KEY or KRAKEN_API_SECRET env"
@@ -71,7 +66,7 @@ jobs:
           j = r.json()
           if j.get("error"):
             raise SystemExit(f"Sanity FAILED: {j['error']}")
-          print("Sanity OK. Balance keys present. (trimmed):", {k:j['result'][k] for k in list(j.get('result',{}))[:3]})
+          print("Sanity OK. Balance keys present.")
           PY
 
       - name: Run main.py
@@ -86,6 +81,3 @@ jobs:
           path: .state/**
           if-no-files-found: warn
           retention-days: 7
-
-      - name: Post job cleanup
-        run: echo "Cleanup complete."
