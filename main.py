@@ -1,403 +1,425 @@
 #!/usr/bin/env python3
 """
-Crypto — Hourly 1-Coin Rotation (LIVE-ready, desync-safe)
-- Holds exactly one position via .state/position.json
-- Exits: SL (1%), TP (5%), Timer(60m & gain<+3%) by default
-- ALWAYS writes .state/run_summary.json/.md
-- Kraken REST via stdlib only
+main.py — Unified crypto rotation runner (LIVE/DRY-RUN) for Kraken.
 
-Adds DESYNC handling:
-- If a SELL fails with 'EOrder:Insufficient funds' we clear position.json
-  and continue to BUY in the same run.
+Features:
+- Loads promoted candidates from .state/momentum_candidates.csv (spike scan promotes here)
+- Single-position rotation with:
+    • 1% stop-loss
+    • 5% take-profit
+    • "<3% in 1 hour" rotate-out rule
+    • Cool-down to avoid instant re-buys of the same symbol
+- Always writes .state/run_summary.md and .state/run_summary.json (even on risk-off)
+- LIVE mode: places Kraken market orders via REST (no external libs needed)
+- DRY_RUN mode: simulates orders but updates .state/position.json so behavior is testable
 
-Enhancements (logging-only, identical trade behavior):
-- Every summary now shows Universe mode (AUTO/FIXED),
-  Active symbol (if any), Next candidate on BUY,
-  the explicit rotation trigger on SELL,
-  and a Candidate audit (top 5 rows from momentum_candidates.csv if present).
+Environment (commonly set via workflow inputs/vars):
+- DRY_RUN: "ON"|"OFF"               (default: "ON")
+- BUY_USD: amount in USD to buy     (default: "10")
+- UNIVERSE_PICK: specific pair to force buy (e.g., "ALCX/USD") (default: "")
+- COOLDOWN_MIN: minutes to avoid re-buying a symbol after exit (default: "60")
+
+Kraken secrets (for LIVE):
+- KRAKEN_API_KEY
+- KRAKEN_API_SECRET (base64)
 """
 
-from __future__ import annotations
-import os, json, time, datetime as dt
+import base64
+import hashlib
+import hmac
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict, List, Optional, Tuple
 
-# ------------------------------- Paths ---------------------------------
-STATE = Path(".state"); STATE.mkdir(parents=True, exist_ok=True)
+import csv
+import urllib.parse
+import urllib.request
+
+# ---------- Paths ----------
+STATE = Path(".state")
+STATE.mkdir(parents=True, exist_ok=True)
 POS_FILE = STATE / "position.json"
 SUMMARY_JSON = STATE / "run_summary.json"
-SUMMARY_MD   = STATE / "run_summary.md"
+SUMMARY_MD = STATE / "run_summary.md"
+LAST_EXIT = STATE / "last_exit_code.txt"
+RISK_FILE = STATE / "last_risk_signal.txt"      # optional; if exists and says OFF => skip
+COOLDOWN_FILE = STATE / "cooldown.json"         # { "SYMBOL": "2025-11-05T22:00:00Z", ... }
+CANDIDATES = STATE / "momentum_candidates.csv"  # spike scan promotes here
 
-# ------------------------------ Env utils ------------------------------
-def env_str(k: str, default: str = "") -> str:
-    v = os.getenv(k, default)
+# ---------- Config helpers ----------
+def env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name, default)
     return "" if v is None else str(v)
 
-def env_int(k: str, default: int = 0) -> int:
-    try: return int(env_str(k, str(default)).strip())
-    except: return default
-
-def env_float(k: str, default: float = 0.0) -> float:
-    try: return float(env_str(k, str(default)).strip())
-    except: return default
-
-def now_iso() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-# --------------------------- Summary writers ---------------------------
-def _save_json(p: Path, obj: Any) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(obj, indent=2))
-
-def _load_json(p: Path) -> Optional[Any]:
-    if p.exists():
-        return json.loads(p.read_text())
-    return None
-
-def universe_line() -> str:
-    pick = env_str("UNIVERSE_PICK", "").strip().upper()
-    if pick:
-        return f"**Universe:** FIXED ({pick})"
-    return  "**Universe:** AUTO (UNIVERSE_PICK not set)"
-
-# ---- Candidate audit (top 5 from momentum_candidates.csv if present) ---
-def read_csv_symbols(csv_path: Path, limit: int = 5) -> List[str]:
-    out: List[str] = []
+def env_float(name: str, default: float) -> float:
     try:
-        if not csv_path.exists(): return out
-        rows = csv_path.read_text().strip().splitlines()
-        if not rows: return out
-        hdr = rows[0].lower().replace(" ", "")
-        start = 1 if ("symbol" in hdr or "," in hdr) else 0
-        for line in rows[start:]:
-            if not line.strip(): continue
-            sym = line.split(",")[0].strip()
-            if sym:
-                out.append(sym)
-                if len(out) >= limit: break
+        return float(env_str(name, ""))
     except Exception:
-        return out
-    return out
+        return default
 
-def write_summary(status: str, details: Dict[str, Any],
-                  active_symbol: Optional[str] = None,
-                  next_candidate: Optional[str] = None,
-                  trigger: Optional[str] = None) -> None:
-    """Writes both JSON and Markdown. Trading behavior is unchanged."""
-    candidate_audit = read_csv_symbols(STATE / "momentum_candidates.csv", limit=5)
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
-    payload = {
-        "when": now_iso(),
-        "mode": "LIVE" if env_str("DRY_RUN","OFF").upper() == "OFF" else "DRY_RUN",
-        "status": status,
-        "universe": "FIXED" if env_str("UNIVERSE_PICK","").strip() else "AUTO",
-        **details
+def iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+# ---------- Kraken minimal REST client ----------
+KRAKEN_BASE = "https://api.kraken.com"
+
+def _kraken_request(path: str, data: Dict[str, Any], key: str, secret_b64: str) -> Dict[str, Any]:
+    """
+    POST to Kraken REST.
+    """
+    url = f"{KRAKEN_BASE}{path}"
+    nonce = str(int(time.time() * 1000))
+    post_data = {"nonce": nonce}
+    post_data.update(data)
+    post_bytes = urllib.parse.urlencode(post_data).encode()
+
+    sha256 = hashlib.sha256((nonce + urllib.parse.urlencode(data)).encode()).digest()
+    msg = path.encode() + sha256
+    secret = base64.b64decode(secret_b64)
+    sig = hmac.new(secret, msg, hashlib.sha512).digest()
+    headers = {
+        "API-Key": key,
+        "API-Sign": base64.b64encode(sig),
+        "User-Agent": "stock-analyzer-app",
+        "Content-Type": "application/x-www-form-urlencoded",
     }
-    if active_symbol:  payload["active_symbol"] = active_symbol
-    if next_candidate: payload["next_candidate"] = next_candidate
-    if trigger:        payload["rotation_trigger"] = trigger
-    if candidate_audit: payload["candidate_audit"] = candidate_audit
+    req = urllib.request.Request(url, data=post_bytes, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        body = resp.read()
+        payload = json.loads(body.decode())
+        return payload
 
-    _save_json(SUMMARY_JSON, payload)
-
-    lines = [
-        f"**When:** {payload['when']}",
-        f"**Mode:** {payload['mode']}",
-        f"**Status:** {status}",
-        universe_line(),
-    ]
-    if active_symbol:
-        lines.append(f"**Active symbol:** {active_symbol}")
-    if next_candidate:
-        lines.append(f"**Next candidate chosen:** {next_candidate}")
-    if trigger:
-        lines.append(f"**Rotation trigger:** {trigger}")
-    if candidate_audit:
-        lines += [
-            "",
-            "**Candidate audit (top of momentum_candidates.csv):**",
-            "",
-            "```",
-            *candidate_audit,
-            "```",
-        ]
-    lines += [
-        "",
-        "```json",
-        json.dumps(details, indent=2),
-        "```",
-    ]
-    SUMMARY_MD.write_text("\n".join(lines))
-
-# ---------------------------- State helpers ----------------------------
-def have_open_position() -> bool:
-    return POS_FILE.exists()
-
-def load_position() -> Optional[Dict[str, Any]]:
-    return _load_json(POS_FILE)
-
-def save_position(symbol: str, qty: float, entry_price: float) -> None:
-    _save_json(POS_FILE, {
-        "symbol": symbol,
-        "qty": float(qty),
-        "entry_price": float(entry_price),
-        "opened_at": time.time()
-    })
-
-def clear_position() -> None:
-    if POS_FILE.exists():
-        POS_FILE.unlink()
-
-def pct_change(from_price: float, to_price: float) -> float:
-    if from_price <= 0: return 0.0
-    return (to_price - from_price) / from_price * 100.0
-
-# ------------------------ Candidate selection --------------------------
-def read_csv_first_symbol(csv_path: Path) -> Optional[str]:
+def kraken_public_ticker(pair: str) -> Optional[float]:
+    """
+    Returns last price for pair like 'ALCXUSD' or 'ALCX/USD' (slash allowed; we normalize).
+    """
+    kr_pair = pair.replace("/", "").upper()
+    url = f"{KRAKEN_BASE}/0/public/Ticker?pair={urllib.parse.quote(kr_pair)}"
+    req = urllib.request.Request(url, headers={"User-Agent": "stock-analyzer-app"})
     try:
-        if not csv_path.exists(): return None
-        rows = csv_path.read_text().strip().splitlines()
-        if not rows: return None
-        hdr = rows[0].lower().replace(" ", "")
-        start = 1 if ("symbol" in hdr or "," in hdr) else 0
-        for line in rows[start:]:
-            if not line.strip(): continue
-            sym = line.split(",")[0].strip()
-            if sym: return sym
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode())
+            if data.get("error"):
+                return None
+            result = data.get("result", {})
+            if not result:
+                return None
+            # result key can be normalized or mapped; pick first key
+            first_key = next(iter(result.keys()))
+            # 'c' field -> last trade [price, lot volume]
+            last = result[first_key]["c"][0]
+            return float(last)
     except Exception:
         return None
-    return None
 
-def normalize_pair(sym: str) -> str:
-    s = sym.upper().replace("-", "").replace("/", "")
-    if s.endswith("USD"): return s
-    return s + "USD"
-
-def select_top_candidate() -> str:
-    # Prefer momentum list; fall back to spike list; then UNIVERSE_PICK.
-    for name in ("momentum_candidates.csv", "spike_candidates.csv"):
-        sym = read_csv_first_symbol(STATE / name)
-        if sym: return normalize_pair(sym)
-    up = env_str("UNIVERSE_PICK", "").strip()
-    if up: return normalize_pair(up)
-    raise RuntimeError("No candidate found (candidates CSV and UNIVERSE_PICK empty).")
-
-# -------------------------- Kraken REST client -------------------------
-import base64, hashlib, hmac, urllib.parse, urllib.request
-
-API_BASE = "https://api.kraken.com"
-KRAKEN_API_KEY    = env_str("KRAKEN_API_KEY", "")
-KRAKEN_API_SECRET = env_str("KRAKEN_API_SECRET", "")
-
-def _http_get(url: str, timeout: int = 20) -> Dict[str, Any]:
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
-
-def _private_request(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    if not KRAKEN_API_KEY or not KRAKEN_API_SECRET:
-        raise RuntimeError("Missing KRAKEN_API_KEY or KRAKEN_API_SECRET")
-    url = API_BASE + path
-    data = dict(data)
-    data["nonce"] = str(int(time.time() * 1000))
-    postdata = urllib.parse.urlencode(data)
-    sha = hashlib.sha256((data["nonce"] + postdata).encode()).digest()
-    msg = path.encode() + sha
-    sig = hmac.new(base64.b64decode(KRAKEN_API_SECRET), msg, hashlib.sha512).digest()
-    headers = {
-        "API-Key": KRAKEN_API_KEY,
-        "API-Sign": base64.b64encode(sig).decode(),
-        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-        "User-Agent": "rotation-bot/1.0",
-    }
-    req = urllib.request.Request(url, data=postdata.encode(), headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=25) as resp:
-        return json.loads(resp.read().decode())
-
-def kraken_last_price(pair: str) -> float:
-    data = _http_get(f"{API_BASE}/0/public/Ticker?pair={pair}")
-    if data.get("error"):
-        raise RuntimeError(f"Ticker error: {data['error']}")
-    result = data.get("result", {})
-    if not result:
-        raise RuntimeError("Ticker empty result")
-    first = next(iter(result.values()))
-    return float(first["c"][0])
-
-def _volume_round(qty: float) -> float:
-    q = float(f"{qty:.8f}")
-    return 0.0 if q < 1e-8 else q
-
-def kraken_add_order_market(pair: str, side: str, volume_base: float) -> Dict[str, Any]:
-    payload = {
-        "pair": pair,
+def kraken_place_market(key: str, secret_b64: str, pair: str, side: str, volume: float) -> Tuple[bool, str]:
+    """
+    Place a market order. side in {"buy","sell"}.
+    Returns (ok, txid_or_error).
+    """
+    pair_norm = pair.replace("/", "").upper()
+    data = {
+        "pair": pair_norm,
         "type": side,
         "ordertype": "market",
-        "volume": f"{_volume_round(volume_base):.8f}",
+        "volume": f"{volume:.8f}",
+        "oflags": "viqc",  # volume in quote currency conversion if needed
     }
-    return _private_request("/0/private/AddOrder", payload)
+    try:
+        resp = _kraken_request("/0/private/AddOrder", data, key, secret_b64)
+        if resp.get("error"):
+            return False, ";".join(resp["error"])
+        txs = resp.get("result", {}).get("txid", [])
+        return True, ",".join(txs) if txs else "OK"
+    except Exception as e:
+        return False, f"EXC:{e}"
 
-# -------------------------- Live buy/sell API --------------------------
-def get_last_price(symbol: str) -> float:
-    return kraken_last_price(symbol)
+# ---------- Files ----------
+def read_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return default
 
-def live_buy(symbol: str, usd_amount: float) -> Dict[str, Any]:
-    price = kraken_last_price(symbol)
-    if price <= 0:
-        raise RuntimeError(f"Bad price for {symbol}: {price}")
-    qty = usd_amount / price
-    qty = _volume_round(qty)
-    if qty <= 0:
-        raise RuntimeError(f"Calculated qty too small for {symbol} at {price} using ${usd_amount}")
-    res = kraken_add_order_market(symbol, "buy", qty)
-    err = res.get("error", [])
-    if err: raise RuntimeError(f"KRAKEN BUY error: {err}")
-    txs  = res.get("result", {}).get("txid", [])
-    return {"symbol": symbol, "qty": qty, "avg_price": price, "txid": txs[0] if txs else None, "raw": res}
+def write_json(path: Path, data: Any) -> None:
+    path.write_text(json.dumps(data, indent=2))
 
-def live_sell(symbol: str, qty: float) -> Dict[str, Any]:
-    qty = _volume_round(qty)
-    if qty <= 0:
-        raise RuntimeError(f"SELL qty too small for {symbol}")
-    res = kraken_add_order_market(symbol, "sell", qty)
-    err = res.get("error", [])
-    if err: raise RuntimeError(f"KRAKEN SELL error: {err}")
-    price = kraken_last_price(symbol)
-    txs  = res.get("result", {}).get("txid", [])
-    return {"symbol": symbol, "qty": qty, "avg_price": price, "txid": txs[0] if txs else None, "raw": res}
+def write_text(path: Path, text: str) -> None:
+    path.write_text(text)
 
-# ------------------------------ Main logic ------------------------------
-def main() -> None:
-    dry_run        = env_str("DRY_RUN","OFF").upper() != "OFF"
-    run_switch     = env_str("RUN_SWITCH","ON").upper() == "ON"
-    usd_per_buy    = env_float("BUY_USD", 25.0)
-    max_positions  = env_int("MAX_POSITIONS", 1)
+# ---------- Cooldown ----------
+def load_cooldown() -> Dict[str, str]:
+    return read_json(COOLDOWN_FILE, {})
 
-    # Exit config (clamp to sane positive values)
-    tp_pct         = max(0.01, abs(env_float("TAKE_PROFIT_PCT", 5.0)))
-    sl_pct         = max(0.01, abs(env_float("STOP_LOSS_PCT", 1.0)))
-    rotate_minutes = max(1,    abs(env_int("ROTATE_MINUTES", 60)))
-    rotate_gain    = max(0.01, abs(env_float("ROTATE_MIN_GAIN_PCT", 3.0)))
+def save_cooldown(cd: Dict[str, str]) -> None:
+    write_json(COOLDOWN_FILE, cd)
 
-    # Initial banner
-    active_sym_banner = load_position().get("symbol") if have_open_position() else None
-    write_summary("start", {
-        "dry_run": dry_run,
-        "run_switch": run_switch,
-        "max_positions": max_positions,
-        "buy_usd": usd_per_buy,
-        "tp_pct": tp_pct, "sl_pct": sl_pct,
-        "rotate_minutes": rotate_minutes, "rotate_gain_pct": rotate_gain
-    }, active_symbol=active_sym_banner)
+def in_cooldown(symbol: str, cd: Dict[str, str]) -> bool:
+    until = cd.get(symbol.upper())
+    if not until:
+        return False
+    try:
+        return datetime.fromisoformat(until.replace("Z", "+00:00")) > now_utc()
+    except Exception:
+        return False
 
-    if not run_switch:
-        write_summary("SKIP", {"reason":"RUN_SWITCH=OFF"}, active_symbol=active_sym_banner)
-        return
+def set_cooldown(symbol: str, minutes: int, cd: Dict[str, str]) -> None:
+    until = now_utc() + timedelta(minutes=minutes)
+    cd[symbol.upper()] = iso(until).replace("+00:00", "Z")
 
-    # --------------------- If holding, evaluate exits ---------------------
-    proceed_to_buy = False
-    if have_open_position():
-        pos = load_position()
-        if not pos:
-            clear_position()
-            write_summary("WARN", {"reason":"position.json unreadable; cleared"})
-            proceed_to_buy = True
-        else:
-            sym = pos["symbol"]; qty = float(pos["qty"])
-            entry = float(pos["entry_price"]); opened = float(pos["opened_at"])
-            price = get_last_price(sym)
-            change = pct_change(entry, price)
-            minutes = (time.time() - opened) / 60.0
-
-            decision, reason = "hold", ""
-            if change <= -sl_pct:
-                decision, reason = "sell", f"SL hit ({change:.2f}%)"
-            elif change >= tp_pct:
-                decision, reason = "sell", f"TP hit (+{change:.2f}%)"
-            elif minutes >= rotate_minutes and change < rotate_gain:
-                decision, reason = "sell", f"Timer {rotate_minutes}m & gain {change:.2f}% < {rotate_gain}%"
-
-            if decision == "sell":
-                if dry_run:
-                    write_summary("DRY SELL", {"symbol": sym, "qty": qty, "price": price, "reason": reason},
-                                  active_symbol=sym, trigger=reason)
-                    clear_position()
-                    proceed_to_buy = True
-                else:
-                    try:
-                        res = live_sell(sym, qty)
-                        write_summary("LIVE SELL OK", {
-                            "symbol": res["symbol"], "qty": res["qty"],
-                            "avg_price": res["avg_price"], "txid": res.get("txid"),
-                            "reason": reason
-                        }, active_symbol=sym, trigger=reason)
-                        clear_position()
-                        proceed_to_buy = True
-                    except Exception as e:
-                        msg = repr(e)
-                        # Desync fix: treat "insufficient funds" as no position -> clear and buy
-                        if "Insufficient funds" in msg:
-                            clear_position()
-                            write_summary("DESYNC CLEAR", {
-                                "symbol": sym, "qty": qty, "exception": msg,
-                                "note": "Kraken shows no coins; cleared stale position.json"
-                            }, active_symbol=sym, trigger="desync-clear-after-sell-error")
-                            proceed_to_buy = True
-                        else:
-                            write_summary("LIVE SELL ERROR", {"symbol": sym, "qty": qty, "exception": msg},
-                                          active_symbol=sym, trigger=reason or "sell-error")
-                            return
+# ---------- Candidates ----------
+def load_candidates(path: Path) -> List[str]:
+    """
+    Reads first column from CSV and returns list of pairs, e.g., ["ALCX/USD", "1INCH/USD", ...]
+    Accepts header names like 'pair', 'symbol' or any first column.
+    """
+    if not path.exists():
+        return []
+    out: List[str] = []
+    with path.open(newline="") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+        if not rows:
+            return out
+        # Detect header if non-symbol-like
+        start_idx = 0
+        if rows and rows[0]:
+            head = rows[0][0].lower()
+            if any(k in head for k in ("pair", "symbol")):
+                start_idx = 1
+        for r in rows[start_idx:]:
+            if not r:
+                continue
+            sym = r[0].strip()
+            if not sym:
+                continue
+            # normalize like "ALCXUSD"
+            sym_norm = sym.replace(" ", "").replace("-", "").upper()
+            # keep slash form for presentation; use no-slash for Kraken endpoints
+            if "/" not in sym_norm and len(sym_norm) > 3:
+                # keep both; we will render "AAA/BBB" in summary, but Kraken uses noslash
+                sym_disp = f"{sym_norm[:-3]}/{sym_norm[-3:]}"
             else:
-                write_summary("HOLD", {"symbol": sym, "qty": qty, "price": price,
-                                       "change_pct": change, "minutes_open": minutes},
-                              active_symbol=sym)
-                return
+                sym_disp = sym.replace(" ", "").upper()
+            out.append(sym_disp)
+    # de-dup preserving order
+    seen = set()
+    unique = []
+    for s in out:
+        key = s.replace("/", "")
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(s)
+    return unique
+
+# ---------- Position ----------
+def load_position() -> Optional[Dict[str, Any]]:
+    return read_json(POS_FILE, None)
+
+def save_position(pos: Optional[Dict[str, Any]]) -> None:
+    if pos is None:
+        if POS_FILE.exists():
+            POS_FILE.unlink(missing_ok=True)
     else:
-        proceed_to_buy = True
+        write_json(POS_FILE, pos)
 
-    # --------------------- Not holding (or cleared): BUY ------------------
-    if not proceed_to_buy:
-        return
-
-    if max_positions <= 0:
-        write_summary("SKIP", {"reason":"MAX_POSITIONS<=0"})
-        return
-
-    if max_positions == 1 and POS_FILE.exists():
-        write_summary("SKIP", {"reason":"position.json present; MAX_POSITIONS=1"})
-        return
-
-    # Candidate
+# ---------- Risk-Off gate (optional) ----------
+def risk_off() -> bool:
     try:
-        pick = select_top_candidate()
-    except Exception as e:
-        write_summary("SKIP", {"reason": f"No candidate: {e}"})
-        return
+        if not RISK_FILE.exists():
+            return False
+        txt = RISK_FILE.read_text().strip().upper()
+        return "OFF" in txt
+    except Exception:
+        return False
 
-    # BUY
+# ---------- Core logic ----------
+def decide_exit(pos: Dict[str, Any], price_now: float) -> Tuple[bool, str, float]:
+    """
+    Returns (should_exit, reason, gain_pct_signed)
+    """
+    avg = float(pos.get("avg_price", 0.0) or 0.0)
+    if avg <= 0 or price_now <= 0:
+        return False, "no-price", 0.0
+    pnl = (price_now - avg) / avg
+    # Rules
+    if pnl <= -0.01:
+        return True, "STOP_1pct", pnl
+    if pnl >= 0.05:
+        return True, "TAKE_PROFIT_5pct", pnl
+    # 1h rotate if gain < 3%
+    entry_iso = pos.get("entry_ts")
     try:
-        if dry_run:
-            price = get_last_price(pick)
-            qty = (usd_per_buy / price) if price > 0 else 0.0
-            qty = float(f"{qty:.8f}")
-            save_position(pick, qty, price)
-            write_summary("DRY BUY", {"symbol": pick, "qty": qty, "entry_price": price},
-                          next_candidate=pick)
-        else:
-            res = live_buy(pick, usd_per_buy)
-            save_position(res["symbol"], float(res["qty"]), float(res["avg_price"]))
-            write_summary("LIVE BUY OK", {
-                "symbol": res["symbol"], "qty": res["qty"],
-                "avg_price": res["avg_price"], "txid": res.get("txid")
-            }, next_candidate=pick)
-    except Exception as e:
-        write_summary("LIVE BUY ERROR" if not dry_run else "DRY BUY ERROR",
-                      {"symbol": pick, "exception": repr(e)},
-                      next_candidate=pick)
+        entry_dt = datetime.fromisoformat(entry_iso.replace("Z", "+00:00"))
+    except Exception:
+        entry_dt = now_utc() - timedelta(hours=99)
+    age = (now_utc() - entry_dt).total_seconds()
+    if age >= 3600 and pnl < 0.03:
+        return True, "ROTATE_LT3pct_AFTER_1h", pnl
+    return False, "HOLD", pnl
 
-# -----------------------------------------------------------------------
+def pick_next(cands: List[str], cooldown: Dict[str, str]) -> Optional[str]:
+    for sym in cands:
+        key = sym.replace("/", "")
+        if not in_cooldown(key, cooldown):
+            return sym
+    return None
+
+def md_header(lines: List[str]) -> None:
+    lines.append(f"**When:** {iso(now_utc())}")
+    lines.append(f"**Mode:** {'DRY_RUN' if env_str('DRY_RUN','ON').upper()!='OFF' else 'LIVE'}")
+    lines.append(f"**Status:** (pending)")
+    lines.append(f"**Universe:** AUTO (UNIVERSE_PICK not set)" if not env_str("UNIVERSE_PICK","") else f"**Universe:** PICK={env_str('UNIVERSE_PICK','')}")
+    lines.append("")
+
+def write_summary(status: str,
+                  details: Dict[str, Any],
+                  candidates_preview: List[str]) -> None:
+    data = {
+        "when": iso(now_utc()),
+        "status": status,
+        **details
+    }
+    write_json(SUMMARY_JSON, data)
+
+    lines: List[str] = []
+    md_header(lines)
+    lines[2] = f"**Status:** {status}"
+    if candidates_preview:
+        lines.append("**Candidate audit (top of momentum_candidates.csv):**")
+        lines.append("")
+        lines.append("```")
+        for s in candidates_preview[:10]:
+            lines.append(s)
+        lines.append("```")
+        lines.append("")
+    if details.get("last_action_json"):
+        lines.append("```json")
+        lines.append(json.dumps(details["last_action_json"], indent=2))
+        lines.append("```")
+    write_text(SUMMARY_MD, "\n".join(lines))
+    write_text(LAST_EXIT, "0" if status.endswith("OK") else "1")
+
+# ---------- Runner ----------
+def main() -> int:
+    dry_run = env_str("DRY_RUN", "ON").upper() != "OFF"
+    buy_usd = env_float("BUY_USD", 10.0)
+    force_pick = env_str("UNIVERSE_PICK", "").strip()
+    cooldown_min = int(env_float("COOLDOWN_MIN", 60))
+
+    # Load candidates
+    cands = load_candidates(CANDIDATES)
+    cand_preview = cands[:]
+    if force_pick:
+        # Put forced pick at the top if present; else insert at top
+        f_disp = force_pick.replace(" ", "").upper()
+        if "/" not in f_disp and len(f_disp) > 3:
+            f_disp = f"{f_disp[:-3]}/{f_disp[-3:]}"
+        cands = [f_disp] + [c for c in cands if c.replace("/", "") != f_disp.replace("/", "")]
+    cooldown = load_cooldown()
+
+    # Risk off?
+    if risk_off():
+        write_summary("RISK_OFF — no trades", {"reason": "risk_off_file"}, cand_preview)
+        return 0
+
+    api_key = env_str("KRAKEN_API_KEY", "")
+    api_secret = env_str("KRAKEN_API_SECRET", "")
+
+    pos = load_position()
+
+    # -------- EXIT PHASE --------
+    last_action: Dict[str, Any] = {}
+    if pos:
+        sym = pos["symbol"]  # "ALCXUSD"
+        disp = f"{sym[:-3]}/{sym[-3:]}" if "/" not in sym else sym
+        # fetch price
+        px = kraken_public_ticker(sym)
+        if px is None:
+            # If public price fails, hold to avoid blind exits
+            write_summary("HOLD (price unavailable)", {"position": pos, "symbol": sym}, cand_preview)
+            return 0
+        should_exit, reason, pnl = decide_exit(pos, px)
+        if should_exit:
+            # SELL
+            qty = float(pos.get("qty", 0.0))
+            ok, tx = (True, "DRY_TX") if dry_run else kraken_place_market(api_key, api_secret, sym, "sell", qty)
+            last_action = {
+                "action": "SELL",
+                "symbol": sym,
+                "qty": qty,
+                "price_now": px,
+                "reason": reason,
+                "pnl_pct": round(pnl * 100, 3),
+                "txid": tx,
+                "ok": ok
+            }
+            # set cooldown
+            set_cooldown(sym, cooldown_min, cooldown)
+            save_cooldown(cooldown)
+            # clear position if sell ok
+            if ok:
+                save_position(None)
+            status = f"LIVE SELL OK" if not dry_run and ok else ("DRY SELL OK" if dry_run and ok else "SELL ERROR")
+            write_summary(status, {"last_action_json": last_action}, cand_preview)
+            # After a sell we fall through to BUY phase (rotation) if ok
+            pos = load_position()
+
+    # -------- BUY PHASE --------
+    if pos:
+        # Already holding => nothing to do
+        write_summary("HOLD (position open)", {"position": pos}, cand_preview)
+        return 0
+
+    # pick next candidate not in cooldown
+    nxt = pick_next(cands, cooldown)
+    if not nxt:
+        write_summary("NO-CANDIDATE (all cooled down or empty list)", {"cooldown_keys": list(cooldown.keys())}, cand_preview)
+        return 0
+
+    sym_noslash = nxt.replace("/", "")
+    # get price for sizing
+    px = kraken_public_ticker(sym_noslash)
+    if px is None or px <= 0:
+        write_summary("SKIP (no price for candidate)", {"candidate": nxt}, cand_preview)
+        return 0
+    volume = max(buy_usd / px, 0.00000001)
+
+    ok, tx = (True, "DRY_TX") if dry_run else kraken_place_market(api_key, api_secret, sym_noslash, "buy", volume)
+    last_action = {
+        "action": "BUY",
+        "symbol": sym_noslash,
+        "qty": volume,
+        "avg_price": px,
+        "txid": tx,
+        "ok": ok
+    }
+    if ok:
+        pos = {
+            "symbol": sym_noslash,
+            "qty": volume,
+            "avg_price": px,
+            "entry_ts": iso(now_utc()).replace("+00:00", "Z")
+        }
+        save_position(pos)
+
+    status = f"LIVE BUY OK" if not dry_run and ok else ("DRY BUY OK" if dry_run and ok else "BUY ERROR")
+    write_summary(status, {"last_action_json": last_action, "position": pos}, cand_preview)
+    return 0
+
+# ---------- Entry ----------
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except Exception as e:
-        write_summary("FATAL", {"exception": repr(e)})
+        # Ensure summary exists even on crash
+        write_summary("FATAL ERROR", {"error": str(e)}, [])
         raise
