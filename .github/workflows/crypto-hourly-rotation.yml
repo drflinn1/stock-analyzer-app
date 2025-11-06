@@ -35,6 +35,7 @@ jobs:
       - name: Preflight — show working dir and current .state
         run: |
           echo "PWD=$(pwd)"
+          echo "workspace=$GITHUB_WORKSPACE"
           python -V
           ls -la .
           mkdir -p .state
@@ -83,6 +84,9 @@ jobs:
           test -f .state/positions.json && cat .state/positions.json || echo "positions.json not found"
           echo "---- last_ok.txt ----"
           test -f .state/last_ok.txt && cat .state/last_ok.txt || echo "last_ok.txt not found"
+          echo "---- absolute path check ----"
+          realpath .state || true
+          find .state -maxdepth 1 -type f -printf '%p\n' || true
 
       - name: Upload .state (artifact)
         if: always()
@@ -90,6 +94,7 @@ jobs:
         with:
           name: state
           path: |
-            .state/
+            ${{ github.workspace }}/.state/**
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7
