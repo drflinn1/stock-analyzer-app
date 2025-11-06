@@ -41,21 +41,33 @@ jobs:
           echo "(before) list .state:"
           ls -la .state || true
 
-      - name: Echo critical env/vars
+      - name: Echo critical env/vars (for visibility)
         run: |
           echo "DRY_RUN=${{ vars.DRY_RUN }}"
           echo "BUY_USD=${{ vars.BUY_USD }}"
           echo "UNIVERSE_PICK=${{ vars.UNIVERSE_PICK }}"
           echo "RESERVE_CASH_PCT=${{ vars.RESERVE_CASH_PCT }}"
-          # Masked by GitHub automatically, just confirming presence:
           if [ -n "${{ secrets.KRAKEN_API_KEY }}" ] && [ -n "${{ secrets.KRAKEN_API_SECRET }}" ]; then
             echo "Secrets: Kraken key/secret are present."
           else
             echo "Secrets: MISSING Kraken key/secret!"
           fi
 
-      - name: Run main.py (repo root)
-        run: python main.py
+      - name: Run main.py (repo root, with real env vars)
+        env:
+          # Map repo Variables → OS env for Python
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          BUY_USD: ${{ vars.BUY_USD }}
+          UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK }}
+          RESERVE_CASH_PCT: ${{ vars.RESERVE_CASH_PCT }}
+          # Map Secrets
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        run: |
+          echo '--- head(main.py) ---'
+          sed -n '1,40p' main.py || true
+          echo '--- running ---'
+          python main.py
 
       - name: Post — show .state after run
         if: always()
