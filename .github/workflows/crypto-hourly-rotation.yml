@@ -5,22 +5,29 @@ on:
     - cron: "*/15 * * * *"
   workflow_dispatch:
 
+concurrency:
+  group: crypto-hourly-rotation
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 12
 
+    # 👉 Make the Kraken secrets available to ALL steps in this job
     env:
-      # Pull Kraken creds from Secrets for EVERY step
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-
-      # Your knobs (examples)
-      DRY_RUN: "OFF"
-      BUY_USD: ${{ vars.BUY_USD || '25' }}
-      UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK || '' }}
+      # normal knobs (from Variables) are fine to keep using:
+      DRY_RUN: ${{ vars.DRY_RUN }}
+      BUY_USD: ${{ vars.BUY_USD }}
 
     steps:
+      - name: Set up git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -34,46 +41,51 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pytz
 
-      - name: "[preflight] persist .state + write summary"
+      - name: [preflight] persist .state + write summary
         run: |
+          set -e
           mkdir -p .state
-          printf "listing .state:\n"
+          echo "listing .state:"
           ls -la .state || true
-          echo "mode: $DRY_RUN (UNIVERSE_PICK not set)" > .state/_note.txt
+          # small note so we always have at least one file to upload
+          date +"%F %T %Z" > .state/_note.txt
+          printf "mode: %s; universe: AUTO (UNIVERSE_PICK not set)\n" "${DRY_RUN:-}" >> .state/_note.txt
 
       - name: Sanity check Kraken keys (same env as trade)
         run: |
-          python - << 'PY'
-          import os, time, base64, hashlib, hmac, urllib.parse, requests
-          key = os.getenv("KRAKEN_API_KEY", "")
-          sec = os.getenv("KRAKEN_API_SECRET", "")
-          if not key or not sec:
-              print("SANITY: Missing env keys"); raise SystemExit(2)
+          python - <<'PY'
+          import os, time, hmac, hashlib, base64, requests
+          # quick private /0/private/Balance call
+          key = os.getenv("KRAKEN_API_KEY","")
+          sec = os.getenv("KRAKEN_API_SECRET","")
+          assert key and sec, "Missing KRAKEN_API_KEY or KRAKEN_API_SECRET env"
           url = "https://api.kraken.com/0/private/Balance"
           nonce = str(int(time.time()*1000))
-          post = {"nonce": nonce}
-          postdata = urllib.parse.urlencode(post)
-          msg = ("/0/private/Balance").encode() + hashlib.sha256((nonce+postdata).encode()).digest()
-          mac = hmac.new(base64.b64decode(sec), msg, hashlib.sha512)
-          headers = {"API-Key": key, "API-Sign": base64.b64encode(mac.digest()).decode()}
-          r = requests.post(url, headers=headers, data=post, timeout=20)
+          data = {"nonce": nonce}
+          postdata = "&".join([f"{k}={v}" for k,v in data.items()])
+          message = ("/0/private/Balance").encode() + hashlib.sha256((nonce+postdata).encode()).digest()
+          secret = base64.b64decode(sec)
+          signature = base64.b64encode(hmac.new(secret, message, hashlib.sha512).digest()).decode()
+          headers = {"API-Key": key, "API-Sign": signature}
+          r = requests.post(url, headers=headers, data=data, timeout=20)
           j = r.json()
           if j.get("error"):
-              print("SANITY: Kraken error ->", j["error"]); raise SystemExit(4)
-          print("SANITY: OK (balance keys valid).")
+            raise SystemExit(f"Sanity FAILED: {j['error']}")
+          print("Sanity OK. Balance keys present. (trimmed):", {k:j['result'][k] for k in list(j.get('result',{}))[:3]})
           PY
 
       - name: Run main.py
         run: |
+          set -e
           python main.py || true
 
       - name: Bundle state (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: crypto-rotation-state
-          path: ./.state/**
+          path: .state/**
           if-no-files-found: warn
+          retention-days: 7
 
       - name: Post job cleanup
-        run: |
-          echo "Cleanup complete."
+        run: echo "Cleanup complete."
