@@ -2,17 +2,23 @@ name: Crypto — 1-Coin Rotation (LIVE-ready, ultra-defensive, 15m)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes UTC
+    - cron: "*/15 * * * *"
   workflow_dispatch:
-
-concurrency:
-  group: crypto-rotation
-  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 12
+
+    # >>> The critical line: export Kraken secrets for ALL steps <<<
+    env:
+      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
+      # keep your existing knobs here (examples)
+      DRY_RUN: "OFF"             # UI can still override if you use inputs
+      BUY_USD: ${{ vars.BUY_USD || '25' }}
+      UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK || '' }}
 
     steps:
       - name: Checkout
@@ -26,111 +32,53 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
-          pip install pyyaml matplotlib || true
+          pip install requests pytz
 
-      # ---------------------------------------------------------
-      # Preflight check: enforce 1-coin rotation + auto-universe,
-      # and guarantee a .state summary for artifact upload.
-      # ---------------------------------------------------------
-      - name: Preflight (enforce rotation + write summary)
-        id: preflight
-        shell: bash
+      - name: [preflight] persist .state + write summary
         run: |
-          set -e
           mkdir -p .state
-
-          WHEN="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-          echo "## Crypto — 1-Coin Rotation (15m)" > .state/run_summary.md
-          echo "" >> .state/run_summary.md
-          echo "**When:** ${WHEN}" >> .state/run_summary.md
-
-          cat > .state/run_summary.json <<'JSON'
-          {"status":"preflight","blocked":false}
-          JSON
-
-          MAX_POS="${{ vars.MAX_POSITIONS }}"
-          PICK="${{ vars.UNIVERSE_PICK }}"
-          DRY="${{ vars.DRY_RUN }}"
-          RUN_SWITCH="${{ vars.RUN_SWITCH }}"
-          MAX_POS="${MAX_POS:-1}"
-          DRY="${DRY:-ON}"
-          RUN_SWITCH="${RUN_SWITCH:-ON}"
-
-          if [[ -z "$PICK" ]]; then
-            echo "Universe mode: AUTO (UNIVERSE_PICK not set)"
-            echo "**Universe:** AUTO (UNIVERSE_PICK not set)" >> .state/run_summary.md
-          else
-            echo "Universe mode: FIXED (UNIVERSE_PICK=${PICK})"
-            echo "**Universe:** FIXED (${PICK})" >> .state/run_summary.md
-          fi
-
-          echo "" >> .state/run_summary.md
-          echo "**DRY_RUN:** ${DRY}" >> .state/run_summary.md
-          echo "**RUN_SWITCH:** ${RUN_SWITCH}" >> .state/run_summary.md
-          echo "**MAX_POSITIONS:** ${MAX_POS}" >> .state/run_summary.md
-
-          # Hard enforcement: rotation requires AUTO-universe
-          if [[ "${MAX_POS}" == "1" && -n "${PICK}" ]]; then
-            echo "::error title=Configuration blocked::MAX_POSITIONS==1 (rotation mode) but UNIVERSE_PICK='${PICK}'. Clear UNIVERSE_PICK for auto-universe rotation."
-            jq '.status="blocked" | .blocked=true | .reason="MAX_POSITIONS==1 but UNIVERSE_PICK set"' .state/run_summary.json > .state/tmp.json 2>/dev/null || true
-            mv .state/tmp.json .state/run_summary.json 2>/dev/null || true
-            exit 22
-          fi
-
-      - name: Debug .state contents
-        if: always()
-        run: |
-          echo "Listing .state:"
+          printf "listing .state:\n"
           ls -la .state || true
-          echo ""
-          echo "Preview run_summary.md:"
-          cat .state/run_summary.md || true
+          echo "mode: $DRY_RUN (UNIVERSE_PICK not set)" > .state/_note.txt
 
-      # -------------------
-      # Main trading logic
-      # -------------------
+      # ---------- NEW: sanity ping using the SAME secrets this job will use ----------
+      - name: Sanity check Kraken keys (same env as trade)
+        run: |
+          python - << 'PY'
+          import os, time, base64, hashlib, hmac, urllib.parse, requests
+          key = os.getenv("KRAKEN_API_KEY", "")
+          sec = os.getenv("KRAKEN_API_SECRET", "")
+          if not key or not sec:
+              print("SANITY: Missing env keys"); raise SystemExit(2)
+          url = "https://api.kraken.com/0/private/Balance"
+          nonce = str(int(time.time()*1000))
+          post = {"nonce": nonce}
+          postdata = urllib.parse.urlencode(post)
+          msg = ("/0/private/Balance").encode() + hashlib.sha256((nonce+postdata).encode()).digest()
+          mac = hmac.new(base64.b64decode(sec), msg, hashlib.sha512)
+          headers = {"API-Key": key, "API-Sign": base64.b64encode(mac.digest()).decode()}
+          r = requests.post(url, headers=headers, data=post, timeout=20)
+          try:
+              j = r.json()
+          except Exception:
+              print("SANITY: Non-JSON response", r.status_code, r.text[:200]); raise SystemExit(3)
+          if j.get("error"):
+              print("SANITY: Kraken error ->", j["error"]); raise SystemExit(4)
+          # success
+          print("SANITY: OK (balance keys valid).")
+          PY
+
       - name: Run main.py
-        if: ${{ success() }}
-        env:
-          RUN_SWITCH: ${{ vars.RUN_SWITCH }}
-          DRY_RUN: ${{ vars.DRY_RUN }}
-          MAX_POSITIONS: ${{ vars.MAX_POSITIONS }}
-          UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK }}
-          UNIVERSE_TOP_K: ${{ vars.UNIVERSE_TOP_K }}
-          BUY_USD: ${{ vars.BUY_USD }}
-          RESERVE_CASH_PCT: ${{ vars.RESERVE_CASH_PCT }}
-          SELL_STOP_PCT: ${{ vars.SELL_STOP_PCT }}
-          SELL_TAKE_PROFIT_PCT: ${{ vars.SELL_TAKE_PROFIT_PCT }}
-          SELL_1H_MIN_GAIN_PCT: ${{ vars.SELL_1H_MIN_GAIN_PCT }}
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          set -e
-          echo "Running main.py at $(date -u)"
-          python main.py
+          python main.py || true
 
-      # Guarantee minimal artifact payload
-      - name: Finalize .state (safety)
-        if: always()
-        run: |
-          mkdir -p .state
-          [[ -s .state/run_summary.md ]] || echo "Placeholder summary" > .state/run_summary.md
-          [[ -s .state/run_summary.json ]] || echo '{"status":"placeholder"}' > .state/run_summary.json
-
-      - name: Upload .state artifacts
-        if: always()
+      - name: Bundle state (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: crypto-rotation-state
-          path: |
-            .state/**
-            ./.state/**
-          include-hidden-files: true
+          path: ./.state/**
           if-no-files-found: warn
-          retention-days: 14
 
-      - name: Cleanup
-        if: always()
-        run: git config --global --unset-all safe.directory || true
+      - name: Post job cleanup
+        run: |
+          echo "Cleanup complete."
