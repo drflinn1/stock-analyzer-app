@@ -2,8 +2,11 @@ name: Crypto - 1-Coin Rotation (LIVE-ready, ultra-defensive, 15m)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/15 * * * *"   # every 15 minutes UTC
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 concurrency:
   group: crypto-hourly-rotation
@@ -14,18 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
 
-    env:
-      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-      DRY_RUN: ${{ vars.DRY_RUN }}
-      BUY_USD: ${{ vars.BUY_USD }}
-
     steps:
-      - name: Set up git
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -34,50 +26,53 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install dependencies (ensure ccxt is present)
         run: |
           python -m pip install --upgrade pip
-          pip install requests pytz
+          pip install -r requirements.txt || true
+          pip install ccxt
 
-      - name: preflight - persist .state and write summary
+      - name: Preflight — show working dir and current .state
         run: |
-          set -e
+          echo "PWD=$(pwd)"
+          python -V
+          ls -la .
           mkdir -p .state
+          echo "(before) list .state:"
           ls -la .state || true
-          date +"%F %T %Z" > .state/_note.txt
-          echo "mode=${DRY_RUN:-}; universe=AUTO (UNIVERSE_PICK not set)" >> .state/_note.txt
 
-      - name: Sanity check Kraken keys (same env as trade)
+      - name: Echo critical env/vars
         run: |
-          python - <<'PY'
-          import os, time, hmac, hashlib, base64, requests
-          key = os.getenv("KRAKEN_API_KEY","")
-          sec = os.getenv("KRAKEN_API_SECRET","")
-          assert key and sec, "Missing KRAKEN_API_KEY or KRAKEN_API_SECRET env"
-          url = "https://api.kraken.com/0/private/Balance"
-          nonce = str(int(time.time()*1000))
-          data = {"nonce": nonce}
-          postdata = "&".join([f"{k}={v}" for k,v in data.items()])
-          message = ("/0/private/Balance").encode() + hashlib.sha256((nonce+postdata).encode()).digest()
-          secret = base64.b64decode(sec)
-          signature = base64.b64encode(hmac.new(secret, message, hashlib.sha512).digest()).decode()
-          headers = {"API-Key": key, "API-Sign": signature}
-          r = requests.post(url, headers=headers, data=data, timeout=20)
-          j = r.json()
-          if j.get("error"):
-            raise SystemExit(f"Sanity FAILED: {j['error']}")
-          print("Sanity OK. Balance keys present.")
-          PY
+          echo "DRY_RUN=${{ vars.DRY_RUN }}"
+          echo "BUY_USD=${{ vars.BUY_USD }}"
+          echo "UNIVERSE_PICK=${{ vars.UNIVERSE_PICK }}"
+          echo "RESERVE_CASH_PCT=${{ vars.RESERVE_CASH_PCT }}"
+          # Masked by GitHub automatically, just confirming presence:
+          if [ -n "${{ secrets.KRAKEN_API_KEY }}" ] && [ -n "${{ secrets.KRAKEN_API_SECRET }}" ]; then
+            echo "Secrets: Kraken key/secret are present."
+          else
+            echo "Secrets: MISSING Kraken key/secret!"
+          fi
 
-      - name: Run main.py
+      - name: Run main.py (repo root)
+        run: python main.py
+
+      - name: Post — show .state after run
+        if: always()
         run: |
-          set -e
-          python main.py || true
+          echo "(after) list .state:"
+          ls -la .state || true
+          echo "---- run_summary.md ----"
+          test -f .state/run_summary.md && sed -n '1,120p' .state/run_summary.md || echo "run_summary.md not found"
+          echo "---- positions.json ----"
+          test -f .state/positions.json && cat .state/positions.json || echo "positions.json not found"
+          echo "---- last_ok.txt ----"
+          test -f .state/last_ok.txt && cat .state/last_ok.txt || echo "last_ok.txt not found"
 
-      - name: Bundle state (artifact)
+      - name: Upload .state (artifact)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: crypto-rotation-state
+          name: state
           path: .state/**
           if-no-files-found: warn
-          retention-days: 7
