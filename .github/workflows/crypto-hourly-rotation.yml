@@ -2,7 +2,7 @@ name: Crypto - 1-Coin Rotation (LIVE-ready, ultra-defensive, 15m)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes UTC
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -55,12 +55,10 @@ jobs:
 
       - name: Run main.py (repo root, with real env vars)
         env:
-          # Map repo Variables → OS env for Python
           DRY_RUN: ${{ vars.DRY_RUN }}
           BUY_USD: ${{ vars.BUY_USD }}
           UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK }}
           RESERVE_CASH_PCT: ${{ vars.RESERVE_CASH_PCT }}
-          # Map Secrets
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
@@ -81,10 +79,11 @@ jobs:
           echo "---- last_ok.txt ----"
           test -f .state/last_ok.txt && cat .state/last_ok.txt || echo "last_ok.txt not found"
 
-      - name: Upload .state (artifact)
+      - name: Upload .state (artifact)   # <— directory, not a glob
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state
-          path: .state/**
+          path: ./.state            # <— this is the fix
           if-no-files-found: warn
+          retention-days: 7
