@@ -21,18 +21,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Restore the most recent .state (so positions.json/last_ok.txt persist)
+      # Safe cache key (no commas, parentheses, or spaces)
       - name: Restore .state cache
-        id: cache-state
         uses: actions/cache@v4
         with:
           path: .state
-          # Primary key is unique per run; restore-keys pull the latest prior cache automatically
-          key: state-${{ github.workflow }}-${{ github.ref_name }}-${{ github.run_id }}
+          key: state-crypto_hourly_rotation-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
-            state-${{ github.workflow }}-${{ github.ref_name }}-
-            state-${{ github.workflow }}-
-            state-
+            state-crypto_hourly_rotation-${{ github.ref_name }}-
+            state-crypto_hourly_rotation-
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -51,8 +48,7 @@ jobs:
           python -V
           ls -la .
           mkdir -p .state
-          # ensure at least one file so artifacts/caching never warn
-          echo "keep" > .state/.keep
+          echo "placeholder" > .state/.keep
           echo "(before) list .state:"
           ls -la .state || true
 
@@ -86,7 +82,7 @@ jobs:
           WINDOW_MIN: ${{ vars.WINDOW_MIN }}
         run: |
           echo '--- head(main.py) ---'
-          sed -n '1,40p' main.py || true
+          sed -n '1,60p' main.py || true
           echo '--- running ---'
           python main.py || echo "(Python exited nonzero)"
 
@@ -108,14 +104,6 @@ jobs:
         with:
           name: state
           path: |
-            .state/**
+            .state/
           if-no-files-found: warn
           retention-days: 7
-
-      # Save the updated .state so the next run restores it (rotation memory)
-      - name: Save updated .state cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: .state
-          key: state-${{ github.workflow }}-${{ github.ref_name }}-${{ github.run_id }}
