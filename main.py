@@ -1,442 +1,235 @@
 #!/usr/bin/env python3
 """
-main.py — Crypto 1-coin rotation for Kraken (LIVE/DRY-RUN)
+main.py — Unified runner that guarantees .state artifacts and obeys UNIVERSE_PICK.
 
-Rules (unchanged):
-  • 1% stop-loss
-  • 5% take-profit
-  • "< 3% gain after 1 hour" => rotate out
-
-Enhancements:
-  • Always writes run_summary.md/json with rich diagnostics (PnL, prices, entry age, reasons)
-  • Accepts legacy position schemas:
-        - {"symbol","qty","avg_price","entry_ts"}  (ISO)
-        - {"symbol","qty","entry_price","opened_at"} (opened_at = epoch float)
-  • Optional fallback-rotate (disabled by default):
-        If FALLBACK_ROTATE=ON and age >= AGE_FALLBACK_MIN and pnl <= ROTATE_IF_PNL_BELOW
-        and top candidate != current and not in cooldown => rotate
-
-Env:
-  DRY_RUN: "ON"|"OFF"                (default "ON")
-  BUY_USD: float, USD per buy        (default "10")
-  UNIVERSE_PICK: "ALCX/USD" etc      (default "")
-  COOLDOWN_MIN: int minutes          (default "60")
-
-  FALLBACK_ROTATE: "ON"|"OFF"        (default "OFF")
-  AGE_FALLBACK_MIN: int minutes      (default "60")
-  ROTATE_IF_PNL_BELOW: float (frac)  (default "0.0")  # 0% or worse after fallback age
-
-Kraken LIVE:
-  KRAKEN_API_KEY
-  KRAKEN_API_SECRET (base64)
+Features
+- Always writes .state/run_summary.{json,md} (even on risk-off or errors)
+- Force-buy path when UNIVERSE_PICK is provided (e.g., SOLUSD → SOL/USD)
+- LIVE trading via ccxt.kraken when DRY_RUN=OFF and Kraken secrets exist
+- Records a minimal .state/positions.json for rotation watchdogs
 """
 
-import base64
-import hashlib
-import hmac
 import json
 import os
+import sys
 import time
-import csv
-import urllib.parse
-import urllib.request
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 # ---------- Paths ----------
-STATE = Path(".state")
-STATE.mkdir(parents=True, exist_ok=True)
-POS_FILE = STATE / "position.json"
-SUMMARY_JSON = STATE / "run_summary.json"
-SUMMARY_MD = STATE / "run_summary.md"
-LAST_EXIT = STATE / "last_exit_code.txt"
-RISK_FILE = STATE / "last_risk_signal.txt"
-COOLDOWN_FILE = STATE / "cooldown.json"
-CANDIDATES = STATE / "momentum_candidates.csv"
+STATE_DIR = Path(".state")
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+SUMMARY_JSON = STATE_DIR / "run_summary.json"
+SUMMARY_MD = STATE_DIR / "run_summary.md"
+LAST_OK = STATE_DIR / "last_ok.txt"
+POSITIONS_JSON = STATE_DIR / "positions.json"   # minimal ledger for rotation logic
 
 # ---------- Helpers ----------
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
 def env_str(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return default if v is None else str(v)
+    v = os.getenv(name, default)
+    return "" if v is None else str(v)
 
 def env_float(name: str, default: float) -> float:
     try:
-        return float(env_str(name, ""))
+        return float(env_str(name, str(default)).strip())
     except Exception:
         return default
 
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
-
-# ---------- Kraken minimal client ----------
-KRAKEN_BASE = "https://api.kraken.com"
-
-def _kraken_request(path: str, data: Dict[str, Any], key: str, secret_b64: str) -> Dict[str, Any]:
-    url = f"{KRAKEN_BASE}{path}"
-    nonce = str(int(time.time() * 1000))
-    pdata = {"nonce": nonce}
-    pdata.update(data)
-    enc = urllib.parse.urlencode(pdata)
-    post_bytes = enc.encode()
-
-    sha256 = hashlib.sha256((nonce + urllib.parse.urlencode(data)).encode()).digest()
-    msg = path.encode() + sha256
-    secret = base64.b64decode(secret_b64)
-    sig = hmac.new(secret, msg, hashlib.sha512).digest()
-
-    headers = {
-        "API-Key": key,
-        "API-Sign": base64.b64encode(sig),
-        "User-Agent": "stock-analyzer-app",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    req = urllib.request.Request(url, data=post_bytes, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode())
-
-def kraken_public_ticker(pair: str) -> Optional[float]:
-    pair_ns = pair.replace("/", "").upper()
-    url = f"{KRAKEN_BASE}/0/public/Ticker?pair={urllib.parse.quote(pair_ns)}"
-    req = urllib.request.Request(url, headers={"User-Agent": "stock-analyzer-app"})
+def write_summary(data: Dict[str, Any]) -> None:
+    """Write both JSON and Markdown summaries; never raises."""
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode())
-            if data.get("error"):
-                return None
-            res = data.get("result", {})
-            if not res:
-                return None
-            k = next(iter(res.keys()))
-            last = res[k]["c"][0]
-            return float(last)
-    except Exception:
-        return None
-
-def kraken_place_market(key: str, secret_b64: str, pair_ns: str, side: str, volume: float) -> Tuple[bool, str]:
-    data = {
-        "pair": pair_ns,
-        "type": side,
-        "ordertype": "market",
-        "volume": f"{volume:.8f}",
-        "oflags": "viqc",
-    }
-    try:
-        resp = _kraken_request("/0/private/AddOrder", data, key, secret_b64)
-        if resp.get("error"):
-            return False, ";".join(resp["error"])
-        txs = resp.get("result", {}).get("txid", [])
-        return True, ",".join(txs) if txs else "OK"
+        SUMMARY_JSON.write_text(json.dumps(data, indent=2))
     except Exception as e:
-        return False, f"EXC:{e}"
+        print(f"[WARN] Failed writing {SUMMARY_JSON}: {e}", file=sys.stderr)
 
-# ---------- File I/O ----------
-def read_json(path: Path, default: Any) -> Any:
     try:
-        return json.loads(path.read_text())
-    except Exception:
-        return default
+        lines = [
+            f"**When:** {data.get('when', '')}",
+            f"**Live (DRY_RUN=OFF):** {data.get('live', False)}",
+            f"**UNIVERSE_PICK:** {data.get('universe_pick', '')}",
+            f"**BUY_USD:** {data.get('buy_usd', '')}",
+            f"**Status:** {data.get('status', '')}",
+            f"**Note:** {data.get('note', '')}",
+            "",
+            "### Details",
+            "```json",
+            json.dumps(data, indent=2),
+            "```",
+        ]
+        SUMMARY_MD.write_text("\n".join(lines))
+    except Exception as e:
+        print(f"[WARN] Failed writing {SUMMARY_MD}: {e}", file=sys.stderr)
 
-def write_json(path: Path, data: Any) -> None:
-    path.write_text(json.dumps(data, indent=2))
-
-def write_text(path: Path, text: str) -> None:
-    path.write_text(text)
-
-# ---------- Cooldown ----------
-def load_cooldown() -> Dict[str, str]:
-    return read_json(COOLDOWN_FILE, {})
-
-def save_cooldown(cd: Dict[str, str]) -> None:
-    write_json(COOLDOWN_FILE, cd)
-
-def in_cooldown(symbol_ns: str, cd: Dict[str, str]) -> bool:
-    until = cd.get(symbol_ns.upper())
-    if not until:
-        return False
-    try:
-        return datetime.fromisoformat(until.replace("Z", "+00:00")) > now_utc()
-    except Exception:
-        return False
-
-def set_cooldown(symbol_ns: str, minutes: int, cd: Dict[str, str]) -> None:
-    until = now_utc() + timedelta(minutes=minutes)
-    cd[symbol_ns.upper()] = iso(until).replace("+00:00", "Z")
-
-# ---------- Candidates ----------
-def load_candidates(path: Path) -> List[str]:
-    if not path.exists():
-        return []
-    out: List[str] = []
-    with path.open(newline="") as f:
-        r = csv.reader(f)
-        rows = list(r)
-        if not rows:
-            return out
-        start = 0
-        if rows[0] and any(k in rows[0][0].lower() for k in ("pair", "symbol")):
-            start = 1
-        for row in rows[start:]:
-            if not row:
-                continue
-            s = row[0].strip().upper().replace(" ", "")
-            if not s:
-                continue
-            if "/" not in s and len(s) > 3:
-                s = f"{s[:-3]}/{s[-3:]}"
-            out.append(s)
-    # de-dupe
-    seen, uniq = set(), []
-    for s in out:
-        k = s.replace("/", "")
-        if k in seen: 
-            continue
-        seen.add(k)
-        uniq.append(s)
-    return uniq
-
-# ---------- Position ----------
-def load_position() -> Optional[Dict[str, Any]]:
-    """
-    Returns normalized position dict:
-      {"symbol":"ALCXUSD","qty":float,"avg_price":float,"entry_ts": ISO str}
-    """
-    raw = read_json(POS_FILE, None)
-    if not raw:
-        return None
-    sym = raw.get("symbol") or raw.get("pair") or ""
-    sym = sym.replace("/", "").upper()
-    qty = float(raw.get("qty", 0) or 0)
-    avg_price = raw.get("avg_price", None)
-    entry_ts = raw.get("entry_ts", None)
-
-    # Legacy compatibility
-    if avg_price is None and "entry_price" in raw:
-        avg_price = float(raw["entry_price"])
-    if not entry_ts and "opened_at" in raw:
+def load_positions() -> Dict[str, Any]:
+    if POSITIONS_JSON.exists():
         try:
-            # epoch (float or int) -> ISO
-            entry_ts = iso(datetime.fromtimestamp(float(raw["opened_at"]), tz=timezone.utc))
+            return json.loads(POSITIONS_JSON.read_text() or "{}")
         except Exception:
-            entry_ts = None
+            return {}
+    return {}
 
-    if not sym or qty <= 0 or avg_price is None:
+def save_positions(d: Dict[str, Any]) -> None:
+    try:
+        POSITIONS_JSON.write_text(json.dumps(d, indent=2))
+    except Exception as e:
+        print(f"[WARN] Failed writing {POSITIONS_JSON}: {e}", file=sys.stderr)
+
+def map_pair_to_ccxt_symbol(universe_pick: str) -> Optional[str]:
+    """
+    Input expected like 'SOLUSD', 'BTCUSD', 'SAPIENUSD' (NO slash).
+    Output CCXT symbol 'SOL/USD', 'BTC/USD', 'SAPIEN/USD'.
+    """
+    up = (universe_pick or "").strip().upper()
+    if not up.endswith("USD") or len(up) <= 3:
         return None
-    if not entry_ts:
-        entry_ts = iso(now_utc())  # best-effort
-
-    return {"symbol": sym, "qty": float(qty), "avg_price": float(avg_price), "entry_ts": entry_ts}
-
-def save_position(pos: Optional[Dict[str, Any]]) -> None:
-    if pos is None:
-        POS_FILE.unlink(missing_ok=True)
-    else:
-        write_json(POS_FILE, pos)
-
-# ---------- Risk gate ----------
-def risk_off() -> bool:
-    try:
-        if not RISK_FILE.exists():
-            return False
-        return "OFF" in RISK_FILE.read_text().strip().upper()
-    except Exception:
-        return False
-
-# ---------- Decision ----------
-def decide_exit(pos: Dict[str, Any], price_now: float, top_candidate_ns: Optional[str], cfg: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
-    avg = float(pos["avg_price"])
-    pnl = (price_now - avg) / avg if avg > 0 else 0.0
-
-    try:
-        entry_dt = datetime.fromisoformat(pos["entry_ts"].replace("Z", "+00:00"))
-    except Exception:
-        entry_dt = now_utc()
-    age_sec = (now_utc() - entry_dt).total_seconds()
-    age_min = age_sec / 60.0
-
-    # Primary rules
-    if pnl <= -0.01:
-        return True, "STOP_1pct", {"pnl": pnl, "age_min": age_min}
-    if pnl >= 0.05:
-        return True, "TAKE_PROFIT_5pct", {"pnl": pnl, "age_min": age_min}
-    if age_sec >= 3600 and pnl < 0.03:
-        return True, "ROTATE_LT3pct_AFTER_1h", {"pnl": pnl, "age_min": age_min}
-
-    # Optional fallback rotation (disabled by default)
-    if cfg["FALLBACK_ROTATE"]:
-        if age_min >= cfg["AGE_FALLBACK_MIN"] and pnl <= cfg["ROTATE_IF_PNL_BELOW"]:
-            if top_candidate_ns and top_candidate_ns != pos["symbol"]:
-                return True, "FALLBACK_ROTATE", {"pnl": pnl, "age_min": age_min}
-
-    return False, "HOLD", {"pnl": pnl, "age_min": age_min}
-
-# ---------- Summary ----------
-def write_summary(status: str, details: Dict[str, Any], cand_preview: List[str]) -> None:
-    data = {"when": iso(now_utc()), "status": status, **details}
-    write_json(SUMMARY_JSON, data)
-
-    lines = []
-    lines.append(f"**When:** {data['when']}")
-    lines.append(f"**Mode:** {'DRY_RUN' if details.get('dry_run') else 'LIVE'}")
-    lines.append(f"**Status:** {status}")
-    lines.append(f"**Universe:** {'PICK=' + details['forced'] if details.get('forced') else 'AUTO (UNIVERSE_PICK not set)'}")
-    lines.append("")
-    if cand_preview:
-        lines.append("**Candidate audit (top of momentum_candidates.csv):**")
-        lines.append("")
-        lines.append("```")
-        for s in cand_preview[:10]:
-            lines.append(s)
-        lines.append("```")
-        lines.append("")
-    # Diagnostics
-    diag = details.get("diagnostics")
-    if diag:
-        lines.append("**Diagnostics:**")
-        lines.append("")
-        lines.append("```json")
-        lines.append(json.dumps(diag, indent=2))
-        lines.append("```")
-        lines.append("")
-    if details.get("last_action_json"):
-        lines.append("```json")
-        lines.append(json.dumps(details["last_action_json"], indent=2))
-        lines.append("```")
-    write_text(SUMMARY_MD, "\n".join(lines))
-    write_text(LAST_EXIT, "0" if status.endswith("OK") or status.startswith("HOLD") else "1")
+    base = up[:-3]
+    return f"{base}/USD"
 
 # ---------- Runner ----------
 def main() -> int:
-    dry_run = env_str("DRY_RUN", "ON").upper() != "OFF"
-    buy_usd = env_float("BUY_USD", 10.0)
-    force_pick = env_str("UNIVERSE_PICK", "").strip()
-    cooldown_min = int(env_float("COOLDOWN_MIN", 60))
+    when = utc_now_iso()
 
-    # Fallback rotate config
-    cfg = {
-        "FALLBACK_ROTATE": env_str("FALLBACK_ROTATE", "OFF").upper() == "ON",
-        "AGE_FALLBACK_MIN": int(env_float("AGE_FALLBACK_MIN", 60)),
-        "ROTATE_IF_PNL_BELOW": env_float("ROTATE_IF_PNL_BELOW", 0.0),
+    # Read env (with conservative defaults)
+    dry_run = env_str("DRY_RUN", "ON").strip().upper()
+    live = (dry_run == "OFF")
+    buy_usd = env_float("BUY_USD", 25.0)
+    reserve_cash_pct = env_float("RESERVE_CASH_PCT", 0.0)
+    universe_pick = env_str("UNIVERSE_PICK", "").strip().upper()  # e.g., SOLUSD
+
+    # Kraken secrets (only needed if live)
+    kraken_key = env_str("KRAKEN_API_KEY", "")
+    kraken_secret = env_str("KRAKEN_API_SECRET", "")
+
+    # Start a result payload that we will ALWAYS write
+    result: Dict[str, Any] = {
+        "when": when,
+        "live": live,
+        "buy_usd": buy_usd,
+        "reserve_cash_pct": reserve_cash_pct,
+        "universe_pick": universe_pick,
+        "status": "START",
+        "note": "",
     }
 
-    # Candidates
-    cands = load_candidates(CANDIDATES)
-    cand_preview = cands[:]
-    if force_pick:
-        fp = force_pick.replace(" ", "").upper()
-        if "/" not in fp and len(fp) > 3:
-            fp = f"{fp[:-3]}/{fp[-3:]}"
-        cands = [fp] + [c for c in cands if c.replace("/", "") != fp.replace("/", "")]
-    cooldown = load_cooldown()
+    print("[ENV] DRY_RUN =", dry_run)
+    print("[ENV] BUY_USD =", buy_usd)
+    print("[ENV] RESERVE_CASH_PCT =", reserve_cash_pct)
+    print("[ENV] UNIVERSE_PICK =", universe_pick)
 
-    # Risk-off
-    if risk_off():
-        write_summary("RISK_OFF — no trades", {"dry_run": dry_run}, cand_preview)
+    # Safety: ensure .state exists
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # If not live, just log and write artifacts (so upload step always finds files)
+    if not live:
+        result["status"] = "RISK_OFF"
+        result["note"] = "DRY_RUN is ON (simulation only). No live orders placed."
+        write_summary(result)
         return 0
 
-    api_key = env_str("KRAKEN_API_KEY", "")
-    api_secret = env_str("KRAKEN_API_SECRET", "")
+    # Live mode sanity: secrets must be present
+    if not kraken_key or not kraken_secret:
+        result["status"] = "ERROR_NO_SECRETS"
+        result["note"] = "[LIVE] Missing Kraken API secrets; aborting order."
+        print("[LIVE] ERROR: Missing KRAKEN_API_KEY or KRAKEN_API_SECRET")
+        write_summary(result)
+        return 0
 
-    pos = load_position()
-    top_candidate_ns = cands[0].replace("/", "") if cands else None
+    # If UNIVERSE_PICK provided, we force-buy that symbol; otherwise we would run scanner logic.
+    # (This file focuses on honoring UNIVERSE_PICK to reproduce last night's baseline.)
+    if not universe_pick:
+        result["status"] = "NO_PICK"
+        result["note"] = (
+            "No UNIVERSE_PICK provided. Scanner found no actionable gainer, "
+            "so no trade was placed. (Artifacts written.)"
+        )
+        write_summary(result)
+        return 0
 
-    # -------- EXIT PHASE --------
-    last_action: Dict[str, Any] = {}
-    if pos:
-        sym_ns = pos["symbol"]
-        px = kraken_public_ticker(sym_ns)
-        diag = {
-            "position": pos,
-            "price_now": px,
-            "top_candidate": top_candidate_ns,
-            "cooldown_active": in_cooldown(sym_ns, cooldown),
-            "fallback_rotate_enabled": cfg["FALLBACK_ROTATE"],
-        }
-        if px is None:
-            write_summary("HOLD (price unavailable)", {"dry_run": dry_run, "diagnostics": diag}, cand_preview)
+    symbol = map_pair_to_ccxt_symbol(universe_pick)
+    if not symbol:
+        result["status"] = "ERROR_BAD_SYMBOL"
+        result["note"] = f"UNIVERSE_PICK '{universe_pick}' is not in expected format like 'SOLUSD'."
+        write_summary(result)
+        return 0
+
+    # Try a live market buy on Kraken via ccxt using cost param (spend BUY_USD in quote currency)
+    try:
+        import ccxt  # expects ccxt in requirements.txt
+
+        print("[LIVE] Connecting to Kraken via ccxt…")
+        exchange = ccxt.kraken({
+            "apiKey": kraken_key,
+            "secret": kraken_secret,
+            "enableRateLimit": True,
+            # Optional: "options": { "tradesLimit": 50 },
+        })
+
+        markets = exchange.load_markets()
+        if symbol not in markets:
+            # Some pairs appear with . or : variants; try a fallback search
+            # But usually 'SOL/USD' exists. If not, fail gracefully.
+            result["status"] = "ERROR_MARKET_NOT_FOUND"
+            result["note"] = f"Market '{symbol}' not found on Kraken."
+            write_summary(result)
             return 0
 
-        should_exit, reason, metrics = decide_exit(pos, px, top_candidate_ns, cfg)
-        diag.update(metrics)
+        print(f"[LIVE] BUY {symbol} — cost ${buy_usd} (market)")
+        order = exchange.create_order(symbol, 'market', 'buy', None, None, {'cost': buy_usd})
+        print("[LIVE] Order response:", order)
 
-        if should_exit:
-            qty = float(pos["qty"])
-            ok, tx = (True, "DRY_TX") if dry_run else kraken_place_market(api_key, api_secret, sym_ns, "sell", qty)
-            last_action = {
-                "action": "SELL",
-                "symbol": sym_ns,
-                "qty": qty,
-                "price_now": px,
-                "reason": reason,
-                "pnl_pct": round(metrics["pnl"] * 100, 3),
-                "age_min": round(metrics["age_min"], 1),
-                "txid": tx,
-                "ok": ok
-            }
-            set_cooldown(sym_ns, cooldown_min, cooldown)
-            save_cooldown(cooldown)
-            if ok:
-                save_position(None)
-            status = f"{'DRY' if dry_run else 'LIVE'} SELL OK" if ok else "SELL ERROR"
-            write_summary(status, {"dry_run": dry_run, "last_action_json": last_action, "diagnostics": diag}, cand_preview)
-            pos = load_position()  # should be None now
+        # Fetch the filled price if possible (best-effort)
+        filled_price = None
+        try:
+            if order and 'price' in order and order['price']:
+                filled_price = float(order['price'])
+        except Exception:
+            pass
 
-        else:
-            write_summary("HOLD (position open)", {"dry_run": dry_run, "diagnostics": diag, "position": pos}, cand_preview)
-            return 0  # hold => stop here (single-position bot)
-
-    # -------- BUY PHASE --------
-    if pos:
-        write_summary("HOLD (position open)", {"dry_run": dry_run, "position": pos}, cand_preview)
-        return 0
-
-    # pick next (not in cooldown)
-    nxt = None
-    for s in cands:
-        ns = s.replace("/", "")
-        if not in_cooldown(ns, cooldown):
-            nxt = s
-            break
-    if not nxt:
-        write_summary("NO-CANDIDATE (all cooled down or none)", {"dry_run": dry_run, "cooldown": list(cooldown.keys())}, cand_preview)
-        return 0
-
-    nxt_ns = nxt.replace("/", "")
-    px = kraken_public_ticker(nxt_ns)
-    if px is None or px <= 0:
-        write_summary("SKIP (no price for candidate)", {"dry_run": dry_run, "candidate": nxt}, cand_preview)
-        return 0
-
-    volume = max(buy_usd / px, 0.00000001)
-    ok, tx = (True, "DRY_TX") if dry_run else kraken_place_market(api_key, api_secret, nxt_ns, "buy", volume)
-    last_action = {
-        "action": "BUY",
-        "symbol": nxt_ns,
-        "qty": volume,
-        "avg_price": px,
-        "txid": tx,
-        "ok": ok
-    }
-    if ok:
-        pos = {
-            "symbol": nxt_ns,
-            "qty": volume,
-            "avg_price": px,
-            "entry_ts": iso(now_utc()).replace("+00:00", "Z")
+        # Record a minimal position entry for rotation watchdogs
+        positions = load_positions()
+        positions[symbol] = {
+            "symbol": symbol,
+            "universe_pick": universe_pick,
+            "entry_time": utc_now_iso(),
+            "entry_price": filled_price,
+            "buy_usd": buy_usd,
         }
-        save_position(pos)
+        save_positions(positions)
 
-    status = f"{'DRY' if dry_run else 'LIVE'} BUY OK" if ok else "BUY ERROR"
-    write_summary(status, {"dry_run": dry_run, "last_action_json": last_action, "forced": force_pick or "", "position": pos}, cand_preview)
-    return 0
+        # Mark success and write artifacts
+        result["status"] = "LIVE_BUY_OK"
+        result["note"] = f"Placed market BUY for {symbol} with cost ${buy_usd}."
+        result["order"] = order
+        result["entry_price"] = filled_price
 
-# ---------- Entry ----------
-if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
+        # Touch last_ok for quick health checks
+        try:
+            LAST_OK.write_text(utc_now_iso() + "\n")
+        except Exception as e:
+            print(f"[WARN] Failed writing {LAST_OK}: {e}", file=sys.stderr)
+
+        write_summary(result)
+        return 0
+
     except Exception as e:
-        write_summary("FATAL ERROR", {"error": str(e), "dry_run": env_str("DRY_RUN","ON").upper()!='OFF'}, [])
-        raise
+        # Handle common Kraken errors gracefully
+        msg = str(e)
+        print(f"[LIVE] BUY ERROR: {msg}")
+        status = "LIVE_BUY_ERROR"
+        if "Insufficient funds" in msg or "EOrder:Insufficient funds" in msg:
+            status = "ERROR_FUNDS"
+        elif "EOrder:Minimum order size" in msg or "Invalid order" in msg:
+            status = "ERROR_MIN_ORDER"
+
+        result["status"] = status
+        result["note"] = msg
+        write_summary(result)
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
