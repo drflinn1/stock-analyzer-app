@@ -1,15 +1,15 @@
-**When:** 2025-11-07T16:56:08+00:00
+**When:** 2025-11-07T17:31:47+00:00
 **Live (DRY_RUN=OFF):** True
 **Pick Source:** CANDIDATES_CSV
-**Pick (symbol):** UAI/USD
+**Pick (symbol):** FLUX/USD
 **BUY_USD:** 15.0
-**Status:** LIVE_BUY_OK
-**Note:** 
+**Status:** BUY_ERROR
+**Note:** ['EGeneral:Invalid arguments:volume']
 
 ### Details
 ```json
 {
-  "when": "2025-11-07T16:56:08+00:00",
+  "when": "2025-11-07T17:31:47+00:00",
   "live": true,
   "buy_usd": 15.0,
   "reserve_cash_pct": 0.0,
@@ -20,47 +20,19 @@
     "slow_min_pct": 3.0,
     "window_min": 30
   },
-  "status": "LIVE_BUY_OK",
-  "note": "",
-  "symbol": "UAI/USD",
+  "status": "BUY_ERROR",
+  "note": "['EGeneral:Invalid arguments:volume']",
+  "symbol": "FLUX/USD",
   "pick_source": "CANDIDATES_CSV",
-  "order": {
-    "id": "OEUP3O-GJAZC-3SNGAA",
-    "clientOrderId": null,
-    "info": {
-      "txid": [
-        "OEUP3O-GJAZC-3SNGAA"
-      ],
-      "descr": {
-        "order": "buy 15.00 UAIUSD @ market"
-      }
-    },
-    "timestamp": null,
-    "datetime": null,
-    "lastTradeTimestamp": null,
-    "status": null,
-    "symbol": "UAI/USD",
-    "type": "market",
-    "timeInForce": "IOC",
-    "postOnly": false,
-    "side": "buy",
-    "price": null,
-    "triggerPrice": null,
-    "takeProfitPrice": null,
-    "stopLossPrice": null,
-    "cost": 15.0,
-    "amount": null,
-    "filled": null,
-    "average": null,
-    "remaining": null,
-    "reduceOnly": null,
-    "fee": null,
-    "trades": [],
-    "fees": [],
-    "lastUpdateTimestamp": null,
-    "stopPrice": null
-  },
-  "entry_price": null,
-  "amount": 60.0024
+  "open_position": {
+    "symbol": null,
+    "qty": 0.0,
+    "avg_price": 0.0,
+    "in_position_since": null,
+    "high_price": null,
+    "source": null,
+    "buy_usd": 0.0,
+    "amount": 0.0
+  }
 }
 ```
