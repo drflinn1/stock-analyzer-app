@@ -2,93 +2,65 @@ name: Crypto - 1-Coin Rotation (LIVE-ready, ultra-defensive, 15m)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"     # every 15 minutes UTC
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
-      DRY_RUN:
-        description: "ON for simulation, OFF for live trading"
-        required: true
-        default: "ON"
-      BUY_USD:
-        description: "Buy size in USD"
-        required: true
-        default: "15"
-      TP_PCT:
-        description: "Take-profit percent"
-        required: true
-        default: "5"
-      SL_PCT:
-        description: "Stop-loss percent (applies only during first HOLD_WINDOW_M minutes)"
-        required: true
-        default: "1"
-      HOLD_WINDOW_M:
-        description: "Hold window in minutes for initial stop/slow rules"
-        required: true
-        default: "60"
-      SLOW_GAIN_PCT:
-        description: "If not at least this % after HOLD_WINDOW_M, exit"
-        required: true
-        default: "3"
-      FORCE_SELL:
-        description: "Optional: ALL or a symbol (e.g., SOON or SOON/USD). Leave blank to disable."
-        required: false
-        default: ""
-      SLIP_PCT:
-        description: "Used only with FORCE_SELL; LIMIT fallback depth %"
-        required: false
-        default: "3.0"
+      DRY_RUN:        { description: "ON or OFF", required: true,  default: "ON" }
+      BUY_USD:        { description: "Buy size USD", required: true, default: "15" }
+      TP_PCT:         { description: "Take-profit %", required: true, default: "5" }
+      SL_PCT:         { description: "Stop-loss % (first HOLD window)", required: true, default: "1" }
+      HOLD_WINDOW_M:  { description: "Hold window (min)", required: true, default: "60" }
+      SLOW_GAIN_PCT:  { description: "Min gain after window", required: true, default: "3" }
+      FORCE_SELL:     { description: "ALL or symbol (optional)", required: false, default: "" }
+      SLIP_PCT:       { description: "Limit fallback % (FORCE_SELL)", required: false, default: "3.0" }
 
 concurrency:
   group: crypto-1coin-rotation
   cancel-in-progress: true
 
-permissions:
-  contents: write
+permissions: { contents: write }
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment: LIVE   # <-- change if your Environment has a different name
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
+      # Accept either secret naming scheme
       - name: Preflight — check Kraken secrets
         shell: bash
         env:
-          HAS_KEY: ${{ secrets.KRAKEN_KEY }}
-          HAS_SECRET: ${{ secrets.KRAKEN_SECRET }}
+          A: ${{ secrets.KRAKEN_KEY }}
+          B: ${{ secrets.KRAKEN_SECRET }}
+          C: ${{ secrets.KRAKEN_API_KEY }}
+          D: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
-          if [[ -z "$HAS_KEY" || -z "$HAS_SECRET" ]]; then
-            echo "::error::Missing KRAKEN_KEY and/or KRAKEN_SECRET (Environment or repo Secrets)."
+          KEY="${A:-$C}"
+          SEC="${B:-$D}"
+          if [[ -z "$KEY" || -z "$SEC" ]]; then
+            echo "::error::Missing Kraken secrets. Add KRAKEN_KEY/KRAKEN_SECRET or KRAKEN_API_KEY/KRAKEN_API_SECRET."
             exit 1
           fi
           echo "Secrets detected."
 
       - name: Run rotation bot
         env:
-          # Secrets (match main.py expectations)
-          KRAKEN_KEY: ${{ secrets.KRAKEN_KEY }}
-          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET }}
+          # Map to names main.py expects
+          KRAKEN_KEY:    ${{ secrets.KRAKEN_KEY    || secrets.KRAKEN_API_KEY }}
+          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET || secrets.KRAKEN_API_SECRET }}
 
-          # Inputs (use defaults when scheduled)
-          DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'ON' }}
-          BUY_USD: ${{ github.event.inputs.BUY_USD || '15' }}
-          TP_PCT: ${{ github.event.inputs.TP_PCT || '5' }}
-          SL_PCT: ${{ github.event.inputs.SL_PCT || '1' }}
+          DRY_RUN:       ${{ github.event.inputs.DRY_RUN || 'ON' }}
+          BUY_USD:       ${{ github.event.inputs.BUY_USD || '15' }}
+          TP_PCT:        ${{ github.event.inputs.TP_PCT || '5' }}
+          SL_PCT:        ${{ github.event.inputs.SL_PCT || '1' }}
           HOLD_WINDOW_M: ${{ github.event.inputs.HOLD_WINDOW_M || '60' }}
           SLOW_GAIN_PCT: ${{ github.event.inputs.SLOW_GAIN_PCT || '3' }}
-
-          # Optional admin override
-          FORCE_SELL: ${{ github.event.inputs.FORCE_SELL || '' }}
-          SLIP_PCT: ${{ github.event.inputs.SLIP_PCT || '3.0' }}
+          FORCE_SELL:    ${{ github.event.inputs.FORCE_SELL || '' }}
+          SLIP_PCT:      ${{ github.event.inputs.SLIP_PCT || '3.0' }}
         run: python main.py
 
       - name: Package .state as a zip
