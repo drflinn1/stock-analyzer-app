@@ -5,14 +5,14 @@ on:
     - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
-      DRY_RUN:        { description: "ON or OFF", required: true,  default: "ON" }
+      DRY_RUN:        { description: "ON for simulation, OFF for live trading", required: true, default: "ON" }
       BUY_USD:        { description: "Buy size USD", required: true, default: "15" }
       TP_PCT:         { description: "Take-profit %", required: true, default: "5" }
       SL_PCT:         { description: "Stop-loss % (first HOLD window)", required: true, default: "1" }
       HOLD_WINDOW_M:  { description: "Hold window (min)", required: true, default: "60" }
       SLOW_GAIN_PCT:  { description: "Min gain after window", required: true, default: "3" }
       FORCE_SELL:     { description: "ALL or symbol (optional)", required: false, default: "" }
-      SLIP_PCT:       { description: "Limit fallback % (FORCE_SELL)", required: false, default: "3.0" }
+      SLIP_PCT:       { description: "Limit fallback % (FORCE_SELL and stables convert)", required: false, default: "3.0" }
 
 concurrency:
   group: crypto-1coin-rotation
@@ -39,20 +39,18 @@ jobs:
           C: ${{ secrets.KRAKEN_API_KEY }}
           D: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
-          KEY="${A:-$C}"
-          SEC="${B:-$D}"
+          KEY="${A:-$C}"; SEC="${B:-$D}"
           if [[ -z "$KEY" || -z "$SEC" ]]; then
             echo "::error::Missing Kraken secrets. Add KRAKEN_KEY/KRAKEN_SECRET or KRAKEN_API_KEY/KRAKEN_API_SECRET."
             exit 1
           fi
           echo "Secrets detected."
 
+      # ---------------- Main bot ----------------
       - name: Run rotation bot
         env:
-          # Map to names main.py expects
           KRAKEN_KEY:    ${{ secrets.KRAKEN_KEY    || secrets.KRAKEN_API_KEY }}
           KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET || secrets.KRAKEN_API_SECRET }}
-
           DRY_RUN:       ${{ github.event.inputs.DRY_RUN || 'ON' }}
           BUY_USD:       ${{ github.event.inputs.BUY_USD || '15' }}
           TP_PCT:        ${{ github.event.inputs.TP_PCT || '5' }}
@@ -63,6 +61,32 @@ jobs:
           SLIP_PCT:      ${{ github.event.inputs.SLIP_PCT || '3.0' }}
         run: python main.py
 
+      # ---------------- Post-run cleanup (1): Dust Sweeper ----------------
+      - name: Dust sweep ALL (force tiny sells)
+        if: always()
+        env:
+          KRAKEN_KEY:    ${{ secrets.KRAKEN_KEY    || secrets.KRAKEN_API_KEY }}
+          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET || secrets.KRAKEN_API_SECRET }}
+          INPUT_SYMBOL:  "ALL"
+          INPUT_SLIP:    ${{ github.event.inputs.SLIP_PCT || '3.0' }}
+          DUST_MIN_USD:  "0.01"     # sweep dust >= 1 cent
+          FORCE_DUST:    "ON"       # try to sell even below DUST_MIN_USD (v1.3 will skip if under exchange min)
+          STABLES:       "USD,ZUSD,USDT,USDC"
+        run: python tools/force_sell.py
+
+      # ---------------- Post-run cleanup (2): Convert Stables -> USD ----------------
+      - name: Convert stables to USD (USDT/USDC)
+        if: always()
+        env:
+          KRAKEN_KEY:    ${{ secrets.KRAKEN_KEY    || secrets.KRAKEN_API_KEY }}
+          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET || secrets.KRAKEN_API_SECRET }}
+          SLIP_PCT:      ${{ github.event.inputs.SLIP_PCT || '3.0' }}
+          STABLES:       "USDT,USDC"
+          MIN_USD:       "0.50"     # ignore pocket change; adjust if you want
+          WRITE_SUMMARY: "ON"
+        run: python tools/convert_stables.py
+
+      # --------- Artifacts
       - name: Package .state as a zip
         if: always()
         run: |
