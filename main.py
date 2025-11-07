@@ -14,7 +14,7 @@ Environment variables (set by workflows):
   TP_PCT:  e.g., "5"   (currently logged; rotation is simple buy-only)
   SL_PCT:  e.g., "1"   (currently logged; rotation is simple buy-only)
   SLOW_WINDOW_MIN: e.g., "60" (logged)
-  UNIVERSE_PICK: "" or a symbol like "SOLUSD"
+  UNIVERSE_PICK: "" or "AUTO" (auto-pick) or a symbol like "SOLUSD"
   KRAKEN_API_KEY, KRAKEN_API_SECRET
 
 Force Sell flags (UI -> envs):
@@ -154,7 +154,6 @@ def get_ticker_price(pair: str) -> float:
     res = kraken_public("Ticker", {"pair": pair})
     if res.get("error"):
         raise RuntimeError(f"Ticker error for {pair}: {res['error']}")
-    # Structure: result -> { "PAIR": { "c": ["last","lot"] , ... } }
     result = res.get("result", {})
     first_key = next(iter(result.keys()))
     last_trade = result[first_key]["c"][0]
@@ -164,7 +163,6 @@ def get_balances() -> Dict[str, float]:
     res = kraken_private("Balance", {})
     if res.get("error"):
         raise RuntimeError(f"Balance error: {res['error']}")
-    # returns {"result": {"XXBT": "0.01", "ZUSD": "100.00", ...}}
     out: Dict[str, float] = {}
     for k, v in res.get("result", {}).items():
         try:
@@ -176,7 +174,7 @@ def get_balances() -> Dict[str, float]:
 def add_order_market(pair: str, side: str, vol: float) -> Dict[str, Any]:
     return kraken_private("AddOrder", {
         "pair": pair,
-        "type": side,            # "buy" or "sell"
+        "type": side,
         "ordertype": "market",
         "volume": f"{vol:.10f}",
     })
@@ -197,7 +195,6 @@ def usd_to_volume(pair: str, spend_usd: float) -> float:
     return max(spend_usd / px, 0.0)
 
 def guess_asset_from_pair(pair: str) -> str:
-    # crude: base asset letters before "USD" or "USDT"
     u = pair.upper()
     if "USD" in u:
         return u.replace("USD","").replace("/","")
@@ -215,7 +212,7 @@ class RunContext:
 
 def action_rotation(ctx: RunContext) -> None:
     """Simple 1-coin pick + BUY. Selection:
-    - UNIVERSE_PICK if provided
+    - UNIVERSE_PICK if provided (and not AUTO)
     - else .state/momentum_candidates.csv top row
     - else fallback SOLUSD
     """
@@ -223,14 +220,21 @@ def action_rotation(ctx: RunContext) -> None:
     tp_pct = safe_float(env("TP_PCT","5"), 5.0)
     sl_pct = safe_float(env("SL_PCT","1"), 1.0)
     window = env("SLOW_WINDOW_MIN","60")
-    forced = env("UNIVERSE_PICK","").strip().upper()
+
+    # Treat common placeholders as AUTO (so you can keep a non-blank variable)
+    forced_raw = env("UNIVERSE_PICK","").strip()
+    forced_upper = forced_raw.upper()
+    if forced_upper in {"", "AUTO", "AUTO-PICK", "AUTOPICK", "ANY", "AUTOSELECT", "AUTO_SELECT"}:
+        forced = ""
+    else:
+        forced = forced_upper
 
     ctx.info.update({
         "BUY_USD": buy_usd,
         "TP_PCT": tp_pct,
         "SL_PCT": sl_pct,
         "SLOW_WINDOW_MIN": window,
-        "UNIVERSE_PICK": forced or "(auto)",
+        "UNIVERSE_PICK": forced if forced else "(auto)",
     })
 
     pair = None
@@ -273,16 +277,13 @@ def action_force_sell(ctx: RunContext) -> None:
 
     targets: List[str] = []
     if symbol == "ALL":
-        # sell everything with non-zero balance EXCEPT stable USD where applicable
         try:
             bals = get_balances() if not ctx.dry_run else {"EXAMPLE": 1.0}
             for a, qty in bals.items():
                 if qty <= 0:
                     continue
-                # crude: skip ZUSD / USDT "balances" (cash), look for a/USD tradable pairs
                 if a.upper() in ("ZUSD","USD","USDT","ZUSDT"):
                     continue
-                # try to form a pair like {asset}USD
                 guess = f"{a.replace('X','').replace('Z','')}USD"
                 targets.append(guess)
         except Exception as e:
@@ -293,17 +294,14 @@ def action_force_sell(ctx: RunContext) -> None:
 
     for pair in targets:
         try:
-            # compute position size (sell all): approximate using balances in base asset
             base_asset = guess_asset_from_pair(pair)
             vol = None
             if ctx.dry_run:
-                vol = 0.000001  # placeholder
+                vol = 0.000001
                 ctx.actions.append(f"[DRY] SELL {pair} (force) all-in (vol≈{vol})")
                 continue
 
-            # LIVE: get balances again to find asset quantity
             bals = get_balances()
-            # common Kraken asset codes sometimes prefixed (e.g., XXBT), try both
             candidates = [base_asset, f"X{base_asset}", f"Z{base_asset}", base_asset.replace("X","").replace("Z","")]
             qty = 0.0
             for k in candidates:
@@ -314,7 +312,6 @@ def action_force_sell(ctx: RunContext) -> None:
                 ctx.actions.append(f"[LIVE] No balance found for {base_asset} -> skip {pair}")
                 continue
 
-            # Try market sell
             try:
                 res = add_order_market(pair, "sell", qty)
                 if res.get("error"):
@@ -322,9 +319,8 @@ def action_force_sell(ctx: RunContext) -> None:
                 txid = ",".join(res.get("result", {}).get("txid", []))
                 ctx.actions.append(f"[LIVE] SELL {pair} {qty:.8f} (market) txid={txid}")
             except Exception as e:
-                # Retry as LIMIT with slip
                 px = get_ticker_price(pair)
-                limit_px = px * (1.0 - slip_pct/100.0)  # more aggressive to fill sells
+                limit_px = px * (1.0 - slip_pct/100.0)
                 res2 = add_order_limit(pair, "sell", qty, limit_px)
                 if res2.get("error"):
                     raise RuntimeError(f"SELL {pair} failed (limit retry): {res2['error']}; original market error: {e}")
@@ -345,7 +341,6 @@ def action_dust_sweep(ctx: RunContext) -> None:
             return
 
         bals = get_balances()
-        # For each non-cash asset, if value in USD < min_usd -> sell
         for a, qty in bals.items():
             if qty <= 0:
                 continue
@@ -359,7 +354,6 @@ def action_dust_sweep(ctx: RunContext) -> None:
                 continue
             value = qty * px
             if value < min_usd:
-                # Try market sell; if blocked, limit with slip
                 try:
                     res = add_order_market(pair, "sell", qty)
                     if res.get("error"):
@@ -391,7 +385,7 @@ def main() -> int:
     summary = RunContext(dry_run=dry)
 
     summary.info["when"] = now_iso()
-    summary.info["runner"] = "main.py v1.0"
+    summary.info["runner"] = "main.py v1.0a (AUTO-aware)"
 
     try:
         if args.force_sell:
@@ -399,12 +393,10 @@ def main() -> int:
         elif args.dust_sweep:
             action_dust_sweep(summary)
         else:
-            # Normal rotation (buy-only, safe; sell guards handled by other jobs/tools)
             action_rotation(summary)
     except Exception as e:
         summary.errors.append(f"Top-level error: {e}")
 
-    # Always write summaries
     out = {
         "when": now_iso(),
         "dry_run": summary.dry_run,
@@ -414,8 +406,6 @@ def main() -> int:
         "artifacts": [str(SUMMARY_JSON), str(SUMMARY_MD)],
     }
     write_summary(out)
-
-    # Non-zero exit on hard errors (keeps Actions honest)
     return 1 if summary.errors and not summary.dry_run else 0
 
 if __name__ == "__main__":
