@@ -1,4 +1,4 @@
-**When:** 2025-11-07T13:34:40+00:00
+**When:** 2025-11-07T13:54:42+00:00
 **Live (DRY_RUN=OFF):** True
 **Pick Source:** CANDIDATES_CSV
 **Pick (symbol):** SOON/USD
@@ -9,7 +9,7 @@
 ### Details
 ```json
 {
-  "when": "2025-11-07T13:34:40+00:00",
+  "when": "2025-11-07T13:54:42+00:00",
   "live": true,
   "buy_usd": 15.0,
   "reserve_cash_pct": 0.0,
@@ -25,11 +25,11 @@
   "symbol": "SOON/USD",
   "pick_source": "CANDIDATES_CSV",
   "order": {
-    "id": "OJZRSM-TS5O7-VWDOA2",
+    "id": "OVN67H-3F4DH-NW7MYG",
     "clientOrderId": null,
     "info": {
       "txid": [
-        "OJZRSM-TS5O7-VWDOA2"
+        "OVN67H-3F4DH-NW7MYG"
       ],
       "descr": {
         "order": "buy 15.00 SOONUSD @ market"
@@ -61,6 +61,6 @@
     "stopPrice": null
   },
   "entry_price": null,
-  "amount": 20.02311
+  "amount": 26.1172
 }
 ```
