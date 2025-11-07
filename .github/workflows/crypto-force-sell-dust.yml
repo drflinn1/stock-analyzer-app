@@ -1,0 +1,62 @@
+name: Crypto Force Sell — Dust Sweeper (ALL)
+
+on:
+  workflow_dispatch:
+    inputs:
+      SLIP_PCT:
+        description: "LIMIT fallback depth % (e.g., 3.0)"
+        required: true
+        default: "3.0"
+      DUST_MIN_USD:
+        description: "Sell anything >= this USD value (set 0.01 to sweep dust)"
+        required: true
+        default: "0.01"
+      FORCE_DUST:
+        description: "ON to sell even below DUST_MIN_USD"
+        required: true
+        default: "ON"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions: { contents: write }
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Preflight — check Kraken secrets
+        shell: bash
+        env:
+          A: ${{ secrets.KRAKEN_KEY }}
+          B: ${{ secrets.KRAKEN_SECRET }}
+          C: ${{ secrets.KRAKEN_API_KEY }}
+          D: ${{ secrets.KRAKEN_API_SECRET }}
+        run: |
+          KEY="${A:-$C}"; SEC="${B:-$D}"
+          if [[ -z "$KEY" || -z "$SEC" ]]; then
+            echo "::error::Missing Kraken secrets. Add KRAKEN_KEY/KRAKEN_SECRET or KRAKEN_API_KEY/KRAKEN_API_SECRET."
+            exit 1
+          fi
+          echo "Secrets detected."
+
+      - name: Force sell ALL (Dust Sweeper)
+        env:
+          KRAKEN_KEY:    ${{ secrets.KRAKEN_KEY    || secrets.KRAKEN_API_KEY }}
+          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET || secrets.KRAKEN_API_SECRET }}
+          INPUT_SYMBOL:  "ALL"
+          INPUT_SLIP:    ${{ github.event.inputs.SLIP_PCT }}
+          DUST_MIN_USD:  ${{ github.event.inputs.DUST_MIN_USD }}
+          FORCE_DUST:    ${{ github.event.inputs.FORCE_DUST }}
+          STABLES:       "USD,ZUSD,USDT,USDC"
+        run: python tools/force_sell.py
+
+      - name: Upload .state summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: force-sell-dust-state
+          path: .state/**
+          if-no-files-found: ignore
