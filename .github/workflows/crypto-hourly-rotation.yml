@@ -2,15 +2,16 @@ name: Crypto - 1-Coin Rotation (LIVE-ready, ultra-defensive, 15m)
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 minutes UTC
+    - cron: "*/15 * * * *"     # keep 15-minute cadence
   workflow_dispatch:
 
-permissions:
-  contents: write
-
+# Avoid overlapping runs of this job
 concurrency:
-  group: crypto-hourly-rotation
-  cancel-in-progress: false
+  group: crypto-1coin-rotation
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   run:
@@ -21,89 +22,57 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Safe cache key (no commas, parentheses, or spaces)
-      - name: Restore .state cache
-        uses: actions/cache@v4
-        with:
-          path: .state
-          key: state-crypto_hourly_rotation-${{ github.ref_name }}-${{ github.run_id }}
-          restore-keys: |
-            state-crypto_hourly_rotation-${{ github.ref_name }}-
-            state-crypto_hourly_rotation-
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies (ensure ccxt is present)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
-          pip install ccxt matplotlib pyyaml
 
-      - name: Preflight — show working dir and current .state
+      - name: Preflight — echo vars & ensure .state
         run: |
-          echo "PWD=$(pwd)"
-          python -V
-          ls -la .
+          set -e
           mkdir -p .state
-          echo "placeholder" > .state/.keep
-          echo "(before) list .state:"
+          echo "=== Runtime Vars ==="
+          echo "DRY_RUN=${{ github.event.inputs.DRY_RUN || env.DRY_RUN || 'ON' }}"
+          echo "TP_PCT=${TP_PCT:=5}"
+          echo "STOP_PCT=${STOP_PCT:=1}"
+          echo "SLOW_MIN_PCT=${SLOW_MIN_PCT:=3}"
+          echo "WINDOW_MIN=${WINDOW_MIN:=30}"
+          echo "UNIVERSE_PICK=${UNIVERSE_PICK}"
+          echo "=== ls -la .state (before) ==="
           ls -la .state || true
 
-      - name: Echo critical env/vars (for visibility)
+      - name: Run main.py (bot)
         run: |
-          echo "DRY_RUN=${{ vars.DRY_RUN }}"
-          echo "BUY_USD=${{ vars.BUY_USD }}"
-          echo "UNIVERSE_PICK=${{ vars.UNIVERSE_PICK }}"
-          echo "RESERVE_CASH_PCT=${{ vars.RESERVE_CASH_PCT }}"
-          echo "TP_PCT=${{ vars.TP_PCT }}"
-          echo "STOP_PCT=${{ vars.STOP_PCT }}"
-          echo "SLOW_MIN_PCT=${{ vars.SLOW_MIN_PCT }}"
-          echo "WINDOW_MIN=${{ vars.WINDOW_MIN }}"
-          if [ -n "${{ secrets.KRAKEN_API_KEY }}" ] && [ -n "${{ secrets.KRAKEN_API_SECRET }}" ]; then
-            echo "Secrets: Kraken key/secret are present."
-          else
-            echo "Secrets: MISSING Kraken key/secret!"
+          set -e
+          python main.py
+
+      # Safety net so artifacts always exist even on HOLD/ERROR runs
+      - name: Always write summary + placeholder position if missing
+        run: |
+          set -e
+          mkdir -p .state
+          if [ ! -f ".state/run_summary.md" ]; then
+            {
+              echo "**When:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+              echo "**DRY_RUN:** ${DRY_RUN:-ON}"
+              echo "**TP_PCT:** ${TP_PCT:-5} | **STOP_PCT:** ${STOP_PCT:-1} | **SLOW_MIN_PCT:** ${SLOW_MIN_PCT:-3} | **WINDOW_MIN:** ${WINDOW_MIN:-30}"
+              echo "**Note:** Auto-generated summary because the bot didn’t emit one this run."
+            } > .state/run_summary.md
           fi
-
-      - name: Run main.py (repo root, with real env vars)
-        env:
-          DRY_RUN: ${{ vars.DRY_RUN }}
-          BUY_USD: ${{ vars.BUY_USD }}
-          UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK }}
-          RESERVE_CASH_PCT: ${{ vars.RESERVE_CASH_PCT }}
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          TP_PCT: ${{ vars.TP_PCT }}
-          STOP_PCT: ${{ vars.STOP_PCT }}
-          SLOW_MIN_PCT: ${{ vars.SLOW_MIN_PCT }}
-          WINDOW_MIN: ${{ vars.WINDOW_MIN }}
-        run: |
-          echo '--- head(main.py) ---'
-          sed -n '1,60p' main.py || true
-          echo '--- running ---'
-          python main.py || echo "(Python exited nonzero)"
-
-      - name: Post — show .state after run
-        if: always()
-        run: |
-          echo "(after) list .state:"
-          ls -la .state || true
-          echo "---- run_summary.md ----"
-          test -f .state/run_summary.md && sed -n '1,160p' .state/run_summary.md || echo "run_summary.md not found"
-          echo "---- positions.json ----"
-          test -f .state/positions.json && cat .state/positions.json || echo "positions.json not found"
-          echo "---- last_ok.txt ----"
-          test -f .state/last_ok.txt && cat .state/last_ok.txt || echo "last_ok.txt not found"
+          if [ ! -f ".state/position.json" ]; then
+            printf '{"symbol":null,"qty":0,"avg_price":0,"in_position_since":null}\n' > .state/position.json
+          fi
+          echo "=== ls -la .state (after) ==="
+          ls -la .state
 
       - name: Upload .state (artifact)
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state
-          path: |
-            .state/
+          path: .state/**
           if-no-files-found: warn
-          retention-days: 7
