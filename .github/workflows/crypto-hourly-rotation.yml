@@ -13,19 +13,19 @@ permissions:
   contents: write   # needed for committing .state
 
 env:
-  # --- Vars bridged from repo Variables (these lines FIX the DRY_RUN issue) ---
-  DRY_RUN: ${{ vars.DRY_RUN }}              # "ON" or "OFF" in repo Variables
+  # Bridge repo Variables -> env (fixes DRY_RUN etc.)
+  DRY_RUN: ${{ vars.DRY_RUN }}              # "ON" or "OFF"
   BUY_USD: ${{ vars.BUY_USD }}              # e.g., 15
-  UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK }}  # e.g., "SOLUSD" or "AUTO"/"NONE"/"-" for blank
+  UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK }}  # "SOLUSD" or "AUTO"/"NONE"/"-" for auto
   TP_PCT: ${{ vars.TP_PCT || '5' }}
   STOP_PCT: ${{ vars.STOP_PCT || '1' }}
   SLOW_MIN_PCT: ${{ vars.SLOW_MIN_PCT || '3' }}
   WINDOW_MIN: ${{ vars.WINDOW_MIN || '30' }}
 
   # Guard & housekeeping
-  AUTO_SELL_ON_MULTI: "OFF"         # OFF=refuse to buy if >1 coin; ON:auto-sell extras (we can wire later)
+  AUTO_SELL_ON_MULTI: "OFF"         # OFF=refuse to buy if >1 coin
   USD_CODES: "USD,ZUSD"
-  COMMIT_STATE: "ON"                 # commit .state back to repo so you can see it without downloading artifacts
+  COMMIT_STATE: "ON"                 # commit .state back to repo for visibility
 
 jobs:
   run:
@@ -54,7 +54,7 @@ jobs:
           set -e
           mkdir -p .state
 
-          # Normalize DRY_RUN to ON/OFF (uppercase), default ON if truly empty
+          # Normalize DRY_RUN to ON/OFF (uppercase), default ON if invalid/empty
           DRY_RUN="${DRY_RUN:-ON}"
           DRY_RUN="$(echo "$DRY_RUN" | tr '[:lower:]' '[:upper:]')"
           if [ "$DRY_RUN" != "ON" ] && [ "$DRY_RUN" != "OFF" ]; then DRY_RUN="ON"; fi
@@ -62,9 +62,7 @@ jobs:
 
           # Normalize UNIVERSE_PICK: treat AUTO/NONE/- as blank (use gainers)
           case "${UNIVERSE_PICK:-}" in
-            AUTO|auto|NONE|none|"-")
-              UNIVERSE_PICK=""
-              ;;
+            AUTO|auto|NONE|none|"-") UNIVERSE_PICK="";;
           esac
           echo "UNIVERSE_PICK=$UNIVERSE_PICK" >> $GITHUB_ENV
 
@@ -136,6 +134,18 @@ jobs:
           PY
 
       - name: Run main.py (bot)
+        env:
+          # <<< FIX: pass secrets to the bot >>>
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          # also pass normalized vars so main.py sees them
+          DRY_RUN: ${{ env.DRY_RUN }}
+          BUY_USD: ${{ env.BUY_USD }}
+          UNIVERSE_PICK: ${{ env.UNIVERSE_PICK }}
+          TP_PCT: ${{ env.TP_PCT }}
+          STOP_PCT: ${{ env.STOP_PCT }}
+          SLOW_MIN_PCT: ${{ env.SLOW_MIN_PCT }}
+          WINDOW_MIN: ${{ env.WINDOW_MIN }}
         run: |
           set -e
           python main.py
