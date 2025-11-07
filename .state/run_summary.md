@@ -1,7 +1,7 @@
-**When:** 2025-11-07T06:59:10+00:00
+**When:** 2025-11-07T07:44:05+00:00
 **Live (DRY_RUN=OFF):** True
 **Pick Source:** CANDIDATES_CSV
-**Pick (symbol):** SOON/USD
+**Pick (symbol):** UAI/USD
 **BUY_USD:** 15.0
 **Status:** LIVE_BUY_OK
 **Note:** 
@@ -9,7 +9,7 @@
 ### Details
 ```json
 {
-  "when": "2025-11-07T06:59:10+00:00",
+  "when": "2025-11-07T07:44:05+00:00",
   "live": true,
   "buy_usd": 15.0,
   "reserve_cash_pct": 0.0,
@@ -22,24 +22,24 @@
   },
   "status": "LIVE_BUY_OK",
   "note": "",
-  "symbol": "SOON/USD",
+  "symbol": "UAI/USD",
   "pick_source": "CANDIDATES_CSV",
   "order": {
-    "id": "OT77MU-F62Q3-P3Q6RL",
+    "id": "ODPFAI-VMHUE-5UTXOD",
     "clientOrderId": null,
     "info": {
       "txid": [
-        "OT77MU-F62Q3-P3Q6RL"
+        "ODPFAI-VMHUE-5UTXOD"
       ],
       "descr": {
-        "order": "buy 15.00 SOONUSD @ market"
+        "order": "buy 15.00 UAIUSD @ market"
       }
     },
     "timestamp": null,
     "datetime": null,
     "lastTradeTimestamp": null,
     "status": null,
-    "symbol": "SOON/USD",
+    "symbol": "UAI/USD",
     "type": "market",
     "timeInForce": "IOC",
     "postOnly": false,
@@ -61,6 +61,6 @@
     "stopPrice": null
   },
   "entry_price": null,
-  "amount": 7.31458
+  "amount": 0.0
 }
 ```
