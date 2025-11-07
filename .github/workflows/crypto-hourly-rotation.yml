@@ -10,13 +10,12 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write   # needed only if COMMIT_STATE=ON
+  contents: write   # only used if COMMIT_STATE=ON
 
 env:
-  # Guard & housekeeping
-  AUTO_SELL_ON_MULTI: "OFF"         # OFF=refuse to buy if >1 coin; ON=auto-sell extras (wire later)
+  AUTO_SELL_ON_MULTI: "OFF"         # OFF=refuse to buy if >1 coin; ON:auto-sell extras (wire later)
   USD_CODES: "USD,ZUSD"
-  COMMIT_STATE: "OFF"               # OFF=default; set to ON if you want .state committed to repo
+  COMMIT_STATE: "OFF"               # OFF=default; set ON to commit .state to repo
 
 jobs:
   run:
@@ -73,12 +72,11 @@ jobs:
             url = "https://api.kraken.com" + path
             data["nonce"] = str(int(time.time()*1000))
             postdata = urllib.parse.urlencode(data)
-            # sign
             msg = (str(data["nonce"]) + postdata).encode()
             sha256 = hashlib.sha256(msg).digest()
             mac = hmac.new(base64.b64decode(sec), path.encode()+sha256, hashlib.sha512)
             sig = base64.b64encode(mac.digest()).decode()
-            r = requests.post(url, headers={"API-Key": key, "API-Sign": sig}, data=data, timeout=20)
+            r = requests.post(url, headers={"API-Key": os.getenv("KRAKEN_API_KEY"), "API-Sign": sig}, data=data, timeout=20)
             return r.json()
 
           bal = kraken_private("/0/private/Balance", {})
@@ -114,7 +112,7 @@ jobs:
           set -e
           python main.py
 
-      # Safety net so artifacts always exist even on HOLD/ERROR runs
+      # Ensure state exists every run (even on HOLD/ERROR)
       - name: Always write summary + placeholder position if missing
         run: |
           set -e
@@ -130,20 +128,23 @@ jobs:
           if [ ! -f ".state/position.json" ]; then
             printf '{"symbol":null,"qty":0,"avg_price":0,"in_position_since":null}\n' > .state/position.json
           fi
-          echo "=== ls -la .state (after write) ==="
-          ls -la .state
-          echo "=== stat files ==="
-          stat .state/run_summary.md || true
-          stat .state/position.json || true
-          sync
-          sleep 2
+          echo "=== ls -la .state (after write) ==="; ls -la .state
+          echo "=== stat files ==="; stat .state/run_summary.md; stat .state/position.json
+          sync; sleep 1
 
-      - name: Upload .state (artifact)
+      # ---- Robust artifact packaging (fixes directory flakiness) ----
+      - name: Package .state as tar.gz
+        run: |
+          set -e
+          tar -czf state.tgz .state
+          ls -l state.tgz
+
+      - name: Upload packaged state
         uses: actions/upload-artifact@v4
         with:
           name: state
-          path: .state           # upload the directory
-          if-no-files-found: warn
+          path: state.tgz
+          if-no-files-found: error
           retention-days: 7
 
       - name: (Optional) Commit .state back to repo
