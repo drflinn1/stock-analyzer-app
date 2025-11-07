@@ -1,4 +1,4 @@
-**When:** 2025-11-07T15:45:43+00:00
+**When:** 2025-11-07T15:59:26+00:00
 **Live (DRY_RUN=OFF):** True
 **Pick Source:** CANDIDATES_CSV
 **Pick (symbol):** UAI/USD
@@ -9,7 +9,7 @@
 ### Details
 ```json
 {
-  "when": "2025-11-07T15:45:43+00:00",
+  "when": "2025-11-07T15:59:26+00:00",
   "live": true,
   "buy_usd": 15.0,
   "reserve_cash_pct": 0.0,
@@ -25,11 +25,11 @@
   "symbol": "UAI/USD",
   "pick_source": "CANDIDATES_CSV",
   "order": {
-    "id": "ON75ZM-YKOIP-3KNEI3",
+    "id": "OWG5SF-PIUYA-K6ASHD",
     "clientOrderId": null,
     "info": {
       "txid": [
-        "ON75ZM-YKOIP-3KNEI3"
+        "OWG5SF-PIUYA-K6ASHD"
       ],
       "descr": {
         "order": "buy 15.00 UAIUSD @ market"
@@ -61,6 +61,6 @@
     "stopPrice": null
   },
   "entry_price": null,
-  "amount": 84.49276
+  "amount": 153.24964
 }
 ```
