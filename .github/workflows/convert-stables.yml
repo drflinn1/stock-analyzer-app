@@ -1,0 +1,52 @@
+name: Crypto Convert Stables → USD (One-Time)
+
+on:
+  workflow_dispatch:
+    inputs:
+      SLIP_PCT:  { description: "Limit fallback %", required: true, default: "3.0" }
+      MIN_USD:   { description: "Skip if est < this USD", required: true, default: "0.50" }
+      STABLES:   { description: "Comma list", required: true, default: "USDT,USDC" }
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions: { contents: write }
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Preflight — check Kraken secrets
+        shell: bash
+        env:
+          A: ${{ secrets.KRAKEN_KEY }}
+          B: ${{ secrets.KRAKEN_SECRET }}
+          C: ${{ secrets.KRAKEN_API_KEY }}
+          D: ${{ secrets.KRAKEN_API_SECRET }}
+        run: |
+          KEY="${A:-$C}"; SEC="${B:-$D}"
+          if [[ -z "$KEY" || -z "$SEC" ]]; then
+            echo "::error::Missing Kraken secrets. Add KRAKEN_KEY/KRAKEN_SECRET or KRAKEN_API_KEY/KRAKEN_API_SECRET."
+            exit 1
+          fi
+          echo "Secrets detected."
+
+      - name: Convert stables to USD
+        env:
+          KRAKEN_KEY:    ${{ secrets.KRAKEN_KEY    || secrets.KRAKEN_API_KEY }}
+          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET || secrets.KRAKEN_API_SECRET }}
+          SLIP_PCT:      ${{ github.event.inputs.SLIP_PCT }}
+          MIN_USD:       ${{ github.event.inputs.MIN_USD }}
+          STABLES:       ${{ github.event.inputs.STABLES }}
+          WRITE_SUMMARY: "ON"
+        run: python tools/convert_stables.py
+
+      - name: Upload .state summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: convert-stables-state
+          path: .state/**
+          if-no-files-found: ignore
