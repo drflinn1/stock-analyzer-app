@@ -1,334 +1,422 @@
 #!/usr/bin/env python3
 """
-Crypto — 1-Coin Rotation (LIVE-ready)
-Implements:
-  • 1% stop during first HOLD_WINDOW_M minutes
-  • 5% take-profit
-  • If not ≥ SLOW_GAIN_PCT after HOLD_WINDOW_M, exit and rotate
-  • Then buy top gainer (USD pairs) on Kraken
-Also supports:
-  • FORCE_SELL=ALL or symbol → uses tools/force_sell.py
-  • Always writes .state/run_summary.md and .state/run_summary.json
-No external deps; uses minimal Kraken REST calls.
+Main unified runner for Crypto Live workflows.
 
-ENV (typical):
-  DRY_RUN=ON|OFF
-  BUY_USD=15
-  TP_PCT=5
-  SL_PCT=1
-  HOLD_WINDOW_M=60
-  SLOW_GAIN_PCT=3
-  FORCE_SELL="" | "ALL" | "SOON" | "SOON/USD"
-  SLIP_PCT=3.0        # used only with FORCE_SELL
-  KRAKEN_KEY / KRAKEN_SECRET  (required for LIVE)
+Features:
+- Hourly 1-coin rotation BUY (lightweight)
+- Force Sell (--force-sell) with SLIP_PCT fallback
+- Dust Sweeper (--dust-sweep) for tiny balances
+- Writes .state/run_summary.json and .state/run_summary.md on every run
 
-Files:
-  .state/positions.json   -> {"symbol":"UAI","qty":60.0,"entry_price":0.25,"entry_ts":1700000000}
-  .state/run_summary.md
-  .state/run_summary.json
+Environment variables (set by workflows):
+  DRY_RUN: "ON" | "OFF"
+  BUY_USD: e.g., "25"
+  TP_PCT:  e.g., "5"   (currently logged; rotation is simple buy-only)
+  SL_PCT:  e.g., "1"   (currently logged; rotation is simple buy-only)
+  SLOW_WINDOW_MIN: e.g., "60" (logged)
+  UNIVERSE_PICK: "" or a symbol like "SOLUSD"
+  KRAKEN_API_KEY, KRAKEN_API_SECRET
+
+Force Sell flags (UI -> envs):
+  --force-sell
+  FORCE_SELL_SYMBOL: "ALL" or "SOLUSD" etc.
+  FORCE_SELL_SLIP_PCT: default "3.0"
+
+Dust Sweeper flags (UI -> envs):
+  --dust-sweep
+  DUST_MIN_USD: default "0.50"
+  DUST_SLIP_PCT: default "3.0"
 """
 
+from __future__ import annotations
+import argparse
 import base64
+import datetime as dt
 import hashlib
 import hmac
+import io
 import json
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 from urllib.parse import urlencode
-import urllib.request
+from urllib.request import Request, urlopen
 
-# ---------- State paths ----------
+# ----------------- State paths (always written) -----------------
 STATE_DIR = Path(".state")
 STATE_DIR.mkdir(parents=True, exist_ok=True)
-POSITIONS = STATE_DIR / "positions.json"
 SUMMARY_JSON = STATE_DIR / "run_summary.json"
 SUMMARY_MD = STATE_DIR / "run_summary.md"
-LAST_OK = STATE_DIR / "last_ok.txt"
 
-API_URL = "https://api.kraken.com"
-
-# ---------- Helpers ----------
-def env_str(name: str, default: str = "") -> str:
+# ----------------- Small utilities -----------------
+def env(name: str, default: str = "") -> str:
     v = os.getenv(name)
-    return default if v is None else str(v).strip()
+    return default if v is None else str(v)
 
-def env_float(name: str, default: float) -> float:
+def now_iso() -> str:
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def usd(x: float) -> str:
+    return f"${x:,.2f}"
+
+def pct(x: float) -> str:
+    return f"{x:.2f}%"
+
+def safe_float(s: Any, default: float = 0.0) -> float:
     try:
-        return float(env_str(name, str(default)))
+        return float(s)
     except Exception:
         return default
 
-def now_utc() -> int:
-    return int(time.time())
+def write_summary(summary: Dict[str, Any]) -> None:
+    # JSON
+    try:
+        SUMMARY_JSON.write_text(json.dumps(summary, indent=2))
+    except Exception as e:
+        print(f"[WARN] Failed writing {SUMMARY_JSON}: {e}", file=sys.stderr)
+    # Markdown
+    try:
+        lines = []
+        lines.append(f"# Run Summary")
+        lines.append("")
+        lines.append(f"**When (UTC):** {summary.get('when','')}")
+        lines.append(f"**Mode:** {'DRY-RUN' if summary.get('dry_run') else 'LIVE'}")
+        if summary.get("info"):
+            lines.append("")
+            lines.append("## Info")
+            for k, v in summary["info"].items():
+                lines.append(f"- **{k}**: {v}")
+        if summary.get("actions"):
+            lines.append("")
+            lines.append("## Actions")
+            for a in summary["actions"]:
+                lines.append(f"- {a}")
+        if summary.get("errors"):
+            lines.append("")
+            lines.append("## Errors")
+            for e in summary["errors"]:
+                lines.append(f"- {e}")
+        if summary.get("artifacts"):
+            lines.append("")
+            lines.append("## Artifacts")
+            for a in summary["artifacts"]:
+                lines.append(f"- {a}")
+        SUMMARY_MD.write_text("\n".join(lines) + "\n")
+    except Exception as e:
+        print(f"[WARN] Failed writing {SUMMARY_MD}: {e}", file=sys.stderr)
 
-def md_append(lines: List[str]) -> None:
-    if not SUMMARY_MD.exists():
-        SUMMARY_MD.write_text("# Run Summary\n\n", encoding="utf-8")
-    ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
-    block = ["", f"### Bot Run — {ts}", ""]
-    block.extend(f"- {ln}" for ln in lines)
-    block.append("")
-    with SUMMARY_MD.open("a", encoding="utf-8") as f:
-        f.write("\n".join(block))
+# ----------------- Kraken REST minimal client (no deps) -----------------
+API_BASE = "https://api.kraken.com"
 
-def write_json_summary(data: Dict[str, Any]) -> None:
-    SUMMARY_JSON.write_text(json.dumps(data, indent=2), encoding="utf-8")
+def _nonce() -> str:
+    return str(int(time.time() * 1000))
 
-def _kraken_request(uri_path: str, data: Dict = None, key: str = "", secret: str = "") -> Dict:
-    """Minimal Kraken REST client (no external libs)."""
-    data = data or {}
+def _kraken_headers(path: str, data: Dict[str, str], secret_b64: str) -> Dict[str, str]:
+    # Kraken signature per docs
     postdata = urlencode(data).encode()
+    sha256 = hashlib.sha256((data["nonce"] + urlencode({k: v for k, v in data.items() if k != "nonce"})).encode()).digest()
+    msg = path.encode() + sha256
+    secret = base64.b64decode(secret_b64)
+    sig = hmac.new(secret, msg, hashlib.sha512).digest()
+    sig_b64 = base64.b64encode(sig).decode()
+    return {
+        "API-Key": env("KRAKEN_API_KEY", ""),
+        "API-Sign": sig_b64,
+        "User-Agent": "stock-analyzer-app/1.0 (no-requests)"
+    }
 
-    if uri_path.startswith("/0/private/"):
-        if not key or not secret:
-            raise RuntimeError("[LIVE] Missing Kraken API credentials.")
-        nonce = str(int(1000 * time.time()))
-        data.update({"nonce": nonce})
-        postdata = urlencode(data).encode()
+def kraken_public(method: str, params: Dict[str, str]|None=None) -> Dict[str, Any]:
+    url = f"{API_BASE}/0/public/{method}"
+    if params:
+        url += "?" + urlencode(params)
+    req = Request(url, headers={"User-Agent":"stock-analyzer-app"})
+    with urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())
 
-        sha256 = hashlib.sha256((nonce + urlencode(data)).encode()).digest()
-        hmac_data = uri_path.encode() + sha256
-        mac = hmac.new(base64.b64decode(secret), hmac_data, hashlib.sha512)
-        sigdigest = base64.b64encode(mac.digest())
+def kraken_private(method: str, data: Dict[str, str]) -> Dict[str, Any]:
+    key = env("KRAKEN_API_KEY")
+    sec = env("KRAKEN_API_SECRET")
+    if not key or not sec:
+        raise RuntimeError("[LIVE] Missing Kraken API credentials.")
 
-        headers = {
-            "API-Key": key,
-            "API-Sign": sigdigest.decode(),
-            "User-Agent": "rotation-bot/1.0",
-            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-        }
-        req = urllib.request.Request(API_URL + uri_path, data=postdata, headers=headers)
-    else:
-        req = urllib.request.Request(API_URL + uri_path, headers={"User-Agent": "rotation-bot/1.0"})
+    path = f"/0/private/{method}"
+    payload = {"nonce": _nonce(), **data}
+    headers = _kraken_headers(path, payload, sec)
+    req = Request(f"{API_BASE}{path}", data=urlencode(payload).encode(), headers=headers)
+    with urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())
 
-    with urllib.request.urlopen(req) as resp:
-        raw = resp.read()
+# ----------------- Trading helpers -----------------
+def get_ticker_price(pair: str) -> float:
+    res = kraken_public("Ticker", {"pair": pair})
+    if res.get("error"):
+        raise RuntimeError(f"Ticker error for {pair}: {res['error']}")
+    # Structure: result -> { "PAIR": { "c": ["last","lot"] , ... } }
+    result = res.get("result", {})
+    first_key = next(iter(result.keys()))
+    last_trade = result[first_key]["c"][0]
+    return float(last_trade)
+
+def get_balances() -> Dict[str, float]:
+    res = kraken_private("Balance", {})
+    if res.get("error"):
+        raise RuntimeError(f"Balance error: {res['error']}")
+    # returns {"result": {"XXBT": "0.01", "ZUSD": "100.00", ...}}
+    out: Dict[str, float] = {}
+    for k, v in res.get("result", {}).items():
         try:
-            return json.loads(raw.decode())
-        except Exception:
-            return {"raw": raw.decode()}
-
-def usd_pairs_map() -> Dict[str, str]:
-    """Return {BASE: ALTNAME} for USD pairs (e.g., {'SOON':'SOONUSD'})."""
-    res = _kraken_request("/0/public/AssetPairs")
-    out = {}
-    if "result" in res:
-        for _, info in res["result"].items():
-            alt = info.get("altname", "")
-            if alt.endswith("USD"):
-                out[alt[:-3]] = alt
+            out[k] = float(v)
+        except:
+            pass
     return out
 
-def ticker_for(pair_alt: str) -> Dict[str, Any]:
-    res = _kraken_request("/0/public/Ticker?pair=" + pair_alt)
-    if "result" not in res:
-        return {}
-    first = next(iter(res["result"]))
-    return res["result"][first]
-
-def best_bid_ask(pair_alt: str) -> Tuple[float, float]:
-    t = ticker_for(pair_alt)
-    if not t:
-        return (0.0, 0.0)
-    bid = float(t["b"][0])
-    ask = float(t["a"][0])
-    return bid, ask
-
-def last_price_and_open(pair_alt: str) -> Tuple[float, float]:
-    t = ticker_for(pair_alt)
-    if not t:
-        return (0.0, 0.0)
-    last = float(t["c"][0])
-    openp = float(t["o"])
-    return last, openp
-
-def account_balances(key: str, secret: str) -> Dict[str, float]:
-    res = _kraken_request("/0/private/Balance", {}, key, secret)
-    if res.get("error"):
-        raise RuntimeError(f"[ERROR] Balance: {res['error']}")
-    raw = res.get("result", {})
-    return {k.replace("Z","").replace("X",""): float(v) for k, v in raw.items()}
-
-def add_order_market(pair_alt: str, side: str, volume: float, key: str, secret: str) -> Dict:
-    data = {
+def add_order_market(pair: str, side: str, vol: float) -> Dict[str, Any]:
+    return kraken_private("AddOrder", {
+        "pair": pair,
+        "type": side,            # "buy" or "sell"
         "ordertype": "market",
-        "type": side,  # "buy" or "sell"
-        "pair": pair_alt,
-        "volume": f"{volume:.8f}",
-    }
-    return _kraken_request("/0/private/AddOrder", data, key, secret)
+        "volume": f"{vol:.10f}",
+    })
 
-# ---------- Position I/O ----------
-def read_position() -> Dict[str, Any]:
-    if not POSITIONS.exists():
-        return {}
-    try:
-        return json.loads(POSITIONS.read_text())
-    except Exception:
-        return {}
+def add_order_limit(pair: str, side: str, vol: float, price: float) -> Dict[str, Any]:
+    return kraken_private("AddOrder", {
+        "pair": pair,
+        "type": side,
+        "ordertype": "limit",
+        "price": f"{price:.8f}",
+        "volume": f"{vol:.10f}",
+    })
 
-def write_position(pos: Dict[str, Any]) -> None:
-    POSITIONS.write_text(json.dumps(pos, indent=2), encoding="utf-8")
+def usd_to_volume(pair: str, spend_usd: float) -> float:
+    px = get_ticker_price(pair)
+    if px <= 0:
+        raise RuntimeError(f"Bad price for {pair}")
+    return max(spend_usd / px, 0.0)
 
-def clear_position() -> None:
-    POSITIONS.write_text("{}", encoding="utf-8")
+def guess_asset_from_pair(pair: str) -> str:
+    # crude: base asset letters before "USD" or "USDT"
+    u = pair.upper()
+    if "USD" in u:
+        return u.replace("USD","").replace("/","")
+    if "USDT" in u:
+        return u.replace("USDT","").replace("/","")
+    return u
 
-# ---------- Gainer scan ----------
-def pick_top_gainer(pairs_map: Dict[str, str], blocklist: List[str] = None) -> str:
+# ----------------- Actions -----------------
+@dataclass
+class RunContext:
+    dry_run: bool
+    actions: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+    info: Dict[str, Any] = field(default_factory=dict)
+
+def action_rotation(ctx: RunContext) -> None:
+    """Simple 1-coin pick + BUY. Selection:
+    - UNIVERSE_PICK if provided
+    - else .state/momentum_candidates.csv top row
+    - else fallback SOLUSD
     """
-    Returns best BASE symbol by 24h % change among USD pairs.
-    Simple heuristic: sort by (last/open - 1).
-    """
-    block = set((blocklist or []))
-    best_base = ""
-    best_change = -999.0
-    checked = 0
+    buy_usd = safe_float(env("BUY_USD","25"), 25.0)
+    tp_pct = safe_float(env("TP_PCT","5"), 5.0)
+    sl_pct = safe_float(env("SL_PCT","1"), 1.0)
+    window = env("SLOW_WINDOW_MIN","60")
+    forced = env("UNIVERSE_PICK","").strip().upper()
 
-    for base, alt in pairs_map.items():
-        if base in block:
-            continue
-        last, openp = last_price_and_open(alt)
-        if last <= 0 or openp <= 0:
-            continue
-        change = (last / openp - 1.0) * 100.0
-        checked += 1
-        if change > best_change:
-            best_change = change
-            best_base = base
+    ctx.info.update({
+        "BUY_USD": buy_usd,
+        "TP_PCT": tp_pct,
+        "SL_PCT": sl_pct,
+        "SLOW_WINDOW_MIN": window,
+        "UNIVERSE_PICK": forced or "(auto)",
+    })
 
-    md_append([f"Gainer scan checked ~{checked} USD pairs. Top: {best_base} ({best_change:.2f}%)."])
-    return best_base
-
-# ---------- Trading rules ----------
-def should_sell(pnl_pct: float, mins_held: float, sl_pct: float, tp_pct: float, slow_pct: float, window_m: float) -> Tuple[bool, str]:
-    # 1) stop inside window
-    if mins_held <= window_m and pnl_pct <= -sl_pct:
-        return True, f"STOP: pnl {pnl_pct:.2f}% ≤ -{sl_pct}% within first {window_m}m"
-    # 2) take profit
-    if pnl_pct >= tp_pct:
-        return True, f"TAKE-PROFIT: pnl {pnl_pct:.2f}% ≥ {tp_pct}%"
-    # 3) slow exit after window
-    if mins_held >= window_m and pnl_pct < slow_pct:
-        return True, f"SLOW-EXIT: after {window_m}m pnl {pnl_pct:.2f}% < {slow_pct}%"
-    return False, ""
-
-# ---------- FORCE_SELL integration ----------
-def maybe_force_sell_and_exit():
-    force = env_str("FORCE_SELL", "")
-    if not force:
-        return
-    slip = env_str("SLIP_PCT", "3.0") or "3.0"
-    md_append([f"FORCE_SELL invoked: symbol='{force}', slip='{slip} %'"])
-    env = os.environ.copy()
-    env["INPUT_SYMBOL"] = force
-    env["INPUT_SLIP"] = slip
-    # Reuse the tool so behavior matches one-time workflow.
-    code = os.system(f"{sys.executable} tools/force_sell.py")  # simple passthrough
-    md_append([f"FORCE_SELL completed with code={code}"])
-    sys.exit(0)
-
-# ---------- Main ----------
-def main():
-    # Always ensure summary exists
-    if not SUMMARY_MD.exists():
-        SUMMARY_MD.write_text("# Run Summary\n\n", encoding="utf-8")
-
-    maybe_force_sell_and_exit()
-
-    dry = env_str("DRY_RUN", "ON").upper() != "OFF"
-    buy_usd = env_float("BUY_USD", 15.0)
-    tp_pct = env_float("TP_PCT", 5.0)
-    sl_pct = env_float("SL_PCT", 1.0)
-    window_m = env_float("HOLD_WINDOW_M", 60.0)
-    slow_pct = env_float("SLOW_GAIN_PCT", 3.0)
-
-    pairs = usd_pairs_map()
-    key = env_str("KRAKEN_KEY", "")
-    secret = env_str("KRAKEN_SECRET", "")
-
-    # Load current position (if any)
-    pos = read_position()
-    lines = [f"Mode={'DRY' if dry else 'LIVE'} BUY_USD={buy_usd} TP={tp_pct}% SL={sl_pct}% WINDOW={window_m}m SLOW={slow_pct}%"]
-
-    if pos.get("symbol"):
-        base = pos["symbol"].upper().replace("/", "")
-        if base.endswith("USD"):
-            base = base[:-3]
-        if base not in pairs:
-            lines.append(f"Position base {base} has no USD pair; skipping.")
-            md_append(lines)
-            write_json_summary({"mode": "hold-skip", "details": lines})
-            LAST_OK.write_text(time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()))
-            return
-
-        pair_alt = pairs[base]
-        last, _open = last_price_and_open(pair_alt)
-        entry_price = float(pos["entry_price"])
-        qty = float(pos["qty"])
-        mins_held = (now_utc() - int(pos["entry_ts"])) / 60.0
-        pnl_pct = (last / entry_price - 1.0) * 100.0
-
-        lines.append(f"Holding {qty:.6f} {base} @ {entry_price:.6f}; now {last:.6f}; held {mins_held:.1f}m; pnl {pnl_pct:.2f}%")
-
-        sell, reason = should_sell(pnl_pct, mins_held, sl_pct, tp_pct, slow_pct, window_m)
-        if sell:
-            if dry:
-                lines.append(f"[DRY] SELL {base}/USD  — {reason}")
-                clear_position()
-            else:
-                res = add_order_market(pair_alt, "sell", qty, key, secret)
-                if res.get("error"):
-                    lines.append(f"[LIVE] SELL ERROR: {res['error']}")
-                else:
-                    lines.append(f"[LIVE] SELL OK: {base}/USD — {reason}")
-                    clear_position()
-            # after selling we will try to buy a new gainer below
-        else:
-            lines.append("Rules: HOLD (no sell this run).")
-            md_append(lines)
-            write_json_summary({"mode": "hold", "details": lines, "pos": pos})
-            LAST_OK.write_text(time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()))
-            return  # still holding; wait for next run
-
-    # If we’re here, there’s no position (either none, or we just sold)
-    top = pick_top_gainer(pairs, blocklist=["USDT","ZUSD","USD"])  # basic sanity block
-    if not top:
-        lines.append("No gainer candidate found.")
-        md_append(lines)
-        write_json_summary({"mode": "idle-no-candidate", "details": lines})
-        LAST_OK.write_text(time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()))
-        return
-
-    pair_alt = pairs[top]
-    bid, ask = best_bid_ask(pair_alt)
-    if ask <= 0:
-        lines.append(f"Bad price for {top}/USD; skipping.")
-        md_append(lines)
-        write_json_summary({"mode": "idle-badprice", "details": lines})
-        LAST_OK.write_text(time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()))
-        return
-
-    qty = max( (buy_usd / ask) * 0.999, 1e-7 )  # shave for fees
-    if dry:
-        lines.append(f"[DRY] BUY {top}/USD ~ ${buy_usd:.2f} (qty≈{qty:.6f} at ask {ask:.6f})")
-        write_position({"symbol": top, "qty": qty, "entry_price": ask, "entry_ts": now_utc()})
+    pair = None
+    if forced:
+        pair = forced
     else:
-        res = add_order_market(pair_alt, "buy", qty, key, secret)
-        if res.get("error"):
-            lines.append(f"[LIVE] BUY ERROR: {res['error']}")
-            md_append(lines)
-            write_json_summary({"mode": "buy-error", "details": lines})
-            LAST_OK.write_text(time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()))
-            return
-        lines.append(f"[LIVE] BUY OK: {top}/USD qty≈{qty:.6f} at ~{ask:.6f}")
-        write_position({"symbol": top, "qty": qty, "entry_price": ask, "entry_ts": now_utc()})
+        # try read momentum_candidates.csv
+        mfile = STATE_DIR / "momentum_candidates.csv"
+        if mfile.exists():
+            try:
+                import csv
+                with mfile.open() as f:
+                    r = list(csv.DictReader(f))
+                if r:
+                    pair = (r[0].get("symbol") or "").upper().strip() or None
+            except Exception as e:
+                ctx.errors.append(f"Read momentum_candidates.csv failed: {e}")
 
-    md_append(lines)
-    write_json_summary({"mode": "buy", "details": lines})
-    LAST_OK.write_text(time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()))
+    if not pair:
+        pair = "SOLUSD"
+
+    try:
+        if ctx.dry_run:
+            vol = usd_to_volume(pair, buy_usd)
+            ctx.actions.append(f"[DRY] BUY {pair} ~{vol:.8f} worth {usd(buy_usd)}")
+        else:
+            vol = usd_to_volume(pair, buy_usd)
+            res = add_order_market(pair, "buy", vol)
+            if res.get("error"):
+                raise RuntimeError(f"BUY error {pair}: {res['error']}")
+            txid = ",".join(res.get("result", {}).get("txid", []))
+            ctx.actions.append(f"[LIVE] BUY {pair} {vol:.8f} ({usd(buy_usd)}) txid={txid}")
+    except Exception as e:
+        ctx.errors.append(str(e))
+
+def action_force_sell(ctx: RunContext) -> None:
+    symbol = env("FORCE_SELL_SYMBOL","ALL").strip().upper()
+    slip_pct = safe_float(env("FORCE_SELL_SLIP_PCT","3.0"), 3.0)
+    ctx.info.update({"FORCE_SELL_SYMBOL": symbol, "FORCE_SELL_SLIP_PCT": slip_pct})
+
+    targets: List[str] = []
+    if symbol == "ALL":
+        # sell everything with non-zero balance EXCEPT stable USD where applicable
+        try:
+            bals = get_balances() if not ctx.dry_run else {"EXAMPLE": 1.0}
+            for a, qty in bals.items():
+                if qty <= 0:
+                    continue
+                # crude: skip ZUSD / USDT "balances" (cash), look for a/USD tradable pairs
+                if a.upper() in ("ZUSD","USD","USDT","ZUSDT"):
+                    continue
+                # try to form a pair like {asset}USD
+                guess = f"{a.replace('X','').replace('Z','')}USD"
+                targets.append(guess)
+        except Exception as e:
+            ctx.errors.append(f"Balance read failed: {e}")
+            return
+    else:
+        targets = [symbol]
+
+    for pair in targets:
+        try:
+            # compute position size (sell all): approximate using balances in base asset
+            base_asset = guess_asset_from_pair(pair)
+            vol = None
+            if ctx.dry_run:
+                vol = 0.000001  # placeholder
+                ctx.actions.append(f"[DRY] SELL {pair} (force) all-in (vol≈{vol})")
+                continue
+
+            # LIVE: get balances again to find asset quantity
+            bals = get_balances()
+            # common Kraken asset codes sometimes prefixed (e.g., XXBT), try both
+            candidates = [base_asset, f"X{base_asset}", f"Z{base_asset}", base_asset.replace("X","").replace("Z","")]
+            qty = 0.0
+            for k in candidates:
+                if k in bals and bals[k] > 0:
+                    qty = bals[k]
+                    break
+            if qty <= 0:
+                ctx.actions.append(f"[LIVE] No balance found for {base_asset} -> skip {pair}")
+                continue
+
+            # Try market sell
+            try:
+                res = add_order_market(pair, "sell", qty)
+                if res.get("error"):
+                    raise RuntimeError(str(res["error"]))
+                txid = ",".join(res.get("result", {}).get("txid", []))
+                ctx.actions.append(f"[LIVE] SELL {pair} {qty:.8f} (market) txid={txid}")
+            except Exception as e:
+                # Retry as LIMIT with slip
+                px = get_ticker_price(pair)
+                limit_px = px * (1.0 - slip_pct/100.0)  # more aggressive to fill sells
+                res2 = add_order_limit(pair, "sell", qty, limit_px)
+                if res2.get("error"):
+                    raise RuntimeError(f"SELL {pair} failed (limit retry): {res2['error']}; original market error: {e}")
+                txid2 = ",".join(res2.get("result", {}).get("txid", []))
+                ctx.actions.append(f"[LIVE] SELL {pair} {qty:.8f} (limit {limit_px:.8f}) txid={txid2} (market blocked: {e})")
+
+        except Exception as e:
+            ctx.errors.append(f"{pair}: {e}")
+
+def action_dust_sweep(ctx: RunContext) -> None:
+    min_usd = safe_float(env("DUST_MIN_USD","0.50"), 0.50)
+    slip_pct = safe_float(env("DUST_SLIP_PCT","3.0"), 3.0)
+    ctx.info.update({"DUST_MIN_USD": min_usd, "DUST_SLIP_PCT": slip_pct})
+
+    try:
+        if ctx.dry_run:
+            ctx.actions.append(f"[DRY] Would sweep positions under {usd(min_usd)}")
+            return
+
+        bals = get_balances()
+        # For each non-cash asset, if value in USD < min_usd -> sell
+        for a, qty in bals.items():
+            if qty <= 0:
+                continue
+            if a.upper() in ("ZUSD","USD","USDT","ZUSDT"):
+                continue
+            pair = f"{a.replace('X','').replace('Z','')}USD"
+            try:
+                px = get_ticker_price(pair)
+            except Exception as e:
+                ctx.errors.append(f"Skip {a}: cannot price {pair}: {e}")
+                continue
+            value = qty * px
+            if value < min_usd:
+                # Try market sell; if blocked, limit with slip
+                try:
+                    res = add_order_market(pair, "sell", qty)
+                    if res.get("error"):
+                        raise RuntimeError(str(res["error"]))
+                    txid = ",".join(res.get("result", {}).get("txid", []))
+                    ctx.actions.append(f"[LIVE] DUST SELL {pair} {qty:.8f} (~{usd(value)}) market txid={txid}")
+                except Exception as e:
+                    limit_px = px * (1.0 - slip_pct/100.0)
+                    res2 = add_order_limit(pair, "sell", qty, limit_px)
+                    if res2.get("error"):
+                        ctx.errors.append(f"DUST {pair} failed: {res2['error']}; original market error: {e}")
+                    else:
+                        txid2 = ",".join(res2.get("result", {}).get("txid", []))
+                        ctx.actions.append(f"[LIVE] DUST SELL {pair} {qty:.8f} (~{usd(value)}) limit {limit_px:.8f} txid={txid2} (market blocked)")
+        if not ctx.actions:
+            ctx.actions.append("[LIVE] Dust sweep found nothing under threshold.")
+
+    except Exception as e:
+        ctx.errors.append(str(e))
+
+# ----------------- Main entry -----------------
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force-sell", action="store_true", help="Force sell symbol(s)")
+    parser.add_argument("--dust-sweep", action="store_true", help="Sell tiny positions under MIN_USD")
+    args = parser.parse_args()
+
+    dry = env("DRY_RUN","ON").upper().strip() != "OFF"
+    summary = RunContext(dry_run=dry)
+
+    summary.info["when"] = now_iso()
+    summary.info["runner"] = "main.py v1.0"
+
+    try:
+        if args.force_sell:
+            action_force_sell(summary)
+        elif args.dust_sweep:
+            action_dust_sweep(summary)
+        else:
+            # Normal rotation (buy-only, safe; sell guards handled by other jobs/tools)
+            action_rotation(summary)
+    except Exception as e:
+        summary.errors.append(f"Top-level error: {e}")
+
+    # Always write summaries
+    out = {
+        "when": now_iso(),
+        "dry_run": summary.dry_run,
+        "info": summary.info,
+        "actions": summary.actions,
+        "errors": summary.errors,
+        "artifacts": [str(SUMMARY_JSON), str(SUMMARY_MD)],
+    }
+    write_summary(out)
+
+    # Non-zero exit on hard errors (keeps Actions honest)
+    return 1 if summary.errors and not summary.dry_run else 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
