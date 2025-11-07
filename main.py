@@ -6,23 +6,25 @@ Features:
 - Hourly 1-coin rotation BUY (lightweight)
 - Force Sell (--force-sell) with SLIP_PCT fallback
 - Dust Sweeper (--dust-sweep) for tiny balances
-- Writes .state/run_summary.json and .state/run_summary.md on every run
+- Always writes .state/run_summary.json and .state/run_summary.md
+- EXIT_ON_ERROR switch to keep workflows green while logging errors
 
-Environment variables (set by workflows):
+Environment variables:
   DRY_RUN: "ON" | "OFF"
   BUY_USD: e.g., "25"
-  TP_PCT:  e.g., "5"   (currently logged; rotation is simple buy-only)
-  SL_PCT:  e.g., "1"   (currently logged; rotation is simple buy-only)
+  TP_PCT:  e.g., "5"   (logged for transparency)
+  SL_PCT:  e.g., "1"   (logged for transparency)
   SLOW_WINDOW_MIN: e.g., "60" (logged)
-  UNIVERSE_PICK: "" or "AUTO" (auto-pick) or a symbol like "SOLUSD"
+  UNIVERSE_PICK: "AUTO" (auto-pick) or a symbol like "SOLUSD"
   KRAKEN_API_KEY, KRAKEN_API_SECRET
+  EXIT_ON_ERROR: "ON" | "OFF"  (default ON; OFF means exit 0 even if errors occur)
 
-Force Sell flags (UI -> envs):
+Force Sell flags (via UI -> env):
   --force-sell
   FORCE_SELL_SYMBOL: "ALL" or "SOLUSD" etc.
   FORCE_SELL_SLIP_PCT: default "3.0"
 
-Dust Sweeper flags (UI -> envs):
+Dust Sweeper flags (via UI -> env):
   --dust-sweep
   DUST_MIN_USD: default "0.50"
   DUST_SLIP_PCT: default "3.0"
@@ -34,24 +36,23 @@ import base64
 import datetime as dt
 import hashlib
 import hmac
-import io
 import json
 import os
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-# ----------------- State paths (always written) -----------------
+# ---------- State ----------
 STATE_DIR = Path(".state")
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 SUMMARY_JSON = STATE_DIR / "run_summary.json"
 SUMMARY_MD = STATE_DIR / "run_summary.md"
 
-# ----------------- Small utilities -----------------
+# ---------- Utils ----------
 def env(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return default if v is None else str(v)
@@ -61,9 +62,6 @@ def now_iso() -> str:
 
 def usd(x: float) -> str:
     return f"${x:,.2f}"
-
-def pct(x: float) -> str:
-    return f"{x:.2f}%"
 
 def safe_float(s: Any, default: float = 0.0) -> float:
     try:
@@ -77,50 +75,52 @@ def write_summary(summary: Dict[str, Any]) -> None:
         SUMMARY_JSON.write_text(json.dumps(summary, indent=2))
     except Exception as e:
         print(f"[WARN] Failed writing {SUMMARY_JSON}: {e}", file=sys.stderr)
-    # Markdown
+    # MD
     try:
         lines = []
-        lines.append(f"# Run Summary")
-        lines.append("")
+        lines.append("# Run Summary\n")
         lines.append(f"**When (UTC):** {summary.get('when','')}")
         lines.append(f"**Mode:** {'DRY-RUN' if summary.get('dry_run') else 'LIVE'}")
-        if summary.get("info"):
-            lines.append("")
-            lines.append("## Info")
-            for k, v in summary["info"].items():
+        info = summary.get("info") or {}
+        if info:
+            lines.append("\n## Info")
+            for k, v in info.items():
                 lines.append(f"- **{k}**: {v}")
-        if summary.get("actions"):
-            lines.append("")
-            lines.append("## Actions")
-            for a in summary["actions"]:
+        acts = summary.get("actions") or []
+        if acts:
+            lines.append("\n## Actions")
+            for a in acts:
                 lines.append(f"- {a}")
-        if summary.get("errors"):
-            lines.append("")
-            lines.append("## Errors")
-            for e in summary["errors"]:
+        errs = summary.get("errors") or []
+        if errs:
+            lines.append("\n## Errors")
+            for e in errs:
                 lines.append(f"- {e}")
-        if summary.get("artifacts"):
-            lines.append("")
-            lines.append("## Artifacts")
-            for a in summary["artifacts"]:
+        arts = summary.get("artifacts") or []
+        if arts:
+            lines.append("\n## Artifacts")
+            for a in arts:
                 lines.append(f"- {a}")
         SUMMARY_MD.write_text("\n".join(lines) + "\n")
     except Exception as e:
         print(f"[WARN] Failed writing {SUMMARY_MD}: {e}", file=sys.stderr)
 
-# ----------------- Kraken REST minimal client (no deps) -----------------
+# ---------- Kraken minimal client ----------
 API_BASE = "https://api.kraken.com"
 
 def _nonce() -> str:
     return str(int(time.time() * 1000))
 
 def _kraken_headers(path: str, data: Dict[str, str], secret_b64: str) -> Dict[str, str]:
-    # Kraken signature per docs
-    postdata = urlencode(data).encode()
-    sha256 = hashlib.sha256((data["nonce"] + urlencode({k: v for k, v in data.items() if k != "nonce"})).encode()).digest()
-    msg = path.encode() + sha256
+    # Kraken signature
+    post_body = urlencode(data).encode()
+    # Per Kraken: HMAC-SHA512 of (path + SHA256(nonce+postdata))
+    import hashlib
+    sha = hashlib.sha256((data["nonce"] + urlencode({k: v for k, v in data.items() if k != "nonce"})).encode()).digest()
+    msg = path.encode() + sha
     secret = base64.b64decode(secret_b64)
-    sig = hmac.new(secret, msg, hashlib.sha512).digest()
+    import hmac as _h
+    sig = _h.new(secret, msg, hashlib.sha512).digest()
     sig_b64 = base64.b64encode(sig).decode()
     return {
         "API-Key": env("KRAKEN_API_KEY", ""),
@@ -128,11 +128,11 @@ def _kraken_headers(path: str, data: Dict[str, str], secret_b64: str) -> Dict[st
         "User-Agent": "stock-analyzer-app/1.0 (no-requests)"
     }
 
-def kraken_public(method: str, params: Dict[str, str]|None=None) -> Dict[str, Any]:
+def kraken_public(method: str, params: Dict[str, str] | None = None) -> Dict[str, Any]:
     url = f"{API_BASE}/0/public/{method}"
     if params:
         url += "?" + urlencode(params)
-    req = Request(url, headers={"User-Agent":"stock-analyzer-app"})
+    req = Request(url, headers={"User-Agent": "stock-analyzer-app"})
     with urlopen(req, timeout=15) as r:
         return json.loads(r.read().decode())
 
@@ -141,7 +141,6 @@ def kraken_private(method: str, data: Dict[str, str]) -> Dict[str, Any]:
     sec = env("KRAKEN_API_SECRET")
     if not key or not sec:
         raise RuntimeError("[LIVE] Missing Kraken API credentials.")
-
     path = f"/0/private/{method}"
     payload = {"nonce": _nonce(), **data}
     headers = _kraken_headers(path, payload, sec)
@@ -149,7 +148,7 @@ def kraken_private(method: str, data: Dict[str, str]) -> Dict[str, Any]:
     with urlopen(req, timeout=15) as r:
         return json.loads(r.read().decode())
 
-# ----------------- Trading helpers -----------------
+# ---------- Trading helpers ----------
 def get_ticker_price(pair: str) -> float:
     res = kraken_public("Ticker", {"pair": pair})
     if res.get("error"):
@@ -167,14 +166,14 @@ def get_balances() -> Dict[str, float]:
     for k, v in res.get("result", {}).items():
         try:
             out[k] = float(v)
-        except:
+        except Exception:
             pass
     return out
 
 def add_order_market(pair: str, side: str, vol: float) -> Dict[str, Any]:
     return kraken_private("AddOrder", {
         "pair": pair,
-        "type": side,
+        "type": side,           # "buy" or "sell"
         "ordertype": "market",
         "volume": f"{vol:.10f}",
     })
@@ -202,7 +201,7 @@ def guess_asset_from_pair(pair: str) -> str:
         return u.replace("USDT","").replace("/","")
     return u
 
-# ----------------- Actions -----------------
+# ---------- Run actions ----------
 @dataclass
 class RunContext:
     dry_run: bool
@@ -211,17 +210,17 @@ class RunContext:
     info: Dict[str, Any] = field(default_factory=dict)
 
 def action_rotation(ctx: RunContext) -> None:
-    """Simple 1-coin pick + BUY. Selection:
-    - UNIVERSE_PICK if provided (and not AUTO)
-    - else .state/momentum_candidates.csv top row
-    - else fallback SOLUSD
+    """Select one coin and BUY.
+    Selection order:
+      - UNIVERSE_PICK if provided and not an AUTO sentinel
+      - else top row of .state/momentum_candidates.csv
+      - else SOLUSD (fallback)
     """
     buy_usd = safe_float(env("BUY_USD","25"), 25.0)
     tp_pct = safe_float(env("TP_PCT","5"), 5.0)
     sl_pct = safe_float(env("SL_PCT","1"), 1.0)
     window = env("SLOW_WINDOW_MIN","60")
 
-    # Treat common placeholders as AUTO (so you can keep a non-blank variable)
     forced_raw = env("UNIVERSE_PICK","").strip()
     forced_upper = forced_raw.upper()
     if forced_upper in {"", "AUTO", "AUTO-PICK", "AUTOPICK", "ANY", "AUTOSELECT", "AUTO_SELECT"}:
@@ -241,7 +240,6 @@ def action_rotation(ctx: RunContext) -> None:
     if forced:
         pair = forced
     else:
-        # try read momentum_candidates.csv
         mfile = STATE_DIR / "momentum_candidates.csv"
         if mfile.exists():
             try:
@@ -252,7 +250,6 @@ def action_rotation(ctx: RunContext) -> None:
                     pair = (r[0].get("symbol") or "").upper().strip() or None
             except Exception as e:
                 ctx.errors.append(f"Read momentum_candidates.csv failed: {e}")
-
     if not pair:
         pair = "SOLUSD"
 
@@ -295,10 +292,8 @@ def action_force_sell(ctx: RunContext) -> None:
     for pair in targets:
         try:
             base_asset = guess_asset_from_pair(pair)
-            vol = None
             if ctx.dry_run:
-                vol = 0.000001
-                ctx.actions.append(f"[DRY] SELL {pair} (force) all-in (vol≈{vol})")
+                ctx.actions.append(f"[DRY] SELL {pair} (force) all-in (vol≈?)")
                 continue
 
             bals = get_balances()
@@ -323,10 +318,10 @@ def action_force_sell(ctx: RunContext) -> None:
                 limit_px = px * (1.0 - slip_pct/100.0)
                 res2 = add_order_limit(pair, "sell", qty, limit_px)
                 if res2.get("error"):
-                    raise RuntimeError(f"SELL {pair} failed (limit retry): {res2['error']}; original market error: {e}")
-                txid2 = ",".join(res2.get("result", {}).get("txid", []))
-                ctx.actions.append(f"[LIVE] SELL {pair} {qty:.8f} (limit {limit_px:.8f}) txid={txid2} (market blocked: {e})")
-
+                    ctx.errors.append(f"SELL {pair} failed (limit retry): {res2['error']}; original market error: {e}")
+                else:
+                    txid2 = ",".join(res2.get("result", {}).get("txid", []))
+                    ctx.actions.append(f"[LIVE] SELL {pair} {qty:.8f} (limit {limit_px:.8f}) txid={txid2} (market blocked)")
         except Exception as e:
             ctx.errors.append(f"{pair}: {e}")
 
@@ -370,11 +365,10 @@ def action_dust_sweep(ctx: RunContext) -> None:
                         ctx.actions.append(f"[LIVE] DUST SELL {pair} {qty:.8f} (~{usd(value)}) limit {limit_px:.8f} txid={txid2} (market blocked)")
         if not ctx.actions:
             ctx.actions.append("[LIVE] Dust sweep found nothing under threshold.")
-
     except Exception as e:
         ctx.errors.append(str(e))
 
-# ----------------- Main entry -----------------
+# ---------- Entry ----------
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--force-sell", action="store_true", help="Force sell symbol(s)")
@@ -383,9 +377,8 @@ def main() -> int:
 
     dry = env("DRY_RUN","ON").upper().strip() != "OFF"
     summary = RunContext(dry_run=dry)
-
     summary.info["when"] = now_iso()
-    summary.info["runner"] = "main.py v1.0a (AUTO-aware)"
+    summary.info["runner"] = "main.py v1.0b (EXIT_ON_ERROR aware)"
 
     try:
         if args.force_sell:
@@ -406,7 +399,13 @@ def main() -> int:
         "artifacts": [str(SUMMARY_JSON), str(SUMMARY_MD)],
     }
     write_summary(out)
-    return 1 if summary.errors and not summary.dry_run else 0
+
+    # Keep job green if EXIT_ON_ERROR=OFF (default ON)
+    exit_on_error = env("EXIT_ON_ERROR","ON").upper().strip() == "ON"
+    has_errors = bool(summary.errors)
+    if summary.dry_run:
+        return 0
+    return 1 if (exit_on_error and has_errors) else 0
 
 if __name__ == "__main__":
     sys.exit(main())
