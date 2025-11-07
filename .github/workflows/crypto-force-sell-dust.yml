@@ -3,12 +3,16 @@ name: Crypto — Dust Sweeper (One-Time)
 on:
   workflow_dispatch:
     inputs:
+      DRY_RUN:
+        description: "ON or OFF (OFF = place real sell orders)"
+        required: false
+        default: "OFF"
       MIN_USD:
         description: "Sell any position below this USD value (e.g., 0.50)"
         required: true
         default: "0.50"
       SLIP_PCT:
-        description: "Limit-order slip % if market order blocks (e.g., 3.0)"
+        description: "If market blocks, retry as LIMIT this % through the book (e.g., 3.0)"
         required: false
         default: "3.0"
 
@@ -16,10 +20,14 @@ permissions:
   contents: read
   actions: read
 
+concurrency:
+  group: dust-sweeper-singleton
+  cancel-in-progress: false
+
 jobs:
   dust_sweep:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,9 +45,35 @@ jobs:
       - name: Ensure .state exists
         run: mkdir -p .state
 
+      - name: Echo inputs & secret presence (safe)
+        env:
+          DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'OFF' }}
+          DUST_MIN_USD: ${{ github.event.inputs.MIN_USD }}
+          DUST_SLIP_PCT: ${{ github.event.inputs.SLIP_PCT || '3.0' }}
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        run: |
+          echo "DRY_RUN=$DRY_RUN"
+          echo "DUST_MIN_USD=$DUST_MIN_USD"
+          echo "DUST_SLIP_PCT=$DUST_SLIP_PCT"
+          if [ -n "${KRAKEN_API_KEY:-}" ]; then echo "Kraken API key: present"; else echo "Kraken API key: MISSING"; fi
+          if [ -n "${KRAKEN_API_SECRET:-}" ]; then echo "Kraken API secret: present"; else echo "Kraken API secret: MISSING"; fi
+
       - name: Run dust sweep
         env:
+          DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'OFF' }}
           DUST_MIN_USD: ${{ github.event.inputs.MIN_USD }}
-          DUST_SLIP_PCT: ${{ github.event.inputs.SLIP_PCT }}
+          DUST_SLIP_PCT: ${{ github.event.inputs.SLIP_PCT || '3.0' }}
+          # 🔐 Kraken creds passed to main.py
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           python main.py --dust-sweep
+
+      - name: Upload .state artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dust-sweep-state-${{ github.run_id }}
+          path: ./.state/**
+          if-no-files-found: warn
