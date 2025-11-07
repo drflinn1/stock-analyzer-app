@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write    # needed to push .state updates
+  contents: write
   actions: read
 
 concurrency:
@@ -39,22 +39,22 @@ jobs:
       - name: Generate momentum_candidates.csv
         run: |
           python - << 'PY'
-import csv, time, os, pathlib
-state = pathlib.Path(".state")
-state.mkdir(exist_ok=True, parents=True)
-rows = [
-  # symbol,quote,rank  (example stub; replace with your real scan logic)
-  ("SOLUSD", "sol-usd", 1),
-  ("BTCUSD", "btc-usd", 2),
-  ("ETHUSD", "eth-usd", 3),
-]
-with open(state / "momentum_candidates.csv", "w", newline="") as f:
-    w = csv.writer(f)
-    w.writerow(["symbol","quote","rank"])
-    for r in rows:
-        w.writerow(r)
-print("Wrote .state/momentum_candidates.csv")
-PY
+          import csv, pathlib
+          state = pathlib.Path(".state")
+          state.mkdir(exist_ok=True, parents=True)
+          rows = [
+              # symbol,quote,rank  (example stub; replace with your real scan logic)
+              ("SOLUSD", "sol-usd", 1),
+              ("BTCUSD", "btc-usd", 2),
+              ("ETHUSD", "eth-usd", 3),
+          ]
+          with open(state / "momentum_candidates.csv", "w", newline="") as f:
+              w = csv.writer(f)
+              w.writerow(["symbol","quote","rank"])
+              for r in rows:
+                  w.writerow(r)
+          print("Wrote .state/momentum_candidates.csv")
+          PY
 
       - name: Make push script executable
         run: chmod +x .github/scripts/push_state.sh
