@@ -1,62 +1,45 @@
-name: Crypto Force Sell — Dust Sweeper (ALL)
+name: Crypto — Dust Sweeper (One-Time)
 
 on:
   workflow_dispatch:
     inputs:
+      MIN_USD:
+        description: "Sell any position below this USD value (e.g., 0.50)"
+        required: true
+        default: "0.50"
       SLIP_PCT:
-        description: "LIMIT fallback depth % (e.g., 3.0)"
-        required: true
+        description: "Limit-order slip % if market order blocks (e.g., 3.0)"
+        required: false
         default: "3.0"
-      DUST_MIN_USD:
-        description: "Sell anything >= this USD value (set 0.01 to sweep dust)"
-        required: true
-        default: "0.01"
-      FORCE_DUST:
-        description: "ON to sell even below DUST_MIN_USD"
-        required: true
-        default: "ON"
+
+permissions:
+  contents: read
+  actions: read
 
 jobs:
-  run:
+  dust_sweep:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
-    permissions: { contents: write }
-
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Preflight — check Kraken secrets
-        shell: bash
-        env:
-          A: ${{ secrets.KRAKEN_KEY }}
-          B: ${{ secrets.KRAKEN_SECRET }}
-          C: ${{ secrets.KRAKEN_API_KEY }}
-          D: ${{ secrets.KRAKEN_API_SECRET }}
-        run: |
-          KEY="${A:-$C}"; SEC="${B:-$D}"
-          if [[ -z "$KEY" || -z "$SEC" ]]; then
-            echo "::error::Missing Kraken secrets. Add KRAKEN_KEY/KRAKEN_SECRET or KRAKEN_API_KEY/KRAKEN_API_SECRET."
-            exit 1
-          fi
-          echo "Secrets detected."
-
-      - name: Force sell ALL (Dust Sweeper)
-        env:
-          KRAKEN_KEY:    ${{ secrets.KRAKEN_KEY    || secrets.KRAKEN_API_KEY }}
-          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET || secrets.KRAKEN_API_SECRET }}
-          INPUT_SYMBOL:  "ALL"
-          INPUT_SLIP:    ${{ github.event.inputs.SLIP_PCT }}
-          DUST_MIN_USD:  ${{ github.event.inputs.DUST_MIN_USD }}
-          FORCE_DUST:    ${{ github.event.inputs.FORCE_DUST }}
-          STABLES:       "USD,ZUSD,USDT,USDC"
-        run: python tools/force_sell.py
-
-      - name: Upload .state summary
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          name: force-sell-dust-state
-          path: .state/**
-          if-no-files-found: ignore
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+
+      - name: Ensure .state exists
+        run: mkdir -p .state
+
+      - name: Run dust sweep
+        env:
+          DUST_MIN_USD: ${{ github.event.inputs.MIN_USD }}
+          DUST_SLIP_PCT: ${{ github.event.inputs.SLIP_PCT }}
+        run: |
+          python main.py --dust-sweep
