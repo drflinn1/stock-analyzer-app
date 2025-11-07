@@ -3,20 +3,21 @@ name: Crypto Force Sell (One-Time)
 on:
   workflow_dispatch:
     inputs:
-      symbol:
+      SYMBOL:
         description: "Symbol to sell (e.g., SOON, SOONUSD, SOON/USD, or ALL)"
         required: true
-        type: string
-      limit_slip_pct:
+        default: "ALL"
+      SLIP_PCT:
         description: "If market is blocked by price-protection, retry as LIMIT this % through the book (e.g., 3.0)"
-        required: false
+        required: true
         default: "3.0"
-        type: string
 
 jobs:
-  sell_all:
+  run:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,16 +27,19 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install ccxt python-dotenv
-
       - name: Force sell
         env:
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          SYMBOL: ${{ inputs.symbol }}
-          LIMIT_SLIP_PCT: ${{ inputs.limit_slip_pct }}
+          KRAKEN_KEY: ${{ secrets.KRAKEN_KEY }}
+          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET }}
+          INPUT_SYMBOL: ${{ github.event.inputs.SYMBOL }}
+          INPUT_SLIP: ${{ github.event.inputs.SLIP_PCT }}
         run: |
           python tools/force_sell.py
+
+      - name: Upload .state summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: force-sell-state
+          path: .state/**
+          if-no-files-found: ignore
