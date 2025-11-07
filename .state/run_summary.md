@@ -1,4 +1,4 @@
-**When:** 2025-11-07T10:29:50+00:00
+**When:** 2025-11-07T11:23:20+00:00
 **Live (DRY_RUN=OFF):** True
 **Pick Source:** CANDIDATES_CSV
 **Pick (symbol):** KOBAN/USD
@@ -9,7 +9,7 @@
 ### Details
 ```json
 {
-  "when": "2025-11-07T10:29:50+00:00",
+  "when": "2025-11-07T11:23:20+00:00",
   "live": true,
   "buy_usd": 15.0,
   "reserve_cash_pct": 0.0,
