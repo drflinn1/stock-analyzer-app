@@ -13,15 +13,19 @@ permissions:
   contents: write   # needed for committing .state
 
 env:
+  # --- Vars bridged from repo Variables (these lines FIX the DRY_RUN issue) ---
+  DRY_RUN: ${{ vars.DRY_RUN }}              # "ON" or "OFF" in repo Variables
+  BUY_USD: ${{ vars.BUY_USD }}              # e.g., 15
+  UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK }}  # e.g., "SOLUSD" or "AUTO"/"NONE"/"-" for blank
+  TP_PCT: ${{ vars.TP_PCT || '5' }}
+  STOP_PCT: ${{ vars.STOP_PCT || '1' }}
+  SLOW_MIN_PCT: ${{ vars.SLOW_MIN_PCT || '3' }}
+  WINDOW_MIN: ${{ vars.WINDOW_MIN || '30' }}
+
   # Guard & housekeeping
   AUTO_SELL_ON_MULTI: "OFF"         # OFF=refuse to buy if >1 coin; ON:auto-sell extras (we can wire later)
   USD_CODES: "USD,ZUSD"
-  COMMIT_STATE: "ON"                 # ON = also commit .state back to repo so you can see files in GitHub
-  # Threshold defaults (can be overridden via repo Variables/UI inputs)
-  TP_PCT: "5"
-  STOP_PCT: "1"
-  SLOW_MIN_PCT: "3"
-  WINDOW_MIN: "30"
+  COMMIT_STATE: "ON"                 # commit .state back to repo so you can see it without downloading artifacts
 
 jobs:
   run:
@@ -43,23 +47,41 @@ jobs:
           pip install -r requirements.txt || true
           pip install requests || true
 
-      - name: Preflight — echo vars & ensure .state
+      - name: Preflight — normalize/echo vars & ensure .state
+        id: preflight
+        shell: bash
         run: |
           set -e
           mkdir -p .state
-          echo "=== Runtime Vars ==="
-          echo "DRY_RUN=${{ github.event.inputs.DRY_RUN || env.DRY_RUN || 'ON' }}"
+
+          # Normalize DRY_RUN to ON/OFF (uppercase), default ON if truly empty
+          DRY_RUN="${DRY_RUN:-ON}"
+          DRY_RUN="$(echo "$DRY_RUN" | tr '[:lower:]' '[:upper:]')"
+          if [ "$DRY_RUN" != "ON" ] && [ "$DRY_RUN" != "OFF" ]; then DRY_RUN="ON"; fi
+          echo "DRY_RUN=$DRY_RUN" >> $GITHUB_ENV
+
+          # Normalize UNIVERSE_PICK: treat AUTO/NONE/- as blank (use gainers)
+          case "${UNIVERSE_PICK:-}" in
+            AUTO|auto|NONE|none|"-")
+              UNIVERSE_PICK=""
+              ;;
+          esac
+          echo "UNIVERSE_PICK=$UNIVERSE_PICK" >> $GITHUB_ENV
+
+          echo "=== Runtime Vars (after normalize) ==="
+          echo "DRY_RUN=$DRY_RUN"
+          echo "BUY_USD=${BUY_USD:-25}"
           echo "TP_PCT=${TP_PCT}"
           echo "STOP_PCT=${STOP_PCT}"
           echo "SLOW_MIN_PCT=${SLOW_MIN_PCT}"
           echo "WINDOW_MIN=${WINDOW_MIN}"
-          echo "UNIVERSE_PICK=${UNIVERSE_PICK}"
+          echo "UNIVERSE_PICK=${UNIVERSE_PICK:-<auto>}"
           echo "AUTO_SELL_ON_MULTI=${AUTO_SELL_ON_MULTI}"
           echo "COMMIT_STATE=${COMMIT_STATE}"
           echo "=== ls -la .state (before) ==="
           ls -la .state || true
 
-      # ---------- Single-position Guard (Kraken) ----------
+      # ---------- Single-position guard (Kraken) ----------
       - name: Single-position guard (Kraken)
         env:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
@@ -126,25 +148,10 @@ jobs:
           if [ ! -f ".state/run_summary.md" ]; then
             {
               echo "**When:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-              echo "**Live (DRY_RUN=OFF):** ${DRY_RUN:-ON} != OFF"
-              echo "**Pick (symbol):**"
-              echo "**BUY_USD:** ${BUY_USD:-25.0}"
-              echo "**Status:**"
-              echo ""
-              echo "### Details"
-              echo '```json'
-              echo "{"
-              echo "  \"when\": \"$(date -u '+%Y-%m-%dT%H:%M:%S+00:00')\","
-              echo "  \"live\": ${DRY_RUN:-ON} = OFF,";
-              echo "  \"buy_usd\": ${BUY_USD:-25.0},"
-              echo "  \"thresholds\": {"
-              echo "    \"tp_pct\": ${TP_PCT:-5},"
-              echo "    \"stop_pct\": ${STOP_PCT:-1},"
-              echo "    \"slow_min_pct\": ${SLOW_MIN_PCT:-3},"
-              echo "    \"window_min\": ${WINDOW_MIN:-30}"
-              echo "  }"
-              echo "}"
-              echo '```'
+              echo "**DRY_RUN:** ${DRY_RUN}"
+              echo "**TP_PCT:** ${TP_PCT} | **STOP_PCT:** ${STOP_PCT} | **SLOW_MIN_PCT:** ${SLOW_MIN_PCT} | **WINDOW_MIN:** ${WINDOW_MIN}"
+              echo "**UNIVERSE_PICK:** ${UNIVERSE_PICK:-<auto>}"
+              echo "**Note:** Auto-generated summary because the bot didn’t emit one this run."
             } > .state/run_summary.md
           fi
           if [ ! -f ".state/position.json" ]; then
