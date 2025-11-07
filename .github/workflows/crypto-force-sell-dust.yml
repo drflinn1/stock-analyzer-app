@@ -64,11 +64,16 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'OFF' }}
           DUST_MIN_USD: ${{ github.event.inputs.MIN_USD }}
           DUST_SLIP_PCT: ${{ github.event.inputs.SLIP_PCT || '3.0' }}
-          # 🔐 Kraken creds passed to main.py
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           python main.py --dust-sweep
+
+      - name: Guarantee at least one artifact file
+        if: always()
+        run: |
+          mkdir -p .state
+          [ -f .state/run_summary.md ] || echo "placeholder" > .state/.keep
 
       - name: Upload .state artifacts
         if: always()
