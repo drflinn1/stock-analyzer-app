@@ -1,15 +1,15 @@
-**When:** 2025-11-07T13:54:42+00:00
+**When:** 2025-11-07T14:27:17+00:00
 **Live (DRY_RUN=OFF):** True
 **Pick Source:** CANDIDATES_CSV
-**Pick (symbol):** SOON/USD
+**Pick (symbol):** KOBAN/USD
 **BUY_USD:** 15.0
-**Status:** LIVE_BUY_OK
-**Note:** 
+**Status:** LIVE_BUY_ERROR
+**Note:** kraken {"error":["EAccount:Invalid permissions:KOBAN trading restricted for US:WA."]}
 
 ### Details
 ```json
 {
-  "when": "2025-11-07T13:54:42+00:00",
+  "when": "2025-11-07T14:27:17+00:00",
   "live": true,
   "buy_usd": 15.0,
   "reserve_cash_pct": 0.0,
@@ -20,47 +20,9 @@
     "slow_min_pct": 3.0,
     "window_min": 30
   },
-  "status": "LIVE_BUY_OK",
-  "note": "",
-  "symbol": "SOON/USD",
-  "pick_source": "CANDIDATES_CSV",
-  "order": {
-    "id": "OVN67H-3F4DH-NW7MYG",
-    "clientOrderId": null,
-    "info": {
-      "txid": [
-        "OVN67H-3F4DH-NW7MYG"
-      ],
-      "descr": {
-        "order": "buy 15.00 SOONUSD @ market"
-      }
-    },
-    "timestamp": null,
-    "datetime": null,
-    "lastTradeTimestamp": null,
-    "status": null,
-    "symbol": "SOON/USD",
-    "type": "market",
-    "timeInForce": "IOC",
-    "postOnly": false,
-    "side": "buy",
-    "price": null,
-    "triggerPrice": null,
-    "takeProfitPrice": null,
-    "stopLossPrice": null,
-    "cost": 15.0,
-    "amount": null,
-    "filled": null,
-    "average": null,
-    "remaining": null,
-    "reduceOnly": null,
-    "fee": null,
-    "trades": [],
-    "fees": [],
-    "lastUpdateTimestamp": null,
-    "stopPrice": null
-  },
-  "entry_price": null,
-  "amount": 26.1172
+  "status": "LIVE_BUY_ERROR",
+  "note": "kraken {\"error\":[\"EAccount:Invalid permissions:KOBAN trading restricted for US:WA.\"]}",
+  "symbol": "KOBAN/USD",
+  "pick_source": "CANDIDATES_CSV"
 }
 ```
