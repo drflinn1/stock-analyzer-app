@@ -1,105 +1,89 @@
-name: Crypto - 1-Coin Rotation (LIVE-ready, ultra-defensive, 15m)
+name: Crypto — 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "0 * * * *"   # hourly at :00 UTC
   workflow_dispatch:
     inputs:
-      DRY_RUN:        { description: "ON for simulation, OFF for live trading", required: true, default: "ON" }
-      BUY_USD:        { description: "Buy size USD", required: true, default: "15" }
-      TP_PCT:         { description: "Take-profit %", required: true, default: "5" }
-      SL_PCT:         { description: "Stop-loss % (first HOLD window)", required: true, default: "1" }
-      HOLD_WINDOW_M:  { description: "Hold window (min)", required: true, default: "60" }
-      SLOW_GAIN_PCT:  { description: "Min gain after window", required: true, default: "3" }
-      FORCE_SELL:     { description: "ALL or symbol (optional)", required: false, default: "" }
-      SLIP_PCT:       { description: "Limit fallback % (FORCE_SELL and stables convert)", required: false, default: "3.0" }
+      DRY_RUN:
+        description: "ON or OFF"
+        required: false
+        default: "ON"
+      BUY_USD:
+        description: "Per-buy USD (e.g., 25)"
+        required: false
+        default: "25"
+      TP_PCT:
+        description: "Take-profit % (e.g., 5)"
+        required: false
+        default: "5"
+      SL_PCT:
+        description: "Initial stop % (e.g., 1)"
+        required: false
+        default: "1"
+      SLOW_WINDOW_MIN:
+        description: "Rotation window minutes (e.g., 60)"
+        required: false
+        default: "60"
+      UNIVERSE_PICK:
+        description: "Optional fixed symbol to force (e.g., SOLUSD). Leave blank to auto-pick."
+        required: false
+        default: ""
 
+permissions:
+  contents: read
+  actions: read
+
+# No git commits from this job; it only uploads artifacts.
 concurrency:
-  group: crypto-1coin-rotation
+  group: rotation-run-main
   cancel-in-progress: true
-
-permissions: { contents: write }
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
+    timeout-minutes: 12
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # Accept either secret naming scheme
-      - name: Preflight — check Kraken secrets
-        shell: bash
-        env:
-          A: ${{ secrets.KRAKEN_KEY }}
-          B: ${{ secrets.KRAKEN_SECRET }}
-          C: ${{ secrets.KRAKEN_API_KEY }}
-          D: ${{ secrets.KRAKEN_API_SECRET }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
         run: |
-          KEY="${A:-$C}"; SEC="${B:-$D}"
-          if [[ -z "$KEY" || -z "$SEC" ]]; then
-            echo "::error::Missing Kraken secrets. Add KRAKEN_KEY/KRAKEN_SECRET or KRAKEN_API_KEY/KRAKEN_API_SECRET."
-            exit 1
-          fi
-          echo "Secrets detected."
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
 
-      # ---------------- Main bot ----------------
-      - name: Run rotation bot
-        env:
-          KRAKEN_KEY:    ${{ secrets.KRAKEN_KEY    || secrets.KRAKEN_API_KEY }}
-          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET || secrets.KRAKEN_API_SECRET }}
-
-          # 👇 For manual runs → github.event.inputs; for schedules → repo Variables; else default
-          DRY_RUN:       ${{ github.event.inputs.DRY_RUN        || vars.DRY_RUN        || 'ON' }}
-          BUY_USD:       ${{ github.event.inputs.BUY_USD        || vars.BUY_USD        || '15' }}
-          TP_PCT:        ${{ github.event.inputs.TP_PCT         || vars.TP_PCT         || '5' }}
-          SL_PCT:        ${{ github.event.inputs.SL_PCT         || vars.SL_PCT         || '1' }}
-          HOLD_WINDOW_M: ${{ github.event.inputs.HOLD_WINDOW_M  || vars.HOLD_WINDOW_M  || '60' }}
-          SLOW_GAIN_PCT: ${{ github.event.inputs.SLOW_GAIN_PCT  || vars.SLOW_GAIN_PCT  || '3' }}
-          FORCE_SELL:    ${{ github.event.inputs.FORCE_SELL     || vars.FORCE_SELL     || '' }}
-          SLIP_PCT:      ${{ github.event.inputs.SLIP_PCT       || vars.SLIP_PCT       || '3.0' }}
-        run: python main.py
-
-      # ---------------- Post-run cleanup (1): Dust Sweeper ----------------
-      - name: Dust sweep ALL (force tiny sells)
-        if: always()
-        env:
-          KRAKEN_KEY:    ${{ secrets.KRAKEN_KEY    || secrets.KRAKEN_API_KEY }}
-          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET || secrets.KRAKEN_API_SECRET }}
-          INPUT_SYMBOL:  "ALL"
-          INPUT_SLIP:    ${{ github.event.inputs.SLIP_PCT || vars.SLIP_PCT || '3.0' }}
-          DUST_MIN_USD:  "0.01"
-          FORCE_DUST:    "ON"
-          STABLES:       "USD,ZUSD,USDT,USDC"
-        run: python tools/force_sell.py
-
-      # ---------------- Post-run cleanup (2): Convert Stables -> USD ----------------
-      - name: Convert stables to USD (USDT/USDC)
-        if: always()
-        env:
-          KRAKEN_KEY:    ${{ secrets.KRAKEN_KEY    || secrets.KRAKEN_API_KEY }}
-          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET || secrets.KRAKEN_API_SECRET }}
-          SLIP_PCT:      ${{ github.event.inputs.SLIP_PCT || vars.SLIP_PCT || '3.0' }}
-          STABLES:       "USDT,USDC"
-          MIN_USD:       "0.50"
-          WRITE_SUMMARY: "ON"
-        run: python tools/convert_stables.py
-
-      - name: Package .state as a zip
-        if: always()
+      - name: Echo critical env/vars
         run: |
-          mkdir -p .state
-          zip -r9 state.zip .state || true
+          echo "DRY_RUN=${{ github.event.inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}"
+          echo "BUY_USD=${{ github.event.inputs.BUY_USD || vars.BUY_USD || '25' }}"
+          echo "TP_PCT=${{ github.event.inputs.TP_PCT || vars.TP_PCT || '5' }}"
+          echo "SL_PCT=${{ github.event.inputs.SL_PCT || vars.SL_PCT || '1' }}"
+          echo "SLOW_WINDOW_MIN=${{ github.event.inputs.SLOW_WINDOW_MIN || vars.SLOW_WINDOW_MIN || '60' }}"
+          echo "UNIVERSE_PICK=${{ github.event.inputs.UNIVERSE_PICK || vars.UNIVERSE_PICK || '' }}"
 
-      - name: Upload artifacts
+      - name: Ensure .state exists
+        run: mkdir -p .state
+
+      - name: Run main
+        env:
+          DRY_RUN: ${{ github.event.inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}
+          BUY_USD: ${{ github.event.inputs.BUY_USD || vars.BUY_USD || '25' }}
+          TP_PCT:  ${{ github.event.inputs.TP_PCT  || vars.TP_PCT  || '5' }}
+          SL_PCT:  ${{ github.event.inputs.SL_PCT  || vars.SL_PCT  || '1' }}
+          SLOW_WINDOW_MIN: ${{ github.event.inputs.SLOW_WINDOW_MIN || vars.SLOW_WINDOW_MIN || '60' }}
+          UNIVERSE_PICK: ${{ github.event.inputs.UNIVERSE_PICK || vars.UNIVERSE_PICK || '' }}
+        run: |
+          python main.py
+
+      - name: Upload .state artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: crypto-rotation-state
-          path: |
-            .state/**
-            state.zip
+          name: state-${{ github.run_id }}
+          path: ./.state/**
           if-no-files-found: warn
