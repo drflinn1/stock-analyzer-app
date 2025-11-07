@@ -1,158 +1,232 @@
 #!/usr/bin/env python3
 """
-Self-contained Force Sell tool for Kraken (spot).
-- Accepts SYMBOL = 'SOON', 'SOONUSD', 'SOON/USD', or 'ALL'
-- Uses ccxt directly (no trader.* imports)
-- If Kraken blocks a market order with price-protection, retries as LIMIT
-  at bid * (1 - LIMIT_SLIP_PCT/100).
-Env:
-  KRAKEN_API_KEY, KRAKEN_API_SECRET, SYMBOL, LIMIT_SLIP_PCT
+tools/force_sell.py
+- One-off or batch ("ALL") liquidations on Kraken Spot.
+- Tries MARKET first; if price-protection blocks it, retries as LIMIT
+  'slip' % through the book to force a fill.
+- Writes an entry to .state/run_summary.md every time it runs.
+
+Inputs via env:
+  KRAKEN_KEY, KRAKEN_SECRET
+  INPUT_SYMBOL   -> "SOON", "SOONUSD", "SOON/USD", or "ALL"
+  INPUT_SLIP     -> e.g. "3.0"  (percent depth for LIMIT fallback)
+
+Safe assumptions:
+- Only sells spot balances into USD (pairs like SOONUSD, SOLUSD, etc.)
+- Ignores tiny dust (< $0.50 est) and assets without a USD pair.
 """
 
+import base64
+import hashlib
+import hmac
+import json
 import os
-import sys
 import time
-from typing import List, Tuple
+from pathlib import Path
+from typing import Dict, List, Tuple
+from urllib.parse import urlencode
 
-import ccxt  # type: ignore
+import urllib.request
 
-API_KEY = os.getenv("KRAKEN_API_KEY", "")
-API_SECRET = os.getenv("KRAKEN_API_SECRET", "")
-INPUT_SYMBOL = (os.getenv("SYMBOL") or "").strip()
-SLIP_PCT = float(os.getenv("LIMIT_SLIP_PCT", "3.0") or "3.0")
+STATE_DIR = Path(".state")
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+SUMMARY_MD = STATE_DIR / "run_summary.md"
 
+API_URL = "https://api.kraken.com"
 
-def fail(msg: str, code: int = 1) -> None:
-    print(f"[ERROR] {msg}")
-    sys.exit(code)
+def _kraken_request(uri_path: str, data: Dict = None, key: str = "", secret: str = "") -> Dict:
+    """Minimal Kraken REST client (no external deps)."""
+    data = data or {}
+    postdata = urlencode(data).encode()
+    headers = {}
 
+    if uri_path.startswith("/0/private/"):
+        if not key or not secret:
+            raise RuntimeError("[ERROR] Missing Kraken API credentials.")
+        nonce = str(int(1000 * time.time()))
+        data.update({"nonce": nonce})
+        postdata = urlencode(data).encode()
 
-def normalize_pair(sym: str) -> str:
-    s = sym.upper().replace(" ", "").replace("-", "")
-    if s == "ALL":
-        return "ALL"
-    if s.endswith("/USD"):
-        return s
-    if s.endswith("USD"):
-        base = s[:-3]
-        return f"{base}/USD"
-    return f"{s}/USD"
+        sha256 = hashlib.sha256((nonce + urlencode(data)).encode()).digest()
+        hmac_data = uri_path.encode() + sha256
+        mac = hmac.new(base64.b64decode(secret), hmac_data, hashlib.sha512)
+        sigdigest = base64.b64encode(mac.digest())
 
-
-def load_exchange() -> ccxt.Exchange:
-    if not API_KEY or not API_SECRET:
-        fail("Missing Kraken API secrets.")
-    ex = ccxt.kraken({
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
-        "enableRateLimit": True,
-    })
-    # Kraken quirk: allow pure market sells without price
-    ex.options["createMarketBuyOrderRequiresPrice"] = False
-    ex.load_markets()
-    return ex
-
-
-def list_sellable_pairs(ex: ccxt.Exchange) -> List[str]:
-    bal = ex.fetch_balance()
-    markets = ex.markets
-    sellable = []
-    for asset, amt in (bal.get("free") or {}).items():
-        try:
-            if amt and amt > 0:
-                pair = f"{asset}/USD"
-                if pair in markets:
-                    sellable.append(pair)
-        except Exception:
-            continue
-    return sellable
-
-
-def amount_for_pair(ex: ccxt.Exchange, pair: str) -> float:
-    base = pair.split("/")[0]
-    bal = ex.fetch_balance()
-    free = (bal.get("free") or {}).get(base, 0.0) or 0.0
-    if free <= 0:
-        # try total as fallback
-        total = (bal.get("total") or {}).get(base, 0.0) or 0.0
-        return float(total)
-    return float(free)
-
-
-def market_sell(ex: ccxt.Exchange, pair: str, amount: float):
-    print(f"[SELL] Market sell {amount} {pair}")
-    return ex.create_order(pair, "market", "sell", amount)
-
-
-def fallback_limit_sell(ex: ccxt.Exchange, pair: str, amount: float, slip_pct: float):
-    ticker = ex.fetch_ticker(pair)
-    bid = float(ticker.get("bid") or 0.0)
-    if bid <= 0:
-        fail(f"No bid for {pair}; cannot place limit.")
-    price = bid * (1 - slip_pct / 100.0)
-    price = round(price, ex.markets[pair]["precision"]["price"])
-    print(f"[SELL] Price-protection hit; retry LIMIT @ {price} ({slip_pct}% under bid)")
-    # Kraken respects 'IOC' for quick execution; if unsupported it is ignored.
-    params = {"timeInForce": "IOC"}
-    return ex.create_order(pair, "limit", "sell", amount, price, params)
-
-
-def sell_pair(ex: ccxt.Exchange, pair: str, slip_pct: float) -> Tuple[str, str]:
-    amt = amount_for_pair(ex, pair)
-    if amt <= 0:
-        return (pair, "SKIP_NO_BALANCE")
-    try:
-        order = market_sell(ex, pair, amt)
-        status = order.get("status") or "placed"
-        return (pair, f"MARKET_OK:{status}")
-    except Exception as e:
-        msg = str(e)
-        if "price protection" in msg.lower() or "EOrder:Price" in msg:
-            try:
-                order = fallback_limit_sell(ex, pair, amt, slip_pct)
-                status = order.get("status") or "placed"
-                return (pair, f"LIMIT_OK:{status}")
-            except Exception as e2:
-                return (pair, f"LIMIT_FAIL:{e2}")
-        return (pair, f"MARKET_FAIL:{e}")
-
-
-def main() -> None:
-    if not INPUT_SYMBOL:
-        fail("SYMBOL input is required (e.g., SOON or ALL).")
-    ex = load_exchange()
-
-    targets: List[str]
-    if normalize_pair(INPUT_SYMBOL) == "ALL":
-        targets = list_sellable_pairs(ex)
-        if not targets:
-            print("[INFO] Nothing to sell (no USD pairs with balance).")
-            sys.exit(0)
+        headers = {
+            "API-Key": key,
+            "API-Sign": sigdigest.decode(),
+            "User-Agent": "force-sell/1.0",
+            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+        }
+        req = urllib.request.Request(API_URL + uri_path, data=postdata, headers=headers)
     else:
-        pair = normalize_pair(INPUT_SYMBOL)
-        if pair not in ex.markets:
-            fail(f"{pair} is not a known Kraken USD spot market.")
-        targets = [pair]
+        req = urllib.request.Request(API_URL + uri_path, headers={"User-Agent": "force-sell/1.0"})
 
-    print(f"[INFO] Selling: {', '.join(targets)}  (slip={SLIP_PCT}%)")
-    results = []
-    for p in targets:
+    with urllib.request.urlopen(req) as resp:
+        raw = resp.read()
         try:
-            res = sell_pair(ex, p, SLIP_PCT)
-            results.append(res)
-            print(f"[RESULT] {res[0]} -> {res[1]}")
-            time.sleep(0.75)  # polite pacing
-        except Exception as e:
-            results.append((p, f"ERROR:{e}"))
-            print(f"[RESULT] {p} -> ERROR:{e}")
+            return json.loads(raw.decode())
+        except Exception:
+            return {"raw": raw.decode()}
 
-    # Non-zero exit only if every attempt failed
-    if any("OK" in r[1] for r in results):
-        sys.exit(0)
-    if any("SKIP_NO_BALANCE" in r[1] for r in results):
-        sys.exit(0)
-    fail("All sell attempts failed.", code=2)
+def _get_pairs_usd_map() -> Dict[str, str]:
+    """Map BASE -> ALTNAME (USD pair), e.g. {'SOON': 'SOONUSD'}"""
+    res = _kraken_request("/0/public/AssetPairs")
+    if "result" not in res:
+        return {}
+    out = {}
+    for _, info in res["result"].items():
+        alt = info.get("altname", "")
+        if alt.endswith("USD"):
+            base = alt[:-3]  # strip 'USD'
+            out[base] = alt
+    return out
 
+def _best_bid_usd(pair_altname: str) -> float:
+    """Get best bid for a USD pair."""
+    res = _kraken_request("/0/public/Ticker?pair=" + pair_altname)
+    if "result" not in res:
+        return 0.0
+    # result key can vary; pull the first
+    first_key = next(iter(res["result"]))
+    bid = float(res["result"][first_key]["b"][0])
+    return bid
+
+def _account_balances(key: str, secret: str) -> Dict[str, float]:
+    res = _kraken_request("/0/private/Balance", {}, key, secret)
+    if res.get("error"):
+        raise RuntimeError(f"[ERROR] Balance: {res['error']}")
+    raw = res.get("result", {})
+    # Normalize asset keys like 'XXBT' -> 'XBT' (Kraken idiosyncrasies). We'll rely on USD pair map for matching.
+    # Here we just pass raw keys; matching is done by USD map 'altname' bases.
+    return {k.replace("Z", "").replace("X", ""): float(v) for k, v in raw.items()}
+
+def _format_sym(user_sym: str) -> str:
+    s = user_sym.strip().upper().replace(" ", "")
+    s = s.replace("/", "")
+    if s.endswith("USD"):
+        s = s[:-3]
+    return s  # base only (e.g., 'SOON')
+
+def _append_summary(lines: List[str]) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+    block = [
+        f"### Force Sell — {ts}",
+        "",
+        *lines,
+        "",
+    ]
+    with SUMMARY_MD.open("a", encoding="utf-8") as f:
+        f.write("\n".join(block))
+
+def _sell_one(pair_altname: str, vol: float, slip_pct: float, key: str, secret: str) -> Tuple[bool, str]:
+    """Try MARKET, then LIMIT at bid*(1-slip). Returns (ok, message)."""
+    # 1) MARKET
+    data = {
+        "ordertype": "market",
+        "type": "sell",
+        "pair": pair_altname,
+        "volume": f"{vol:.8f}",
+        "oflags": "viqc",  # volume in quote currency flag is harmless for market sells
+    }
+    res = _kraken_request("/0/private/AddOrder", data, key, secret)
+    if not res.get("error"):
+        return True, f"[SELL] MARKET {vol} {pair_altname} -> OK"
+
+    err_list = res.get("error", [])
+    err_text = ", ".join(err_list) if isinstance(err_list, list) else str(err_list)
+
+    # 2) LIMIT fallback if price protection / similar
+    bid = _best_bid_usd(pair_altname)
+    limit_px = bid * (1.0 - slip_pct / 100.0)
+    data2 = {
+        "ordertype": "limit",
+        "type": "sell",
+        "pair": pair_altname,
+        "volume": f"{vol:.8f}",
+        "price": f"{limit_px:.8f}",
+    }
+    res2 = _kraken_request("/0/private/AddOrder", data2, key, secret)
+    if not res2.get("error"):
+        return True, f"[SELL] LIMIT {vol} {pair_altname} @ ~{limit_px:.8f} -> OK (fallback after: {err_text})"
+    err2 = res2.get("error", [])
+    err2_text = ", ".join(err2) if isinstance(err2, list) else str(err2)
+    return False, f"[ERROR] MARKET failed: {err_text} | LIMIT fallback failed: {err2_text}"
+
+def main():
+    key = os.getenv("KRAKEN_KEY", "")
+    secret = os.getenv("KRAKEN_SECRET", "")
+    sym_in = os.getenv("INPUT_SYMBOL", "").strip()
+    slip_str = os.getenv("INPUT_SLIP", "3.0").strip() or "3.0"
+    slip_pct = float(slip_str)
+
+    if not sym_in:
+        raise SystemExit("[ERROR] INPUT_SYMBOL is required.")
+
+    pairs_map = _get_pairs_usd_map()  # BASE -> ALTNAME
+    results: List[str] = []
+    sold_any = False
+
+    if sym_in.upper() != "ALL":
+        base = _format_sym(sym_in)
+        if base not in pairs_map:
+            raise SystemExit(f"[ERROR] No USD pair found for {base}.")
+        # volume from balances
+        bals = _account_balances(key, secret)
+        vol = 0.0
+        # balances keys may be Krakenized; try direct and fallback to exact base
+        for k, v in bals.items():
+            if k.upper() == base or k.upper().endswith(base):
+                vol = max(vol, v)
+        if vol <= 0:
+            raise SystemExit(f"[INFO] No balance to sell for {base}.")
+        vol *= 0.999  # leave hair for fees
+        pair_alt = pairs_map[base]
+        print(f"[INFO] Selling: {base}/USD  (slip={slip_pct:.1f}%)")
+        ok, msg = _sell_one(pair_alt, vol, slip_pct, key, secret)
+        results.append(msg)
+        sold_any = sold_any or ok
+    else:
+        print(f"[INFO] Selling: ALL  (slip={slip_pct:.1f}%)")
+        bals = _account_balances(key, secret)
+        # quick ticker map for USD pairs
+        skip = []
+        for base, pair_alt in pairs_map.items():
+            # find balance entry matching base (allow keys with prefixes)
+            vol = 0.0
+            for k, v in bals.items():
+                if k.upper() == base or k.upper().endswith(base):
+                    vol = max(vol, v)
+            if vol <= 0:
+                continue
+            # ignore very small est values (<$0.50)
+            bid = _best_bid_usd(pair_alt)
+            if bid * vol < 0.5:
+                skip.append(f"{base} (dust)")
+                continue
+            vol *= 0.999
+            ok, msg = _sell_one(pair_alt, vol, slip_pct, key, secret)
+            results.append(msg)
+            sold_any = sold_any or ok
+
+        if not results:
+            results.append("[INFO] Nothing to sell (no balances with USD pairs).")
+        if skip:
+            results.append("[INFO] Skipped tiny dust: " + ", ".join(skip))
+
+    # Write summary block
+    _append_summary([
+        f"- Request: symbol='{sym_in}', slip='{slip_pct} %'",
+        *[f"- {line}" for line in results],
+    ])
+
+    # Print final outcome to logs
+    for line in results:
+        print(line)
+    if sold_any:
+        print("[RESULT] One or more sell orders placed.")
+    else:
+        print("[RESULT] No orders placed.")
 
 if __name__ == "__main__":
     main()
