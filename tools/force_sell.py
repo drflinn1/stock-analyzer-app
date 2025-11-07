@@ -25,7 +25,6 @@ import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 from urllib.parse import urlencode
-
 import urllib.request
 
 STATE_DIR = Path(".state")
@@ -38,7 +37,6 @@ def _kraken_request(uri_path: str, data: Dict = None, key: str = "", secret: str
     """Minimal Kraken REST client (no external deps)."""
     data = data or {}
     postdata = urlencode(data).encode()
-    headers = {}
 
     if uri_path.startswith("/0/private/"):
         if not key or not secret:
@@ -55,12 +53,12 @@ def _kraken_request(uri_path: str, data: Dict = None, key: str = "", secret: str
         headers = {
             "API-Key": key,
             "API-Sign": sigdigest.decode(),
-            "User-Agent": "force-sell/1.0",
+            "User-Agent": "force-sell/1.1",
             "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
         }
         req = urllib.request.Request(API_URL + uri_path, data=postdata, headers=headers)
     else:
-        req = urllib.request.Request(API_URL + uri_path, headers={"User-Agent": "force-sell/1.0"})
+        req = urllib.request.Request(API_URL + uri_path, headers={"User-Agent": "force-sell/1.1"})
 
     with urllib.request.urlopen(req) as resp:
         raw = resp.read()
@@ -87,7 +85,6 @@ def _best_bid_usd(pair_altname: str) -> float:
     res = _kraken_request("/0/public/Ticker?pair=" + pair_altname)
     if "result" not in res:
         return 0.0
-    # result key can vary; pull the first
     first_key = next(iter(res["result"]))
     bid = float(res["result"][first_key]["b"][0])
     return bid
@@ -97,8 +94,6 @@ def _account_balances(key: str, secret: str) -> Dict[str, float]:
     if res.get("error"):
         raise RuntimeError(f"[ERROR] Balance: {res['error']}")
     raw = res.get("result", {})
-    # Normalize asset keys like 'XXBT' -> 'XBT' (Kraken idiosyncrasies). We'll rely on USD pair map for matching.
-    # Here we just pass raw keys; matching is done by USD map 'altname' bases.
     return {k.replace("Z", "").replace("X", ""): float(v) for k, v in raw.items()}
 
 def _format_sym(user_sym: str) -> str:
@@ -127,7 +122,7 @@ def _sell_one(pair_altname: str, vol: float, slip_pct: float, key: str, secret: 
         "type": "sell",
         "pair": pair_altname,
         "volume": f"{vol:.8f}",
-        "oflags": "viqc",  # volume in quote currency flag is harmless for market sells
+        "oflags": "viqc",
     }
     res = _kraken_request("/0/private/AddOrder", data, key, secret)
     if not res.get("error"):
@@ -138,17 +133,18 @@ def _sell_one(pair_altname: str, vol: float, slip_pct: float, key: str, secret: 
 
     # 2) LIMIT fallback if price protection / similar
     bid = _best_bid_usd(pair_altname)
-    limit_px = bid * (1.0 - slip_pct / 100.0)
+    # ---- precision clamp: 5 decimals to satisfy Kraken tick-size rules
+    limit_px = round(bid * (1.0 - slip_pct / 100.0), 5)
     data2 = {
         "ordertype": "limit",
         "type": "sell",
         "pair": pair_altname,
         "volume": f"{vol:.8f}",
-        "price": f"{limit_px:.8f}",
+        "price": f"{limit_px:.5f}",   # format to 5 dp as well
     }
     res2 = _kraken_request("/0/private/AddOrder", data2, key, secret)
     if not res2.get("error"):
-        return True, f"[SELL] LIMIT {vol} {pair_altname} @ ~{limit_px:.8f} -> OK (fallback after: {err_text})"
+        return True, f"[SELL] LIMIT {vol} {pair_altname} @ ~{limit_px:.5f} -> OK (fallback after: {err_text})"
     err2 = res2.get("error", [])
     err2_text = ", ".join(err2) if isinstance(err2, list) else str(err2)
     return False, f"[ERROR] MARKET failed: {err_text} | LIMIT fallback failed: {err2_text}"
@@ -171,10 +167,8 @@ def main():
         base = _format_sym(sym_in)
         if base not in pairs_map:
             raise SystemExit(f"[ERROR] No USD pair found for {base}.")
-        # volume from balances
         bals = _account_balances(key, secret)
         vol = 0.0
-        # balances keys may be Krakenized; try direct and fallback to exact base
         for k, v in bals.items():
             if k.upper() == base or k.upper().endswith(base):
                 vol = max(vol, v)
@@ -189,17 +183,14 @@ def main():
     else:
         print(f"[INFO] Selling: ALL  (slip={slip_pct:.1f}%)")
         bals = _account_balances(key, secret)
-        # quick ticker map for USD pairs
         skip = []
         for base, pair_alt in pairs_map.items():
-            # find balance entry matching base (allow keys with prefixes)
             vol = 0.0
             for k, v in bals.items():
                 if k.upper() == base or k.upper().endswith(base):
                     vol = max(vol, v)
             if vol <= 0:
                 continue
-            # ignore very small est values (<$0.50)
             bid = _best_bid_usd(pair_alt)
             if bid * vol < 0.5:
                 skip.append(f"{base} (dust)")
@@ -214,13 +205,11 @@ def main():
         if skip:
             results.append("[INFO] Skipped tiny dust: " + ", ".join(skip))
 
-    # Write summary block
     _append_summary([
         f"- Request: symbol='{sym_in}', slip='{slip_pct} %'",
         *[f"- {line}" for line in results],
     ])
 
-    # Print final outcome to logs
     for line in results:
         print(line)
     if sold_any:
