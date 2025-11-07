@@ -43,7 +43,6 @@ jobs:
           state = pathlib.Path(".state")
           state.mkdir(exist_ok=True, parents=True)
           rows = [
-              # symbol,quote,rank  (example stub; replace with your real scan logic)
               ("SOLUSD", "sol-usd", 1),
               ("BTCUSD", "btc-usd", 2),
               ("ETHUSD", "eth-usd", 3),
@@ -56,8 +55,9 @@ jobs:
           print("Wrote .state/momentum_candidates.csv")
           PY
 
+      # Your helper is at /scripts, so chmod that path:
       - name: Make push script executable
-        run: chmod +x .github/scripts/push_state.sh
+        run: chmod +x scripts/push_state.sh
 
       - name: Commit & push .state safely (rebase + retry)
-        run: .github/scripts/push_state.sh "Momentum Scan: update .state/momentum_candidates.csv"
+        run: ./scripts/push_state.sh 'Momentum Scan: update .state/momentum_candidates.csv'
