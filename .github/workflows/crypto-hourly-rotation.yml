@@ -14,19 +14,19 @@ on:
         required: false
         default: "25"
       TP_PCT:
-        description: "Take-profit % (e.g., 5)"
+        description: "Take-profit %"
         required: false
         default: "5"
       SL_PCT:
-        description: "Initial stop % (e.g., 1)"
+        description: "Initial stop %"
         required: false
         default: "1"
       SLOW_WINDOW_MIN:
-        description: "Rotation window minutes (e.g., 60)"
+        description: "Rotation window minutes"
         required: false
         default: "60"
       UNIVERSE_PICK:
-        description: "Optional fixed symbol to force (e.g., SOLUSD). Leave blank to auto-pick."
+        description: "Optional fixed symbol (e.g., SOLUSD). Leave blank to auto-pick."
         required: false
         default: ""
 
@@ -34,7 +34,6 @@ permissions:
   contents: read
   actions: read
 
-# No git commits from this job; it only uploads artifacts.
 concurrency:
   group: rotation-run-main
   cancel-in-progress: true
@@ -57,14 +56,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
 
-      - name: Echo critical env/vars
+      - name: Echo critical env/vars (safe)
+        env:
+          DRY_RUN: ${{ github.event.inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}
+          BUY_USD: ${{ github.event.inputs.BUY_USD || vars.BUY_USD || '25' }}
+          TP_PCT:  ${{ github.event.inputs.TP_PCT  || vars.TP_PCT  || '5' }}
+          SL_PCT:  ${{ github.event.inputs.SL_PCT  || vars.SL_PCT  || '1' }}
+          SLOW_WINDOW_MIN: ${{ github.event.inputs.SLOW_WINDOW_MIN || vars.SLOW_WINDOW_MIN || '60' }}
+          UNIVERSE_PICK: ${{ github.event.inputs.UNIVERSE_PICK || vars.UNIVERSE_PICK || '' }}
+          # Secrets (presence check only; values never printed)
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
-          echo "DRY_RUN=${{ github.event.inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}"
-          echo "BUY_USD=${{ github.event.inputs.BUY_USD || vars.BUY_USD || '25' }}"
-          echo "TP_PCT=${{ github.event.inputs.TP_PCT || vars.TP_PCT || '5' }}"
-          echo "SL_PCT=${{ github.event.inputs.SL_PCT || vars.SL_PCT || '1' }}"
-          echo "SLOW_WINDOW_MIN=${{ github.event.inputs.SLOW_WINDOW_MIN || vars.SLOW_WINDOW_MIN || '60' }}"
-          echo "UNIVERSE_PICK=${{ github.event.inputs.UNIVERSE_PICK || vars.UNIVERSE_PICK || '' }}"
+          echo "DRY_RUN=$DRY_RUN"
+          echo "BUY_USD=$BUY_USD"
+          echo "TP_PCT=$TP_PCT"
+          echo "SL_PCT=$SL_PCT"
+          echo "SLOW_WINDOW_MIN=$SLOW_WINDOW_MIN"
+          echo "UNIVERSE_PICK=$UNIVERSE_PICK"
+          if [ -n "${KRAKEN_API_KEY:-}" ]; then echo "Kraken API key: present"; else echo "Kraken API key: MISSING"; fi
+          if [ -n "${KRAKEN_API_SECRET:-}" ]; then echo "Kraken API secret: present"; else echo "Kraken API secret: MISSING"; fi
 
       - name: Ensure .state exists
         run: mkdir -p .state
@@ -77,6 +88,9 @@ jobs:
           SL_PCT:  ${{ github.event.inputs.SL_PCT  || vars.SL_PCT  || '1' }}
           SLOW_WINDOW_MIN: ${{ github.event.inputs.SLOW_WINDOW_MIN || vars.SLOW_WINDOW_MIN || '60' }}
           UNIVERSE_PICK: ${{ github.event.inputs.UNIVERSE_PICK || vars.UNIVERSE_PICK || '' }}
+          # 🔐 pass Kraken creds to main.py
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           python main.py
 
