@@ -18,6 +18,7 @@ jobs:
     timeout-minutes: 12
     permissions:
       contents: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,6 +27,18 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Preflight — check Kraken secrets
+        shell: bash
+        env:
+          HAS_KEY: ${{ secrets.KRAKEN_KEY }}
+          HAS_SECRET: ${{ secrets.KRAKEN_SECRET }}
+        run: |
+          if [[ -z "$HAS_KEY" || -z "$HAS_SECRET" ]]; then
+            echo "::error::Missing KRAKEN_KEY and/or KRAKEN_SECRET (repo Settings → Secrets and variables → Actions → Secrets)."
+            exit 1
+          fi
+          echo "Secrets detected."
 
       - name: Force sell
         env:
