@@ -51,14 +51,16 @@ jobs:
         env:
           KRAKEN_KEY:    ${{ secrets.KRAKEN_KEY    || secrets.KRAKEN_API_KEY }}
           KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET || secrets.KRAKEN_API_SECRET }}
-          DRY_RUN:       ${{ github.event.inputs.DRY_RUN || 'ON' }}
-          BUY_USD:       ${{ github.event.inputs.BUY_USD || '15' }}
-          TP_PCT:        ${{ github.event.inputs.TP_PCT || '5' }}
-          SL_PCT:        ${{ github.event.inputs.SL_PCT || '1' }}
-          HOLD_WINDOW_M: ${{ github.event.inputs.HOLD_WINDOW_M || '60' }}
-          SLOW_GAIN_PCT: ${{ github.event.inputs.SLOW_GAIN_PCT || '3' }}
-          FORCE_SELL:    ${{ github.event.inputs.FORCE_SELL || '' }}
-          SLIP_PCT:      ${{ github.event.inputs.SLIP_PCT || '3.0' }}
+
+          # 👇 For manual runs → github.event.inputs; for schedules → repo Variables; else default
+          DRY_RUN:       ${{ github.event.inputs.DRY_RUN        || vars.DRY_RUN        || 'ON' }}
+          BUY_USD:       ${{ github.event.inputs.BUY_USD        || vars.BUY_USD        || '15' }}
+          TP_PCT:        ${{ github.event.inputs.TP_PCT         || vars.TP_PCT         || '5' }}
+          SL_PCT:        ${{ github.event.inputs.SL_PCT         || vars.SL_PCT         || '1' }}
+          HOLD_WINDOW_M: ${{ github.event.inputs.HOLD_WINDOW_M  || vars.HOLD_WINDOW_M  || '60' }}
+          SLOW_GAIN_PCT: ${{ github.event.inputs.SLOW_GAIN_PCT  || vars.SLOW_GAIN_PCT  || '3' }}
+          FORCE_SELL:    ${{ github.event.inputs.FORCE_SELL     || vars.FORCE_SELL     || '' }}
+          SLIP_PCT:      ${{ github.event.inputs.SLIP_PCT       || vars.SLIP_PCT       || '3.0' }}
         run: python main.py
 
       # ---------------- Post-run cleanup (1): Dust Sweeper ----------------
@@ -68,9 +70,9 @@ jobs:
           KRAKEN_KEY:    ${{ secrets.KRAKEN_KEY    || secrets.KRAKEN_API_KEY }}
           KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET || secrets.KRAKEN_API_SECRET }}
           INPUT_SYMBOL:  "ALL"
-          INPUT_SLIP:    ${{ github.event.inputs.SLIP_PCT || '3.0' }}
-          DUST_MIN_USD:  "0.01"     # sweep dust >= 1 cent
-          FORCE_DUST:    "ON"       # try to sell even below DUST_MIN_USD (v1.3 will skip if under exchange min)
+          INPUT_SLIP:    ${{ github.event.inputs.SLIP_PCT || vars.SLIP_PCT || '3.0' }}
+          DUST_MIN_USD:  "0.01"
+          FORCE_DUST:    "ON"
           STABLES:       "USD,ZUSD,USDT,USDC"
         run: python tools/force_sell.py
 
@@ -80,13 +82,12 @@ jobs:
         env:
           KRAKEN_KEY:    ${{ secrets.KRAKEN_KEY    || secrets.KRAKEN_API_KEY }}
           KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET || secrets.KRAKEN_API_SECRET }}
-          SLIP_PCT:      ${{ github.event.inputs.SLIP_PCT || '3.0' }}
+          SLIP_PCT:      ${{ github.event.inputs.SLIP_PCT || vars.SLIP_PCT || '3.0' }}
           STABLES:       "USDT,USDC"
-          MIN_USD:       "0.50"     # ignore pocket change; adjust if you want
+          MIN_USD:       "0.50"
           WRITE_SUMMARY: "ON"
         run: python tools/convert_stables.py
 
-      # --------- Artifacts
       - name: Package .state as a zip
         if: always()
         run: |
