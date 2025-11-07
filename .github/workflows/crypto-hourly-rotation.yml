@@ -2,7 +2,7 @@ name: Crypto - 1-Coin Rotation (LIVE-ready, ultra-defensive, 15m)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"          # keep 15-minute cadence
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -10,12 +10,18 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write   # only used if COMMIT_STATE=ON
+  contents: write   # needed for committing .state
 
 env:
-  AUTO_SELL_ON_MULTI: "OFF"         # OFF=refuse to buy if >1 coin; ON:auto-sell extras (wire later)
+  # Guard & housekeeping
+  AUTO_SELL_ON_MULTI: "OFF"         # OFF=refuse to buy if >1 coin; ON:auto-sell extras (we can wire later)
   USD_CODES: "USD,ZUSD"
-  COMMIT_STATE: "OFF"               # OFF=default; set ON to commit .state to repo
+  COMMIT_STATE: "ON"                 # ON = also commit .state back to repo so you can see files in GitHub
+  # Threshold defaults (can be overridden via repo Variables/UI inputs)
+  TP_PCT: "5"
+  STOP_PCT: "1"
+  SLOW_MIN_PCT: "3"
+  WINDOW_MIN: "30"
 
 jobs:
   run:
@@ -43,10 +49,10 @@ jobs:
           mkdir -p .state
           echo "=== Runtime Vars ==="
           echo "DRY_RUN=${{ github.event.inputs.DRY_RUN || env.DRY_RUN || 'ON' }}"
-          echo "TP_PCT=${TP_PCT:=5}"
-          echo "STOP_PCT=${STOP_PCT:=1}"
-          echo "SLOW_MIN_PCT=${SLOW_MIN_PCT:=3}"
-          echo "WINDOW_MIN=${WINDOW_MIN:=30}"
+          echo "TP_PCT=${TP_PCT}"
+          echo "STOP_PCT=${STOP_PCT}"
+          echo "SLOW_MIN_PCT=${SLOW_MIN_PCT}"
+          echo "WINDOW_MIN=${WINDOW_MIN}"
           echo "UNIVERSE_PICK=${UNIVERSE_PICK}"
           echo "AUTO_SELL_ON_MULTI=${AUTO_SELL_ON_MULTI}"
           echo "COMMIT_STATE=${COMMIT_STATE}"
@@ -76,7 +82,7 @@ jobs:
             sha256 = hashlib.sha256(msg).digest()
             mac = hmac.new(base64.b64decode(sec), path.encode()+sha256, hashlib.sha512)
             sig = base64.b64encode(mac.digest()).decode()
-            r = requests.post(url, headers={"API-Key": os.getenv("KRAKEN_API_KEY"), "API-Sign": sig}, data=data, timeout=20)
+            r = requests.post(url, headers={"API-Key": key, "API-Sign": sig}, data=data, timeout=20)
             return r.json()
 
           bal = kraken_private("/0/private/Balance", {})
@@ -120,19 +126,34 @@ jobs:
           if [ ! -f ".state/run_summary.md" ]; then
             {
               echo "**When:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-              echo "**DRY_RUN:** ${DRY_RUN:-ON}"
-              echo "**TP_PCT:** ${TP_PCT:-5} | **STOP_PCT:** ${STOP_PCT:-1} | **SLOW_MIN_PCT:** ${SLOW_MIN_PCT:-3} | **WINDOW_MIN:** ${WINDOW_MIN:-30}"
-              echo "**Note:** Auto-generated summary because the bot didn’t emit one this run."
+              echo "**Live (DRY_RUN=OFF):** ${DRY_RUN:-ON} != OFF"
+              echo "**Pick (symbol):**"
+              echo "**BUY_USD:** ${BUY_USD:-25.0}"
+              echo "**Status:**"
+              echo ""
+              echo "### Details"
+              echo '```json'
+              echo "{"
+              echo "  \"when\": \"$(date -u '+%Y-%m-%dT%H:%M:%S+00:00')\","
+              echo "  \"live\": ${DRY_RUN:-ON} = OFF,";
+              echo "  \"buy_usd\": ${BUY_USD:-25.0},"
+              echo "  \"thresholds\": {"
+              echo "    \"tp_pct\": ${TP_PCT:-5},"
+              echo "    \"stop_pct\": ${STOP_PCT:-1},"
+              echo "    \"slow_min_pct\": ${SLOW_MIN_PCT:-3},"
+              echo "    \"window_min\": ${WINDOW_MIN:-30}"
+              echo "  }"
+              echo "}"
+              echo '```'
             } > .state/run_summary.md
           fi
           if [ ! -f ".state/position.json" ]; then
             printf '{"symbol":null,"qty":0,"avg_price":0,"in_position_since":null}\n' > .state/position.json
           fi
           echo "=== ls -la .state (after write) ==="; ls -la .state
-          echo "=== stat files ==="; stat .state/run_summary.md; stat .state/position.json
           sync; sleep 1
 
-      # ---- Robust artifact packaging (fixes directory flakiness) ----
+      # Robust artifact packaging
       - name: Package .state as tar.gz
         run: |
           set -e
@@ -147,7 +168,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: (Optional) Commit .state back to repo
+      - name: Commit .state back to repo (enabled)
         if: env.COMMIT_STATE == 'ON'
         run: |
           set -e
