@@ -1,59 +1,79 @@
-name: Crypto Force Sell (One-Time)
+name: Crypto — Force Sell (One-Time)
 
 on:
   workflow_dispatch:
     inputs:
+      DRY_RUN:
+        description: "ON or OFF (OFF = place real sell orders)"
+        required: false
+        default: "OFF"
       SYMBOL:
-        description: "Symbol to sell (e.g., SOON, SOONUSD, SOON/USD, or ALL)"
+        description: "Symbol to sell (e.g., SOLUSD or ALL)"
         required: true
         default: "ALL"
       SLIP_PCT:
-        description: "If market is blocked by price-protection, retry as LIMIT this % through the book (e.g., 3.0)"
-        required: true
+        description: "If market blocks, retry as LIMIT this % through the book (e.g., 3.0)"
+        required: false
         default: "3.0"
 
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: force-sell-singleton
+  cancel-in-progress: false
+
 jobs:
-  run:
+  force_sell:
     runs-on: ubuntu-latest
     timeout-minutes: 12
-    permissions: { contents: write }
-
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # Accept either secret naming scheme
-      - name: Preflight — check Kraken secrets
-        shell: bash
-        env:
-          A: ${{ secrets.KRAKEN_KEY }}
-          B: ${{ secrets.KRAKEN_SECRET }}
-          C: ${{ secrets.KRAKEN_API_KEY }}
-          D: ${{ secrets.KRAKEN_API_SECRET }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
         run: |
-          KEY="${A:-$C}"
-          SEC="${B:-$D}"
-          if [[ -z "$KEY" || -z "$SEC" ]]; then
-            echo "::error::Missing Kraken secrets. Add KRAKEN_KEY/KRAKEN_SECRET or KRAKEN_API_KEY/KRAKEN_API_SECRET."
-            exit 1
-          fi
-          echo "KEY_OK=1" >> $GITHUB_ENV
-          echo "SECRET_OK=1" >> $GITHUB_ENV
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
 
-      - name: Force sell
+      - name: Ensure .state exists
+        run: mkdir -p .state
+
+      - name: Echo inputs & secret presence (safe)
         env:
-          # Map to the names force_sell.py expects
-          KRAKEN_KEY: ${{ secrets.KRAKEN_KEY || secrets.KRAKEN_API_KEY }}
-          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET || secrets.KRAKEN_API_SECRET }}
-          INPUT_SYMBOL: ${{ github.event.inputs.SYMBOL }}
-          INPUT_SLIP: ${{ github.event.inputs.SLIP_PCT }}
-        run: python tools/force_sell.py
+          DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'OFF' }}
+          FORCE_SELL_SYMBOL: ${{ github.event.inputs.SYMBOL }}
+          FORCE_SELL_SLIP_PCT: ${{ github.event.inputs.SLIP_PCT || '3.0' }}
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        run: |
+          echo "DRY_RUN=$DRY_RUN"
+          echo "FORCE_SELL_SYMBOL=$FORCE_SELL_SYMBOL"
+          echo "FORCE_SELL_SLIP_PCT=$FORCE_SELL_SLIP_PCT"
+          if [ -n "${KRAKEN_API_KEY:-}" ]; then echo "Kraken API key: present"; else echo "Kraken API key: MISSING"; fi
+          if [ -n "${KRAKEN_API_SECRET:-}" ]; then echo "Kraken API secret: present"; else echo "Kraken API secret: MISSING"; fi
 
-      - name: Upload .state summary
+      - name: Run force sell
+        env:
+          DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'OFF' }}
+          FORCE_SELL_SYMBOL: ${{ github.event.inputs.SYMBOL }}
+          FORCE_SELL_SLIP_PCT: ${{ github.event.inputs.SLIP_PCT || '3.0' }}
+          # 🔐 Kraken creds passed to main.py
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        run: |
+          python main.py --force-sell
+
+      - name: Upload .state artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: force-sell-state
-          path: .state/**
-          if-no-files-found: ignore
+          name: force-sell-state-${{ github.run_id }}
+          path: ./.state/**
+          if-no-files-found: warn
