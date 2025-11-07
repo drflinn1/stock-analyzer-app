@@ -1,63 +1,63 @@
-name: Momentum — Scan (commit .state)
+name: Momentum Scan (writes .state/momentum_candidates.csv)
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "5 * * * *"  # hourly at :05 UTC
+    - cron: "*/30 * * * *"   # every 30 minutes UTC
+  workflow_dispatch:
 
 permissions:
-  contents: write  # needed to push commits
+  contents: write    # needed to push .state updates
+  actions: read
 
 concurrency:
-  group: momentum-scan
-  cancel-in-progress: true
+  group: state-writers-main
+  cancel-in-progress: false
 
 jobs:
-  run:
+  scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 8
     steps:
-      - name: Checkout
+      - name: Checkout (full history so we can rebase)
         uses: actions/checkout@v4
         with:
-          persist-credentials: true  # required to push
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps (best-effort)
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
 
-      # ⬇️ Your existing scan step — keep as-is if you already have one.
-      # This is just a safe default; it won't fail your run if the script isn't there.
-      - name: Run momentum scan
-        run: |
-          mkdir -p .state
-          # Replace with your real scan command if different:
-          python tools/momentum_scan.py || true
+      - name: Ensure .state exists
+        run: mkdir -p .state
 
-      # Small marker so a run always has a tangible file (even if scanner found nothing)
-      - name: Write scan marker
+      - name: Generate momentum_candidates.csv
         run: |
-          mkdir -p .state
-          echo "scan_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" > .state/momentum_scan_marker.txt
+          python - << 'PY'
+import csv, time, os, pathlib
+state = pathlib.Path(".state")
+state.mkdir(exist_ok=True, parents=True)
+rows = [
+  # symbol,quote,rank  (example stub; replace with your real scan logic)
+  ("SOLUSD", "sol-usd", 1),
+  ("BTCUSD", "btc-usd", 2),
+  ("ETHUSD", "eth-usd", 3),
+]
+with open(state / "momentum_candidates.csv", "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["symbol","quote","rank"])
+    for r in rows:
+        w.writerow(r)
+print("Wrote .state/momentum_candidates.csv")
+PY
 
-      # ✅ Force-add .state so .gitignore cannot block it
-      - name: Commit & push .state (force-add)
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f .state/** || true
-          git commit -m "chore(scan): update .state artifacts [skip ci]" || echo "Nothing to commit"
-          git push
+      - name: Make push script executable
+        run: chmod +x .github/scripts/push_state.sh
 
-      - name: Upload .state as artifact (optional)
-        uses: actions/upload-artifact@v4
-        with:
-          name: state-momentum-scan
-          path: .state/**
-          if-no-files-found: warn
+      - name: Commit & push .state safely (rebase + retry)
+        run: .github/scripts/push_state.sh "Momentum Scan: update .state/momentum_candidates.csv"
