@@ -55,9 +55,9 @@ jobs:
           print("Wrote .state/momentum_candidates.csv")
           PY
 
-      # Your helper is at /scripts, so chmod that path:
       - name: Make push script executable
         run: chmod +x scripts/push_state.sh
 
       - name: Commit & push .state safely (rebase + retry)
-        run: ./scripts/push_state.sh 'Momentum Scan: update .state/momentum_candidates.csv'
+        run: |
+          ./scripts/push_state.sh "Momentum Scan: update .state/momentum_candidates.csv"
