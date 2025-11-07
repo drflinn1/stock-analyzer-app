@@ -16,39 +16,39 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 12
-    permissions:
-      contents: write
-    environment: LIVE  # <-- use your exact Environment name
+    permissions: { contents: write }
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
+      # Accept either secret naming scheme
       - name: Preflight — check Kraken secrets
         shell: bash
         env:
-          HAS_KEY: ${{ secrets.KRAKEN_KEY }}
-          HAS_SECRET: ${{ secrets.KRAKEN_SECRET }}
+          A: ${{ secrets.KRAKEN_KEY }}
+          B: ${{ secrets.KRAKEN_SECRET }}
+          C: ${{ secrets.KRAKEN_API_KEY }}
+          D: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
-          if [[ -z "$HAS_KEY" || -z "$HAS_SECRET" ]]; then
-            echo "::error::Missing KRAKEN_KEY and/or KRAKEN_SECRET (Environment or repo Secrets)."
+          KEY="${A:-$C}"
+          SEC="${B:-$D}"
+          if [[ -z "$KEY" || -z "$SEC" ]]; then
+            echo "::error::Missing Kraken secrets. Add KRAKEN_KEY/KRAKEN_SECRET or KRAKEN_API_KEY/KRAKEN_API_SECRET."
             exit 1
           fi
-          echo "Secrets detected."
+          echo "KEY_OK=1" >> $GITHUB_ENV
+          echo "SECRET_OK=1" >> $GITHUB_ENV
 
       - name: Force sell
         env:
-          KRAKEN_KEY: ${{ secrets.KRAKEN_KEY }}
-          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET }}
+          # Map to the names force_sell.py expects
+          KRAKEN_KEY: ${{ secrets.KRAKEN_KEY || secrets.KRAKEN_API_KEY }}
+          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET || secrets.KRAKEN_API_SECRET }}
           INPUT_SYMBOL: ${{ github.event.inputs.SYMBOL }}
           INPUT_SLIP: ${{ github.event.inputs.SLIP_PCT }}
-        run: |
-          python tools/force_sell.py
+        run: python tools/force_sell.py
 
       - name: Upload .state summary
         if: always()
