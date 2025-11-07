@@ -18,6 +18,7 @@ jobs:
     timeout-minutes: 12
     permissions:
       contents: write
+    environment: LIVE  # <-- use your exact Environment name
 
     steps:
       - name: Checkout
@@ -35,7 +36,7 @@ jobs:
           HAS_SECRET: ${{ secrets.KRAKEN_SECRET }}
         run: |
           if [[ -z "$HAS_KEY" || -z "$HAS_SECRET" ]]; then
-            echo "::error::Missing KRAKEN_KEY and/or KRAKEN_SECRET (repo Settings → Secrets and variables → Actions → Secrets)."
+            echo "::error::Missing KRAKEN_KEY and/or KRAKEN_SECRET (Environment or repo Secrets)."
             exit 1
           fi
           echo "Secrets detected."
