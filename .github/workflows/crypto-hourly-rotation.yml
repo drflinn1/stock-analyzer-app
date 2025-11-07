@@ -10,12 +10,13 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write   # needed only if COMMIT_STATE=ON
 
 env:
-  # Guard behavior (safe defaults)
-  AUTO_SELL_ON_MULTI: "OFF"         # OFF = refuse to buy if >1 coin; ON = auto-sell extras to keep 1
-  USD_CODES: "USD,ZUSD"             # Kraken may use ZUSD in Balance
+  # Guard & housekeeping
+  AUTO_SELL_ON_MULTI: "OFF"         # OFF=refuse to buy if >1 coin; ON=auto-sell extras (wire later)
+  USD_CODES: "USD,ZUSD"
+  COMMIT_STATE: "OFF"               # OFF=default; set to ON if you want .state committed to repo
 
 jobs:
   run:
@@ -49,6 +50,7 @@ jobs:
           echo "WINDOW_MIN=${WINDOW_MIN:=30}"
           echo "UNIVERSE_PICK=${UNIVERSE_PICK}"
           echo "AUTO_SELL_ON_MULTI=${AUTO_SELL_ON_MULTI}"
+          echo "COMMIT_STATE=${COMMIT_STATE}"
           echo "=== ls -la .state (before) ==="
           ls -la .state || true
 
@@ -66,58 +68,45 @@ jobs:
             key = os.getenv("KRAKEN_API_KEY","")
             sec = os.getenv("KRAKEN_API_SECRET","")
             if not key or not sec:
-              return {"error":["EAPI:MissingKeySecret"], "result":{}}
+              print("[GUARD] Missing keys; skipping guard.")
+              sys.exit(0)
             url = "https://api.kraken.com" + path
             data["nonce"] = str(int(time.time()*1000))
             postdata = urllib.parse.urlencode(data)
-            # Kraken signature
-            encoded = (str(data["nonce"]) + postdata).encode()
-            sha256 = hashlib.sha256(encoded).digest()
-            message = path.encode() + sha256
-            mac = hmac.new(base64.b64decode(sec), message, hashlib.sha512)
-            sig = base64.b64encode(mac.digest())
-            headers = {"API-Key": key, "API-Sign": sig.decode()}
-            r = requests.post(url, headers=headers, data=data, timeout=20)
+            # sign
+            msg = (str(data["nonce"]) + postdata).encode()
+            sha256 = hashlib.sha256(msg).digest()
+            mac = hmac.new(base64.b64decode(sec), path.encode()+sha256, hashlib.sha512)
+            sig = base64.b64encode(mac.digest()).decode()
+            r = requests.post(url, headers={"API-Key": key, "API-Sign": sig}, data=data, timeout=20)
             return r.json()
 
-          # Fetch balances
           bal = kraken_private("/0/private/Balance", {})
+          if bal.get("error"):
+            print("[GUARD] Balance error; skipping:", bal["error"])
+            sys.exit(0)
+
           usd_codes = set(os.getenv("USD_CODES","USD,ZUSD").split(","))
-          # If no keys or error, skip guard safely
-          if "error" in bal and bal["error"]:
-            print("[GUARD] Balance error or missing keys; skipping guard:", bal["error"])
+          balances = {a:float(v) for a,v in (bal.get("result") or {}).items() if float(v) > 0.0000001}
+          nonusd = {a:v for a,v in balances.items() if a not in usd_codes}
+          print("[GUARD] Non-USD holdings:", nonusd)
+
+          if len(nonusd) <= 1:
             sys.exit(0)
 
-          balances = bal.get("result", {}) or {}
-          nonusd = {a:float(v) for a,v in balances.items() if a not in usd_codes and float(v) > 0.0000001}
-
-          # Count non-USD assets that are > ~dust
-          n = len(nonusd)
-          print("[GUARD] Non-USD holdings:", json.dumps(nonusd))
-          if n <= 1:
-            sys.exit(0)
-
-          # More than one coin → enforce single-position policy
           os.makedirs(".state", exist_ok=True)
-          with open(".state/run_summary.md", "w") as f:
+          with open(".state/run_summary.md","w") as f:
             f.write(f"**When:** {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n")
             f.write("**Policy:** Single-position enforced\n")
             f.write(f"**Detected non-USD assets:** {json.dumps(nonusd)}\n")
-            f.write("**Action:** ")
-
             if os.getenv("AUTO_SELL_ON_MULTI","OFF").upper() != "ON":
-              f.write("Refused to buy (AUTO_SELL_ON_MULTI=OFF). Fix manually or run Force Sell.\n")
-              print("[GUARD] >1 coins detected; refusing to buy (safe mode).")
-              # exit 0 so job is green but rotation is skipped
+              f.write("**Action:** Refused to buy (AUTO_SELL_ON_MULTI=OFF). Use Force Sell to clear extras.\n")
+              print("[GUARD] >1 coins → refusing to buy (safe mode).")
               sys.exit(0)
             else:
-              f.write("Auto-sell is ON, attempting to reduce to 1 asset.\n")
-
-          # Optional auto-sell path (kept off by default to avoid surprises)
-          # NOTE: We DO NOT implement sells here to avoid pair-symbol ambiguity.
-          # Leave a clear message and exit; you can turn ON and we’ll wire exact pairs later.
-          print("[GUARD] Auto-sell not executed in safe build. Set AUTO_SELL_ON_MULTI=ON and ask for pair mapping if you want this enabled.")
-          sys.exit(0)
+              f.write("**Action:** Auto-sell requested (not wired in this safe build).\n")
+              print("[GUARD] Auto-sell requested; not enabled in safe build.")
+              sys.exit(0)
           PY
 
       - name: Run main.py (bot)
@@ -141,12 +130,28 @@ jobs:
           if [ ! -f ".state/position.json" ]; then
             printf '{"symbol":null,"qty":0,"avg_price":0,"in_position_since":null}\n' > .state/position.json
           fi
-          echo "=== ls -la .state (after) ==="
+          echo "=== ls -la .state (after write) ==="
           ls -la .state
+          echo "=== stat files ==="
+          stat .state/run_summary.md || true
+          stat .state/position.json || true
+          sync
+          sleep 2
 
       - name: Upload .state (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: state
-          path: .state            # upload the directory (stops the warning)
+          path: .state           # upload the directory
           if-no-files-found: warn
+          retention-days: 7
+
+      - name: (Optional) Commit .state back to repo
+        if: env.COMMIT_STATE == 'ON'
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .state/* || true
+          git commit -m "chore(.state): update rotation artifacts [skip ci]" || echo "No changes to commit"
+          git push || echo "No push (detached HEAD on PR?)"
