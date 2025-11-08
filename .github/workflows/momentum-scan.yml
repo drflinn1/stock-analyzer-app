@@ -1,63 +1,75 @@
-name: Momentum Scan (writes .state/momentum_candidates.csv)
+name: Momentum — Scan (writes momentum_candidates.csv)
 
 on:
   schedule:
     - cron: "*/30 * * * *"   # every 30 minutes UTC
-  workflow_dispatch:
-
-permissions:
-  contents: write
-  actions: read
-
-concurrency:
-  group: state-writers-main
-  cancel-in-progress: false
+  workflow_dispatch: {}
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 8
+
+    permissions:
+      contents: write
+
+    env:
+      DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}
+      SCAN_LIMIT: ${{ vars.SCAN_LIMIT || '12' }}
+
     steps:
-      - name: Checkout (full history so we can rebase)
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt || true
+          fi
+          pip install pyyaml matplotlib || true
 
-      - name: Ensure .state exists
-        run: mkdir -p .state
-
-      - name: Generate momentum_candidates.csv
+      - name: Ensure .state exists and seed placeholders
         run: |
-          python - << 'PY'
-          import csv, pathlib
-          state = pathlib.Path(".state")
-          state.mkdir(exist_ok=True, parents=True)
-          rows = [
-              ("SOLUSD", "sol-usd", 1),
-              ("BTCUSD", "btc-usd", 2),
-              ("ETHUSD", "eth-usd", 3),
-          ]
-          with open(state / "momentum_candidates.csv", "w", newline="") as f:
-              w = csv.writer(f)
-              w.writerow(["symbol","quote","rank"])
-              for r in rows:
-                  w.writerow(r)
-          print("Wrote .state/momentum_candidates.csv")
-          PY
+          mkdir -p .state
+          # Seed an empty-but-valid CSV header to prevent artifact warnings if scan produces nothing
+          if [ ! -f .state/momentum_candidates.csv ]; then
+            echo "symbol,quote,rank" > .state/momentum_candidates.csv
+          fi
+          if [ ! -f .state/scan_summary.md ]; then
+            echo "# Momentum Scan Summary" > .state/scan_summary.md
+            echo "*When:* $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> .state/scan_summary.md
+            echo "*Note:* Seeded; the scanner will overwrite if it finds candidates." >> .state/scan_summary.md
+          fi
 
-      - name: Make push script executable
-        run: chmod +x scripts/push_state.sh
-
-      - name: Commit & push .state safely (rebase + retry)
+      - name: Run scanner
+        id: runscan
+        shell: bash
         run: |
-          ./scripts/push_state.sh "Momentum Scan: update .state/momentum_candidates.csv"
+          set -e
+          echo "DRY_RUN=${DRY_RUN}  SCAN_LIMIT=${SCAN_LIMIT}"
+
+          # If you have a dedicated scanner file, call it here; otherwise, use main.py with a flag.
+          if [ -f momentum_scan.py ]; then
+            python momentum_scan.py
+          else
+            # Fallback: call main.py with a mode if your script supports it; otherwise this no-ops.
+            python main.py --scan || true
+          fi
+
+          # Reconfirm .state exists
+          mkdir -p .state
+
+      - name: Upload scan artifacts (CSV + summary)
+        uses: actions/upload-artifact@v4
+        with:
+          name: momentum-scan-${{ github.run_id }}
+          path: |
+            .state/momentum_candidates.csv
+            .state/scan_summary.md
+          if-no-files-found: ignore
