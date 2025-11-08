@@ -2,7 +2,7 @@ name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "0 * * * *"   # hourly at minute 0 UTC
   workflow_dispatch:
 
 permissions:
@@ -15,7 +15,8 @@ jobs:
     timeout-minutes: 12
 
     env:
-      DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}             # ON=paper / OFF=live
+      # Flip in Settings → Secrets and variables → Actions → Variables
+      DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}             # ON=paper, OFF=live
       BUY_USD: ${{ vars.BUY_USD || '25' }}
       TP_PCT: ${{ vars.TP_PCT || '5' }}
       STOP_PCT: ${{ vars.STOP_PCT || '1' }}
@@ -23,7 +24,7 @@ jobs:
       SLOW_GAIN_REQ: ${{ vars.SLOW_GAIN_REQ || '3' }}
       UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK || '' }}
 
-      # Keys (either canonical or legacy names in Secrets)
+      # Keys (canonical or legacy)
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || secrets.KRAKEN_KEY || '' }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || secrets.KRAKEN_SECRET || '' }}
 
@@ -64,7 +65,7 @@ jobs:
           fi
           echo "Keys present check: OK."
 
-      # Guarantee artifact presence even if Python exits early
+      # Always have something to upload
       - name: Prepare .state placeholder
         run: |
           mkdir -p .state
@@ -75,11 +76,16 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/src:${{ github.workspace }}/trader
         run: |
           python -u main.py || true
-          ls -la .state
+          echo "Contents of .state after run:"
+          ls -la .state || true
+          tar -czf state_bundle.tgz .state || true
+          echo "Created state_bundle.tgz size:" $(du -h state_bundle.tgz | cut -f1)
 
-      - name: Upload .state artifacts
+      - name: Upload .state artifacts (folder + tarball)
         uses: actions/upload-artifact@v4
         with:
           name: crypto-hourly-rotation-${{ github.run_id }}
-          path: .state/**
+          path: |
+            .state
+            state_bundle.tgz
           if-no-files-found: warn
