@@ -2,66 +2,31 @@ name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "0 * * * *"   # run hourly at minute 0 (UTC)
   workflow_dispatch:
-    inputs:
-      DRY_RUN:
-        description: "ON = simulate, OFF = live trading"
-        required: true
-        default: "ON"
-      TP_PCT:
-        description: "Take profit percent (e.g., 5 for 5%)"
-        required: false
-        default: ""
-      SL_PCT:
-        description: "Stop loss percent (e.g., 1 for 1%)"
-        required: false
-        default: ""
-      SLOW_WINDOW_MIN:
-        description: "Rotation window minutes (e.g., 60)"
-        required: false
-        default: ""
-      BUY_USD:
-        description: "Per-trade buy size in USD"
-        required: false
-        default: ""
-      UNIVERSE_PICK:
-        description: "Optional single pair to force (e.g., SOLUSD). Leave blank for scanner."
-        required: false
-        default: ""
+
+permissions:
+  contents: write   # needed for artifact upload and (optionally) committing .state files
+  actions: read
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: write
+    timeout-minutes: 12
 
     env:
-      VARS_SNAPSHOT: ${{ toJSON(vars) }}
-      RAW_INPUTS: ${{ toJSON(github.event.inputs) }}
+      # Pull from Repository Variables when present, otherwise defaults below.
+      DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}             # ON=paper / OFF=live
+      BUY_USD: ${{ vars.BUY_USD || '25' }}
+      TP_PCT: ${{ vars.TP_PCT || '5' }}               # take-profit %
+      STOP_PCT: ${{ vars.STOP_PCT || '1' }}           # stop-loss %
+      WINDOW_MIN: ${{ vars.WINDOW_MIN || '60' }}      # rotation window minutes
+      SLOW_GAIN_REQ: ${{ vars.SLOW_GAIN_REQ || '3' }} # min gain within window
+      UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK || '' }}  # optional single pair (e.g., SOL/USD)
 
-      # Legacy vars (if present)
-      _TP_VAR:          ${{ vars.TAKE_PROFIT_PCT }}
-      _SL_VAR:          ${{ vars.STOP_LOSS_PCT }}
-      _SLOW_MIN_PCT:    ${{ vars.SLOW_MIN_PCT }}
-      _RUN_SWITCH:      ${{ vars.RUN_SWITCH }}
-      _BUY_VAR:         ${{ vars.BUY_USD }}
-      _PICK_VAR:        ${{ vars.UNIVERSE_PICK }}
-      _DRY_VAR:         ${{ vars.DRY_RUN }}
-      _WIN_VAR:         ${{ vars.SLOW_WINDOW_MIN }}
-
-      # UI inputs
-      _DRY_IN:  ${{ github.event.inputs.DRY_RUN }}
-      _TP_IN:   ${{ github.event.inputs.TP_PCT }}
-      _SL_IN:   ${{ github.event.inputs.SL_PCT }}
-      _WIN_IN:  ${{ github.event.inputs.SLOW_WINDOW_MIN }}
-      _BUY_IN:  ${{ github.event.inputs.BUY_USD }}
-      _PICK_IN: ${{ github.event.inputs.UNIVERSE_PICK }}
-
-      # Secrets (masked)
-      KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+      # Keys: look first for canonical names, then legacy alternates.
+      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || secrets.KRAKEN_KEY || '' }}
+      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || secrets.KRAKEN_SECRET || '' }}
 
     steps:
       - name: Checkout
@@ -72,129 +37,45 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install dependencies (force-install core deps incl. requests)
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
-          pip install pyyaml matplotlib || true
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt || true
+          fi
+          # Ensure these exist even if requirements.txt is absent/incomplete
+          pip install --upgrade --no-input requests pandas python-dateutil pyyaml
 
-      - name: Resolve and echo configuration (inputs win)
-        id: resolve
-        shell: bash
+      - name: Echo critical env (no secrets)
         run: |
-          echo "---- RAW INPUTS ----"
-          echo '${{ env.RAW_INPUTS }}'
-          echo "---- VARS SNAPSHOT ----"
-          echo '${{ env.VARS_SNAPSHOT }}'
-
-          DRY_IN="${_DRY_IN^^}"; DRY_VAR="${_DRY_VAR^^}"
-          DRY_RUN="${DRY_IN:-$DRY_VAR}"; DRY_RUN="${DRY_RUN:-ON}"
-          TP_PCT="${_TP_IN:-${_TP_VAR:-5}}"
-          SL_PCT="${_SL_IN:-${_SL_VAR:-1}}"
-          SLOW_WINDOW_MIN="${_WIN_IN:-${_WIN_VAR:-60}}"
-          BUY_USD="${_BUY_IN:-${_BUY_VAR:-25}}"
-          UNIVERSE_PICK="${_PICK_IN:-${_PICK_VAR:-}}"
-          SLOW_MIN_PCT="${_SLOW_MIN_PCT:-3}"
-          RUN_SWITCH="${_RUN_SWITCH:-ON}"
-
-          echo "---- RESOLVED ----"
-          echo "RUN_SWITCH=${RUN_SWITCH}"
           echo "DRY_RUN=${DRY_RUN}"
-          echo "TP_PCT=${TP_PCT}  SL_PCT=${SL_PCT}"
-          echo "SLOW_WINDOW_MIN=${SLOW_WINDOW_MIN}  SLOW_MIN_PCT=${SLOW_MIN_PCT}"
           echo "BUY_USD=${BUY_USD}"
-          echo "UNIVERSE_PICK=${UNIVERSE_PICK:-<blank>}"
+          echo "TP_PCT=${TP_PCT}"
+          echo "STOP_PCT=${STOP_PCT}"
+          echo "WINDOW_MIN=${WINDOW_MIN}"
+          echo "SLOW_GAIN_REQ=${SLOW_GAIN_REQ}"
+          echo "UNIVERSE_PICK=${UNIVERSE_PICK:-<empty>}"
 
-          {
-            echo "RUN_SWITCH=${RUN_SWITCH}"
-            echo "DRY_RUN=${DRY_RUN}"
-            echo "TP_PCT=${TP_PCT}";         echo "TAKE_PROFIT_PCT=${TP_PCT}"
-            echo "SL_PCT=${SL_PCT}";         echo "STOP_LOSS_PCT=${SL_PCT}"
-            echo "SLOW_WINDOW_MIN=${SLOW_WINDOW_MIN}"
-            echo "SLOW_MIN_PCT=${SLOW_MIN_PCT}"
-            echo "BUY_USD=${BUY_USD}"
-            echo "UNIVERSE_PICK=${UNIVERSE_PICK}"
-          } >> $GITHUB_ENV
-
-      - name: Live preflight (secrets & mode)
-        shell: bash
+      - name: Key sanity check (no secret values shown)
         run: |
-          echo "Mode: ${DRY_RUN}"
-          if [ "${DRY_RUN}" = "OFF" ]; then
-            if [ -z "${KRAKEN_API_KEY}" ] || [ -z "${KRAKEN_API_SECRET}" ]; then
-              echo "::error::DRY_RUN=OFF but Kraken secrets are missing."
-              exit 1
-            fi
-            echo "Kraken secrets present (masked)."
-          else
-            echo "DRY_RUN=ON (simulation)."
+          missing=0
+          if [ -z "${KRAKEN_API_KEY}" ]; then echo "::error::Missing KRAKEN_API_KEY (or KRAKEN_KEY)"; missing=1; fi
+          if [ -z "${KRAKEN_API_SECRET}" ]; then echo "::error::Missing KRAKEN_API_SECRET (or KRAKEN_SECRET)"; missing=1; fi
+          if [ "${DRY_RUN}" = "OFF" ] && [ $missing -ne 0 ]; then
+            echo "::error::LIVE mode requires API keys in repo Secrets."; exit 1
           fi
+          echo "Keys present check: OK (note: values not displayed)."
 
-      - name: Ensure .state exists and show any candidates
-        shell: bash
+      - name: Run rotation
+        env:
+          # Expose PYTHONPATH so `import trader...` works if you use a local package
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/src:${{ github.workspace }}/trader
         run: |
-          mkdir -p .state
-          touch .state/main_stdout.log
-          if [ -f .state/momentum_candidates.csv ]; then
-            echo "Top of .state/momentum_candidates.csv:"
-            head -n 20 .state/momentum_candidates.csv || true
-          else
-            echo "No local .state/momentum_candidates.csv found."
-          fi
+          python -u main.py
 
-      - name: Fallback to internal scanner if no candidates
-        if: env.UNIVERSE_PICK == ''
-        shell: bash
-        run: |
-          if [ ! -s .state/momentum_candidates.csv ] || [ "$(wc -l < .state/momentum_candidates.csv)" -le 1 ]; then
-            echo "No usable candidates CSV → setting UNIVERSE_PICK=AUTO for internal scan."
-            echo "UNIVERSE_PICK=AUTO" >> $GITHUB_ENV
-          fi
-          echo "Final UNIVERSE_PICK=${UNIVERSE_PICK:-<blank>}"
-
-      - name: Seed minimal summaries
-        run: |
-          [ -f .state/run_summary.md ] || {
-            echo "# Run Summary" > .state/run_summary.md
-            echo "*When:* $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> .state/run_summary.md
-            echo "*Note:* Seeded to avoid empty artifact warnings." >> .state/run_summary.md
-          }
-          [ -f .state/run_summary.json ] || echo '{"seeded": true, "when": "'$(date -u +%FT%TZ)'"}' > .state/run_summary.json
-
-      - name: Run bot main.py (capture logs, never drop artifacts)
-        id: runbot
-        shell: bash
-        run: |
-          set +e    # do NOT stop on error; we want to write diagnostics first
-          echo "----- BEGIN main.py -----"
-          echo "DRY_RUN=${DRY_RUN}"
-          echo "TP_PCT=${TP_PCT}  SL_PCT=${SL_PCT}"
-          echo "SLOW_WINDOW_MIN=${SLOW_WINDOW_MIN}  SLOW_MIN_PCT=${SLOW_MIN_PCT}"
-          echo "BUY_USD=${BUY_USD}"
-          echo "UNIVERSE_PICK=${UNIVERSE_PICK:-<blank>}"
-          python -X faulthandler -u main.py 2>&1 | tee -a .state/main_stdout.log
-          EXIT=${PIPESTATUS[0]}
-          echo "----- END main.py (exit ${EXIT}) -----" | tee -a .state/main_stdout.log
-
-          # Always write a small diagnostic so we have artifacts
-          TS=$(date -u +%FT%TZ)
-          echo "{\"when\":\"${TS}\",\"exit_code\":${EXIT},\"dry_run\":\"${DRY_RUN}\",\"tp\":${TP_PCT},\"sl\":${SL_PCT},\"window_min\":${SLOW_WINDOW_MIN},\"slow_min_pct\":${SLOW_MIN_PCT},\"buy_usd\":${BUY_USD},\"universe_pick\":\"${UNIVERSE_PICK}\"}" > .state/last_exit.json
-
-          if [ ${EXIT} -ne 0 ]; then
-            echo "----- DEBUG DUMP (.state) -----"
-            ls -la .state || true
-            echo "----- run_summary.json -----";   cat .state/run_summary.json 2>/dev/null || true
-            echo "----- run_summary.md -----";     sed -n '1,200p' .state/run_summary.md 2>/dev/null || true
-            echo "----- positions.json -----";      sed -n '1,200p' .state/positions.json 2>/dev/null || true
-            echo "----- kpi_history.csv (tail) -----"; tail -n 50 .state/kpi_history.csv 2>/dev/null || true
-            # Exit AFTER diagnostics are written, so artifacts always exist
-          fi
-          exit ${EXIT}
-
-      - name: Upload .state artifact (always)
-        if: always()
+      - name: Upload .state artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: state-${{ github.run_id }}
+          name: crypto-hourly-rotation-${{ github.run_id }}
           path: ./.state/**
           if-no-files-found: warn
