@@ -2,7 +2,7 @@ name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes UTC
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       DRY_RUN:
@@ -33,7 +33,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     permissions:
       contents: write
 
@@ -41,7 +41,7 @@ jobs:
       VARS_SNAPSHOT: ${{ toJSON(vars) }}
       RAW_INPUTS: ${{ toJSON(github.event.inputs) }}
 
-      # legacy repo vars if present
+      # legacy repo vars (may exist)
       _TP_VAR:          ${{ vars.TAKE_PROFIT_PCT }}
       _SL_VAR:          ${{ vars.STOP_LOSS_PCT }}
       _SLOW_MIN_PCT:    ${{ vars.SLOW_MIN_PCT }}
@@ -58,6 +58,10 @@ jobs:
       _WIN_IN:  ${{ github.event.inputs.SLOW_WINDOW_MIN }}
       _BUY_IN:  ${{ github.event.inputs.BUY_USD }}
       _PICK_IN: ${{ github.event.inputs.UNIVERSE_PICK }}
+
+      # secrets (masked by GitHub)
+      KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
+      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
     steps:
       - name: Checkout
@@ -112,13 +116,27 @@ jobs:
             echo "UNIVERSE_PICK=${UNIVERSE_PICK}"
           } >> $GITHUB_ENV
 
+      - name: Live preflight (secrets & mode)
+        shell: bash
+        run: |
+          echo "Mode: ${DRY_RUN}"
+          if [ "${DRY_RUN}" = "OFF" ]; then
+            if [ -z "${KRAKEN_API_KEY}" ] || [ -z "${KRAKEN_API_SECRET}" ]; then
+              echo "::error::DRY_RUN=OFF but Kraken secrets are missing."
+              exit 1
+            fi
+            echo "Kraken secrets present (masked)."
+          else
+            echo "DRY_RUN=ON (simulation)."
+          fi
+
       - name: Ensure .state exists and show any candidates
         shell: bash
         run: |
           mkdir -p .state
           if [ -f .state/momentum_candidates.csv ]; then
-            echo "Top of existing .state/momentum_candidates.csv:"
-            head -n 10 .state/momentum_candidates.csv || true
+            echo "Top of .state/momentum_candidates.csv:"
+            head -n 20 .state/momentum_candidates.csv || true
           else
             echo "No local .state/momentum_candidates.csv found."
           fi
@@ -127,9 +145,8 @@ jobs:
         if: env.UNIVERSE_PICK == ''
         shell: bash
         run: |
-          # If the file is missing or only has header, switch to AUTO so main.py scans internally.
           if [ ! -s .state/momentum_candidates.csv ] || [ "$(wc -l < .state/momentum_candidates.csv)" -le 1 ]; then
-            echo "No usable candidates CSV → setting UNIVERSE_PICK=AUTO (internal scanner)."
+            echo "No usable candidates CSV → setting UNIVERSE_PICK=AUTO for internal scan."
             echo "UNIVERSE_PICK=AUTO" >> $GITHUB_ENV
           fi
           echo "Final UNIVERSE_PICK=${UNIVERSE_PICK:-<blank>}"
@@ -143,22 +160,34 @@ jobs:
           }
           [ -f .state/run_summary.json ] || echo '{"seeded": true, "when": "'$(date -u +%FT%TZ)'"}' > .state/run_summary.json
 
-      - name: Run bot main.py
+      - name: Run bot main.py (verbose, capture logs)
         id: runbot
         shell: bash
         run: |
-          set -e
+          set -o pipefail
+          echo "----- BEGIN main.py -----"
           echo "DRY_RUN=${DRY_RUN}"
           echo "TP_PCT=${TP_PCT}  SL_PCT=${SL_PCT}"
           echo "SLOW_WINDOW_MIN=${SLOW_WINDOW_MIN}  SLOW_MIN_PCT=${SLOW_MIN_PCT}"
           echo "BUY_USD=${BUY_USD}"
           echo "UNIVERSE_PICK=${UNIVERSE_PICK:-<blank>}"
-          python main.py
-          mkdir -p .state
+          python -u main.py 2>&1 | tee .state/main_stdout.log
+          EXIT=${PIPESTATUS[0]}
+          echo "----- END main.py (exit ${EXIT}) -----"
+          if [ ${EXIT} -ne 0 ]; then
+            echo "----- DEBUG DUMP (.state) -----"
+            ls -la .state || true
+            echo "----- run_summary.json -----";   cat .state/run_summary.json 2>/dev/null || true
+            echo "----- run_summary.md -----";     sed -n '1,200p' .state/run_summary.md 2>/dev/null || true
+            echo "----- positions.json -----";      sed -n '1,200p' .state/positions.json 2>/dev/null || true
+            echo "----- kpi_history.csv (tail) -----"; tail -n 50 .state/kpi_history.csv 2>/dev/null || true
+            exit ${EXIT}
+          fi
 
-      - name: Upload .state artifact (no-warning even if empty)
+      - name: Upload .state artifact (always try)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
           path: ./.state/**
-          if-no-files-found: ignore
+          if-no-files-found: warn
