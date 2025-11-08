@@ -41,7 +41,7 @@ jobs:
       VARS_SNAPSHOT: ${{ toJSON(vars) }}
       RAW_INPUTS: ${{ toJSON(github.event.inputs) }}
 
-      # legacy repo vars (may exist)
+      # Legacy vars (if present)
       _TP_VAR:          ${{ vars.TAKE_PROFIT_PCT }}
       _SL_VAR:          ${{ vars.STOP_LOSS_PCT }}
       _SLOW_MIN_PCT:    ${{ vars.SLOW_MIN_PCT }}
@@ -59,7 +59,7 @@ jobs:
       _BUY_IN:  ${{ github.event.inputs.BUY_USD }}
       _PICK_IN: ${{ github.event.inputs.UNIVERSE_PICK }}
 
-      # secrets (masked by GitHub)
+      # Secrets (masked)
       KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
@@ -134,6 +134,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p .state
+          touch .state/main_stdout.log
           if [ -f .state/momentum_candidates.csv ]; then
             echo "Top of .state/momentum_candidates.csv:"
             head -n 20 .state/momentum_candidates.csv || true
@@ -160,20 +161,25 @@ jobs:
           }
           [ -f .state/run_summary.json ] || echo '{"seeded": true, "when": "'$(date -u +%FT%TZ)'"}' > .state/run_summary.json
 
-      - name: Run bot main.py (verbose, capture logs)
+      - name: Run bot main.py (capture logs, never drop artifacts)
         id: runbot
         shell: bash
         run: |
-          set -o pipefail
+          set +e    # do NOT stop on error; we want to write diagnostics first
           echo "----- BEGIN main.py -----"
           echo "DRY_RUN=${DRY_RUN}"
           echo "TP_PCT=${TP_PCT}  SL_PCT=${SL_PCT}"
           echo "SLOW_WINDOW_MIN=${SLOW_WINDOW_MIN}  SLOW_MIN_PCT=${SLOW_MIN_PCT}"
           echo "BUY_USD=${BUY_USD}"
           echo "UNIVERSE_PICK=${UNIVERSE_PICK:-<blank>}"
-          python -u main.py 2>&1 | tee .state/main_stdout.log
+          python -X faulthandler -u main.py 2>&1 | tee -a .state/main_stdout.log
           EXIT=${PIPESTATUS[0]}
-          echo "----- END main.py (exit ${EXIT}) -----"
+          echo "----- END main.py (exit ${EXIT}) -----" | tee -a .state/main_stdout.log
+
+          # Always write a small diagnostic so we have artifacts
+          TS=$(date -u +%FT%TZ)
+          echo "{\"when\":\"${TS}\",\"exit_code\":${EXIT},\"dry_run\":\"${DRY_RUN}\",\"tp\":${TP_PCT},\"sl\":${SL_PCT},\"window_min\":${SLOW_WINDOW_MIN},\"slow_min_pct\":${SLOW_MIN_PCT},\"buy_usd\":${BUY_USD},\"universe_pick\":\"${UNIVERSE_PICK}\"}" > .state/last_exit.json
+
           if [ ${EXIT} -ne 0 ]; then
             echo "----- DEBUG DUMP (.state) -----"
             ls -la .state || true
@@ -181,10 +187,11 @@ jobs:
             echo "----- run_summary.md -----";     sed -n '1,200p' .state/run_summary.md 2>/dev/null || true
             echo "----- positions.json -----";      sed -n '1,200p' .state/positions.json 2>/dev/null || true
             echo "----- kpi_history.csv (tail) -----"; tail -n 50 .state/kpi_history.csv 2>/dev/null || true
-            exit ${EXIT}
+            # Exit AFTER diagnostics are written, so artifacts always exist
           fi
+          exit ${EXIT}
 
-      - name: Upload .state artifact (always try)
+      - name: Upload .state artifact (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
