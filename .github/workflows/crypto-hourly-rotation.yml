@@ -37,20 +37,19 @@ jobs:
     permissions:
       contents: write
 
-    # Snapshot current repo variables (legacy names) so we can fall back safely.
     env:
       VARS_SNAPSHOT: ${{ toJSON(vars) }}
       RAW_INPUTS: ${{ toJSON(github.event.inputs) }}
 
-      # Legacy repo variable names (may or may not exist)
+      # legacy repo vars if present
       _TP_VAR:          ${{ vars.TAKE_PROFIT_PCT }}
       _SL_VAR:          ${{ vars.STOP_LOSS_PCT }}
-      _SLOW_MIN_PCT:    ${{ vars.SLOW_MIN_PCT }}         # e.g., 3 (% gain required by end of window)
-      _RUN_SWITCH:      ${{ vars.RUN_SWITCH }}           # ON/OFF master switch (optional)
+      _SLOW_MIN_PCT:    ${{ vars.SLOW_MIN_PCT }}
+      _RUN_SWITCH:      ${{ vars.RUN_SWITCH }}
       _BUY_VAR:         ${{ vars.BUY_USD }}
       _PICK_VAR:        ${{ vars.UNIVERSE_PICK }}
       _DRY_VAR:         ${{ vars.DRY_RUN }}
-      _WIN_VAR:         ${{ vars.SLOW_WINDOW_MIN }}      # if you already have a minutes var
+      _WIN_VAR:         ${{ vars.SLOW_WINDOW_MIN }}
 
       # UI inputs
       _DRY_IN:  ${{ github.event.inputs.DRY_RUN }}
@@ -84,18 +83,14 @@ jobs:
           echo "---- VARS SNAPSHOT ----"
           echo '${{ env.VARS_SNAPSHOT }}'
 
-          # Normalize DRY_RUN
-          DRY_IN="${_DRY_IN^^}"
-          DRY_VAR="${_DRY_VAR^^}"
-
-          # Inputs → Vars → Defaults
+          DRY_IN="${_DRY_IN^^}"; DRY_VAR="${_DRY_VAR^^}"
           DRY_RUN="${DRY_IN:-$DRY_VAR}"; DRY_RUN="${DRY_RUN:-ON}"
           TP_PCT="${_TP_IN:-${_TP_VAR:-5}}"
           SL_PCT="${_SL_IN:-${_SL_VAR:-1}}"
           SLOW_WINDOW_MIN="${_WIN_IN:-${_WIN_VAR:-60}}"
           BUY_USD="${_BUY_IN:-${_BUY_VAR:-25}}"
           UNIVERSE_PICK="${_PICK_IN:-${_PICK_VAR:-}}"
-          SLOW_MIN_PCT="${_SLOW_MIN_PCT:-3}"     # default 3% “must achieve by window end”
+          SLOW_MIN_PCT="${_SLOW_MIN_PCT:-3}"
           RUN_SWITCH="${_RUN_SWITCH:-ON}"
 
           echo "---- RESOLVED ----"
@@ -104,29 +99,43 @@ jobs:
           echo "TP_PCT=${TP_PCT}  SL_PCT=${SL_PCT}"
           echo "SLOW_WINDOW_MIN=${SLOW_WINDOW_MIN}  SLOW_MIN_PCT=${SLOW_MIN_PCT}"
           echo "BUY_USD=${BUY_USD}"
-          echo "UNIVERSE_PICK=${UNIVERSE_PICK:-<blank>} (blank = let scanner decide)"
+          echo "UNIVERSE_PICK=${UNIVERSE_PICK:-<blank>}"
 
-          # Export BOTH naming styles so main.py (old or new) works unchanged.
           {
             echo "RUN_SWITCH=${RUN_SWITCH}"
             echo "DRY_RUN=${DRY_RUN}"
-
-            echo "TP_PCT=${TP_PCT}"
-            echo "TAKE_PROFIT_PCT=${TP_PCT}"
-
-            echo "SL_PCT=${SL_PCT}"
-            echo "STOP_LOSS_PCT=${SL_PCT}"
-
+            echo "TP_PCT=${TP_PCT}";         echo "TAKE_PROFIT_PCT=${TP_PCT}"
+            echo "SL_PCT=${SL_PCT}";         echo "STOP_LOSS_PCT=${SL_PCT}"
             echo "SLOW_WINDOW_MIN=${SLOW_WINDOW_MIN}"
             echo "SLOW_MIN_PCT=${SLOW_MIN_PCT}"
-
             echo "BUY_USD=${BUY_USD}"
             echo "UNIVERSE_PICK=${UNIVERSE_PICK}"
           } >> $GITHUB_ENV
 
-      - name: Ensure .state exists and seed minimal summaries
+      - name: Ensure .state exists and show any candidates
+        shell: bash
         run: |
           mkdir -p .state
+          if [ -f .state/momentum_candidates.csv ]; then
+            echo "Top of existing .state/momentum_candidates.csv:"
+            head -n 10 .state/momentum_candidates.csv || true
+          else
+            echo "No local .state/momentum_candidates.csv found."
+          fi
+
+      - name: Fallback to internal scanner if no candidates
+        if: env.UNIVERSE_PICK == ''
+        shell: bash
+        run: |
+          # If the file is missing or only has header, switch to AUTO so main.py scans internally.
+          if [ ! -s .state/momentum_candidates.csv ] || [ "$(wc -l < .state/momentum_candidates.csv)" -le 1 ]; then
+            echo "No usable candidates CSV → setting UNIVERSE_PICK=AUTO (internal scanner)."
+            echo "UNIVERSE_PICK=AUTO" >> $GITHUB_ENV
+          fi
+          echo "Final UNIVERSE_PICK=${UNIVERSE_PICK:-<blank>}"
+
+      - name: Seed minimal summaries
+        run: |
           [ -f .state/run_summary.md ] || {
             echo "# Run Summary" > .state/run_summary.md
             echo "*When:* $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> .state/run_summary.md
