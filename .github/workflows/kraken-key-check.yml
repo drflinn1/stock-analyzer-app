@@ -13,14 +13,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-      - name: Call private /Balance
+        with:
+          python-version: "3.11"
+
+      - name: Call private /Balance (clear PASS/FAIL)
         run: |
           python - <<'PY'
-          import os, time, hmac, hashlib, base64, urllib.parse, requests, json
-          key=os.getenv("KRAKEN_API_KEY"); sec=os.getenv("KRAKEN_API_SECRET")
+          import os, time, hmac, hashlib, base64, urllib.parse, requests, json, sys
+          key=os.getenv("KRAKEN_API_KEY") or ""
+          sec=os.getenv("KRAKEN_API_SECRET") or ""
+          print("=== SANITY CHECK: Kraken REST /0/private/Balance ===")
+          print(f"KEY present? {'YES' if bool(key) else 'NO'}  | length={len(key)}")
+          print(f"SECRET present? {'YES' if bool(sec) else 'NO'}  | length={len(sec)}")
           if not key or not sec:
-              raise SystemExit("Missing KRAKEN_API_KEY/SECRET")
+              print("RESULT: FAIL — Missing KRAKEN_API_KEY/SECRET in repo Secrets.")
+              sys.exit(1)
+
           uri="https://api.kraken.com/0/private/Balance"
           path="/0/private/Balance"
           nonce=str(int(time.time()*1000))
@@ -31,13 +39,38 @@ jobs:
           mac=hmac.new(base64.b64decode(sec), (path.encode()+sha256), hashlib.sha512)
           sig=base64.b64encode(mac.digest()).decode()
           headers={"API-Key": key, "API-Sign": sig}
-          r=requests.post(uri, data=data, headers=headers, timeout=20)
+
+          try:
+              r=requests.post(uri, data=data, headers=headers, timeout=20)
+          except Exception as e:
+              print("HTTP ERROR:", e)
+              print("RESULT: FAIL — Network/HTTP error.")
+              sys.exit(1)
+
           print("HTTP", r.status_code)
-          print(r.text)
-          payload = r.json()
-          if payload.get("error")==[]:
-              print("OK: Auth works.")
+          try:
+              payload=r.json()
+          except Exception:
+              print("Raw response:", r.text[:4000])
+              print("RESULT: FAIL — Response not JSON.")
+              sys.exit(1)
+
+          print("JSON response:", json.dumps(payload, indent=2)[:4000])
+
+          errors=payload.get("error", [])
+          if errors==[]:
+              print("RESULT: PASS — Auth OK.")
+              sys.exit(0)
+
+          # Common Kraken error mappings
+          err = "; ".join(errors)
+          if "EAPI:Invalid key" in err:
+              print("RESULT: FAIL — EAPI:Invalid key (wrong key type, or pasted API Key incorrectly).")
+          elif "EAPI:Invalid signature" in err:
+              print("RESULT: FAIL — EAPI:Invalid signature (Private Key/secret mismatch).")
+          elif "EGeneral:Permission denied" in err:
+              print("RESULT: FAIL — Permission denied (missing Add Order / Query Funds / etc.).")
           else:
-              print("Auth failed:", payload.get("error"))
-              raise SystemExit(1)
+              print("RESULT: FAIL —", err or "Unknown error.")
+          sys.exit(1)
           PY
