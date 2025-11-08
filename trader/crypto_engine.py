@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Crypto engine with tight SELL GUARD + cost-basis backfill from trade history.
+Crypto engine with tight SELL GUARD + cost/amount compliance for Kraken.
 
 SELL knobs (Variables):
   SELL_HARD_STOP_PCT=3
@@ -16,7 +16,7 @@ Secrets: KRAKEN_API_KEY, KRAKEN_API_SECRET
 
 import os, json, time, math
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import ccxt
 
@@ -28,6 +28,7 @@ STABLES = {"USD","USDT","USDC","EUR","GBP"}
 EXCLUDE_TICKERS = {"SPX","PUMP","BABY","ALKIMI"}
 
 def _now(): return time.strftime("%Y-%m-%d %H:%M:%S")
+def _b(s, d): return str(s).lower() in {"1","true","yes","on"} if s is not None else d
 def _fi(name, default):
     try: return float(os.getenv(name, default))
     except: return float(default)
@@ -66,12 +67,8 @@ def pick_candidates(ex: ccxt.Exchange, top_k:int) -> List[Dict]:
             else: continue
         qv = float(t.get("quoteVolume") or 0.0)
         if qv < 10000: continue
-        out.append({
-            "symbol":sym,
-            "price":float(t.get("last") or t.get("close") or 0.0),
-            "change24h":float(ch),
-            "quoteVolUsd":qv
-        })
+        out.append({"symbol":sym,"price":float(t.get("last") or t.get("close") or 0.0),
+                    "change24h":float(ch),"quoteVolUsd":qv})
     out.sort(key=lambda r:(r["change24h"], r["quoteVolUsd"]), reverse=True)
     return out[:max(1,int(top_k))]
 
@@ -90,55 +87,74 @@ def fetch_positions_snapshot(ex: ccxt.Exchange):
 
 def get_cash_balance_usd(ex: ccxt.Exchange) -> float:
     """
-    Kraken sometimes exposes fiat as ZUSD inside balances.
-    Prefer 'free' (available) and fall back to 'total'.
+    Kraken often parks fiat as USD or ZUSD. Sum both.
     """
-    bal = ex.fetch_balance() or {}
-    def _free(code: str) -> float:
-        b = bal.get(code) or {}
-        return float(b.get("free") or b.get("total") or 0.0)
-    usd_free  = _free("USD")
-    zusd_free = _free("ZUSD")
-    return max(usd_free, zusd_free)
+    bal = ex.fetch_balance()
+    def _amt(code: str) -> float:
+        bucket = bal.get(code, {}) or {}
+        return float(bucket.get("free") or bucket.get("total") or 0.0)
+    return max(0.0, _amt("USD") + _amt("ZUSD"))
 
-def _ensure_min_notional(ex: ccxt.Exchange, symbol:str, spend:float)->float:
-    m = ex.markets.get(symbol, {}) or {}
-    mc = float(((m.get("limits") or {}).get("cost") or {}).get("min") or 0.0)
-    return max(spend, mc)
+# ---------- ORDER SIZING that satisfies BOTH min cost and min amount ----------
+def _min_reqs(ex: ccxt.Exchange, symbol: str) -> Tuple[float, float]:
+    """
+    Return (min_cost_usd, min_amount) for the market, defaulting to 0 if absent.
+    """
+    m = ex.markets[symbol]
+    min_cost = float(((m.get("limits") or {}).get("cost") or {}).get("min") or 0.0)
+    min_amt  = float(((m.get("limits") or {}).get("amount") or {}).get("min") or 0.0)
+    return (min_cost, min_amt)
+
+def _size_qty_meeting_requirements(ex: ccxt.Exchange, symbol: str, target_notional_usd: float, last_price: float) -> float:
+    """
+    Compute a quantity that simultaneously meets:
+      - min base amount
+      - min notional (cost)
+    with a tiny 2% headroom to avoid edge rejections after precision rounding.
+    """
+    headroom = 1.02
+    min_cost, min_amt = _min_reqs(ex, symbol)
+
+    # Start from notional → amount
+    qty = max(0.0, target_notional_usd / max(last_price, 1e-9))
+
+    # Enforce base minimum
+    qty = max(qty, min_amt * headroom)
+
+    # Enforce notional minimum
+    if min_cost > 0:
+        qty = max(qty, (min_cost * headroom) / max(last_price, 1e-9))
+
+    # Apply exchange precision
+    qty = float(ex.amount_to_precision(symbol, qty))
+
+    # If rounding zeroed it out, bump slightly and round again
+    if qty <= 0:
+        qty = float(ex.amount_to_precision(symbol, (min_amt or (target_notional_usd / max(last_price,1e-9))) * headroom))
+
+    return qty
 
 def buy_market(ex: ccxt.Exchange, symbol:str, notional:float, dry:bool):
-    # Safety: include a tiny fee/price drift buffer
-    FEE_BUFFER = 1.01  # +1%
-    notional = _ensure_min_notional(ex, symbol, notional)
     last = float(ex.fetch_ticker(symbol)["last"])
-    if last <= 0:
-        raise Exception(f"Ticker price unavailable for {symbol}")
-    qty = float(ex.amount_to_precision(symbol, notional / last))
-    if qty <= 0:
-        raise Exception(f"Computed qty <= 0 for {symbol} (notional={notional}, last={last})")
+    qty  = _size_qty_meeting_requirements(ex, symbol, notional, last)
 
-    # Pre-flight cash check to avoid “Insufficient funds”
-    cash = get_cash_balance_usd(ex)
-    need = notional * FEE_BUFFER
-    if cash < need and not dry:
-        raise ccxt.InsufficientFunds(f"USD/ZUSD free={cash:.2f} < needed≈{need:.2f}")
+    if qty <= 0:
+        raise ValueError(f"Calculated order qty is zero for {symbol} (last={last}, notional={notional})")
 
     if dry:
         print(f"[order][dry-run] BUY {symbol} ${notional:.2f} qty≈{qty}")
-        return {"id":"dry","symbol":symbol,"amount":qty,"price":last}
+        return {"id":"dry","symbol":symbol,"amount":float(qty),"price":last}
+
     print(f"[order] BUY {symbol} ${notional:.2f} qty≈{qty}")
-    return ex.create_market_buy_order(symbol, qty)
+    return ex.create_market_buy_order(symbol, float(qty))
 
 def sell_market(ex: ccxt.Exchange, symbol:str, qty:float, dry:bool):
-    qp = float(ex.amount_to_precision(symbol, qty))
-    if qp <= 0:
-        print(f"[order] Skipping SELL {symbol}: qty after precision <= 0")
-        return {"id":"skip","symbol":symbol,"amount":0.0}
+    qp = ex.amount_to_precision(symbol, qty)
     if dry:
         print(f"[order][dry-run] SELL {symbol} qty≈{qp}")
-        return {"id":"dry","symbol":symbol,"amount":qp}
+        return {"id":"dry","symbol":symbol,"amount":float(qp)}
     print(f"[order] SELL {symbol} qty≈{qp}")
-    return ex.create_market_sell_order(symbol, qp)
+    return ex.create_market_sell_order(symbol, float(qp))
 
 # ----- ledger -----
 def load_ledger()->Dict[str,Dict]:
@@ -151,29 +167,28 @@ def save_ledger(d:Dict[str,Dict])->None:
     LEDGER.write_text(json.dumps(d, indent=2))
 
 def ensure_entry(ledger:Dict[str,Dict], symbol:str, entry:float, set_high=True):
-    k = symbol.upper()
-    rec = ledger.get(k)
+    rec = ledger.get(symbol.upper())
     if not rec:
-        ledger[k] = {"entry":float(entry), "high":float(entry if set_high else 0.0), "added":_now()}
+        ledger[symbol.upper()] = {"entry":float(entry), "high":float(entry if set_high else 0.0), "added":_now()}
     else:
         rec["entry"] = float(rec.get("entry", entry))
         if set_high:
             rec["high"] = float(max(rec.get("high", entry), entry))
 
 def update_high(ledger:Dict[str,Dict], symbol:str, price:float):
-    k = symbol.upper()
-    rec=ledger.get(k)
+    rec=ledger.get(symbol.upper())
     if not rec:
-        ledger[k]={"entry":float(price),"high":float(price),"added":_now()}
+        ledger[symbol.upper()]={"entry":float(price),"high":float(price),"added":_now()}
     else:
         rec["high"]=float(max(rec.get("high",price), price))
 
 # ----- cost-basis backfill from trades -----
-def _backfill_avg_entry_from_trades(ex:ccxt.Exchange, symbol:str, current_qty:float, lookback_days:int)->float|None:
+def _backfill_avg_entry_from_trades(ex:ccxt.Exchange, symbol:str, current_qty:float, lookback_days:int)->float or None:
     try:
         since = int(time.time()*1000) - lookback_days*24*3600*1000
-        qty_net=0.0; cost_usd=0.0; cursor_since = since
-        for _ in range(2):  # 2 pages defensive
+        qty_net=0.0; cost_usd=0.0
+        cursor_since = since
+        for _ in range(2):
             trades = ex.fetch_my_trades(symbol=symbol, since=cursor_since, limit=200)
             if not trades: break
             for t in trades:
@@ -192,7 +207,8 @@ def _backfill_avg_entry_from_trades(ex:ccxt.Exchange, symbol:str, current_qty:fl
             cursor_since = int(trades[-1]["timestamp"])+1 if trades else cursor_since
         if qty_net<=0:
             return None
-        return float(cost_usd/max(qty_net,1e-9))
+        avg_entry = cost_usd/max(qty_net,1e-9)
+        return float(avg_entry)
     except Exception as e:
         print(f"[backfill] {symbol} failed: {e}")
         return None
@@ -203,14 +219,14 @@ def run_trading_loop()->int:
     dry = DRY_RUN!="OFF"
     api_key = os.getenv("KRAKEN_API_KEY",""); api_secret=os.getenv("KRAKEN_API_SECRET","")
 
-    MIN_BUY_USD      = _fi("MIN_BUY_USD",10.0)
-    MAX_BUYS_PER_RUN = _ii("MAX_BUYS_PER_RUN",2)
-    MAX_POSITIONS    = _ii("MAX_POSITIONS",6)
-    RESERVE_CASH_PCT = _fi("RESERVE_CASH_PCT",0.0)
+    MIN_BUY_USD     = _fi("MIN_BUY_USD",10.0)
+    MAX_BUYS_PER_RUN= _ii("MAX_BUYS_PER_RUN",2)
+    MAX_POSITIONS   = _ii("MAX_POSITIONS",6)
+    RESERVE_CASH_PCT= _fi("RESERVE_CASH_PCT",0.0)
 
-    UNIVERSE_TOP_K   = _ii("UNIVERSE_TOP_K",25)
-    MIN_24H_PCT      = _fi("MIN_24H_PCT",0.0)
-    MIN_BASE_VOL_USD = _fi("MIN_BASE_VOL_USD",10000.0)
+    UNIVERSE_TOP_K  = _ii("UNIVERSE_TOP_K",25)
+    MIN_24H_PCT     = _fi("MIN_24H_PCT",0.0)
+    MIN_BASE_VOL_USD= _fi("MIN_BASE_VOL_USD",10000.0)
 
     SELL_HARD_STOP_PCT   = _fi("SELL_HARD_STOP_PCT",3.0)
     SELL_TRAIL_PCT       = _fi("SELL_TRAIL_PCT",2.0)
@@ -225,7 +241,7 @@ def run_trading_loop()->int:
     positions = fetch_positions_snapshot(ex)
     held = {p["symbol"].upper() for p in positions}
 
-    # Backfill entries for existing bags (so sells can trigger immediately)
+    # --- Backfill entries for existing bags so sells can trigger immediately
     for p in positions:
         sym = p["symbol"].upper()
         if sym not in ledger or ledger[sym].get("entry") is None:
@@ -237,7 +253,7 @@ def run_trading_loop()->int:
                 ensure_entry(ledger, sym, p["price"] or 0.0, set_high=True)
     save_ledger(ledger)
 
-    # SELL GUARD
+    # --- SELL GUARD (tight)
     sells=0
     for p in positions:
         sym=p["symbol"].upper(); price=float(p["price"] or 0.0); qty=float(p["qty"] or 0.0)
@@ -259,26 +275,22 @@ def run_trading_loop()->int:
             sell_market(ex, sym, qty, dry); sells+=1; ledger.pop(sym,None); continue
     save_ledger(ledger)
 
+    # refresh after sells
     if sells:
         positions = fetch_positions_snapshot(ex)
         held = {p["symbol"].upper() for p in positions}
 
-    # BUY side
+    # --- BUY side
     cash = get_cash_balance_usd(ex)
     spendable = max(0.0, cash - cash*(RESERVE_CASH_PCT/100.0))
     universe = pick_candidates(ex, UNIVERSE_TOP_K)
     if WL: universe = [c for c in universe if c["symbol"].upper() in WL]
-    filtered = [
-        c for c in universe
-        if c["change24h"]>=MIN_24H_PCT
-        and c["quoteVolUsd"]>=MIN_BASE_VOL_USD
-        and c["symbol"].upper() not in held
-    ]
+    filtered = [c for c in universe if c["change24h"]>=MIN_24H_PCT and c["quoteVolUsd"]>=MIN_BASE_VOL_USD and c["symbol"].upper() not in held]
 
     BUY_GATES_MD.write_text("\n".join([
         "## BUY_DIAGNOSTIC",
         f"- time: {_now()}",
-        f"- cash: {cash:.2f} spendable: {spendable:.2f}",
+        f"- cash(usdzusd): {cash:.2f} spendable: {spendable:.2f}",
         f"- positions: {len(held)}",
         f"- candidates: total={len(universe)} after_filters={len(filtered)}",
         f"- whitelist: {'on' if WL else 'off'}",
@@ -318,5 +330,9 @@ def run_hourly_rotation(
     slow_gain_req: float = 3.0,
     universe_pick: str | None = None,
 ) -> int:
-    """Compatibility wrapper; env vars still drive behavior."""
+    """
+    Compatibility wrapper so main.py can call this symbol.
+    Your engine already reads env vars inside run_trading_loop(), so we
+    simply delegate and ignore incoming kwargs (keeps behavior unchanged).
+    """
     return run_trading_loop()
