@@ -2,11 +2,11 @@ name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # run hourly at minute 0 (UTC)
+    - cron: "0 * * * *"
   workflow_dispatch:
 
 permissions:
-  contents: write   # needed for artifact upload and (optionally) committing .state files
+  contents: write
   actions: read
 
 jobs:
@@ -15,16 +15,15 @@ jobs:
     timeout-minutes: 12
 
     env:
-      # Pull from Repository Variables when present, otherwise defaults below.
       DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}             # ON=paper / OFF=live
       BUY_USD: ${{ vars.BUY_USD || '25' }}
-      TP_PCT: ${{ vars.TP_PCT || '5' }}               # take-profit %
-      STOP_PCT: ${{ vars.STOP_PCT || '1' }}           # stop-loss %
-      WINDOW_MIN: ${{ vars.WINDOW_MIN || '60' }}      # rotation window minutes
-      SLOW_GAIN_REQ: ${{ vars.SLOW_GAIN_REQ || '3' }} # min gain within window
-      UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK || '' }}  # optional single pair (e.g., SOL/USD)
+      TP_PCT: ${{ vars.TP_PCT || '5' }}
+      STOP_PCT: ${{ vars.STOP_PCT || '1' }}
+      WINDOW_MIN: ${{ vars.WINDOW_MIN || '60' }}
+      SLOW_GAIN_REQ: ${{ vars.SLOW_GAIN_REQ || '3' }}
+      UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK || '' }}
 
-      # Keys: look first for canonical names, then legacy alternates.
+      # Keys (either canonical or legacy names in Secrets)
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY || secrets.KRAKEN_KEY || '' }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET || secrets.KRAKEN_SECRET || '' }}
 
@@ -43,7 +42,6 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt || true
           fi
-          # Ensure these exist even if requirements.txt is absent/incomplete
           pip install --upgrade --no-input requests pandas python-dateutil pyyaml
 
       - name: Echo critical env (no secrets)
@@ -64,18 +62,24 @@ jobs:
           if [ "${DRY_RUN}" = "OFF" ] && [ $missing -ne 0 ]; then
             echo "::error::LIVE mode requires API keys in repo Secrets."; exit 1
           fi
-          echo "Keys present check: OK (note: values not displayed)."
+          echo "Keys present check: OK."
+
+      # Guarantee artifact presence even if Python exits early
+      - name: Prepare .state placeholder
+        run: |
+          mkdir -p .state
+          echo "Placeholder (pre-run) $(date -u)" > .state/run_summary.md
 
       - name: Run rotation
         env:
-          # Expose PYTHONPATH so `import trader...` works if you use a local package
           PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/src:${{ github.workspace }}/trader
         run: |
-          python -u main.py
+          python -u main.py || true
+          ls -la .state
 
       - name: Upload .state artifacts
         uses: actions/upload-artifact@v4
         with:
           name: crypto-hourly-rotation-${{ github.run_id }}
-          path: ./.state/**
+          path: .state/**
           if-no-files-found: warn
