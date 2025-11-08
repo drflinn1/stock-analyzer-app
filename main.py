@@ -111,21 +111,21 @@ API_BASE = "https://api.kraken.com"
 def _nonce() -> str:
     return str(int(time.time() * 1000))
 
-def _kraken_headers(path: str, data: Dict[str, str], secret_b64: str) -> Dict[str, str]:
-    # Kraken signature
-    post_body = urlencode(data).encode()
-    # Per Kraken: HMAC-SHA512 of (path + SHA256(nonce+postdata))
-    import hashlib
-    sha = hashlib.sha256((data["nonce"] + urlencode({k: v for k, v in data.items() if k != "nonce"})).encode()).digest()
-    msg = path.encode() + sha
-    secret = base64.b64decode(secret_b64)
-    import hmac as _h
-    sig = _h.new(secret, msg, hashlib.sha512).digest()
-    sig_b64 = base64.b64encode(sig).decode()
+def _kraken_headers(path: str, data: Dict[str, str], secret_b64: str, api_key: str) -> Dict[str, str]:
+    """
+    Correct Kraken signature:
+      API-Sign = base64( HMAC-SHA512( base64decode(secret), path + SHA256(nonce + POSTDATA) ) )
+    where POSTDATA is the full urlencoded body INCLUDING the nonce key/value.
+    """
+    postdata = urlencode(data)                # full body with nonce
+    sha = hashlib.sha256((data["nonce"] + postdata).encode()).digest()
+    mac = hmac.new(base64.b64decode(secret_b64), path.encode() + sha, hashlib.sha512)
+    sig_b64 = base64.b64encode(mac.digest()).decode()
     return {
-        "API-Key": env("KRAKEN_API_KEY", ""),
+        "API-Key": api_key,
         "API-Sign": sig_b64,
-        "User-Agent": "stock-analyzer-app/1.0 (no-requests)"
+        "User-Agent": "stock-analyzer-app/1.0 (urllib)",
+        "Content-Type": "application/x-www-form-urlencoded",
     }
 
 def kraken_public(method: str, params: Dict[str, str] | None = None) -> Dict[str, Any]:
@@ -133,20 +133,29 @@ def kraken_public(method: str, params: Dict[str, str] | None = None) -> Dict[str
     if params:
         url += "?" + urlencode(params)
     req = Request(url, headers={"User-Agent": "stock-analyzer-app"})
-    with urlopen(req, timeout=15) as r:
+    with urlopen(req, timeout=20) as r:
         return json.loads(r.read().decode())
 
 def kraken_private(method: str, data: Dict[str, str]) -> Dict[str, Any]:
-    key = env("KRAKEN_API_KEY")
-    sec = env("KRAKEN_API_SECRET")
-    if not key or not sec:
+    api_key = env("KRAKEN_API_KEY")
+    secret = env("KRAKEN_API_SECRET")
+    if not api_key or not secret:
         raise RuntimeError("[LIVE] Missing Kraken API credentials.")
     path = f"/0/private/{method}"
     payload = {"nonce": _nonce(), **data}
-    headers = _kraken_headers(path, payload, sec)
-    req = Request(f"{API_BASE}{path}", data=urlencode(payload).encode(), headers=headers)
-    with urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode())
+    headers = _kraken_headers(path, payload, secret, api_key)
+    body = urlencode(payload).encode()
+    req = Request(f"{API_BASE}{path}", data=body, headers=headers, method="POST")
+    try:
+        with urlopen(req, timeout=25) as r:
+            txt = r.read().decode()
+            out = json.loads(txt)
+    except Exception as e:
+        raise RuntimeError(f"HTTP error calling {method}: {e}")
+    if isinstance(out, dict) and out.get("error"):
+        # Bubble Kraken errors clearly for logs
+        raise RuntimeError(f"{method} error: {out['error']}")
+    return out
 
 # ---------- Trading helpers ----------
 def get_ticker_price(pair: str) -> float:
@@ -160,8 +169,6 @@ def get_ticker_price(pair: str) -> float:
 
 def get_balances() -> Dict[str, float]:
     res = kraken_private("Balance", {})
-    if res.get("error"):
-        raise RuntimeError(f"Balance error: {res['error']}")
     out: Dict[str, float] = {}
     for k, v in res.get("result", {}).items():
         try:
@@ -176,6 +183,7 @@ def add_order_market(pair: str, side: str, vol: float) -> Dict[str, Any]:
         "type": side,           # "buy" or "sell"
         "ordertype": "market",
         "volume": f"{vol:.10f}",
+        # You can add "oflags":"post" etc. if needed
     })
 
 def add_order_limit(pair: str, side: str, vol: float, price: float) -> Dict[str, Any]:
@@ -210,12 +218,7 @@ class RunContext:
     info: Dict[str, Any] = field(default_factory=dict)
 
 def action_rotation(ctx: RunContext) -> None:
-    """Select one coin and BUY.
-    Selection order:
-      - UNIVERSE_PICK if provided and not an AUTO sentinel
-      - else top row of .state/momentum_candidates.csv
-      - else SOLUSD (fallback)
-    """
+    """Select one coin and BUY."""
     buy_usd = safe_float(env("BUY_USD","25"), 25.0)
     tp_pct = safe_float(env("TP_PCT","5"), 5.0)
     sl_pct = safe_float(env("SL_PCT","1"), 1.0)
@@ -254,14 +257,11 @@ def action_rotation(ctx: RunContext) -> None:
         pair = "SOLUSD"
 
     try:
+        vol = usd_to_volume(pair, buy_usd)
         if ctx.dry_run:
-            vol = usd_to_volume(pair, buy_usd)
             ctx.actions.append(f"[DRY] BUY {pair} ~{vol:.8f} worth {usd(buy_usd)}")
         else:
-            vol = usd_to_volume(pair, buy_usd)
             res = add_order_market(pair, "buy", vol)
-            if res.get("error"):
-                raise RuntimeError(f"BUY error {pair}: {res['error']}")
             txid = ",".join(res.get("result", {}).get("txid", []))
             ctx.actions.append(f"[LIVE] BUY {pair} {vol:.8f} ({usd(buy_usd)}) txid={txid}")
     except Exception as e:
@@ -309,8 +309,6 @@ def action_force_sell(ctx: RunContext) -> None:
 
             try:
                 res = add_order_market(pair, "sell", qty)
-                if res.get("error"):
-                    raise RuntimeError(str(res["error"]))
                 txid = ",".join(res.get("result", {}).get("txid", []))
                 ctx.actions.append(f"[LIVE] SELL {pair} {qty:.8f} (market) txid={txid}")
             except Exception as e:
@@ -351,8 +349,6 @@ def action_dust_sweep(ctx: RunContext) -> None:
             if value < min_usd:
                 try:
                     res = add_order_market(pair, "sell", qty)
-                    if res.get("error"):
-                        raise RuntimeError(str(res["error"]))
                     txid = ",".join(res.get("result", {}).get("txid", []))
                     ctx.actions.append(f"[LIVE] DUST SELL {pair} {qty:.8f} (~{usd(value)}) market txid={txid}")
                 except Exception as e:
@@ -378,7 +374,7 @@ def main() -> int:
     dry = env("DRY_RUN","ON").upper().strip() != "OFF"
     summary = RunContext(dry_run=dry)
     summary.info["when"] = now_iso()
-    summary.info["runner"] = "main.py v1.0b (EXIT_ON_ERROR aware)"
+    summary.info["runner"] = "main.py v1.0c (fixed Kraken signing)"
 
     try:
         if args.force_sell:
