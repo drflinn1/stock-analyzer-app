@@ -38,18 +38,25 @@ jobs:
     permissions:
       contents: write
 
+    # 1) Raw materials: inputs and repo Vars
     env:
-      # --- Secrets (set in repo → Settings → Secrets and variables → Actions → Secrets) ---
-      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+      RAW_INPUTS: ${{ toJSON(github.event.inputs) }}
+      VARS_SNAPSHOT: ${{ toJSON(vars) }}
 
-      # --- Repo/Org Variables (can be overridden by dispatch inputs) ---
-      DRY_RUN: ${{ github.event.inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}
-      TP_PCT: ${{ github.event.inputs.TP_PCT || vars.TP_PCT || '5' }}
-      SL_PCT: ${{ github.event.inputs.SL_PCT || vars.SL_PCT || '1' }}
-      SLOW_WINDOW_MIN: ${{ github.event.inputs.SLOW_WINDOW_MIN || vars.SLOW_WINDOW_MIN || '60' }}
-      BUY_USD: ${{ github.event.inputs.BUY_USD || vars.BUY_USD || '25' }}
-      UNIVERSE_PICK: ${{ github.event.inputs.UNIVERSE_PICK || vars.UNIVERSE_PICK || '' }}
+      # Prefer non-empty inputs; otherwise fall back to repo vars; finally hard defaults.
+      _DRY_IN:          ${{ github.event.inputs.DRY_RUN }}
+      _TP_IN:           ${{ github.event.inputs.TP_PCT }}
+      _SL_IN:           ${{ github.event.inputs.SL_PCT }}
+      _WIN_IN:          ${{ github.event.inputs.SLOW_WINDOW_MIN }}
+      _BUY_IN:          ${{ github.event.inputs.BUY_USD }}
+      _PICK_IN:         ${{ github.event.inputs.UNIVERSE_PICK }}
+
+      _TP_VAR:          ${{ vars.TP_PCT }}
+      _SL_VAR:          ${{ vars.SL_PCT }}
+      _WIN_VAR:         ${{ vars.SLOW_WINDOW_MIN }}
+      _BUY_VAR:         ${{ vars.BUY_USD }}
+      _PICK_VAR:        ${{ vars.UNIVERSE_PICK }}
+      _DRY_VAR:         ${{ vars.DRY_RUN }}
 
     steps:
       - name: Checkout
@@ -66,8 +73,45 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt || true
           fi
-          # Safety pins for common libs used in your repo
           pip install pyyaml matplotlib || true
+
+      - name: Resolve and echo inputs vs vars (debug)
+        id: resolve
+        shell: bash
+        run: |
+          echo "---- RAW INPUTS JSON ----"
+          echo '${{ env.RAW_INPUTS }}'
+          echo "---- REPO VARS SNAPSHOT ----"
+          echo '${{ env.VARS_SNAPSHOT }}'
+
+          # Normalize (uppercase DRY_RUN)
+          DRY_IN="${_DRY_IN^^}"
+          DRY_VAR="${_DRY_VAR^^}"
+
+          # Prefer non-empty inputs over vars; then safe defaults
+          DRY_RUN="${DRY_IN:-$DRY_VAR}"
+          DRY_RUN="${DRY_RUN:-ON}"
+
+          TP_PCT="${_TP_IN:-${_TP_VAR:-5}}"
+          SL_PCT="${_SL_IN:-${_SL_VAR:-1}}"
+          SLOW_WINDOW_MIN="${_WIN_IN:-${_WIN_VAR:-60}}"
+          BUY_USD="${_BUY_IN:-${_BUY_VAR:-25}}"
+          UNIVERSE_PICK="${_PICK_IN:-${_PICK_VAR:-}}"
+
+          echo "---- RESOLVED VALUES ----"
+          echo "DRY_RUN=${DRY_RUN}"
+          echo "TP_PCT=${TP_PCT}  SL_PCT=${SL_PCT}  WINDOW=${SLOW_WINDOW_MIN}m  BUY_USD=${BUY_USD}"
+          echo "UNIVERSE_PICK=${UNIVERSE_PICK:-<blank>}"
+
+          # Export for later steps
+          {
+            echo "DRY_RUN=${DRY_RUN}"
+            echo "TP_PCT=${TP_PCT}"
+            echo "SL_PCT=${SL_PCT}"
+            echo "SLOW_WINDOW_MIN=${SLOW_WINDOW_MIN}"
+            echo "BUY_USD=${BUY_USD}"
+            echo "UNIVERSE_PICK=${UNIVERSE_PICK}"
+          } >> $GITHUB_ENV
 
       - name: Ensure .state exists and seed minimal summaries
         run: |
@@ -88,12 +132,8 @@ jobs:
           set -e
           echo "DRY_RUN=${DRY_RUN}"
           echo "TP_PCT=${TP_PCT}  SL_PCT=${SL_PCT}  WINDOW=${SLOW_WINDOW_MIN}m  BUY_USD=${BUY_USD}"
-          echo "UNIVERSE_PICK=${UNIVERSE_PICK}"
-
-          # main runner (expected to read env vars above)
+          echo "UNIVERSE_PICK=${UNIVERSE_PICK:-<blank>}"
           python main.py
-
-          # Guarantee .state exists even if script exits early without writing
           mkdir -p .state
 
       - name: Upload .state artifact (no-warning even if empty)
