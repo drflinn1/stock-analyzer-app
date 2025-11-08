@@ -34,29 +34,31 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 12
-
     permissions:
       contents: write
 
-    # 1) Raw materials: inputs and repo Vars
+    # Snapshot current repo variables (legacy names) so we can fall back safely.
     env:
-      RAW_INPUTS: ${{ toJSON(github.event.inputs) }}
       VARS_SNAPSHOT: ${{ toJSON(vars) }}
+      RAW_INPUTS: ${{ toJSON(github.event.inputs) }}
 
-      # Prefer non-empty inputs; otherwise fall back to repo vars; finally hard defaults.
-      _DRY_IN:          ${{ github.event.inputs.DRY_RUN }}
-      _TP_IN:           ${{ github.event.inputs.TP_PCT }}
-      _SL_IN:           ${{ github.event.inputs.SL_PCT }}
-      _WIN_IN:          ${{ github.event.inputs.SLOW_WINDOW_MIN }}
-      _BUY_IN:          ${{ github.event.inputs.BUY_USD }}
-      _PICK_IN:         ${{ github.event.inputs.UNIVERSE_PICK }}
-
-      _TP_VAR:          ${{ vars.TP_PCT }}
-      _SL_VAR:          ${{ vars.SL_PCT }}
-      _WIN_VAR:         ${{ vars.SLOW_WINDOW_MIN }}
+      # Legacy repo variable names (may or may not exist)
+      _TP_VAR:          ${{ vars.TAKE_PROFIT_PCT }}
+      _SL_VAR:          ${{ vars.STOP_LOSS_PCT }}
+      _SLOW_MIN_PCT:    ${{ vars.SLOW_MIN_PCT }}         # e.g., 3 (% gain required by end of window)
+      _RUN_SWITCH:      ${{ vars.RUN_SWITCH }}           # ON/OFF master switch (optional)
       _BUY_VAR:         ${{ vars.BUY_USD }}
       _PICK_VAR:        ${{ vars.UNIVERSE_PICK }}
       _DRY_VAR:         ${{ vars.DRY_RUN }}
+      _WIN_VAR:         ${{ vars.SLOW_WINDOW_MIN }}      # if you already have a minutes var
+
+      # UI inputs
+      _DRY_IN:  ${{ github.event.inputs.DRY_RUN }}
+      _TP_IN:   ${{ github.event.inputs.TP_PCT }}
+      _SL_IN:   ${{ github.event.inputs.SL_PCT }}
+      _WIN_IN:  ${{ github.event.inputs.SLOW_WINDOW_MIN }}
+      _BUY_IN:  ${{ github.event.inputs.BUY_USD }}
+      _PICK_IN: ${{ github.event.inputs.UNIVERSE_PICK }}
 
     steps:
       - name: Checkout
@@ -70,45 +72,54 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt || true
-          fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
           pip install pyyaml matplotlib || true
 
-      - name: Resolve and echo inputs vs vars (debug)
+      - name: Resolve and echo configuration (inputs win)
         id: resolve
         shell: bash
         run: |
-          echo "---- RAW INPUTS JSON ----"
+          echo "---- RAW INPUTS ----"
           echo '${{ env.RAW_INPUTS }}'
-          echo "---- REPO VARS SNAPSHOT ----"
+          echo "---- VARS SNAPSHOT ----"
           echo '${{ env.VARS_SNAPSHOT }}'
 
-          # Normalize (uppercase DRY_RUN)
+          # Normalize DRY_RUN
           DRY_IN="${_DRY_IN^^}"
           DRY_VAR="${_DRY_VAR^^}"
 
-          # Prefer non-empty inputs over vars; then safe defaults
-          DRY_RUN="${DRY_IN:-$DRY_VAR}"
-          DRY_RUN="${DRY_RUN:-ON}"
-
+          # Inputs → Vars → Defaults
+          DRY_RUN="${DRY_IN:-$DRY_VAR}"; DRY_RUN="${DRY_RUN:-ON}"
           TP_PCT="${_TP_IN:-${_TP_VAR:-5}}"
           SL_PCT="${_SL_IN:-${_SL_VAR:-1}}"
           SLOW_WINDOW_MIN="${_WIN_IN:-${_WIN_VAR:-60}}"
           BUY_USD="${_BUY_IN:-${_BUY_VAR:-25}}"
           UNIVERSE_PICK="${_PICK_IN:-${_PICK_VAR:-}}"
+          SLOW_MIN_PCT="${_SLOW_MIN_PCT:-3}"     # default 3% “must achieve by window end”
+          RUN_SWITCH="${_RUN_SWITCH:-ON}"
 
-          echo "---- RESOLVED VALUES ----"
+          echo "---- RESOLVED ----"
+          echo "RUN_SWITCH=${RUN_SWITCH}"
           echo "DRY_RUN=${DRY_RUN}"
-          echo "TP_PCT=${TP_PCT}  SL_PCT=${SL_PCT}  WINDOW=${SLOW_WINDOW_MIN}m  BUY_USD=${BUY_USD}"
-          echo "UNIVERSE_PICK=${UNIVERSE_PICK:-<blank>}"
+          echo "TP_PCT=${TP_PCT}  SL_PCT=${SL_PCT}"
+          echo "SLOW_WINDOW_MIN=${SLOW_WINDOW_MIN}  SLOW_MIN_PCT=${SLOW_MIN_PCT}"
+          echo "BUY_USD=${BUY_USD}"
+          echo "UNIVERSE_PICK=${UNIVERSE_PICK:-<blank>} (blank = let scanner decide)"
 
-          # Export for later steps
+          # Export BOTH naming styles so main.py (old or new) works unchanged.
           {
+            echo "RUN_SWITCH=${RUN_SWITCH}"
             echo "DRY_RUN=${DRY_RUN}"
+
             echo "TP_PCT=${TP_PCT}"
+            echo "TAKE_PROFIT_PCT=${TP_PCT}"
+
             echo "SL_PCT=${SL_PCT}"
+            echo "STOP_LOSS_PCT=${SL_PCT}"
+
             echo "SLOW_WINDOW_MIN=${SLOW_WINDOW_MIN}"
+            echo "SLOW_MIN_PCT=${SLOW_MIN_PCT}"
+
             echo "BUY_USD=${BUY_USD}"
             echo "UNIVERSE_PICK=${UNIVERSE_PICK}"
           } >> $GITHUB_ENV
@@ -116,14 +127,12 @@ jobs:
       - name: Ensure .state exists and seed minimal summaries
         run: |
           mkdir -p .state
-          if [ ! -f .state/run_summary.md ]; then
+          [ -f .state/run_summary.md ] || {
             echo "# Run Summary" > .state/run_summary.md
             echo "*When:* $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> .state/run_summary.md
             echo "*Note:* Seeded to avoid empty artifact warnings." >> .state/run_summary.md
-          fi
-          if [ ! -f .state/run_summary.json ]; then
-            echo '{"seeded": true, "when": "'$(date -u +%FT%TZ)'"}' > .state/run_summary.json
-          fi
+          }
+          [ -f .state/run_summary.json ] || echo '{"seeded": true, "when": "'$(date -u +%FT%TZ)'"}' > .state/run_summary.json
 
       - name: Run bot main.py
         id: runbot
@@ -131,7 +140,9 @@ jobs:
         run: |
           set -e
           echo "DRY_RUN=${DRY_RUN}"
-          echo "TP_PCT=${TP_PCT}  SL_PCT=${SL_PCT}  WINDOW=${SLOW_WINDOW_MIN}m  BUY_USD=${BUY_USD}"
+          echo "TP_PCT=${TP_PCT}  SL_PCT=${SL_PCT}"
+          echo "SLOW_WINDOW_MIN=${SLOW_WINDOW_MIN}  SLOW_MIN_PCT=${SLOW_MIN_PCT}"
+          echo "BUY_USD=${BUY_USD}"
           echo "UNIVERSE_PICK=${UNIVERSE_PICK:-<blank>}"
           python main.py
           mkdir -p .state
