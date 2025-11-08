@@ -2,9 +2,11 @@
 """
 Main unified runner for Crypto — Hourly 1-Coin Rotation.
 
-✅ Always writes .state/run_summary.json + .state/run_summary.md
-✅ Compatible with Kraken key names: KRAKEN_API_KEY / KRAKEN_API_SECRET or KRAKEN_KEY / KRAKEN_SECRET
-✅ Safe default: DRY_RUN=ON (paper)
+- Always writes .state/run_summary.json + .state/run_summary.md
+- Reads Kraken keys: KRAKEN_API_KEY / KRAKEN_API_SECRET (or legacy KRAKEN_KEY / KRAKEN_SECRET)
+- DRY_RUN=ON by default (paper)
+- If your legacy engine exists (trader.crypto_engine.run_hourly_rotation), it will be called.
+  Otherwise we safely no-op so the workflow never crashes.
 """
 
 from __future__ import annotations
@@ -26,16 +28,13 @@ LAST_OK = STATE_DIR / "last_ok.txt"
 
 # ---------- Helpers ----------
 def env_str(name: str, default: str = "") -> str:
-    """Read environment variable as string with default."""
     val = os.getenv(name)
     return default if val is None else str(val)
 
 def now_iso() -> str:
-    """Return current UTC timestamp as string."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 def write_summary(data: Dict[str, Any]) -> None:
-    """Write JSON + Markdown summaries to .state."""
     SUMMARY_JSON.write_text(json.dumps(data, indent=2))
     lines = [
         "# Crypto — Hourly 1-Coin Rotation",
@@ -48,13 +47,13 @@ def write_summary(data: Dict[str, Any]) -> None:
         f"**SLOW_GAIN_REQ:** {data.get('slow_gain_req')}%",
         f"**UNIVERSE_PICK:** {data.get('universe_pick') or '<auto>'}",
         "",
+        f"**Engine:** {data.get('engine')}",
         f"**Status:** {data.get('status')}",
         f"**Note:** {data.get('note') or '-'}",
     ]
     SUMMARY_MD.write_text("\n".join(lines))
 
 def keys_present() -> bool:
-    """Return True if Kraken API keys exist."""
     k = os.getenv("KRAKEN_API_KEY") or os.getenv("KRAKEN_KEY") or ""
     s = os.getenv("KRAKEN_API_SECRET") or os.getenv("KRAKEN_SECRET") or ""
     return bool(k and s)
@@ -70,24 +69,39 @@ def main() -> int:
     universe_pick = env_str("UNIVERSE_PICK", "")
 
     note = ""
-    live_keys_ok = keys_present()
+    engine = "noop"
+    status = "ok"
 
-    # Safety check for live mode
+    live_keys_ok = keys_present()
     if dry_run == "OFF" and not live_keys_ok:
-        note = "LIVE requested but API keys missing — aborting orders."
         status = "skipped"
-    else:
-        # Placeholder for actual trading logic
-        status = "ok"
+        note = "LIVE requested but API keys missing — aborting orders."
+
+    # Try to use your existing engine if present
+    if status == "ok":
         try:
-            # --- Example simulation ---
+            from trader.crypto_engine import run_hourly_rotation  # type: ignore
+            engine = "trader.crypto_engine.run_hourly_rotation"
+            # Call your engine with simple kwargs (adjust inside your function as needed)
+            run_hourly_rotation(
+                dry_run=(dry_run != "OFF"),
+                buy_usd=float(buy_usd),
+                tp_pct=float(tp_pct),
+                stop_pct=float(stop_pct),
+                window_min=int(window_min),
+                slow_gain_req=float(slow_gain_req),
+                universe_pick=(universe_pick or None),
+            )
+        except ModuleNotFoundError:
+            # No local engine; keep a tiny simulated run
+            engine = "noop"
             time.sleep(0.5)
-            # Insert your trading logic call here later
+            note = "Local engine not found; ran no-op. (This is expected if you haven't added trader/ yet.)"
         except Exception as e:
             status = "error"
             note = f"{type(e).__name__}: {e}"
 
-    # Always create .state artifacts
+    # Always write artifacts
     summary = {
         "when": now_iso(),
         "dry_run": dry_run,
@@ -97,15 +111,14 @@ def main() -> int:
         "window_min": window_min,
         "slow_gain_req": slow_gain_req,
         "universe_pick": universe_pick or None,
+        "engine": engine,
         "status": status,
         "note": note,
     }
-
     write_summary(summary)
 
     if status == "error" or (dry_run == "OFF" and not live_keys_ok):
         return 1
-
     LAST_OK.write_text(now_iso())
     return 0
 
