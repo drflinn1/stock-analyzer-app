@@ -1,47 +1,56 @@
-name: Crypto — 1-Coin Rotation (LIVE-ready, ultra-defensive)
+name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # hourly at :00 UTC
+    - cron: "*/30 * * * *"   # every 30 minutes UTC
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: "ON or OFF"
-        required: false
+        description: "ON = simulate, OFF = live trading"
+        required: true
         default: "ON"
-      BUY_USD:
-        description: "Per-buy USD (e.g., 25)"
-        required: false
-        default: "25"
       TP_PCT:
-        description: "Take-profit %"
-        required: false
-        default: "5"
-      SL_PCT:
-        description: "Initial stop %"
-        required: false
-        default: "1"
-      SLOW_WINDOW_MIN:
-        description: "Rotation window minutes"
-        required: false
-        default: "60"
-      UNIVERSE_PICK:
-        description: "Optional fixed symbol (e.g., SOLUSD). Leave blank to auto-pick."
+        description: "Take profit percent (e.g., 5 for 5%)"
         required: false
         default: ""
-
-permissions:
-  contents: read
-  actions: read
-
-concurrency:
-  group: rotation-run-main
-  cancel-in-progress: true
+      SL_PCT:
+        description: "Stop loss percent (e.g., 1 for 1%)"
+        required: false
+        default: ""
+      SLOW_WINDOW_MIN:
+        description: "Rotation window minutes (e.g., 60)"
+        required: false
+        default: ""
+      BUY_USD:
+        description: "Per-trade buy size in USD"
+        required: false
+        default: ""
+      UNIVERSE_PICK:
+        description: "Optional single pair to force (e.g., SOLUSD). Leave blank for scanner."
+        required: false
+        default: ""
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+
+    permissions:
+      contents: write
+
+    env:
+      # --- Secrets (set in repo → Settings → Secrets and variables → Actions → Secrets) ---
+      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
+      # --- Repo/Org Variables (can be overridden by dispatch inputs) ---
+      DRY_RUN: ${{ github.event.inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}
+      TP_PCT: ${{ github.event.inputs.TP_PCT || vars.TP_PCT || '5' }}
+      SL_PCT: ${{ github.event.inputs.SL_PCT || vars.SL_PCT || '1' }}
+      SLOW_WINDOW_MIN: ${{ github.event.inputs.SLOW_WINDOW_MIN || vars.SLOW_WINDOW_MIN || '60' }}
+      BUY_USD: ${{ github.event.inputs.BUY_USD || vars.BUY_USD || '25' }}
+      UNIVERSE_PICK: ${{ github.event.inputs.UNIVERSE_PICK || vars.UNIVERSE_PICK || '' }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,65 +60,45 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt || true
+          fi
+          # Safety pins for common libs used in your repo
+          pip install pyyaml matplotlib || true
 
-      - name: Echo critical env/vars (safe)
-        env:
-          DRY_RUN: ${{ github.event.inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}
-          BUY_USD: ${{ github.event.inputs.BUY_USD || vars.BUY_USD || '25' }}
-          TP_PCT:  ${{ github.event.inputs.TP_PCT  || vars.TP_PCT  || '5' }}
-          SL_PCT:  ${{ github.event.inputs.SL_PCT  || vars.SL_PCT  || '1' }}
-          SLOW_WINDOW_MIN: ${{ github.event.inputs.SLOW_WINDOW_MIN || vars.SLOW_WINDOW_MIN || '60' }}
-          UNIVERSE_PICK: ${{ github.event.inputs.UNIVERSE_PICK || vars.UNIVERSE_PICK || '' }}
-          # secrets presence check only
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          # NEW: keep job green even if trade errors occur (they’ll be logged in .state/run_summary.md)
-          EXIT_ON_ERROR: 'OFF'
-        run: |
-          echo "DRY_RUN=$DRY_RUN"
-          echo "BUY_USD=$BUY_USD"
-          echo "TP_PCT=$TP_PCT"
-          echo "SL_PCT=$SL_PCT"
-          echo "SLOW_WINDOW_MIN=$SLOW_WINDOW_MIN"
-          echo "UNIVERSE_PICK=$UNIVERSE_PICK"
-          echo "EXIT_ON_ERROR=$EXIT_ON_ERROR"
-          if [ -n "${KRAKEN_API_KEY:-}" ]; then echo "Kraken API key: present"; else echo "Kraken API key: MISSING"; fi
-          if [ -n "${KRAKEN_API_SECRET:-}" ]; then echo "Kraken API secret: present"; else echo "Kraken API secret: MISSING"; fi
-
-      - name: Ensure .state exists
-        run: mkdir -p .state
-
-      - name: Run main
-        env:
-          DRY_RUN: ${{ github.event.inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}
-          BUY_USD: ${{ github.event.inputs.BUY_USD || vars.BUY_USD || '25' }}
-          TP_PCT:  ${{ github.event.inputs.TP_PCT  || vars.TP_PCT  || '5' }}
-          SL_PCT:  ${{ github.event.inputs.SL_PCT  || vars.SL_PCT  || '1' }}
-          SLOW_WINDOW_MIN: ${{ github.event.inputs.SLOW_WINDOW_MIN || vars.SLOW_WINDOW_MIN || '60' }}
-          UNIVERSE_PICK: ${{ github.event.inputs.UNIVERSE_PICK || vars.UNIVERSE_PICK || '' }}
-          # pass secrets to main.py for LIVE runs
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          # NEW flag honored by main.py
-          EXIT_ON_ERROR: 'OFF'
-        run: |
-          python main.py
-
-      # Make sure an artifact always exists so upload never warns
-      - name: Guarantee at least one artifact file
-        if: always()
+      - name: Ensure .state exists and seed minimal summaries
         run: |
           mkdir -p .state
-          [ -f .state/run_summary.md ] || echo "placeholder" > .state/.keep
+          if [ ! -f .state/run_summary.md ]; then
+            echo "# Run Summary" > .state/run_summary.md
+            echo "*When:* $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> .state/run_summary.md
+            echo "*Note:* Seeded to avoid empty artifact warnings." >> .state/run_summary.md
+          fi
+          if [ ! -f .state/run_summary.json ]; then
+            echo '{"seeded": true, "when": "'$(date -u +%FT%TZ)'"}' > .state/run_summary.json
+          fi
 
-      - name: Upload .state artifacts
-        if: always()
+      - name: Run bot main.py
+        id: runbot
+        shell: bash
+        run: |
+          set -e
+          echo "DRY_RUN=${DRY_RUN}"
+          echo "TP_PCT=${TP_PCT}  SL_PCT=${SL_PCT}  WINDOW=${SLOW_WINDOW_MIN}m  BUY_USD=${BUY_USD}"
+          echo "UNIVERSE_PICK=${UNIVERSE_PICK}"
+
+          # main runner (expected to read env vars above)
+          python main.py
+
+          # Guarantee .state exists even if script exits early without writing
+          mkdir -p .state
+
+      - name: Upload .state artifact (no-warning even if empty)
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
           path: ./.state/**
-          if-no-files-found: warn
+          if-no-files-found: ignore
