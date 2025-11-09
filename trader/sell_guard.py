@@ -7,11 +7,11 @@ Triggers:
 - TP_PCT:   sell if gain >= TP_PCT since entry.
 - SLOW_GAIN after WINDOW_MIN minutes: if gain < SLOW_GAIN_REQ → sell (rotate).
 
-Artifacts:
-- .state/sell_log.md (append)
-- .state/last_sell.json
-- .state/run_summary.md (note appended)
-- .state/positions.json (deleted on sell)
+Artifacts (written under .state/):
+- sell_log.md (append)
+- last_sell.json
+- run_summary.md (note appended)
+- positions.json (deleted on sell)
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from typing import Dict, Any, Optional
 
 import ccxt
 
-# Optional Slack notifier (safe to import even if webhook unset)
+# Optional Slack notifier (safe if missing)
 try:
     from trader.notify import notify_slack  # type: ignore
 except Exception:
@@ -103,7 +103,7 @@ def run_sell_guard(
     """
     Returns: {"action": "hold"|"sold", "note": "..."}
     """
-    # Defaults
+    # Defaults from env if not provided
     if dry_run is None:
         dry_run = (env_str("DRY_RUN", "ON").upper() != "OFF")
     tp = tp_pct if tp_pct is not None else env_float("TP_PCT", 5.0)
