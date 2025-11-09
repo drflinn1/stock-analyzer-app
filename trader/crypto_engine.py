@@ -1,17 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-Crypto engine with tight SELL GUARD + cost/amount compliance for Kraken.
+Crypto engine with tight SELL GUARD + cost-basis backfill + Kraken min-order handling.
 
-SELL knobs (Variables):
+Env/Vars used (same as before):
+  DRY_RUN=ON|OFF
+  MIN_BUY_USD=40        # your target spend per buy (will be raised to exchange minimum if needed)
+  MAX_BUYS_PER_RUN=2
+  MAX_POSITIONS=6
+  RESERVE_CASH_PCT=0
+  UNIVERSE_TOP_K=25
+  MIN_24H_PCT=0
+  MIN_BASE_VOL_USD=25000
+  WHITELIST="SYM1/USD,SYM2/USD"  (optional)
+
+Sell guard (unchanged defaults; can be overridden via repo variables):
   SELL_HARD_STOP_PCT=3
   SELL_TRAIL_PCT=2
   SELL_TAKE_PROFIT_PCT=5
-  BACKFILL_LOOKBACK_DAYS=60   # how far to fetch trades to compute cost basis
+  BACKFILL_LOOKBACK_DAYS=60
 
-Other knobs (unchanged): DRY_RUN, MIN_BUY_USD, MAX_BUYS_PER_RUN, MAX_POSITIONS,
-RESERVE_CASH_PCT, UNIVERSE_TOP_K, MIN_24H_PCT, MIN_BASE_VOL_USD, WHITELIST, etc.
-
-Secrets: KRAKEN_API_KEY, KRAKEN_API_SECRET
+Secrets:
+  KRAKEN_API_KEY, KRAKEN_API_SECRET
 """
 
 import os, json, time, math
@@ -25,16 +34,18 @@ LEDGER = STATE_DIR / "positions.json"
 BUY_GATES_MD = STATE_DIR / "buy_gates.md"
 
 STABLES = {"USD","USDT","USDC","EUR","GBP"}
-EXCLUDE_TICKERS = {"SPX","PUMP","BABY","ALKIMI"}
+EXCLUDE_TICKERS = {"SPX","PUMP","BABY","ALKIMI"}  # defensive
 
-def _now(): return time.strftime("%Y-%m-%d %H:%M:%S")
+def _now(): return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 def _b(s, d): return str(s).lower() in {"1","true","yes","on"} if s is not None else d
-def _fi(name, default):
+def _fi(name, default): 
     try: return float(os.getenv(name, default))
     except: return float(default)
-def _ii(name, default):
+def _ii(name, default): 
     try: return int(float(os.getenv(name, default)))
     except: return int(default)
+
+# ---------------- Exchange helpers ----------------
 
 def build_exchange(api_key:str, api_secret:str) -> ccxt.Exchange:
     ex = ccxt.kraken({
@@ -54,6 +65,21 @@ def _is_bad_coin(symbol:str) -> bool:
     if base.upper() in STABLES: return True
     return False
 
+def _market_min_rules(ex: ccxt.Exchange, symbol: str, last_price: float) -> Tuple[float, float]:
+    """
+    Return (min_amount, min_notional_usd) for symbol.
+    """
+    m = ex.markets.get(symbol, {}) or {}
+    limits = m.get("limits", {}) or {}
+    amount_min = float((limits.get("amount", {}) or {}).get("min") or 0.0)
+    cost_min = float((limits.get("cost", {}) or {}).get("min") or 0.0)
+    # Compute notional implied by amount_min if price known
+    notional_from_amount = (amount_min * last_price) if (amount_min and last_price) else 0.0
+    min_notional = max(cost_min, notional_from_amount)
+    return (amount_min, min_notional)
+
+# ---------------- Discovery / positions ----------------
+
 def pick_candidates(ex: ccxt.Exchange, top_k:int) -> List[Dict]:
     tickers = ex.fetch_tickers()
     out=[]
@@ -67,8 +93,12 @@ def pick_candidates(ex: ccxt.Exchange, top_k:int) -> List[Dict]:
             else: continue
         qv = float(t.get("quoteVolume") or 0.0)
         if qv < 10000: continue
-        out.append({"symbol":sym,"price":float(t.get("last") or t.get("close") or 0.0),
-                    "change24h":float(ch),"quoteVolUsd":qv})
+        out.append({
+            "symbol": sym,
+            "price": float(t.get("last") or t.get("close") or 0.0),
+            "change24h": float(ch),
+            "quoteVolUsd": qv
+        })
     out.sort(key=lambda r:(r["change24h"], r["quoteVolUsd"]), reverse=True)
     return out[:max(1,int(top_k))]
 
@@ -86,77 +116,67 @@ def fetch_positions_snapshot(ex: ccxt.Exchange):
     return pos
 
 def get_cash_balance_usd(ex: ccxt.Exchange) -> float:
-    """
-    Kraken often parks fiat as USD or ZUSD. Sum both.
-    """
     bal = ex.fetch_balance()
-    def _amt(code: str) -> float:
-        bucket = bal.get(code, {}) or {}
-        return float(bucket.get("free") or bucket.get("total") or 0.0)
-    return max(0.0, _amt("USD") + _amt("ZUSD"))
+    usd = bal.get("USD",{})
+    free = float(usd.get("free") or 0.0)
+    total = float(usd.get("total") or free)
+    return max(free,total)
 
-# ---------- ORDER SIZING that satisfies BOTH min cost and min amount ----------
-def _min_reqs(ex: ccxt.Exchange, symbol: str) -> Tuple[float, float]:
+# ---------------- Order sizing with MIN handling ----------------
+
+def _round_amount(ex: ccxt.Exchange, symbol: str, amount: float) -> float:
+    try:
+        return float(ex.amount_to_precision(symbol, amount))
+    except Exception:
+        return amount
+
+def _ensure_min_order(ex: ccxt.Exchange, symbol: str, target_notional: float) -> Tuple[float, float, float, float]:
     """
-    Return (min_cost_usd, min_amount) for the market, defaulting to 0 if absent.
+    Given a target_notional (USD), compute a valid (qty, notional) meeting Kraken's min rules.
+    Returns: (qty, notional, amount_min, min_notional)
+    Does NOT check wallet cash; caller should compare with spendable.
     """
-    m = ex.markets[symbol]
-    min_cost = float(((m.get("limits") or {}).get("cost") or {}).get("min") or 0.0)
-    min_amt  = float(((m.get("limits") or {}).get("amount") or {}).get("min") or 0.0)
-    return (min_cost, min_amt)
-
-def _size_qty_meeting_requirements(ex: ccxt.Exchange, symbol: str, target_notional_usd: float, last_price: float) -> float:
-    """
-    Compute a quantity that simultaneously meets:
-      - min base amount
-      - min notional (cost)
-    with a tiny 2% headroom to avoid edge rejections after precision rounding.
-    """
-    headroom = 1.02
-    min_cost, min_amt = _min_reqs(ex, symbol)
-
-    # Start from notional → amount
-    qty = max(0.0, target_notional_usd / max(last_price, 1e-9))
-
-    # Enforce base minimum
-    qty = max(qty, min_amt * headroom)
-
-    # Enforce notional minimum
-    if min_cost > 0:
-        qty = max(qty, (min_cost * headroom) / max(last_price, 1e-9))
-
-    # Apply exchange precision
-    qty = float(ex.amount_to_precision(symbol, qty))
-
-    # If rounding zeroed it out, bump slightly and round again
-    if qty <= 0:
-        qty = float(ex.amount_to_precision(symbol, (min_amt or (target_notional_usd / max(last_price,1e-9))) * headroom))
-
-    return qty
-
-def buy_market(ex: ccxt.Exchange, symbol:str, notional:float, dry:bool):
     last = float(ex.fetch_ticker(symbol)["last"])
-    qty  = _size_qty_meeting_requirements(ex, symbol, notional, last)
+    amount_min, min_notional = _market_min_rules(ex, symbol, last)
 
-    if qty <= 0:
-        raise ValueError(f"Calculated order qty is zero for {symbol} (last={last}, notional={notional})")
+    # Desired qty from target USD
+    qty = target_notional / max(last, 1e-12)
 
+    # Raise to meet amount_min if present
+    if amount_min > 0:
+        qty = max(qty, amount_min)
+
+    qty = _round_amount(ex, symbol, qty)
+    notional = qty * last
+
+    # If still below min_notional (or Kraken has only cost.min), bump notional modestly
+    if min_notional > 0 and notional < min_notional:
+        notional = min_notional * 1.02  # +2% safety
+        qty = _round_amount(ex, symbol, notional / max(last,1e-12))
+        notional = qty * last
+
+    return qty, notional, amount_min, max(min_notional, 0.0)
+
+def buy_market(ex: ccxt.Exchange, symbol: str, target_notional: float, dry: bool):
+    qty, notional, amount_min, min_notional = _ensure_min_order(ex, symbol, target_notional)
     if dry:
-        print(f"[order][dry-run] BUY {symbol} ${notional:.2f} qty≈{qty}")
-        return {"id":"dry","symbol":symbol,"amount":float(qty),"price":last}
+        print(f"[order][dry-run] BUY {symbol} target=${target_notional:.2f} -> qty≈{qty} notional≈${notional:.2f} "
+              f"(amount_min={amount_min}, min_notional≈${min_notional:.2f})")
+        return {"id":"dry","symbol":symbol,"amount":float(qty),"price":float(ex.fetch_ticker(symbol)["last"])}
 
-    print(f"[order] BUY {symbol} ${notional:.2f} qty≈{qty}")
+    print(f"[order] BUY {symbol} notional≈${notional:.2f} qty≈{qty}")
     return ex.create_market_buy_order(symbol, float(qty))
 
 def sell_market(ex: ccxt.Exchange, symbol:str, qty:float, dry:bool):
-    qp = ex.amount_to_precision(symbol, qty)
+    qp = _round_amount(ex, symbol, qty)
     if dry:
         print(f"[order][dry-run] SELL {symbol} qty≈{qp}")
         return {"id":"dry","symbol":symbol,"amount":float(qp)}
     print(f"[order] SELL {symbol} qty≈{qp}")
     return ex.create_market_sell_order(symbol, float(qp))
 
-# ----- ledger -----
+# ---------------- Ledger ----------------
+
 def load_ledger()->Dict[str,Dict]:
     if LEDGER.exists():
         try: return json.loads(LEDGER.read_text() or "{}")
@@ -182,7 +202,8 @@ def update_high(ledger:Dict[str,Dict], symbol:str, price:float):
     else:
         rec["high"]=float(max(rec.get("high",price), price))
 
-# ----- cost-basis backfill from trades -----
+# --------- Backfill average entry from trades ----------
+
 def _backfill_avg_entry_from_trades(ex:ccxt.Exchange, symbol:str, current_qty:float, lookback_days:int)->float or None:
     try:
         since = int(time.time()*1000) - lookback_days*24*3600*1000
@@ -200,7 +221,7 @@ def _backfill_avg_entry_from_trades(ex:ccxt.Exchange, symbol:str, current_qty:fl
                     qty_net += amount
                     cost_usd += amount*price
                 elif side=="sell":
-                    avg = cost_usd/max(qty_net,1e-9) if qty_net>0 else price
+                    avg = (cost_usd/max(qty_net,1e-9)) if qty_net>0 else price
                     reduce = min(qty_net, amount)
                     qty_net -= reduce
                     cost_usd -= reduce*avg
@@ -213,7 +234,8 @@ def _backfill_avg_entry_from_trades(ex:ccxt.Exchange, symbol:str, current_qty:fl
         print(f"[backfill] {symbol} failed: {e}")
         return None
 
-# ----- main loop -----
+# ---------------- Main loop ----------------
+
 def run_trading_loop()->int:
     DRY_RUN = os.getenv("DRY_RUN","ON").upper()
     dry = DRY_RUN!="OFF"
@@ -241,7 +263,7 @@ def run_trading_loop()->int:
     positions = fetch_positions_snapshot(ex)
     held = {p["symbol"].upper() for p in positions}
 
-    # --- Backfill entries for existing bags so sells can trigger immediately
+    # Backfill entries for currently held coins
     for p in positions:
         sym = p["symbol"].upper()
         if sym not in ledger or ledger[sym].get("entry") is None:
@@ -253,7 +275,7 @@ def run_trading_loop()->int:
                 ensure_entry(ledger, sym, p["price"] or 0.0, set_high=True)
     save_ledger(ledger)
 
-    # --- SELL GUARD (tight)
+    # SELL guard
     sells=0
     for p in positions:
         sym=p["symbol"].upper(); price=float(p["price"] or 0.0); qty=float(p["qty"] or 0.0)
@@ -275,38 +297,76 @@ def run_trading_loop()->int:
             sell_market(ex, sym, qty, dry); sells+=1; ledger.pop(sym,None); continue
     save_ledger(ledger)
 
-    # refresh after sells
     if sells:
         positions = fetch_positions_snapshot(ex)
         held = {p["symbol"].upper() for p in positions}
 
-    # --- BUY side
+    # BUY side
     cash = get_cash_balance_usd(ex)
     spendable = max(0.0, cash - cash*(RESERVE_CASH_PCT/100.0))
+
     universe = pick_candidates(ex, UNIVERSE_TOP_K)
     if WL: universe = [c for c in universe if c["symbol"].upper() in WL]
-    filtered = [c for c in universe if c["change24h"]>=MIN_24H_PCT and c["quoteVolUsd"]>=MIN_BASE_VOL_USD and c["symbol"].upper() not in held]
 
-    BUY_GATES_MD.write_text("\n".join([
+    # Filter by 24h change / volume and by min-notional affordability vs MIN_BUY_USD
+    filtered=[]
+    min_diag_lines = [
         "## BUY_DIAGNOSTIC",
         f"- time: {_now()}",
-        f"- cash(usdzusd): {cash:.2f} spendable: {spendable:.2f}",
+        f"- cash: {cash:.2f} spendable: {spendable:.2f}",
+        f"- target_buy_usd (MIN_BUY_USD): {MIN_BUY_USD:.2f}",
         f"- positions: {len(held)}",
-        f"- candidates: total={len(universe)} after_filters={len(filtered)}",
-        f"- whitelist: {'on' if WL else 'off'}",
-    ]) + "\n")
+    ]
+    for c in universe:
+        if c["change24h"] < MIN_24H_PCT: continue
+        if c["quoteVolUsd"] < MIN_BASE_VOL_USD: continue
+        if c["symbol"].upper() in held: continue
+
+        # Check min rules for this pair; skip if pair's real min exceeds our target
+        try:
+            last = c["price"] if c["price"]>0 else float(ex.fetch_ticker(c["symbol"])["last"])
+        except Exception:
+            last = c["price"]
+        amount_min, min_notional = _market_min_rules(ex, c["symbol"], last)
+        min_diag_lines.append(f"- {c['symbol']}: amount_min={amount_min} min_notional≈${min_notional:.2f}")
+        if min_notional and MIN_BUY_USD < (min_notional - 1e-6):
+            # Pair requires more USD than we intend to spend; skip to avoid Kraken error.
+            continue
+
+        filtered.append(c)
+
+    BUY_GATES_MD.write_text("\n".join(min_diag_lines) + "\n")
 
     buys=0
     max_new = max(0, MAX_POSITIONS - len(held))
     slots = min(MAX_BUYS_PER_RUN, max_new)
+
     for c in filtered:
-        if buys>=slots or spendable<MIN_BUY_USD: break
+        if buys>=slots: break
+        if spendable < MIN_BUY_USD: break
+
         sym=c["symbol"].upper()
         try:
-            buy_market(ex, sym, MIN_BUY_USD, dry)
+            # If true min_notional is higher than MIN_BUY_USD but <= our spendable,
+            # buy at the true minimum (engine will bump automatically in buy_market).
+            order = buy_market(ex, sym, MIN_BUY_USD, dry)
+
+            # Set entry/high on first buy to last price
             last=float(ex.fetch_ticker(sym)["last"])
             ensure_entry(ledger, sym, last, set_high=True); save_ledger(ledger)
-            buys+=1; spendable-=MIN_BUY_USD
+            buys+=1
+
+            # Update spendable using executed notional if available
+            try:
+                spendable -= float(order.get("cost") or MIN_BUY_USD)
+            except Exception:
+                spendable -= MIN_BUY_USD
+
+        except ccxt.InsufficientFunds as e:
+            print(f"[engine] BUY skipped for {sym}: insufficient funds ({e})")
+        except ccxt.InvalidOrder as e:
+            # Should be rare now; log and continue
+            print(f"[engine] BUY invalid for {sym}: {e}")
         except Exception as e:
             print(f"[engine] BUY failed for {sym}: {e}")
 
@@ -320,7 +380,7 @@ def run_trading_loop()->int:
 if __name__ == "__main__":
     raise SystemExit(run_trading_loop())
 
-# ---- adapter for new main.py API ----
+# ---- adapter for new main.py API (kept for compatibility) ----
 def run_hourly_rotation(
     dry_run: bool = True,
     buy_usd: float = 25.0,
@@ -330,9 +390,4 @@ def run_hourly_rotation(
     slow_gain_req: float = 3.0,
     universe_pick: str | None = None,
 ) -> int:
-    """
-    Compatibility wrapper so main.py can call this symbol.
-    Your engine already reads env vars inside run_trading_loop(), so we
-    simply delegate and ignore incoming kwargs (keeps behavior unchanged).
-    """
     return run_trading_loop()
