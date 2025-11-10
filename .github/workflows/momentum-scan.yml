@@ -1,9 +1,9 @@
-name: Momentum — Scan (hourly)
+name: Momentum — Scan (Real)
 
 on:
-  schedule:
-    - cron: "5 * * * *"   # :05 each hour (after rotation)
   workflow_dispatch:
+  schedule:
+    - cron: "0 * * * *"   # every hour
 
 permissions:
   contents: write
@@ -15,38 +15,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install requests pyyaml
+          pip install -r requirements.txt || true
+          pip install pandas yfinance matplotlib pyyaml requests
 
-      - name: Ensure .state
-        run: mkdir -p .state
+      - name: Run real momentum scanner
+        run: python tools/momentum_scan.py
 
-      # >>> run your scanner (placeholder script for now)
-      - name: Run momentum scanner
-        run: python tools/mock_momentum_scan.py
+      - name: Normalize & add schema columns
+        run: python tools/csv_schema_fix.py .state/momentum_candidates.csv
 
-      - name: Normalize candidate CSV schema
-        run: python tools/csv_schema_fix.py
-
-      - name: List .state contents
-        run: ls -la .state || true
-
-      - name: Zip .state (scan)
-        run: |
-          STATE_ZIP="state-scan-${GITHUB_RUN_NUMBER}.zip"
-          (cd . && zip -r "$STATE_ZIP" .state >/dev/null)
-          ls -lh "$STATE_ZIP"
-
-      - name: Upload scan artifacts
+      - name: Zip and upload CSV artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: scan-${{ github.run_number }}
-          path: state-scan-${{ github.run_number }}.zip
-          retention-days: 7
+          name: momentum_scan_outputs
+          path: |
+            .state/momentum_candidates.csv
+            .state/momentum_candidates_fixed.csv
