@@ -2,7 +2,7 @@ name: Momentum — Spike Scan (hourly)
 
 on:
   schedule:
-    - cron: "10 * * * *"   # runs at :10 each hour (after main scan)
+    - cron: "10 * * * *"   # :10 each hour (after momentum scan)
   workflow_dispatch:
 
 permissions:
@@ -28,28 +28,9 @@ jobs:
       - name: Ensure .state
         run: mkdir -p .state
 
-      # 👉 Your real spike scan should write: .state/spike_candidates.csv
-      - name: Run spike scanner (placeholder)
-        run: |
-          python - <<'PY'
-import csv, random
-from pathlib import Path
-pairs = ["KAVA/USD","STRK/USD","EAT/USD","CFG/USD"]
-rows = []
-for i,p in enumerate(pairs):
-    rows.append({
-      "pair": p,
-      "score": round(10+random.random()*20, 3),
-      "pct24": round(5+random.random()*15, 2),
-      "usd_vol": int(50_000+random.random()*2_000_000),
-      "ema_slope": round(-0.02+random.random()*0.04, 5),
-    })
-out = Path(".state")/"spike_candidates.csv"
-with out.open("w", newline="", encoding="utf-8") as f:
-    w = csv.DictWriter(f, fieldnames=["pair","score","pct24","usd_vol","ema_slope"])
-    w.writeheader(); w.writerows(rows)
-print(f"wrote {out}")
-PY
+      # >>> run your spike scanner (placeholder script for now)
+      - name: Run spike scanner
+        run: python tools/mock_spike_scan.py
 
       - name: Normalize candidate CSV schema
         run: python tools/csv_schema_fix.py
