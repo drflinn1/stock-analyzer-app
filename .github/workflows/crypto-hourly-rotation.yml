@@ -41,20 +41,19 @@ jobs:
           python tools/csv_schema_fix.py .state/momentum_candidates.csv || true
           python tools/csv_schema_fix.py .state/spike_candidates.csv || true
 
-      # === NEW: Prefer spike if fresh & decent, else fall back to momentum ===
-      - name: Select freshest candidates (spike-first)
+      # === Prefer spike if fresh & valid, then NORMALIZE SYMBOLS for main.py ===
+      - name: Select candidates (spike-first) + normalize symbols (USD, no slash)
         run: |
           python - <<'PY'
-          import os, time, shutil, pandas as pd
+          import os, time, shutil, pandas as pd, re
 
           MOM_FIXED = ".state/momentum_candidates_fixed.csv"
           SPIKE_FIXED = ".state/spike_candidates_fixed.csv"
-          SELECTED   = ".state/candidates_selected.csv"  # for logging/inspection
+          SELECTED_RAW   = ".state/candidates_selected_raw.csv"
+          SELECTED_NORM  = ".state/candidates_selected_norm.csv"
 
           def fresh_enough(path, max_age_min=20):
-              if not os.path.exists(path): return False
-              age_s = time.time() - os.path.getmtime(path)
-              return age_s <= max_age_min * 60
+              return os.path.exists(path) and (time.time() - os.path.getmtime(path) <= max_age_min*60)
 
           def good_spike(path):
               try:
@@ -62,43 +61,83 @@ jobs:
                   if len(df) < 5:
                       print(f"Spike not used: only {len(df)} rows (<5).")
                       return False
-                  # Liquidity check if usd_vol present (not mandatory)
-                  if "usd_vol" in df.columns:
-                      # require at least one candidate with >= $100k in last window
-                      ok = (df["usd_vol"].fillna(0) >= 100000).any()
-                      if not ok:
-                          print("Spike not used: liquidity check failed (usd_vol < 100k on all rows).")
-                          return False
+                  if "usd_vol" in df.columns and (df["usd_vol"].fillna(0) >= 100000).any() is False:
+                      print("Spike not used: liquidity check failed (usd_vol < 100k on all rows).")
+                      return False
                   return True
               except Exception as e:
                   print("Spike not used: error reading spike file:", e)
                   return False
 
+          # Choose source
           use_spike = fresh_enough(SPIKE_FIXED, 20) and good_spike(SPIKE_FIXED)
+          src = SPIKE_FIXED if use_spike else MOM_FIXED
+          print("✔ Using", "SPIKE" if use_spike else "MOMENTUM", "candidates →", src)
 
-          if use_spike:
-              src = SPIKE_FIXED
-              print("✔ Using SPIKE candidates (fresh & valid).")
-          else:
-              src = MOM_FIXED
-              print("ℹ Using MOMENTUM candidates (spike missing/stale/weak).")
+          # Load + normalize to what main.py expects:
+          # - column 'symbol' present
+          # - remove '/', uppercase
+          # - prefer USD pairs; if scarce, allow USDT fallback
+          df = pd.read_csv(src)
 
-          # Save a copy for visibility, and also overwrite the momentum_fixed
-          # so main.py keeps reading the same path it already expects.
-          shutil.copyfile(src, SELECTED)
-          shutil.copyfile(src, MOM_FIXED)
-          print(f"Selected → {SELECTED} (and mirrored to {MOM_FIXED})")
+          # Ensure required cols exist
+          if "symbol" not in df.columns:
+              # try 'pair' fallback if present
+              if "pair" in df.columns:
+                  df["symbol"] = df["pair"]
+              else:
+                  raise SystemExit("No 'symbol' (or 'pair') column found in source CSV")
 
-          # Show quick preview
+          def norm_sym(s: str) -> str:
+              s = str(s).upper().strip()
+              s = s.replace("/", "")          # e.g., MELANIA/USD -> MELANIAUSD
+              s = re.sub(r"[^A-Z0-9]", "", s) # keep alnum only
+              return s
+
+          df["symbol_norm"] = df["symbol"].map(norm_sym)
+
+          # Prefer USD (not USDT); if none, keep all
+          usd_mask   = df["symbol_norm"].str.endswith("USD", na=False) & ~df["symbol_norm"].str.endswith("USDT", na=False)
+          if usd_mask.any():
+              df = df.loc[usd_mask].copy()
+
+          # Keep only required columns in final order
+          out = pd.DataFrame({
+              "symbol": df["symbol_norm"],
+              "quote":  df["quote"] if "quote" in df.columns else None,
+              "rank":   df["rank"]  if "rank"  in df.columns else range(1, len(df)+1)
+          })
+
+          # Save debug copy and the mirrored file main.py reads
+          out.to_csv(SELECTED_NORM, index=False)
+          # mirror to momentum_fixed so main.py uses the normalized list
+          out.to_csv(MOM_FIXED, index=False)
+
+          # Also keep a raw snapshot for inspection (optional)
           try:
-              df = pd.read_csv(SELECTED)
-              print("\n=== Selected top 5 ===")
-              print(df.head(5).to_string(index=False))
-          except Exception as e:
-              print("Preview error:", e)
+              df.to_csv(SELECTED_RAW, index=False)
+          except Exception:
+              pass
+
+          print("\n=== Selected (normalized) top 10 ===")
+          print(out.head(10).to_string(index=False))
           PY
 
-      # 🚀 Run your rotation bot (reads .state/momentum_candidates_fixed.csv as usual)
+      # Optional quick peek remains
+      - name: Echo latest picks (top 5)
+        run: |
+          python - <<'PY'
+          import os, pandas as pd
+          fp = ".state/momentum_candidates_fixed.csv"
+          if os.path.exists(fp):
+              df = pd.read_csv(fp)
+              print("\\n=== Final candidates fed to bot (top 5) ===")
+              print(df.head(5).to_string(index=False))
+          else:
+              print("No momentum_candidates_fixed.csv found")
+          PY
+
+      # 🚀 Run your rotation bot (reads .state/momentum_candidates_fixed.csv)
       - name: Run bot
         env:
           PYTHONUNBUFFERED: "1"
