@@ -1,401 +1,232 @@
 #!/usr/bin/env python3
 """
 crypto_engine.py
-Unified engine for "Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)".
+Price + candidate utilities for the rotation bot.
 
-Adds:
-- Cooldown after a SELL (COOLDOWN_MIN) so we don't rebuy immediately.
-- No-rebuy during cooldown of the last-sold pair.
-- Trailing stop + Break-even via sell_guard.
-- SWITCH_IF_GAP: If another candidate outranks current by N rank points, rotate early.
-- Portfolio snapshot written each run to .state/portfolio_history.csv.
+Goals:
+- Never stall the buy/sell logic due to missing/invalid quotes.
+- Work even when .state/momentum_candidates.csv is missing quotes or is read-only.
+- Use Kraken public API as a reliable fallback.
 
-New:
-- Robust price sourcing: use momentum_candidates.csv if present,
-  else query Kraken PUBLIC ticker (no keys) so guard never stalls on "invalid price(s)".
+Exports used by main.py (safe to call):
+- load_candidates(csv_path=".state/momentum_candidates.csv") -> list[dict]
+- get_public_quote(pair: str) -> float | None
+- get_public_quotes(pairs: list[str]) -> dict[str, float]
+- normalize_pair(s: str) -> str
 """
 
 from __future__ import annotations
-from pathlib import Path
-from typing import Dict, Any, List, Tuple, Optional
-import os
-import json
+
 import csv
+import os
 import time
+from pathlib import Path
+from typing import Dict, List, Optional
 
-import requests  # <- public ticker fallback
-
-from trader.sell_guard import GuardCfg, Position, run_sell_guard
+import requests
 
 STATE_DIR = Path(".state")
-SUMMARY_JSON = STATE_DIR / "run_summary.json"
-SUMMARY_MD   = STATE_DIR / "run_summary.md"
-POSITIONS    = STATE_DIR / "positions.json"
-LAST_SELL    = STATE_DIR / "last_sell.json"
-SELL_LOG_MD  = STATE_DIR / "sell_log.md"
-COOLDOWN_JS  = STATE_DIR / "cooldown.json"
-PORTFOLIO_CSV= STATE_DIR / "portfolio_history.csv"
-CANDIDATES   = STATE_DIR / "momentum_candidates.csv"
+CANDIDATES_CSV = STATE_DIR / "momentum_candidates.csv"
 
-# ----------------- env helpers -----------------
+# Simple in-process cache so repeated asks in one run are cheap
+_QUOTES_CACHE: Dict[str, float] = {}
+_CACHE_TTL = 30  # seconds
+_CACHE_STAMP: Dict[str, float] = {}
 
-def env_str(name: str, default: str = "") -> str:
-    val = os.getenv(name, default)
-    return "" if val is None else str(val)
 
-def env_float(name: str, default: float) -> float:
-    try:
-        return float(env_str(name, str(default)).strip())
-    except Exception:
-        return default
+# ----------------------------- Kraken Public API -----------------------------
 
-def env_on(name: str, default: bool = False) -> bool:
-    v = env_str(name, "ON" if default else "OFF").upper().strip()
-    return v in ("1", "TRUE", "ON", "YES")
-
-# ----------------- io helpers -----------------
-
-def now_utc() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
-
-def read_json(path: Path, default):
-    try:
-        return json.loads(path.read_text())
-    except Exception:
-        return default
-
-def write_json(path: Path, data) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2))
-
-def append_md(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        path.write_text("# Sell Log\nWhen (UTC) | Pair | Amount | Entry | Price | Pct | Reason | Mode | OrderId\n---|---|---:|---:|---:|---:|---|---|---\n")
-    with path.open("a", encoding="utf-8") as f:
-        f.write(text)
-
-def ensure_portfolio_csv():
-    if not PORTFOLIO_CSV.exists():
-        PORTFOLIO_CSV.write_text("when_utc,total_usd,fiat_usd,stable_usd,position_pair,position_amt,position_px,position_val_usd,notes\n")
-
-# ----------------- price helpers -----------------
-
-def _norm_pair_to_kraken_symbol(pair: str) -> str:
-    """E.g., 'EAT/USD' -> 'EATUSD' (Kraken public ticker format)"""
-    return pair.replace("/", "").upper()
-
-def _kraken_public_price(pair: str) -> float:
+def _kraken_ticker(pair_code: str) -> Optional[float]:
     """
-    Best-effort public price from Kraken (no keys). Returns 0 on failure.
+    Call Kraken public ticker for the given pair code (e.g., 'SOLUSD', 'XRPUSD').
+    Returns last trade price as float or None on failure.
     """
+    url = "https://api.kraken.com/0/public/Ticker"
     try:
-        sym = _norm_pair_to_kraken_symbol(pair)
-        url = f"https://api.kraken.com/0/public/Ticker?pair={sym}"
-        r = requests.get(url, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        if "error" in data and data["error"]:
-            return 0.0
+        resp = requests.get(url, params={"pair": pair_code}, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("error"):
+            return None
+        # Kraken returns result under the passed pair key (can be remapped internally)
         result = data.get("result", {})
         if not result:
-            return 0.0
-        # first (only) key holds the ticker dict
-        key = next(iter(result.keys()))
-        entry = result[key]
-        # Kraken returns last trade array "c": ["price","lot size"]
-        last = entry.get("c", [])
-        if last and float(last[0]) > 0:
-            return float(last[0])
-        # fallback: ask price "a": ["price","wholeLot","lotDecimals"]
-        ask = entry.get("a", [])
-        if ask and float(ask[0]) > 0:
-            return float(ask[0])
+            return None
+        # Grab the first (only) entry
+        _k, v = next(iter(result.items()))
+        # 'c': [<last_price>, <lot>]
+        last = v.get("c", [None])[0]
+        if last is None:
+            return None
+        return float(last)
     except Exception:
-        pass
-    return 0.0
+        return None
 
-def get_current_price(pair: str) -> float:
+
+def _to_kraken_code(pair: str) -> str:
     """
-    Price sourcing order:
-      1) .state/momentum_candidates.csv (columns: symbol|pair, quote|price)
-      2) Kraken PUBLIC ticker (no keys)
-      3) 0.0 (signals not found)
+    Convert 'SOL/USD' -> 'SOLUSD', 'XBT/USD' -> 'XBTUSD', 'DOGEUSD' -> 'DOGEUSD'.
+    We don't attempt the legacy X/Z prefixes here—Kraken accepts 'SOLUSD' etc.
     """
-    # 1) from candidates CSV
+    p = pair.strip().upper().replace(" ", "")
+    if "/" in p:
+        a, b = p.split("/", 1)
+        return f"{a}{b}"
+    return p
+
+
+def normalize_pair(s: str) -> str:
+    """
+    Normalizes incoming pair labels to a standard 'BASE/QUOTE' form with upper case.
+    Accepts 'sol/usd', 'SOLUSD', 'SOL-USD', 'SOL/USD' → 'SOL/USD'
+    """
+    t = s.strip().upper().replace("-", "/")
+    if "/" in t:
+        a, b = t.split("/", 1)
+        return f"{a}/{b}"
+    # If no slash, assume USD quote
+    if t.endswith("USD"):
+        return f"{t[:-3]}/USD"
+    return t
+
+
+def _is_valid_price(x: Optional[float]) -> bool:
+    if x is None:
+        return False
+    # sanity: > 0 and not NaN/Inf (float checks)
     try:
-        if CANDIDATES.exists():
-            with CANDIDATES.open(newline="") as f:
-                rdr = csv.DictReader(f)
-                target = pair.replace("/", "").upper()
-                for r in rdr:
-                    sym = (r.get("symbol") or r.get("pair") or "").strip().upper()
-                    if not sym:
-                        continue
-                    if "/" not in sym and not sym.endswith("USD"):
-                        sym = f"{sym}/USD"
-                    if sym.replace("/", "") == target:
-                        q = r.get("quote") or r.get("price")
-                        if q is not None and float(q) > 0:
-                            return float(q)
+        return x > 0 and x < 1e9
     except Exception:
-        pass
+        return False
 
-    # 2) Kraken public
-    px = _kraken_public_price(pair)
-    if px > 0:
-        return px
 
-    # 3) not found
-    return 0.0
+def get_public_quote(pair: str) -> Optional[float]:
+    """
+    Cached public-quote getter for a single pair.
+    """
+    pair_norm = normalize_pair(pair)
+    now = time.time()
+    if pair_norm in _QUOTES_CACHE and (now - _CACHE_STAMP.get(pair_norm, 0)) <= _CACHE_TTL:
+        return _QUOTES_CACHE[pair_norm]
 
-# ----------------- candidates / ranking -----------------
+    code = _to_kraken_code(pair_norm)
+    price = _kraken_ticker(code)
+    if _is_valid_price(price):
+        _QUOTES_CACHE[pair_norm] = float(price)
+        _CACHE_STAMP[pair_norm] = now
+        return float(price)
+    return None
 
-def read_candidates() -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    if not CANDIDATES.exists():
+
+def get_public_quotes(pairs: List[str]) -> Dict[str, float]:
+    """
+    Batch convenience: returns a dict of {normalized_pair: price} for valid quotes only.
+    """
+    out: Dict[str, float] = {}
+    for p in pairs:
+        pn = normalize_pair(p)
+        q = get_public_quote(pn)
+        if _is_valid_price(q):
+            out[pn] = float(q)
+    return out
+
+
+# ----------------------------- Candidates Loader -----------------------------
+
+def _parse_candidates_csv(csv_path: Path) -> List[dict]:
+    """
+    Reads CSV rows. Accepts headers with at least: pair, rank
+    Optional header: quote. If missing/invalid, we will public-fetch later.
+    Returns a list of dicts with normalized fields.
+    """
+    rows: List[dict] = []
+    if not csv_path.exists():
         return rows
-    with CANDIDATES.open() as f:
-        rdr = csv.DictReader(f)
-        for r in rdr:
-            sym = (r.get("symbol") or r.get("pair") or "").strip().upper()
-            if not sym:
-                continue
-            row = {
-                "symbol": sym if "/" in sym else f"{sym}",
-                "rank": float(r.get("rank") or r.get("score") or 0.0),
-                "quote": float(r.get("quote") or r.get("price") or 0.0),
-            }
-            rows.append(row)
-    rows.sort(key=lambda x: x["rank"], reverse=True)
+
+    try:
+        with csv_path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            # flexible header names
+            hdr = {h.lower().strip(): h for h in reader.fieldnames or []}
+
+            def get(row, key, default=""):
+                # search case-insensitively
+                for k in (key, key.lower(), key.upper()):
+                    if k in row:
+                        return row[k]
+                # header map help
+                if key in hdr:
+                    return row.get(hdr[key], default)
+                return default
+
+            for row in reader:
+                pair_raw = get(row, "pair", "").strip()
+                if not pair_raw:
+                    pair_raw = get(row, "symbol", "").strip()
+                if not pair_raw:
+                    continue
+
+                pair = normalize_pair(pair_raw)
+                rank_s = get(row, "rank", "").strip()
+                quote_s = get(row, "quote", "").strip()
+
+                try:
+                    rank = int(float(rank_s)) if rank_s != "" else 0
+                except Exception:
+                    rank = 0
+
+                try:
+                    quote = float(quote_s) if quote_s not in ("", None) else None
+                except Exception:
+                    quote = None
+
+                rows.append({"pair": pair, "rank": rank, "quote": quote})
+    except Exception:
+        # if unreadable / locked / malformed, just return empty; caller will refetch
+        return []
+
     return rows
 
-def top_candidate_symbol() -> Optional[str]:
-    rows = read_candidates()
-    if not rows:
-        return None
-    sym = rows[0]["symbol"]
-    if "/" not in sym and not sym.endswith("USD"):
-        sym = f"{sym}/USD"
-    return sym
 
-def rank_gap(current_pair: str) -> float:
-    rows = read_candidates()
-    if not rows:
-        return 0.0
-    top = rows[0]["rank"]
-    cur = None
+def _fill_missing_quotes(rows: List[dict]) -> List[dict]:
+    """
+    For any candidate without a valid quote, fetch from Kraken public API.
+    """
     for r in rows:
-        if r["symbol"].replace("/", "") == current_pair.replace("/", ""):
-            cur = r["rank"]
-            break
-    if cur is None:
-        return 0.0
-    return float(top - cur)
+        if not _is_valid_price(r.get("quote")):
+            q = get_public_quote(r["pair"])
+            if _is_valid_price(q):
+                r["quote"] = float(q)
+    return rows
 
-# ----------------- cooldown / no-rebuy -----------------
 
-def record_cooldown(pair: str) -> None:
-    js = read_json(COOLDOWN_JS, {})
-    js[pair] = int(time.time())
-    write_json(COOLDOWN_JS, js)
+def _best_effort_candidates(csv_path: Path) -> List[dict]:
+    """
+    Best-effort pipeline: read CSV if present, fill any missing quotes via public API.
+    If file is missing/readonly/corrupt, fallback to a trivial default universe that
+    still yields a valid price so the run never stalls.
+    """
+    rows = _parse_candidates_csv(csv_path)
 
-def is_in_cooldown(pair: str, minutes: float) -> bool:
-    if minutes <= 0:
-        return False
-    js = read_json(COOLDOWN_JS, {})
-    ts = int(js.get(pair, 0))
-    if ts <= 0:
-        return False
-    return (time.time() - ts) < (minutes * 60.0)
+    if not rows:
+        # Fallback tiny universe — matches the YAML seed so behavior is predictable
+        rows = [{"pair": "EAT/USD", "rank": 100, "quote": None}]
 
-# ----------------- artifacts -----------------
+    rows = _fill_missing_quotes(rows)
 
-def write_summary(data: Dict[str, Any]) -> None:
-    write_json(SUMMARY_JSON, data)
-    lines = [
-        f"# Crypto — Hourly 1-Coin Rotation",
-        f"When: {data.get('when','')}",
-        f"DRY_RUN: {data.get('dry_run','')}",
-        f"BUY_USD: {data.get('buy_usd','')}",
-        f"TP_PCT: {data.get('tp_pct','')}",
-        f"STOP_PCT: {data.get('stop_pct','')}",
-        f"WINDOW_MIN: {data.get('window_min','')}",
-        f"SLOW_GAIN_REQ: {data.get('slow_gain_req','')}",
-        f"UNIVERSE_PICK: {data.get('universe_pick','')}",
-        f"Engine: {data.get('engine','')}",
-        f"Status: {data.get('status','')}",
-        f"Note: {data.get('note','')}",
-    ]
-    SUMMARY_MD.write_text("\n".join(lines) + "\n")
+    # Final safety: filter only those with valid quotes
+    rows = [r for r in rows if _is_valid_price(r.get("quote"))]
 
-def write_sell_artifacts(payload: Dict[str, Any]) -> None:
-    write_json(LAST_SELL, payload)
-    md = (
-        f"{payload['when']} | {payload['pair']} | {payload['amount']:.6f} | "
-        f"{payload['entry']:.8f} | {payload['price']:.8f} | "
-        f"{payload['pct']:.4f} | {payload['reason']} | {payload['mode']} | {payload['order_id']}\n"
-    )
-    append_md(SELL_LOG_MD, md)
-    if POSITIONS.exists():
-        POSITIONS.unlink(missing_ok=True)
-    record_cooldown(payload["pair"])
+    return rows
 
-def snapshot_portfolio(pair: Optional[str]) -> None:
-    ensure_portfolio_csv()
-    fiat_usd = float(env_str("FAKE_FIAT_USD", "0") or "0")
-    total_usd = fiat_usd
-    pos_amt = 0.0
-    pos_px  = 0.0
-    pos_val = 0.0
-    notes = ""
-    if POSITIONS.exists():
-        p = read_json(POSITIONS, {})
-        pos_amt = float(p.get("amount") or 0.0)
-        pos_px  = float(p.get("entry") or p.get("entry_px") or 0.0)
-        sym = p.get("pair") or pair or ""
-        cp = get_current_price(sym) if sym else 0.0
-        pos_val = pos_amt * (cp or 0.0)
-        total_usd += pos_val
-    else:
-        notes = "flat"
-    with PORTFOLIO_CSV.open("a", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([time.strftime("%-m/%-d/%Y %H:%M", time.gmtime()), f"{total_usd:.4f}", f"{fiat_usd:.4f}", "0.000",
-                    pair or "", f"{pos_amt:.6f}", f"{pos_px:.8f}", f"{pos_val:.2f}", notes])
 
-# ----------------- main engine -----------------
-
-def run_hourly_rotation() -> None:
-    when = now_utc()
-    mode = "OFF" if env_on("DRY_RUN", False) is False else "ON"   # OFF = LIVE, ON = DRY
-    dry_txt = "OFF" if mode == "OFF" else "ON"
-
-    buy_usd = env_float("BUY_USD", 25.0)
-    tp_pct  = env_float("TP_PCT", 5.0)
-    stop_pct= env_float("STOP_PCT", 1.0)
-
-    cooldown_min       = env_float("COOLDOWN_MIN", 30.0)
-    no_rebuy_min       = env_float("NO_REBUY_MIN", cooldown_min)
-    trail_start_pct    = env_float("TRAIL_START_PCT", 3.0)
-    trail_backoff_pct  = env_float("TRAIL_BACKOFF_PCT", 0.8)
-    be_trigger_pct     = env_float("BE_TRIGGER_PCT", 2.0)
-    switch_if_gap      = env_float("SWITCH_IF_GAP", 0.0)
-    switch_min_hold    = env_float("SWITCH_MIN_HOLD_MIN", 10.0)
-
-    note = []
-    engine = "trader.crypto_engine.run_hourly_rotation"
-
-    # If holding, run guard (with robust price fetch)
-    if POSITIONS.exists():
-        p = read_json(POSITIONS, {})
-        pair = p.get("pair", "EAT/USD")
-        amount = float(p.get("amount", 0.0))
-        entry  = float(p.get("entry") or p.get("entry_px") or 0.0)
-
-        cur_px = get_current_price(pair)  # <- now robust
-        cfg = GuardCfg(
-            stop_pct=stop_pct,
-            tp_pct=tp_pct,
-            trail_start_pct=trail_start_pct,
-            trail_backoff_pct=trail_backoff_pct,
-            be_trigger_pct=be_trigger_pct,
-        )
-        pos = Position(pair=pair, amount=amount, entry_px=entry)
-
-        did_sell, rsn = run_sell_guard(
-            pos=pos,
-            cur_price=cur_px,
-            cfg=cfg,
-            mode=mode,
-            place_sell_fn=place_market_sell,
-            write_sell_artifacts_fn=write_sell_artifacts,
-        )
-
-        if did_sell:
-            note.append(f"[{mode}] {rsn}")
-        else:
-            note.append(f"Guard: {rsn}")
-
-            if switch_if_gap > 0:
-                gap = rank_gap(pair)
-                try:
-                    held_secs = time.time() - int(time.mktime(time.strptime(p.get("when","1970-01-01 00:00:00"), "%Y-%m-%d %H:%M:%S")))
-                except Exception:
-                    held_secs = 999999
-                if gap >= switch_if_gap and held_secs >= (switch_min_hold * 60.0):
-                    ok, oid = place_market_sell(pair, amount, mode)
-                    payload = {
-                        "when": now_utc().replace(" UTC",""),
-                        "pair": pair,
-                        "amount": round(amount, 8),
-                        "entry": round(entry, 8),
-                        "price": round(cur_px, 8),
-                        "pct": round((cur_px/entry-1)*100.0 if entry>0 else 0.0, 4),
-                        "reason": f"SWITCH gap {gap:.1f}>= {switch_if_gap:.1f}",
-                        "mode": mode.upper(),
-                        "order_id": oid,
-                    }
-                    write_sell_artifacts(payload)
-                    note.append(f"Switch-on-superior: rotated out of {pair} (gap {gap:.1f})")
-
-    # BUY logic (only if flat)
-    flat = not POSITIONS.exists()
-    target_pair = top_candidate_symbol() or "EAT/USD"
-
-    if read_json(LAST_SELL, {}).get("pair") == target_pair and is_in_cooldown(target_pair, no_rebuy_min):
-        note.append(f"No-rebuy: {target_pair} in cooldown ({int(no_rebuy_min)}m)")
-        target_pair = None
-
-    if flat and target_pair and not is_in_cooldown(target_pair, cooldown_min):
-        ok, oid, amt, fill_px = place_market_buy(target_pair, buy_usd, mode)
-        if ok and amt > 0:
-            write_json(POSITIONS, {
-                "pair": target_pair,
-                "amount": amt,
-                "entry": fill_px,
-                "when": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
-            })
-            note.append(f"[{mode}] BUY {target_pair}: {amt:.6f} @~{fill_px:.8f}")
-        else:
-            note.append(f"BUY error {target_pair}: {oid}")
-    elif flat and target_pair and is_in_cooldown(target_pair, cooldown_min):
-        note.append(f"Cooldown holding: {target_pair} ({int(cooldown_min)}m)")
-
-    snapshot_portfolio(target_pair or read_json(POSITIONS, {}).get("pair"))
-
-    data = {
-        "when": when,
-        "dry_run": dry_txt,
-        "buy_usd": str(int(buy_usd)),
-        "tp_pct": str(tp_pct),
-        "stop_pct": str(stop_pct),
-        "window_min": env_str("WINDOW_MIN", "30"),
-        "slow_gain_req": env_str("SLOW_GAIN_REQ", "3"),
-        "universe_pick": env_str("UNIVERSE_PICK", "AUTO"),
-        "engine": engine,
-        "status": "ok",
-        "note": " | ".join(note) if note else "ok",
-    }
-    write_summary(data)
-
-# --- simple market order stubs (unchanged interface) ---
-
-def place_market_sell(pair: str, amount: float, mode: str) -> Tuple[bool, str]:
-    if mode.upper() == "OFF":  # LIVE
-        return True, "LIVE-" + str(int(time.time()))
-    else:
-        return True, "DRY-" + str(int(time.time()))
-
-def place_market_buy(pair: str, usd: float, mode: str) -> Tuple[bool, str, float, float]:
-    px = get_current_price(pair)
-    if px <= 0:
-        return False, "NOQUOTE", 0.0, 0.0
-    amt = usd / px
-    if mode.upper() == "OFF":
-        return True, "LIVE-" + str(int(time.time())), amt, px
-    else:
-        return True, "DRY-" + str(int(time.time())), amt, px
-
-if __name__ == "__main__":
-    run_hourly_rotation()
+def load_candidates(csv_path: str | Path = CANDIDATES_CSV) -> List[dict]:
+    """
+    Public API for main.py.
+    Returns sorted candidates (highest rank first) with guaranteed valid 'quote' floats.
+    """
+    path = Path(csv_path)
+    rows = _best_effort_candidates(path)
+    # Highest rank first (ties stable)
+    rows.sort(key=lambda r: (r.get("rank", 0), r["pair"]), reverse=True)
+    return rows
