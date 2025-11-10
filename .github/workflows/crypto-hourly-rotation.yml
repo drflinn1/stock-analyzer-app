@@ -2,7 +2,7 @@ name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
-    - cron: "0 * * * *"    # every hour
+    - cron: "0 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -26,7 +26,6 @@ jobs:
           pip install -r requirements.txt || true
           pip install requests pandas pyyaml matplotlib || true
 
-      # Run scanners "inline" (no artifacts)
       - name: Ensure .state exists
         run: mkdir -p .state
 
@@ -41,40 +40,34 @@ jobs:
           python tools/csv_schema_fix.py .state/momentum_candidates.csv || true
           python tools/csv_schema_fix.py .state/spike_candidates.csv || true
 
-      # Prefer SPIKE if fresh/valid, then normalize symbols to what main.py expects
       - name: Select candidates (spike-first) + normalize symbols (USD, no slash)
         run: |
           python - <<'PY'
-          import os, time, shutil, pandas as pd, re
-          MOM_FIXED = ".state/momentum_candidates_fixed.csv"
-          SPIKE_FIXED = ".state/spike_candidates_fixed.csv"
-          def fresh_enough(p, m=20): return os.path.exists(p) and (time.time()-os.path.getmtime(p) <= m*60)
-          def good_spike(p):
+          import os, time, pandas as pd, re
+          MOM_FIXED=".state/momentum_candidates_fixed.csv"
+          SPIKE_FIXED=".state/spike_candidates_fixed.csv"
+          def fresh(p,m=20): return os.path.exists(p) and (time.time()-os.path.getmtime(p)<=m*60)
+          def good(p):
               try:
-                  df = pd.read_csv(p)
-                  if len(df) < 5: return False
-                  if "usd_vol" in df.columns and not (df["usd_vol"].fillna(0) >= 100000).any(): return False
-                  return True
-              except Exception: return False
-          src = SPIKE_FIXED if (fresh_enough(SPIKE_FIXED,20) and good_spike(SPIKE_FIXED)) else MOM_FIXED
-          print("Using", "SPIKE" if src==SPIKE_FIXED else "MOMENTUM", "→", src)
-          df = pd.read_csv(src)
+                  df=pd.read_csv(p)
+                  if len(df)<5: return False
+                  return not("usd_vol" in df.columns and not (df["usd_vol"].fillna(0)>=100000).any())
+              except: return False
+          src = SPIKE_FIXED if (fresh(SPIKE_FIXED,20) and good(SPIKE_FIXED)) else MOM_FIXED
+          df=pd.read_csv(src)
           if "symbol" not in df.columns:
-              if "pair" in df.columns: df["symbol"] = df["pair"]
-              else: raise SystemExit("No 'symbol' or 'pair' column found.")
-          def norm_sym(s):
-              s = str(s).upper().strip().replace("/","")
+              if "pair" in df.columns: df["symbol"]=df["pair"]
+              else: raise SystemExit("No symbol/pair col")
+          def norm(s):
+              s=str(s).upper().strip().replace("/","")
               return re.sub(r"[^A-Z0-9]","",s)
-          df["symbol_norm"] = df["symbol"].map(norm_sym)
-          usd_mask = df["symbol_norm"].str.endswith("USD", na=False) & ~df["symbol_norm"].str.endswith("USDT", na=False)
-          if usd_mask.any(): df = df.loc[usd_mask].copy()
-          out = pd.DataFrame({
-              "symbol": df["symbol_norm"],
-              "quote":  df["quote"] if "quote" in df.columns else None,
-              "rank":   df["rank"]  if "rank"  in df.columns else range(1, len(df)+1)
-          })
-          out.to_csv(".state/candidates_selected_norm.csv", index=False)
-          out.to_csv(MOM_FIXED, index=False)  # path main.py reads
+          df["symbol"]=df["symbol"].map(norm)
+          usd=df["symbol"].str.endswith("USD") & ~df["symbol"].str.endswith("USDT")
+          if usd.any(): df=df.loc[usd].copy()
+          out=pd.DataFrame({"symbol":df["symbol"],
+                            "quote": df["quote"] if "quote" in df.columns else None,
+                            "rank":  df["rank"]  if "rank"  in df.columns else range(1,len(df)+1)})
+          out.to_csv(MOM_FIXED,index=False)
           print("\n=== Selected (normalized) top 10 ===")
           print(out.head(10).to_string(index=False))
           PY
@@ -82,25 +75,53 @@ jobs:
       - name: Echo latest picks (top 5)
         run: |
           python - <<'PY'
-          import os, pandas as pd
-          fp = ".state/momentum_candidates_fixed.csv"
+          import pandas as pd, os
+          fp=".state/momentum_candidates_fixed.csv"
           if os.path.exists(fp):
-              df = pd.read_csv(fp)
-              print("\\n=== Final candidates fed to bot (top 5) ===")
+              df=pd.read_csv(fp)
+              print("\n=== Final candidates (top 5) ===")
               print(df.head(5).to_string(index=False))
           else:
-              print("No momentum_candidates_fixed.csv found")
+              print("No candidates file")
           PY
 
-      # RUN BOT with repo Variables AND Kraken Secrets injected
+      # ---- Preflight: gather Kraken secrets from multiple possible names and export ----
+      - name: Preflight secrets (Kraken)
+        id: ksec
+        shell: bash
+        env:
+          # Try multiple common names; first non-empty wins
+          K1: ${{ secrets.KRAKEN_API_KEY }}
+          K2: ${{ secrets.KRAKEN_KEY }}
+          K3: ${{ secrets.API_KEY }}
+          K4: ${{ secrets.KRAKEN_PUBLIC_KEY }}
+          S1: ${{ secrets.KRAKEN_API_SECRET }}
+          S2: ${{ secrets.KRAKEN_SECRET }}
+          S3: ${{ secrets.API_SECRET }}
+          S4: ${{ secrets.KRAKEN_PRIVATE_KEY }}
+        run: |
+          KEY="${K1:-${K2:-${K3:-${K4:-}}}}"
+          SEC="${S1:-${S2:-${S3:-${S4:-}}}}"
+          if [ -z "$KEY" ] || [ -z "$SEC" ]; then
+            echo "::warning::Kraken secrets appear empty. Check repo Settings → Secrets (names like KRAKEN_API_KEY / KRAKEN_API_SECRET)."
+            echo "found_key_len=0"  >> $GITHUB_OUTPUT
+            echo "found_sec_len=0"  >> $GITHUB_OUTPUT
+          else
+            echo "found_key_len=${#KEY}" >> $GITHUB_OUTPUT
+            echo "found_sec_len=${#SEC}" >> $GITHUB_OUTPUT
+            # export for next step
+            echo "KRAKEN_API_KEY=$KEY"     >> $GITHUB_ENV
+            echo "KRAKEN_API_SECRET=$SEC"  >> $GITHUB_ENV
+          fi
+          echo "Masked preview: key_len=${#KEY}, sec_len=${#SEC}"
+
+      # 🚀 Run bot
       - name: Run bot
         env:
           PYTHONUNBUFFERED: "1"
-
-          # Force crypto broker for this workflow
           BROKER: kraken
 
-          # ---- Repo Variables (Settings → Secrets and variables → Actions → Variables) ----
+          # Repo Variables
           DRY_RUN:           ${{ vars.DRY_RUN }}
           BUY_USD:           ${{ vars.BUY_USD }}
           TP_PCT:            ${{ vars.TP_PCT }}
@@ -111,18 +132,14 @@ jobs:
           RESERVE_CASH_PCT:  ${{ vars.RESERVE_CASH_PCT }}
           UNIVERSE_PICK:     ${{ vars.UNIVERSE_PICK }}
 
-          # ---- Kraken API Secrets (Settings → Secrets and variables → Actions → Secrets) ----
-          # Make sure these names match exactly how you saved them.
-          KRAKEN_API_KEY:     ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}
-          # If you also store any of these, they will pass through harmlessly:
-          KRAKEN_API_KEY2:        ${{ secrets.KRAKEN_API_KEY2 }}
-          KRAKEN_API_SECRET2:     ${{ secrets.KRAKEN_API_SECRET2 }}
-          KRAKEN_PASSPHRASE:      ${{ secrets.KRAKEN_PASSPHRASE }}
-          KRAKEN_PRIVATE_KEY:     ${{ secrets.KRAKEN_PRIVATE_KEY }}
+          # Kraken secrets populated by preflight step into GITHUB_ENV:
+          KRAKEN_API_KEY:    ${{ env.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ env.KRAKEN_API_SECRET }}
         run: |
           echo "=== ENV ==="
           echo "DRY_RUN = ${DRY_RUN}"
           echo "BUY_USD = ${BUY_USD}"
           echo "BROKER  = ${BROKER}"
+          echo "Kraken key length  : ${{ steps.ksec.outputs.found_key_len }}"
+          echo "Kraken secret length: ${{ steps.ksec.outputs.found_sec_len }}"
           python main.py
