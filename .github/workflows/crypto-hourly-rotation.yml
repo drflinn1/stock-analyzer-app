@@ -16,10 +16,21 @@ jobs:
 
     env:
       # Flip in Settings → Secrets and variables → Actions → Variables
-      DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}             # ON=paper, OFF=live
+      DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}          # ON = paper, OFF = live
       BUY_USD: ${{ vars.BUY_USD || '25' }}
       TP_PCT: ${{ vars.TP_PCT || '5' }}
       STOP_PCT: ${{ vars.STOP_PCT || '1' }}
+
+      # New guard & rotation knobs (safe defaults)
+      COOLDOWN_MIN: ${{ vars.COOLDOWN_MIN || '30' }}         # skip immediate rebuy after a sell
+      NO_REBUY_MIN: ${{ vars.NO_REBUY_MIN || vars.COOLDOWN_MIN || '30' }}
+      TRAIL_START_PCT: ${{ vars.TRAIL_START_PCT || '3.0' }}
+      TRAIL_BACKOFF_PCT: ${{ vars.TRAIL_BACKOFF_PCT || '0.8' }}
+      BE_TRIGGER_PCT: ${{ vars.BE_TRIGGER_PCT || '2.0' }}
+      SWITCH_IF_GAP: ${{ vars.SWITCH_IF_GAP || '0' }}        # 0 disables early rotation
+      SWITCH_MIN_HOLD_MIN: ${{ vars.SWITCH_MIN_HOLD_MIN || '10' }}
+
+      # Optional cosmetics in summary
       WINDOW_MIN: ${{ vars.WINDOW_MIN || '60' }}
       SLOW_GAIN_REQ: ${{ vars.SLOW_GAIN_REQ || '3' }}
       UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK || '' }}
@@ -43,7 +54,7 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt || true
           fi
-          pip install --upgrade --no-input requests pandas python-dateutil pyyaml
+          pip install --upgrade requests pandas python-dateutil pyyaml
 
       - name: Echo critical env (no secrets)
         run: |
@@ -51,6 +62,13 @@ jobs:
           echo "BUY_USD=${BUY_USD}"
           echo "TP_PCT=${TP_PCT}"
           echo "STOP_PCT=${STOP_PCT}"
+          echo "COOLDOWN_MIN=${COOLDOWN_MIN}"
+          echo "NO_REBUY_MIN=${NO_REBUY_MIN}"
+          echo "TRAIL_START_PCT=${TRAIL_START_PCT}"
+          echo "TRAIL_BACKOFF_PCT=${TRAIL_BACKOFF_PCT}"
+          echo "BE_TRIGGER_PCT=${BE_TRIGGER_PCT}"
+          echo "SWITCH_IF_GAP=${SWITCH_IF_GAP}"
+          echo "SWITCH_MIN_HOLD_MIN=${SWITCH_MIN_HOLD_MIN}"
           echo "WINDOW_MIN=${WINDOW_MIN}"
           echo "SLOW_GAIN_REQ=${SLOW_GAIN_REQ}"
           echo "UNIVERSE_PICK=${UNIVERSE_PICK:-<empty>}"
@@ -75,7 +93,7 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/src:${{ github.workspace }}/trader
         run: |
-          python -u main.py || true
+          python -m trader.crypto_engine || true
           echo "Contents of .state after run:"
           ls -la .state || true
           tar -czf state_bundle.tgz .state || true
