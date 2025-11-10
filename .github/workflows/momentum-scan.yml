@@ -1,75 +1,74 @@
-name: Momentum — Scan (writes momentum_candidates.csv)
+name: Momentum — Scan (hourly)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes UTC
-  workflow_dispatch: {}
+    - cron: "5 * * * *"   # runs at :05 each hour (after rotation)
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
-
-    permissions:
-      contents: write
-
-    env:
-      DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}
-      SCAN_LIMIT: ${{ vars.SCAN_LIMIT || '12' }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt || true
-          fi
-          pip install pyyaml matplotlib || true
+          pip install requests pyyaml
 
-      - name: Ensure .state exists and seed placeholders
+      - name: Ensure .state
+        run: mkdir -p .state
+
+      # 👉 Your existing scan step(s) go here.
+      # Replace this placeholder with your real script. It should write:
+      #   .state/momentum_candidates.csv
+      - name: Run momentum scanner (placeholder)
         run: |
-          mkdir -p .state
-          # Seed an empty-but-valid CSV header to prevent artifact warnings if scan produces nothing
-          if [ ! -f .state/momentum_candidates.csv ]; then
-            echo "symbol,quote,rank" > .state/momentum_candidates.csv
-          fi
-          if [ ! -f .state/scan_summary.md ]; then
-            echo "# Momentum Scan Summary" > .state/scan_summary.md
-            echo "*When:* $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> .state/scan_summary.md
-            echo "*Note:* Seeded; the scanner will overwrite if it finds candidates." >> .state/scan_summary.md
-          fi
+          python - <<'PY'
+import csv, random, time
+from pathlib import Path
+pairs = ["KAVA/USD","STRK/USD","EAT/USD","CFG/USD"]
+rows = []
+for i,p in enumerate(pairs):
+    rows.append({
+      "pair": p,
+      "score": round(10+random.random()*20, 3),
+      "pct24": round(5+random.random()*15, 2),
+      "usd_vol": int(50_000+random.random()*2_000_000),
+      "ema_slope": round(-0.02+random.random()*0.04, 5),
+    })
+out = Path(".state")/"momentum_candidates.csv"
+with out.open("w", newline="", encoding="utf-8") as f:
+    w = csv.DictWriter(f, fieldnames=["pair","score","pct24","usd_vol","ema_slope"])
+    w.writeheader(); w.writerows(rows)
+print(f"wrote {out}")
+PY
 
-      - name: Run scanner
-        id: runscan
-        shell: bash
+      # 🔧 Normalize to guarantee pair, rank, quote columns
+      - name: Normalize candidate CSV schema
+        run: python tools/csv_schema_fix.py
+
+      - name: List .state contents
+        run: ls -la .state || true
+
+      - name: Zip .state (scan)
         run: |
-          set -e
-          echo "DRY_RUN=${DRY_RUN}  SCAN_LIMIT=${SCAN_LIMIT}"
+          STATE_ZIP="state-scan-${GITHUB_RUN_NUMBER}.zip"
+          (cd . && zip -r "$STATE_ZIP" .state >/dev/null)
+          ls -lh "$STATE_ZIP"
 
-          # If you have a dedicated scanner file, call it here; otherwise, use main.py with a flag.
-          if [ -f momentum_scan.py ]; then
-            python momentum_scan.py
-          else
-            # Fallback: call main.py with a mode if your script supports it; otherwise this no-ops.
-            python main.py --scan || true
-          fi
-
-          # Reconfirm .state exists
-          mkdir -p .state
-
-      - name: Upload scan artifacts (CSV + summary)
+      - name: Upload scan artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: momentum-scan-${{ github.run_id }}
-          path: |
-            .state/momentum_candidates.csv
-            .state/scan_summary.md
-          if-no-files-found: ignore
+          name: scan-${{ github.run_number }}
+          path: state-scan-${{ github.run_number }}.zip
+          retention-days: 7
