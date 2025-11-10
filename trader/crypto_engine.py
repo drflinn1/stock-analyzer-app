@@ -287,10 +287,11 @@ def run_hourly_rotation() -> None:
             pos=pos,
             cur_price=cur_px,
             cfg=cfg,
-            mode=mode,
+            mode=mode,  # optional; explicit ON/OFF for the guard
             place_sell_fn=place_market_sell,
             write_sell_artifacts_fn=write_sell_artifacts,
         )
+
         if did_sell:
             note.append(f"[{mode}] {rsn}")
             # sold → flat; skip buy until cooldown handled below
