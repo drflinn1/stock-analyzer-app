@@ -31,6 +31,18 @@ jobs:
       - name: Normalize & add schema columns
         run: python tools/csv_schema_fix.py .state/momentum_candidates.csv
 
+      - name: Echo top 5 picks
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          try:
+              df = pd.read_csv(".state/momentum_candidates_fixed.csv")
+              print("\\n=== Momentum top 5 ===")
+              print(df.head(5).to_string(index=False))
+          except Exception as e:
+              print("No momentum_candidates_fixed.csv yet:", e)
+          PY
+
       - name: Zip and upload CSV artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -38,3 +50,4 @@ jobs:
           path: |
             .state/momentum_candidates.csv
             .state/momentum_candidates_fixed.csv
+          retention-days: 14
