@@ -26,7 +26,7 @@ jobs:
           pip install -r requirements.txt || true
           pip install requests pandas pyyaml matplotlib || true
 
-      # === Run scanners locally (no artifacts needed) ===
+      # Run scanners "inline" (no artifacts)
       - name: Ensure .state exists
         run: mkdir -p .state
 
@@ -41,71 +41,40 @@ jobs:
           python tools/csv_schema_fix.py .state/momentum_candidates.csv || true
           python tools/csv_schema_fix.py .state/spike_candidates.csv || true
 
-      # Prefer spike if fresh & valid, then normalize symbols for main.py (USD, no slash)
+      # Prefer SPIKE if fresh/valid, then normalize symbols to what main.py expects
       - name: Select candidates (spike-first) + normalize symbols (USD, no slash)
         run: |
           python - <<'PY'
           import os, time, shutil, pandas as pd, re
-
           MOM_FIXED = ".state/momentum_candidates_fixed.csv"
           SPIKE_FIXED = ".state/spike_candidates_fixed.csv"
-          SELECTED_RAW   = ".state/candidates_selected_raw.csv"
-          SELECTED_NORM  = ".state/candidates_selected_norm.csv"
-
-          def fresh_enough(path, max_age_min=20):
-              return os.path.exists(path) and (time.time() - os.path.getmtime(path) <= max_age_min*60)
-
-          def good_spike(path):
+          def fresh_enough(p, m=20): return os.path.exists(p) and (time.time()-os.path.getmtime(p) <= m*60)
+          def good_spike(p):
               try:
-                  df = pd.read_csv(path)
-                  if len(df) < 5:
-                      print(f"Spike not used: only {len(df)} rows (<5).")
-                      return False
-                  if "usd_vol" in df.columns and (df["usd_vol"].fillna(0) >= 100000).any() is False:
-                      print("Spike not used: liquidity check failed (usd_vol < 100k on all rows).")
-                      return False
+                  df = pd.read_csv(p)
+                  if len(df) < 5: return False
+                  if "usd_vol" in df.columns and not (df["usd_vol"].fillna(0) >= 100000).any(): return False
                   return True
-              except Exception as e:
-                  print("Spike not used: error reading spike file:", e)
-                  return False
-
-          use_spike = fresh_enough(SPIKE_FIXED, 20) and good_spike(SPIKE_FIXED)
-          src = SPIKE_FIXED if use_spike else MOM_FIXED
-          print("✔ Using", "SPIKE" if use_spike else "MOMENTUM", "candidates →", src)
-
+              except Exception: return False
+          src = SPIKE_FIXED if (fresh_enough(SPIKE_FIXED,20) and good_spike(SPIKE_FIXED)) else MOM_FIXED
+          print("Using", "SPIKE" if src==SPIKE_FIXED else "MOMENTUM", "→", src)
           df = pd.read_csv(src)
           if "symbol" not in df.columns:
-              if "pair" in df.columns:
-                  df["symbol"] = df["pair"]
-              else:
-                  raise SystemExit("No 'symbol' (or 'pair') column found in source CSV")
-
-          def norm_sym(s: str) -> str:
-              s = str(s).upper().strip()
-              s = s.replace("/", "")          # MELANIA/USD -> MELANIAUSD
-              s = re.sub(r"[^A-Z0-9]", "", s) # keep alnum
-              return s
-
+              if "pair" in df.columns: df["symbol"] = df["pair"]
+              else: raise SystemExit("No 'symbol' or 'pair' column found.")
+          def norm_sym(s):
+              s = str(s).upper().strip().replace("/","")
+              return re.sub(r"[^A-Z0-9]","",s)
           df["symbol_norm"] = df["symbol"].map(norm_sym)
-
           usd_mask = df["symbol_norm"].str.endswith("USD", na=False) & ~df["symbol_norm"].str.endswith("USDT", na=False)
-          if usd_mask.any():
-              df = df.loc[usd_mask].copy()
-
+          if usd_mask.any(): df = df.loc[usd_mask].copy()
           out = pd.DataFrame({
               "symbol": df["symbol_norm"],
               "quote":  df["quote"] if "quote" in df.columns else None,
               "rank":   df["rank"]  if "rank"  in df.columns else range(1, len(df)+1)
           })
-
-          out.to_csv(SELECTED_NORM, index=False)
-          out.to_csv(MOM_FIXED, index=False)  # mirror to the path main.py expects
-
-          try:
-              df.to_csv(SELECTED_RAW, index=False)
-          except Exception:
-              pass
-
+          out.to_csv(".state/candidates_selected_norm.csv", index=False)
+          out.to_csv(MOM_FIXED, index=False)  # path main.py reads
           print("\n=== Selected (normalized) top 10 ===")
           print(out.head(10).to_string(index=False))
           PY
@@ -123,24 +92,37 @@ jobs:
               print("No momentum_candidates_fixed.csv found")
           PY
 
-      # 🚀 Run your rotation bot with env vars taken from repo Variables
+      # RUN BOT with repo Variables AND Kraken Secrets injected
       - name: Run bot
         env:
           PYTHONUNBUFFERED: "1"
 
-          # Force the correct broker for this workflow (override any repo Variable)
+          # Force crypto broker for this workflow
           BROKER: kraken
 
-          # Pull values from Repository Variables (Settings → Variables → Actions)
-          # If any are unset, main.py will use its own defaults.
-          DRY_RUN: ${{ vars.DRY_RUN }}
-          BUY_USD: ${{ vars.BUY_USD }}
-          TP_PCT: ${{ vars.TP_PCT }}
-          SL_PCT: ${{ vars.SL_PCT }}
-          SLOW_GAIN_PCT: ${{ vars.SLOW_GAIN_PCT }}
-          SLOW_WINDOW_MIN: ${{ vars.SLOW_WINDOW_MIN }}
-          MAX_POSITIONS: ${{ vars.MAX_POSITIONS }}
-          RESERVE_CASH_PCT: ${{ vars.RESERVE_CASH_PCT }}
-          UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK }}
+          # ---- Repo Variables (Settings → Secrets and variables → Actions → Variables) ----
+          DRY_RUN:           ${{ vars.DRY_RUN }}
+          BUY_USD:           ${{ vars.BUY_USD }}
+          TP_PCT:            ${{ vars.TP_PCT }}
+          SL_PCT:            ${{ vars.SL_PCT }}
+          SLOW_GAIN_PCT:     ${{ vars.SLOW_GAIN_PCT }}
+          SLOW_WINDOW_MIN:   ${{ vars.SLOW_WINDOW_MIN }}
+          MAX_POSITIONS:     ${{ vars.MAX_POSITIONS }}
+          RESERVE_CASH_PCT:  ${{ vars.RESERVE_CASH_PCT }}
+          UNIVERSE_PICK:     ${{ vars.UNIVERSE_PICK }}
+
+          # ---- Kraken API Secrets (Settings → Secrets and variables → Actions → Secrets) ----
+          # Make sure these names match exactly how you saved them.
+          KRAKEN_API_KEY:     ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET:  ${{ secrets.KRAKEN_API_SECRET }}
+          # If you also store any of these, they will pass through harmlessly:
+          KRAKEN_API_KEY2:        ${{ secrets.KRAKEN_API_KEY2 }}
+          KRAKEN_API_SECRET2:     ${{ secrets.KRAKEN_API_SECRET2 }}
+          KRAKEN_PASSPHRASE:      ${{ secrets.KRAKEN_PASSPHRASE }}
+          KRAKEN_PRIVATE_KEY:     ${{ secrets.KRAKEN_PRIVATE_KEY }}
         run: |
+          echo "=== ENV ==="
+          echo "DRY_RUN = ${DRY_RUN}"
+          echo "BUY_USD = ${BUY_USD}"
+          echo "BROKER  = ${BROKER}"
           python main.py
