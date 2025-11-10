@@ -5,19 +5,7 @@ Main unified runner for Crypto Live workflows.
 - Resilient quotes via trader.crypto_engine (CSV + public fallback)
 - Clear, minimal state in .state/
 - DRY_RUN simulates; LIVE validates secrets and logs intended action
-
-Env / Repo Variables expected (strings or numbers):
-  DRY_RUN            -> "ON" or "OFF"  (default "ON")
-  BUY_USD            -> float dollars  (default 25.0)
-  TP_PCT             -> float percent  (default 5.0)
-  SL_PCT             -> float percent  (default 1.0)
-  SLOW_GAIN_PCT      -> float percent  (default 3.0)
-  SLOW_WINDOW_MIN    -> float minutes  (default 60.0)
-  UNIVERSE_PICK      -> optional pair override (e.g., "SOL/USD")
-
-Secrets for LIVE (validated; order placement is intentionally no-op here):
-  KRAKEN_API_KEY
-  KRAKEN_API_SECRET
+- Hardened against corrupt state (e.g., entry_price == 0) and zero-division
 """
 
 from __future__ import annotations
@@ -55,6 +43,8 @@ SUMMARY_MD     = STATE_DIR / "run_summary.md"
 LAST_OK        = STATE_DIR / "last_ok.txt"
 
 
+# --------------------- env helpers ---------------------
+
 def env_str(name: str, default: str = "") -> str:
     val = os.getenv(name, default)
     if val is None:
@@ -74,13 +64,48 @@ def is_dry_run() -> bool:
     return env_str("DRY_RUN", "ON").upper() == "ON"
 
 
+def sanitize_universe_pick(s: str) -> str:
+    """
+    Treat AUTO/NONE/ANY/blank as no override.
+    """
+    v = s.strip().upper()
+    if v in ("", "AUTO", "NONE", "ANY", "NULL", "NA"):
+        return ""
+    return v
+
+
+# --------------------- time helpers ---------------------
+
 def now_ts() -> float:
     return time.time()
 
 
 def minutes_since(ts: float) -> float:
-    return max(0.0, (now_ts() - float(ts)) / 60.0)
+    try:
+        return max(0.0, (now_ts() - float(ts)) / 60.0)
+    except Exception:
+        return 0.0
 
+
+# --------------------- PnL helpers ---------------------
+
+def safe_pct_change(current: Optional[float], entry: Optional[float]) -> float:
+    """
+    Safe PnL% calculator: returns 0.0 if values are invalid.
+    """
+    try:
+        if current is None or entry is None:
+            return 0.0
+        current = float(current)
+        entry = float(entry)
+        if current <= 0 or entry <= 0:
+            return 0.0
+        return (current - entry) / entry * 100.0
+    except Exception:
+        return 0.0
+
+
+# --------------------- position model ---------------------
 
 @dataclass
 class Position:
@@ -104,27 +129,31 @@ def read_position() -> Optional[Position]:
         data = json.loads(POSITIONS_JSON.read_text())
         if not isinstance(data, dict):
             return None
-        return Position(
+        pos = Position(
             pair=str(data.get("pair", "")),
             entry_price=float(data.get("entry_price", 0.0)),
             entry_ts=float(data.get("entry_ts", 0.0)),
             buy_usd=float(data.get("buy_usd", 0.0)),
         )
+        # Auto-repair: if entry_price or ts invalid, treat as no position
+        if pos.entry_price <= 0 or pos.entry_ts <= 0 or not pos.pair:
+            return None
+        return pos
     except Exception:
         return None
 
 
 def write_position(pos: Optional[Position]) -> None:
     if pos is None:
-        # clear file
         POSITIONS_JSON.write_text(json.dumps({}, indent=2))
     else:
         POSITIONS_JSON.write_text(json.dumps(pos.to_dict(), indent=2))
 
 
+# --------------------- summary writers ---------------------
+
 def write_summary(payload: Dict[str, Any]) -> None:
     SUMMARY_JSON.write_text(json.dumps(payload, indent=2))
-    # small human-readable MD
     lines = [
         f"**When:** {payload.get('when','')}",
         f"**DRY_RUN:** {payload.get('dry_run')}",
@@ -148,20 +177,20 @@ def write_summary(payload: Dict[str, Any]) -> None:
     LAST_OK.write_text(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
 
 
+# --------------------- core utils ---------------------
+
 def pick_pair(universe_pick: str) -> str:
     """
     Returns the chosen pair for BUY.
     If UNIVERSE_PICK set, try that first; otherwise top-ranked from candidates.
     """
-    if universe_pick:
-        return normalize_pair(universe_pick)
+    uni = sanitize_universe_pick(universe_pick)
+    if uni:
+        return normalize_pair(uni)
 
     candidates = load_candidates()
     if not candidates:
-        # crypto_engine guarantees at least 1 with valid quote, but double-guard here
         return "EAT/USD"
-
-    # Already sorted by rank desc; pick the first
     return normalize_pair(candidates[0]["pair"])
 
 
@@ -192,7 +221,7 @@ def log_env() -> Dict[str, Any]:
 
 def simulate_buy(pair: str, buy_usd: float) -> Position:
     q = get_quote(pair)
-    if q is None or q <= 0:
+    if not q or q <= 0:
         raise RuntimeError(f"BUY abort: invalid quote for {pair}")
     pos = Position(pair=pair, entry_price=float(q), entry_ts=now_ts(), buy_usd=float(buy_usd))
     write_position(pos)
@@ -201,7 +230,7 @@ def simulate_buy(pair: str, buy_usd: float) -> Position:
 
 
 def simulate_sell(pos: Position, reason: str, current_price: float) -> Dict[str, Any]:
-    pnl_pct = (current_price - pos.entry_price) / pos.entry_price * 100.0
+    pnl_pct = safe_pct_change(current_price, pos.entry_price)
     write_position(None)
     print(f"[DRY] SELL {pos.pair} @ {current_price:.6f}  PnL={pnl_pct:.3f}%  ({reason})")
     return {"pnl_pct": pnl_pct, "reason": reason}
@@ -211,7 +240,6 @@ def live_buy_notice(pair: str, buy_usd: float) -> None:
     if not have_live_secrets():
         print("[LIVE] Missing Kraken API secrets; aborting order.")
         return
-    # Safe default: log the intended action. (Your existing Kraken adapter can be wired here.)
     q = get_quote(pair)
     print(f"[LIVE] Would BUY {pair} for ${buy_usd:.2f} at ~{q if q else 'N/A'} (market).")
 
@@ -223,6 +251,8 @@ def live_sell_notice(pair: str, reason: str) -> None:
     q = get_quote(pair)
     print(f"[LIVE] Would SELL {pair} at ~{q if q else 'N/A'} (market). Reason: {reason}")
 
+
+# --------------------- main ---------------------
 
 def main() -> None:
     env = log_env()
@@ -240,8 +270,7 @@ def main() -> None:
     # === If we have a position, run sell-guard ===
     if pos:
         cur = get_quote(pos.pair)
-        if not cur or cur <= 0:
-            # With new crypto_engine this should be rare, but handle gracefully.
+        if not cur or cur <= 0 or pos.entry_price <= 0:
             reason = "HOLD: invalid price(s)"
             print(reason)
             write_summary({
@@ -250,8 +279,8 @@ def main() -> None:
                 "action": "HOLD",
                 "pair": pos.pair,
                 "reason": reason,
-                "entry_price": pos.entry_price,
-                "current_price": None,
+                "entry_price": pos.entry_price if pos.entry_price > 0 else None,
+                "current_price": cur if cur and cur > 0 else None,
                 "pnl_pct": None,
                 "minutes_held": pos.minutes_held,
                 "env": env,
@@ -270,7 +299,9 @@ def main() -> None:
 
         action = guard.get("action", "HOLD")
         reason = guard.get("reason", "guard ok")
-        pnl_pct = guard.get("pnl_pct", (cur - pos.entry_price) / pos.entry_price * 100.0)
+        pnl_pct = guard.get("pnl_pct")
+        if pnl_pct is None:
+            pnl_pct = safe_pct_change(cur, pos.entry_price)
 
         if action == "SELL":
             if dry:
@@ -278,8 +309,6 @@ def main() -> None:
                 pnl_pct = result["pnl_pct"]
             else:
                 live_sell_notice(pos.pair, reason)
-                # We don't mutate state in LIVE here; assume your live adapter clears it after a true fill.
-                # To keep state consistent even without a live adapter, we'll clear locally:
                 write_position(None)
 
             write_summary({
@@ -315,7 +344,6 @@ def main() -> None:
     pair = pick_pair(uni_pick)
     q = get_quote(pair)
     if not q or q <= 0:
-        # With the new engine + YAML seed, this should not happen. Still guard.
         reason = "BUY abort: invalid quote"
         print(f"{reason} for {pair}")
         write_summary({
@@ -336,7 +364,6 @@ def main() -> None:
         pos = simulate_buy(pair, buy_usd)
     else:
         live_buy_notice(pair, buy_usd)
-        # Mirror DRY behavior for continuity of state unless you have a live adapter updating this.
         pos = Position(pair=pair, entry_price=float(q), entry_ts=now_ts(), buy_usd=float(buy_usd))
         write_position(pos)
 
