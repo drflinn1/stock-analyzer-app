@@ -1,26 +1,44 @@
 #!/usr/bin/env python3
 """
 Normalize candidate CSVs so rotation always sees the columns it expects.
-
-Targets (if present):
-  .state/momentum_candidates.csv
-  .state/spike_candidates.csv
-
-Guarantees each row has:
-  - pair  (normalized like 'SOL/USD')
-  - rank  (int; higher is better; from existing rank or derived from 'score')
-  - quote (float; filled from Kraken public price if missing)
-
-Other columns (score, pct24, usd_vol, ema_slope, etc.) are preserved.
+Independent version (no imports from trader/).
 """
-from __future__ import annotations
-import csv, math
+
+import csv
+import math
+import requests
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from trader.crypto_engine import get_public_quote, normalize_pair
 
 STATE_DIR = Path(".state")
 FILES = [STATE_DIR / "momentum_candidates.csv", STATE_DIR / "spike_candidates.csv"]
+KRAKEN_URL = "https://api.kraken.com/0/public/Ticker"
+
+
+def normalize_pair(symbol: str) -> str:
+    """Normalize crypto pair names like 'SOLUSD' or 'SOL-USD' -> 'SOL/USD'."""
+    if not symbol:
+        return ""
+    s = symbol.strip().upper().replace("-", "/")
+    if not s.endswith("/USD") and "USD" in s and "/" not in s:
+        s = s.replace("USD", "/USD")
+    return s
+
+
+def get_public_quote(pair: str) -> Optional[float]:
+    """Get current price from Kraken public API."""
+    try:
+        sym = pair.replace("/", "")
+        resp = requests.get(KRAKEN_URL, params={"pair": sym}, timeout=8)
+        data = resp.json().get("result", {})
+        if not data:
+            return None
+        ticker = next(iter(data.values()))
+        price = float(ticker["c"][0])
+        return price
+    except Exception:
+        return None
+
 
 def _to_float(x: Any) -> Optional[float]:
     try:
@@ -29,18 +47,21 @@ def _to_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
+
 def _to_int(x: Any) -> Optional[int]:
     try:
         return int(float(str(x).strip()))
     except Exception:
         return None
 
+
 def _rank_from_scores(rows: List[Dict[str, Any]], score_key: str = "score") -> List[int]:
-    # Highest score -> highest rank number (100, 99, ...).
+    """Highest score -> highest rank number (100, 99, ...)."""
     scored, has_any = [], False
     for i, r in enumerate(rows):
         try:
-            val = float(r.get(score_key)); has_any = True
+            val = float(r.get(score_key))
+            has_any = True
         except Exception:
             val = float("-inf")
         scored.append((i, val))
@@ -51,9 +72,11 @@ def _rank_from_scores(rows: List[Dict[str, Any]], score_key: str = "score") -> L
         return [rank_map[i] for i in range(len(rows))]
     return [100 - i for i in range(len(rows))]
 
+
 def _normalize_file(path: Path) -> None:
     if not path.exists():
         return
+
     rows: List[Dict[str, Any]] = []
     with path.open("r", newline="", encoding="utf-8") as f:
         rd = csv.DictReader(f)
@@ -89,9 +112,11 @@ def _normalize_file(path: Path) -> None:
     core = ["pair", "rank", "quote"]
     seen, extras = set(core), []
     for h in headers:
-        if h.lower() in ("pair", "rank", "quote"): continue
+        if h.lower() in ("pair", "rank", "quote"):
+            continue
         if h not in seen:
-            extras.append(h); seen.add(h)
+            extras.append(h)
+            seen.add(h)
     out_headers = core + extras
 
     tmp = path.with_suffix(".tmp")
@@ -106,6 +131,7 @@ def _normalize_file(path: Path) -> None:
             wr.writerow(out)
     tmp.replace(path)
 
+
 def main() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     for p in FILES:
@@ -114,6 +140,7 @@ def main() -> None:
         except Exception as e:
             (STATE_DIR / "csv_fix_error.log").write_text(f"{p.name}: {e}\n", encoding="utf-8")
     (STATE_DIR / "last_csv_fix.txt").write_text("ok\n", encoding="utf-8")
+
 
 if __name__ == "__main__":
     main()
