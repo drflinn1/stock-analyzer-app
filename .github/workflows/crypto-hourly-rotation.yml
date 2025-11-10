@@ -41,7 +41,7 @@ jobs:
           python tools/csv_schema_fix.py .state/momentum_candidates.csv || true
           python tools/csv_schema_fix.py .state/spike_candidates.csv || true
 
-      # === Prefer spike if fresh & valid, then NORMALIZE SYMBOLS for main.py ===
+      # Prefer spike if fresh & valid, then normalize symbols for main.py (USD, no slash)
       - name: Select candidates (spike-first) + normalize symbols (USD, no slash)
         run: |
           python - <<'PY'
@@ -69,20 +69,12 @@ jobs:
                   print("Spike not used: error reading spike file:", e)
                   return False
 
-          # Choose source
           use_spike = fresh_enough(SPIKE_FIXED, 20) and good_spike(SPIKE_FIXED)
           src = SPIKE_FIXED if use_spike else MOM_FIXED
           print("✔ Using", "SPIKE" if use_spike else "MOMENTUM", "candidates →", src)
 
-          # Load + normalize to what main.py expects:
-          # - column 'symbol' present
-          # - remove '/', uppercase
-          # - prefer USD pairs; if scarce, allow USDT fallback
           df = pd.read_csv(src)
-
-          # Ensure required cols exist
           if "symbol" not in df.columns:
-              # try 'pair' fallback if present
               if "pair" in df.columns:
                   df["symbol"] = df["pair"]
               else:
@@ -90,30 +82,25 @@ jobs:
 
           def norm_sym(s: str) -> str:
               s = str(s).upper().strip()
-              s = s.replace("/", "")          # e.g., MELANIA/USD -> MELANIAUSD
-              s = re.sub(r"[^A-Z0-9]", "", s) # keep alnum only
+              s = s.replace("/", "")          # MELANIA/USD -> MELANIAUSD
+              s = re.sub(r"[^A-Z0-9]", "", s) # keep alnum
               return s
 
           df["symbol_norm"] = df["symbol"].map(norm_sym)
 
-          # Prefer USD (not USDT); if none, keep all
-          usd_mask   = df["symbol_norm"].str.endswith("USD", na=False) & ~df["symbol_norm"].str.endswith("USDT", na=False)
+          usd_mask = df["symbol_norm"].str.endswith("USD", na=False) & ~df["symbol_norm"].str.endswith("USDT", na=False)
           if usd_mask.any():
               df = df.loc[usd_mask].copy()
 
-          # Keep only required columns in final order
           out = pd.DataFrame({
               "symbol": df["symbol_norm"],
               "quote":  df["quote"] if "quote" in df.columns else None,
               "rank":   df["rank"]  if "rank"  in df.columns else range(1, len(df)+1)
           })
 
-          # Save debug copy and the mirrored file main.py reads
           out.to_csv(SELECTED_NORM, index=False)
-          # mirror to momentum_fixed so main.py uses the normalized list
-          out.to_csv(MOM_FIXED, index=False)
+          out.to_csv(MOM_FIXED, index=False)  # mirror to the path main.py expects
 
-          # Also keep a raw snapshot for inspection (optional)
           try:
               df.to_csv(SELECTED_RAW, index=False)
           except Exception:
@@ -123,7 +110,6 @@ jobs:
           print(out.head(10).to_string(index=False))
           PY
 
-      # Optional quick peek remains
       - name: Echo latest picks (top 5)
         run: |
           python - <<'PY'
@@ -137,10 +123,24 @@ jobs:
               print("No momentum_candidates_fixed.csv found")
           PY
 
-      # 🚀 Run your rotation bot (reads .state/momentum_candidates_fixed.csv)
+      # 🚀 Run your rotation bot with env vars taken from repo Variables
       - name: Run bot
         env:
           PYTHONUNBUFFERED: "1"
-          # Keep your existing repo variables/secrets (BUY_USD, DRY_RUN, MAX_POSITIONS, TP_PCT, SL_PCT, etc.)
+
+          # Force the correct broker for this workflow (override any repo Variable)
+          BROKER: kraken
+
+          # Pull values from Repository Variables (Settings → Variables → Actions)
+          # If any are unset, main.py will use its own defaults.
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          BUY_USD: ${{ vars.BUY_USD }}
+          TP_PCT: ${{ vars.TP_PCT }}
+          SL_PCT: ${{ vars.SL_PCT }}
+          SLOW_GAIN_PCT: ${{ vars.SLOW_GAIN_PCT }}
+          SLOW_WINDOW_MIN: ${{ vars.SLOW_WINDOW_MIN }}
+          MAX_POSITIONS: ${{ vars.MAX_POSITIONS }}
+          RESERVE_CASH_PCT: ${{ vars.RESERVE_CASH_PCT }}
+          UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK }}
         run: |
           python main.py
