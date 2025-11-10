@@ -5,10 +5,8 @@ on:
     - cron: "0 * * * *"    # every hour
   workflow_dispatch:
 
-# Needed so this job can download artifacts produced by other workflows
 permissions:
   contents: read
-  actions: read
 
 jobs:
   rotate:
@@ -28,39 +26,82 @@ jobs:
           pip install -r requirements.txt || true
           pip install requests pandas pyyaml matplotlib || true
 
-      # Pull the latest Momentum/Spike scan artifacts into .state/
-      - name: Pull latest momentum/spike artifacts → .state/
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          chmod +x tools/fetch_latest_scan_artifacts.sh
-          bash tools/fetch_latest_scan_artifacts.sh
+      # === Run scanners locally (no artifacts needed) ===
+      - name: Ensure .state exists
+        run: mkdir -p .state
 
-      # Optional: print a quick preview in the logs
-      - name: Echo latest picks (top 5)
+      - name: Run momentum scanner (local)
+        run: python tools/momentum_scan.py
+
+      - name: Run spike scanner (local)
+        run: python tools/momentum_spike.py
+
+      - name: Normalize CSV schemas
+        run: |
+          python tools/csv_schema_fix.py .state/momentum_candidates.csv || true
+          python tools/csv_schema_fix.py .state/spike_candidates.csv || true
+
+      # === NEW: Prefer spike if fresh & decent, else fall back to momentum ===
+      - name: Select freshest candidates (spike-first)
         run: |
           python - <<'PY'
-          import os, pandas as pd
-          def show(fp, label):
-              if os.path.exists(fp):
-                  try:
-                      df = pd.read_csv(fp)
-                      print(f"\n=== {label} (top 5) ===")
-                      print(df.head(5).to_string(index=False))
-                  except Exception as e:
-                      print(f"{label}: unable to read {fp}: {e}")
-              else:
-                  print(f"{label}: {fp} not found")
-          show(".state/momentum_candidates_fixed.csv", "Momentum candidates")
-          show(".state/spike_candidates_fixed.csv", "Spike candidates")
+          import os, time, shutil, pandas as pd
+
+          MOM_FIXED = ".state/momentum_candidates_fixed.csv"
+          SPIKE_FIXED = ".state/spike_candidates_fixed.csv"
+          SELECTED   = ".state/candidates_selected.csv"  # for logging/inspection
+
+          def fresh_enough(path, max_age_min=20):
+              if not os.path.exists(path): return False
+              age_s = time.time() - os.path.getmtime(path)
+              return age_s <= max_age_min * 60
+
+          def good_spike(path):
+              try:
+                  df = pd.read_csv(path)
+                  if len(df) < 5:
+                      print(f"Spike not used: only {len(df)} rows (<5).")
+                      return False
+                  # Liquidity check if usd_vol present (not mandatory)
+                  if "usd_vol" in df.columns:
+                      # require at least one candidate with >= $100k in last window
+                      ok = (df["usd_vol"].fillna(0) >= 100000).any()
+                      if not ok:
+                          print("Spike not used: liquidity check failed (usd_vol < 100k on all rows).")
+                          return False
+                  return True
+              except Exception as e:
+                  print("Spike not used: error reading spike file:", e)
+                  return False
+
+          use_spike = fresh_enough(SPIKE_FIXED, 20) and good_spike(SPIKE_FIXED)
+
+          if use_spike:
+              src = SPIKE_FIXED
+              print("✔ Using SPIKE candidates (fresh & valid).")
+          else:
+              src = MOM_FIXED
+              print("ℹ Using MOMENTUM candidates (spike missing/stale/weak).")
+
+          # Save a copy for visibility, and also overwrite the momentum_fixed
+          # so main.py keeps reading the same path it already expects.
+          shutil.copyfile(src, SELECTED)
+          shutil.copyfile(src, MOM_FIXED)
+          print(f"Selected → {SELECTED} (and mirrored to {MOM_FIXED})")
+
+          # Show quick preview
+          try:
+              df = pd.read_csv(SELECTED)
+              print("\n=== Selected top 5 ===")
+              print(df.head(5).to_string(index=False))
+          except Exception as e:
+              print("Preview error:", e)
           PY
 
-      # 🚀 Run your rotation bot
+      # 🚀 Run your rotation bot (reads .state/momentum_candidates_fixed.csv as usual)
       - name: Run bot
         env:
           PYTHONUNBUFFERED: "1"
-          # (Keep your existing env/vars in repo settings: BUY_USD, DRY_RUN, TP_PCT, SL_PCT, etc.)
-          # Kraken secrets remain in Secrets (KRAKEN_API_KEY / KRAKEN_API_SECRET / etc.)
+          # Keep your existing repo variables/secrets (BUY_USD, DRY_RUN, MAX_POSITIONS, TP_PCT, SL_PCT, etc.)
         run: |
           python main.py
