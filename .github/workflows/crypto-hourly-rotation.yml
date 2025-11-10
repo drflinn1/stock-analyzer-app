@@ -74,7 +74,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_number }}
-          path: |
-            ./.state/**
+          path: ./.state
           if-no-files-found: warn
           retention-days: 7
