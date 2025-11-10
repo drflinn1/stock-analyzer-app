@@ -1,92 +1,77 @@
-# tools/run_with_safe_sell.py
+#!/usr/bin/env python3
 """
-Runs main.py after installing a resilient SELL patch for ccxt exchanges.
-Prevents run-stopping 'Insufficient funds' on market sells by:
-  - using FREE balance with a safety epsilon
-  - rounding to exchange precision
-  - optional cancel_all_orders before sell
-  - retrying once with -1%
-If still not fillable, logs and returns a 'skipped' order dict instead of raising.
+Compat runner that used to call run_sell_guard(dry_run=...).
+Now forwarded to use `mode=` so older workflows won't break.
 """
+from __future__ import annotations
+from pathlib import Path
+import os, json, time
 
-import os
-import runpy
-import ccxt
-from ccxt.base.errors import InsufficientFunds
+from trader.sell_guard import GuardCfg, Position, run_sell_guard
 
-EPS_PCT = float(os.getenv("SELL_SAFETY_EPS_PCT", "0.25")) / 100.0
-CANCEL_BEFORE = os.getenv("CANCEL_OPEN_ORDERS_BEFORE_SELL", "true").lower() == "true"
+STATE_DIR     = Path(".state")
+POSITIONS     = STATE_DIR / "positions.json"
+LAST_SELL     = STATE_DIR / "last_sell.json"
+SELL_LOG_MD   = STATE_DIR / "sell_log.md"
 
-# keep original for fallback / calls
-_ORIG_CREATE_ORDER = ccxt.base.exchange.Exchange.create_order
+def env_on(name: str, default: bool = False) -> bool:
+    v = os.getenv(name, "ON" if default else "OFF").upper().strip()
+    return v in ("1","TRUE","ON","YES")
 
-def _safe_sell_wrapper(self, symbol, type, side, amount, *args, **kwargs):
-    # For non-sell or non-market, do normal behavior
-    if (side or "").lower() != "sell" or (type or "").lower() != "market":
-        return _ORIG_CREATE_ORDER(self, symbol, type, side, amount, *args, **kwargs)
+def append_md(p: Path, text: str) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if not p.exists():
+        p.write_text("# Sell Log\nWhen (UTC) | Pair | Amount | Entry | Price | Pct | Reason | Mode | OrderId\n---|---|---:|---:|---:|---:|---|---|---\n")
+    with p.open("a", encoding="utf-8") as f:
+        f.write(text)
 
-    try:
-        # Try normal first — it may succeed.
-        return _ORIG_CREATE_ORDER(self, symbol, type, side, amount, *args, **kwargs)
-    except InsufficientFunds:
-        pass  # we'll try safely below
-    except Exception as e:
-        # unknown exchange error — try safe path anyway
-        print(f"[sellwarn] {symbol}: initial sell raised {type(e).__name__}: {e}")
+def write_sell_artifacts(payload):
+    LAST_SELL.write_text(json.dumps(payload, indent=2))
+    md = (
+        f"{payload['when']} | {payload['pair']} | {payload['amount']:.6f} | "
+        f"{payload['entry']:.8f} | {payload['price']:.8f} | "
+        f"{payload['pct']:.4f} | {payload['reason']} | {payload['mode']} | {payload['order_id']}\n"
+    )
+    append_md(SELL_LOG_MD, md)
+    if POSITIONS.exists():
+        POSITIONS.unlink(missing_ok=True)
 
-    # Lookup base coin and free balance
-    try:
-        m = self.market(symbol) if hasattr(self, "market") else None
-        base = (m.get("base") if m else None) or symbol.split("/")[0]
-        bal = self.fetch_balance() or {}
-        free = (bal.get(base, {}) or {}).get("free", 0) or 0.0
-    except Exception as e:
-        print(f"[sellwarn] {symbol}: failed to fetch balance/market: {type(e).__name__}: {e}")
-        free = 0.0
+def place_market_sell(pair: str, amount: float, mode: str):
+    if mode.upper() == "OFF":
+        return True, "LIVE-" + str(int(time.time()))
+    return True, "DRY-" + str(int(time.time()))
 
-    # Compute safe amount
-    try:
-        safe_amt = min(float(amount), float(free) * (1.0 - EPS_PCT))
-        safe_amt = float(self.amount_to_precision(symbol, safe_amt))
-    except Exception:
-        safe_amt = 0.0
+def get_current_price(_pair: str) -> float:
+    # Minimal placeholder – your real engine handles quotes.
+    return float(os.getenv("FAKE_QUOTE", "1.0"))
 
-    if safe_amt <= 0:
-        print(f"[sellskip] {symbol}: qty adjusted to 0 (free={free}) -> skip")
-        return {"id": None, "status": "skipped", "symbol": symbol, "amount": 0.0}
+def main():
+    mode = "OFF" if env_on("DRY_RUN", False) is False else "ON"
+    if not POSITIONS.exists():
+        print("flat; nothing to sell")
+        return
 
-    if CANCEL_BEFORE:
-        try:
-            self.cancel_all_orders(symbol)
-        except Exception:
-            pass  # non-fatal
+    p = json.loads(POSITIONS.read_text())
+    pos = Position(pair=p["pair"], amount=float(p["amount"]), entry_px=float(p.get("entry") or p.get("entry_px") or 0.0))
+    cur_px = get_current_price(pos.pair)
 
-    # Attempt 1: safe size
-    try:
-        order = _ORIG_CREATE_ORDER(self, symbol, "market", "sell", safe_amt, *args, **kwargs)
-        print(f"[order] SELL {symbol} qty={safe_amt} ok id={order.get('id')}")
-        return order
-    except InsufficientFunds:
-        pass
-    except Exception as e:
-        print(f"[sellwarn] {symbol}: safe sell attempt err {type(e).__name__}: {e}")
+    cfg = GuardCfg(
+        stop_pct=float(os.getenv("STOP_PCT", "1")),
+        tp_pct=float(os.getenv("TP_PCT", "5")),
+        trail_start_pct=float(os.getenv("TRAIL_START_PCT", "3")),
+        trail_backoff_pct=float(os.getenv("TRAIL_BACKOFF_PCT", "0.8")),
+        be_trigger_pct=float(os.getenv("BE_TRIGGER_PCT", "2")),
+    )
 
-    # Attempt 2: trim by 1%
-    try:
-        safe_amt2 = float(self.amount_to_precision(symbol, safe_amt * 0.99))
-        if safe_amt2 > 0:
-            order = _ORIG_CREATE_ORDER(self, symbol, "market", "sell", safe_amt2, *args, **kwargs)
-            print(f"[order] SELL {symbol} retry qty={safe_amt2} ok id={order.get('id')}")
-            return order
-    except Exception as e:
-        print(f"[sellwarn] {symbol}: retry err {type(e).__name__}: {e}")
+    did_sell, rsn = run_sell_guard(
+        pos=pos,
+        cur_price=cur_px,
+        cfg=cfg,
+        mode=mode,  # <<<<<<<<<<<<<< uses mode now
+        place_sell_fn=place_market_sell,
+        write_sell_artifacts_fn=write_sell_artifacts,
+    )
+    print("sell_guard:", did_sell, rsn)
 
-    print(f"[sellskip] {symbol}: insufficient funds after retries -> skip")
-    # Return a benign object so caller code continues without throwing
-    return {"id": None, "status": "skipped", "symbol": symbol, "amount": safe_amt}
-
-# Monkeypatch ccxt for all exchanges
-ccxt.base.exchange.Exchange.create_order = _safe_sell_wrapper
-
-# Finally, run your existing main.py in-process so the patch applies.
-runpy.run_path("main.py", run_name="__main__")
+if __name__ == "__main__":
+    main()
