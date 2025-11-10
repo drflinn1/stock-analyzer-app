@@ -1,68 +1,71 @@
-name: Momentum — Spike Scan (commit .state, promote spikes)
+name: Momentum — Spike Scan (hourly)
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"  # every 30 minutes UTC
+    - cron: "10 * * * *"   # runs at :10 each hour (after main scan)
+  workflow_dispatch:
 
 permissions:
   contents: write
 
-concurrency:
-  group: momentum-spike-scan
-  cancel-in-progress: true
-
 jobs:
-  run:
+  spike_scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          persist-credentials: true
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps (best-effort)
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
+          pip install requests pyyaml
 
-      - name: Run spike scanner
+      - name: Ensure .state
+        run: mkdir -p .state
+
+      # 👉 Your real spike scan should write: .state/spike_candidates.csv
+      - name: Run spike scanner (placeholder)
         run: |
-          mkdir -p .state
-          python tools/momentum_spike.py || true
+          python - <<'PY'
+import csv, random
+from pathlib import Path
+pairs = ["KAVA/USD","STRK/USD","EAT/USD","CFG/USD"]
+rows = []
+for i,p in enumerate(pairs):
+    rows.append({
+      "pair": p,
+      "score": round(10+random.random()*20, 3),
+      "pct24": round(5+random.random()*15, 2),
+      "usd_vol": int(50_000+random.random()*2_000_000),
+      "ema_slope": round(-0.02+random.random()*0.04, 5),
+    })
+out = Path(".state")/"spike_candidates.csv"
+with out.open("w", newline="", encoding="utf-8") as f:
+    w = csv.DictWriter(f, fieldnames=["pair","score","pct24","usd_vol","ema_slope"])
+    w.writeheader(); w.writerows(rows)
+print(f"wrote {out}")
+PY
 
-      - name: Write spike-scan marker
+      - name: Normalize candidate CSV schema
+        run: python tools/csv_schema_fix.py
+
+      - name: List .state contents
+        run: ls -la .state || true
+
+      - name: Zip .state (spike)
         run: |
-          mkdir -p .state
-          echo "spike_scan_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" > .state/momentum_spike_marker.txt
+          STATE_ZIP="state-spike-${GITHUB_RUN_NUMBER}.zip"
+          (cd . && zip -r "$STATE_ZIP" .state >/dev/null)
+          ls -lh "$STATE_ZIP"
 
-      # Promote spikes to the list consumed by the rotation
-      - name: Promote spike candidates to momentum list (if present)
-        run: |
-          if [ -s ".state/spike_candidates.csv" ]; then
-            awk 'NR==1 || !seen[$0]++' .state/spike_candidates.csv > .state/momentum_candidates.csv
-            echo "Spikes promoted to .state/momentum_candidates.csv"
-          else
-            echo "No spike_candidates.csv to promote (skipping)"
-          fi
-
-      - name: Commit & push .state (force-add)
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f .state/** || true
-          git commit -m "chore(spike-scan): update & promote spikes -> momentum [skip ci]" || echo "Nothing to commit"
-          git push
-
-      - name: Upload .state as artifact (optional)
+      - name: Upload spike artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: state-momentum-spike
-          path: .state/**
-          if-no-files-found: warn
+          name: spike-${{ github.run_number }}
+          path: state-spike-${{ github.run_number }}.zip
+          retention-days: 7
