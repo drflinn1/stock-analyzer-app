@@ -2,15 +2,18 @@ name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # Every hour at :00
+    - cron: "0 * * * *"    # every hour
   workflow_dispatch:
 
+# Needed so this job can download artifacts produced by other workflows
 permissions:
-  contents: write
+  contents: read
+  actions: read
 
 jobs:
   rotate:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,75 +25,42 @@ jobs:
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          pip install requests pyyaml
+          pip install -r requirements.txt || true
+          pip install requests pandas pyyaml matplotlib || true
 
-      # ---------- Optional tiny safety net (best-effort) ----------
-      - name: Seed candidates if missing (best-effort)
-        run: |
-          mkdir -p .state
-          if [ ! -f .state/momentum_candidates.csv ]; then
-            echo "pair,rank,quote" > .state/momentum_candidates.csv
-            echo "EAT/USD,100,0.01" >> .state/momentum_candidates.csv
-          fi
-
-      # ---------- Normalize CSV schema so rank/quote always exist ----------
-      - name: Normalize candidate CSV schema
-        run: python tools/csv_schema_fix.py
-
-      - name: Echo critical env/vars
-        run: |
-          echo "DRY_RUN=${DRY_RUN}"
-          echo "BUY_USD=${BUY_USD}"
-          echo "TP_PCT=${TP_PCT}"
-          echo "SL_PCT=${SL_PCT}"
-          echo "SLOW_GAIN_PCT=${SLOW_GAIN_PCT}"
-          echo "SLOW_WINDOW_MIN=${SLOW_WINDOW_MIN}"
-          echo "UNIVERSE_PICK=${UNIVERSE_PICK}"
-        shell: bash
-
-      - name: Run rotation
+      # Pull the latest Momentum/Spike scan artifacts into .state/
+      - name: Pull latest momentum/spike artifacts → .state/
         env:
-          # Secrets
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          # Vars
-          DRY_RUN: ${{ vars.DRY_RUN }}
-          BUY_USD: ${{ vars.BUY_USD }}
-          TP_PCT: ${{ vars.TP_PCT }}
-          SL_PCT: ${{ vars.SL_PCT }}
-          SLOW_GAIN_PCT: ${{ vars.SLOW_GAIN_PCT }}
-          SLOW_WINDOW_MIN: ${{ vars.SLOW_WINDOW_MIN }}
-          UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          python -u main.py
+          chmod +x tools/fetch_latest_scan_artifacts.sh
+          bash tools/fetch_latest_scan_artifacts.sh
 
-      - name: List .state contents
-        if: always()
+      # Optional: print a quick preview in the logs
+      - name: Echo latest picks (top 5)
         run: |
-          echo "----- .state -----"
-          ls -la .state || true
-          echo "------------------"
+          python - <<'PY'
+          import os, pandas as pd
+          def show(fp, label):
+              if os.path.exists(fp):
+                  try:
+                      df = pd.read_csv(fp)
+                      print(f"\n=== {label} (top 5) ===")
+                      print(df.head(5).to_string(index=False))
+                  except Exception as e:
+                      print(f"{label}: unable to read {fp}: {e}")
+              else:
+                  print(f"{label}: {fp} not found")
+          show(".state/momentum_candidates_fixed.csv", "Momentum candidates")
+          show(".state/spike_candidates_fixed.csv", "Spike candidates")
+          PY
 
-      # Pack and upload artifacts (always)
-      - name: Zip .state
-        if: always()
+      # 🚀 Run your rotation bot
+      - name: Run bot
+        env:
+          PYTHONUNBUFFERED: "1"
+          # (Keep your existing env/vars in repo settings: BUY_USD, DRY_RUN, TP_PCT, SL_PCT, etc.)
+          # Kraken secrets remain in Secrets (KRAKEN_API_KEY / KRAKEN_API_SECRET / etc.)
         run: |
-          set -e
-          STATE_ZIP="state-${GITHUB_RUN_NUMBER}.zip"
-          if [ -d .state ] && [ "$(ls -A .state)" ]; then
-            (cd . && zip -r "$STATE_ZIP" .state >/dev/null)
-          else
-            echo "empty" > .state/empty.txt
-            (cd . && zip -r "$STATE_ZIP" .state >/dev/null)
-          fi
-          ls -lh "$STATE_ZIP" || true
-
-      - name: Upload .state artifacts (zip)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: state-${{ github.run_number }}
-          path: state-${{ github.run_number }}.zip
-          if-no-files-found: warn
-          retention-days: 7
+          python main.py
