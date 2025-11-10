@@ -69,11 +69,27 @@ jobs:
           ls -la .state || true
           echo "------------------"
 
-      - name: Upload .state artifacts
+      # Pack .state to avoid glob quirks with hidden dirs/symlinks
+      - name: Zip .state
+        if: always()
+        run: |
+          set -e
+          STATE_ZIP="state-${GITHUB_RUN_NUMBER}.zip"
+          if [ -d .state ] && [ "$(ls -A .state)" ]; then
+            (cd . && zip -r "$STATE_ZIP" .state >/dev/null)
+          else
+            echo "(no files in .state) creating placeholder"
+            echo "empty" > .state/empty.txt
+            (cd . && zip -r "$STATE_ZIP" .state >/dev/null)
+          fi
+          echo "ZIPPED: $STATE_ZIP"
+          ls -lh "$STATE_ZIP" || true
+
+      - name: Upload .state artifacts (zip)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_number }}
-          path: ./.state
+          path: state-${{ github.run_number }}.zip
           if-no-files-found: warn
           retention-days: 7
