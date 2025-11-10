@@ -1,174 +1,149 @@
 #!/usr/bin/env python3
 """
 sell_guard.py
-Live/Dry sell-guard with:
-- Fixed STOP %
-- Fixed TAKE-PROFIT %
-- Trailing stop (arms after TRAIL_START_PCT gain, trails by TRAIL_BACKOFF_PCT)
-- Break-even stop (raises floor to entry once BE_TRIGGER_PCT gain seen)
-- Cooldown & no-rebuy support via state helpers (timestamps written by engine)
+Stateless SELL guard used by the crypto engine.
 
-This module is intentionally self-contained and side-effect free for logic.
-Execution (placing orders, writing files) is delegated to call-backs provided
-by the engine (crypto_engine.py).
+Rules supported (stateless):
+- STOP_PCT: hard stop if % change <= -STOP_PCT
+- TP_PCT:   take profit if % change >=  TP_PCT
+- TRAILING: once gain >= TRAIL_START_PCT, sell on dip below
+            (TRAIL_START_PCT - TRAIL_BACKOFF_PCT) from entry
+            (stateless floor version)
+- BREAK-EVEN: once gain >= BE_TRIGGER_PCT, sell if price < entry
+
+This module is intentionally light and pure so it can be called from
+any engine. Persistence / cooldown / artifacts are handled by the caller.
+
+Interface:
+    did_sell, reason = run_sell_guard(
+        pos=Position(...),
+        cur_price=...,
+        cfg=GuardCfg(...),
+        mode="ON" or "OFF",              # optional; OFF = LIVE, ON = DRY
+        place_sell_fn=callable,          # (pair:str, amount:float, mode:str) -> (ok:bool, order_id:str)
+        write_sell_artifacts_fn=callable # (payload:dict) -> None
+    )
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple
-import json
+from typing import Callable, Tuple
 import time
-import math
 
-STATE_DIR = Path(".state")
-TRAIL_STATE = STATE_DIR / "trail_state.json"
 
-# ---------- small utils ----------
-
-def utc_now_str() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-
-def _read_json(path: Path, default):
-    try:
-        return json.loads(path.read_text())
-    except Exception:
-        return default
-
-def _write_json(path: Path, data) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2))
-
-# ---------- config & state ----------
-
-@dataclass
-class GuardCfg:
-    stop_pct: float            # e.g., 1.0
-    tp_pct: float              # e.g., 5.0
-    trail_start_pct: float     # e.g., 3.0 (arm trailing after this gain)
-    trail_backoff_pct: float   # e.g., 0.8 (sell if drop >= this % from high)
-    be_trigger_pct: float      # e.g., 2.0 (raise stop to at least entry)
-
+# --------- Data types ---------
 
 @dataclass
 class Position:
     pair: str
     amount: float
-    entry_px: float            # average entry price
+    entry_px: float
 
 
 @dataclass
-class GuardDecision:
-    action: str                # "hold" | "sell"
-    reason: str
-    new_high: Optional[float] = None   # for external state update
+class GuardCfg:
+    stop_pct: float = 1.0          # e.g., 1.0  -> sell at -1.0%
+    tp_pct: float = 5.0            # e.g., 5.0  -> sell at +5.0%
+    trail_start_pct: float = 3.0   # gain threshold to arm a trailing floor
+    trail_backoff_pct: float = 0.8 # how much under trail_start to allow before sell
+    be_trigger_pct: float = 2.0    # once gain >= this, sell if price < entry
 
 
-# ---------- trailing/break-even helpers ----------
+# --------- Helpers ---------
 
-def _trail_state_get(pair: str) -> Dict[str, float]:
-    data = _read_json(TRAIL_STATE, {})
-    return data.get(pair, {"high": 0.0, "be_armed": False})
-
-def _trail_state_set(pair: str, high: float, be_armed: bool) -> None:
-    data = _read_json(TRAIL_STATE, {})
-    data[pair] = {"high": float(high), "be_armed": bool(be_armed)}
-    _write_json(TRAIL_STATE, data)
-
-def _pct_change(from_px: float, to_px: float) -> float:
-    if from_px <= 0.0:
+def pct_change(cur: float, ref: float) -> float:
+    if ref <= 0:
         return 0.0
-    return (to_px / from_px - 1.0) * 100.0
+    return (cur / ref - 1.0) * 100.0
 
 
-# ---------- core logic ----------
-
-def evaluate_guard(pos: Position, cur_price: float, cfg: GuardCfg) -> GuardDecision:
-    """
-    Decide whether to sell or hold based on:
-      STOP%, TP%, Trailing stop (armed after start gain), Break-even.
-    """
-    # base floors/ceilings
-    stop_floor = pos.entry_px * (1.0 - cfg.stop_pct / 100.0)
-    tp_level  = pos.entry_px * (1.0 + cfg.tp_pct   / 100.0)
-
-    # trail state
-    t = _trail_state_get(pos.pair)
-    high = max(float(t.get("high", 0.0)), pos.entry_px, cur_price)
-    be_armed = bool(t.get("be_armed", False))
-
-    # update high-water mark
-    if cur_price > high:
-        high = cur_price
-
-    # arm BE (raise stop to at least entry) if gain reached
-    gain_pct = _pct_change(pos.entry_px, high)
-    if gain_pct >= cfg.be_trigger_pct:
-        be_armed = True
-        stop_floor = max(stop_floor, pos.entry_px)
-
-    # arm trailing once start gain reached
-    if gain_pct >= cfg.trail_start_pct:
-        trail_floor = high * (1.0 - cfg.trail_backoff_pct / 100.0)
-        stop_floor = max(stop_floor, trail_floor)
-
-    # decision
-    if cur_price <= stop_floor:
-        reason = []
-        if cur_price <= pos.entry_px * (1.0 - cfg.stop_pct / 100.0):
-            reason.append(f"STOP {cfg.stop_pct:.2f}% hit")
-        if cur_price <= high * (1.0 - cfg.trail_backoff_pct / 100.0) and gain_pct >= cfg.trail_start_pct:
-            reason.append(f"TRAIL {cfg.trail_backoff_pct:.2f}% from high")
-        if be_armed and cur_price <= pos.entry_px:
-            reason.append("BE floor")
-        rsn = " & ".join(reason) if reason else "Stop floor"
-        return GuardDecision(action="sell", reason=rsn, new_high=high)
-
-    if cur_price >= tp_level:
-        return GuardDecision(action="sell", reason=f"TP {cfg.tp_pct:.2f}% hit", new_high=high)
-
-    return GuardDecision(action="hold", reason="Hold", new_high=high)
+def _write_sell(
+    pos: Position,
+    cur_px: float,
+    mode: str,
+    reason: str,
+    order_id: str,
+    write_sell_artifacts_fn,
+) -> None:
+    payload = {
+        "when": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        "pair": pos.pair,
+        "amount": round(pos.amount, 8),
+        "entry": round(pos.entry_px, 8),
+        "price": round(cur_px, 8),
+        "pct": round(pct_change(cur_px, pos.entry_px), 4),
+        "reason": reason,
+        "mode": mode.upper(),
+        "order_id": order_id,
+    }
+    try:
+        write_sell_artifacts_fn(payload)
+    except Exception:
+        # best-effort; guard should never hard-crash the run due to artifacts
+        pass
 
 
-# ---------- execution wrapper (called by engine) ----------
+# --------- Core guard ---------
 
 def run_sell_guard(
+    *,
     pos: Position,
     cur_price: float,
     cfg: GuardCfg,
-    mode: str,
+    mode: str = "ON",  # OFF = LIVE, ON = DRY
     place_sell_fn: Callable[[str, float, str], Tuple[bool, str]],
-    write_sell_artifacts_fn: Callable[[Dict], None],
+    write_sell_artifacts_fn,
 ) -> Tuple[bool, str]:
     """
-    Evaluates guard and, if needed, places a sell via the provided callback.
-
-    place_sell_fn(pair, amount, mode) -> (ok, order_id_or_msg)
-    write_sell_artifacts_fn(payload_dict) -> None     # engine logs MD/JSON, cooldown, etc.
-
-    Returns (did_sell, message)
+    Returns (did_sell, reason)
     """
-    decision = evaluate_guard(pos, cur_price, cfg)
-    _trail_state_set(pos.pair, decision.new_high or pos.entry_px, gain_reached(pos, decision.new_high or pos.entry_px, cfg))
+    entry = float(pos.entry_px or 0.0)
+    px = float(cur_price or 0.0)
 
-    if decision.action == "sell":
+    if entry <= 0 or px <= 0:
+        return False, "HOLD: invalid price(s)"
+
+    gain = pct_change(px, entry)
+
+    # Rule 1: Hard STOP
+    if cfg.stop_pct > 0 and gain <= -abs(cfg.stop_pct):
         ok, oid = place_sell_fn(pos.pair, pos.amount, mode)
-        payload = {
-            "when": utc_now_str(),
-            "pair": pos.pair,
-            "amount": round(float(pos.amount), 8),
-            "entry": round(float(pos.entry_px), 8),
-            "price": round(float(cur_price), 8),
-            "pct": round(_pct_change(pos.entry_px, cur_price), 4),
-            "reason": decision.reason,
-            "mode": mode.upper(),
-            "order_id": oid,
-        }
-        write_sell_artifacts_fn(payload)
-        return ok, f"SOLD {pos.pair}: {decision.reason}"
-    else:
-        return False, decision.reason
+        if ok:
+            _write_sell(pos, px, mode, f"STOP {cfg.stop_pct:.2f}% hit", oid, write_sell_artifacts_fn)
+            return True, f"SOLD {pos.pair}: STOP {cfg.stop_pct:.2f}% hit"
+        return False, f"HOLD: stop error {oid}"
 
+    # Rule 2: Take-Profit
+    if cfg.tp_pct > 0 and gain >= abs(cfg.tp_pct):
+        ok, oid = place_sell_fn(pos.pair, pos.amount, mode)
+        if ok:
+            _write_sell(pos, px, mode, f"TP {cfg.tp_pct:.2f}% hit", oid, write_sell_artifacts_fn)
+            return True, f"SOLD {pos.pair}: TP {cfg.tp_pct:.2f}% hit"
+        return False, f"HOLD: tp error {oid}"
 
-def gain_reached(pos: Position, high: float, cfg: GuardCfg) -> bool:
-    return _pct_change(pos.entry_px, high) >= cfg.be_trigger_pct
+    # Rule 3: Stateless Trailing floor
+    # Once gain >= trail_start, sell if price falls below a floor defined from entry:
+    # floor_gain = trail_start - trail_backoff
+    # Example: start=3%, backoff=0.8% → sell if gain <= 2.2% (after it first exceeds 3%)
+    if cfg.trail_start_pct > 0:
+        floor_gain = cfg.trail_start_pct - max(0.0, cfg.trail_backoff_pct)
+        if gain >= cfg.trail_start_pct and gain <= floor_gain:
+            ok, oid = place_sell_fn(pos.pair, pos.amount, mode)
+            if ok:
+                _write_sell(pos, px, mode,
+                            f"TRAIL armed@{cfg.trail_start_pct:.2f}% → dip to {floor_gain:.2f}%", oid,
+                            write_sell_artifacts_fn)
+                return True, f"SOLD {pos.pair}: TRAIL dip to {floor_gain:.2f}%"
+            return False, f"HOLD: trail error {oid}"
+
+    # Rule 4: Break-even tighten
+    # If we ever get to >= be_trigger, we refuse to go below entry (sell if px < entry).
+    if cfg.be_trigger_pct > 0 and gain >= cfg.be_trigger_pct and px < entry:
+        ok, oid = place_sell_fn(pos.pair, pos.amount, mode)
+        if ok:
+            _write_sell(pos, px, mode, f"BE tighten @{cfg.be_trigger_pct:.2f}% (px < entry)", oid,
+                        write_sell_artifacts_fn)
+            return True, f"SOLD {pos.pair}: BREAK-EVEN tighten"
+        return False, f"HOLD: break-even error {oid}"
+
+    return False, f"HOLD: gain {gain:.2f}%"
