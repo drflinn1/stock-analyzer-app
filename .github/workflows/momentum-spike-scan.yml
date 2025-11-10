@@ -23,10 +23,11 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt || true
-          pip install pandas yfinance matplotlib pyyaml requests
+          pip install pandas requests pyyaml matplotlib
 
+      # IMPORTANT: this matches your repo's real spike scanner
       - name: Run real spike scanner
-        run: python tools/spike_scan.py
+        run: python tools/momentum_spike.py
 
       - name: Normalize & add schema columns
         run: python tools/csv_schema_fix.py .state/spike_candidates.csv
