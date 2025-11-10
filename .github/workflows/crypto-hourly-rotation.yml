@@ -2,8 +2,7 @@ name: Crypto — Hourly 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
-    # Every hour at minute 0 (adjust if you prefer)
-    - cron: "0 * * * *"
+    - cron: "0 * * * *"   # Every hour at :00
   workflow_dispatch:
 
 permissions:
@@ -43,15 +42,16 @@ jobs:
           echo "SL_PCT=${SL_PCT}"
           echo "SLOW_GAIN_PCT=${SLOW_GAIN_PCT}"
           echo "SLOW_WINDOW_MIN=${SLOW_WINDOW_MIN}"
+          echo "UNIVERSE_PICK=${UNIVERSE_PICK}"
         shell: bash
 
       - name: Run rotation
         env:
-          # Secrets (must be set in repo → Settings → Secrets and variables → Actions)
+          # Secrets
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-          # Vars (repo → Settings → Variables) — keep using your existing values
+          # Vars
           DRY_RUN: ${{ vars.DRY_RUN }}
           BUY_USD: ${{ vars.BUY_USD }}
           TP_PCT: ${{ vars.TP_PCT }}
@@ -61,3 +61,22 @@ jobs:
           UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK }}
         run: |
           python -u main.py
+
+      # Help debug and prove files exist
+      - name: List .state contents
+        if: always()
+        run: |
+          echo "----- .state -----"
+          ls -la .state || true
+          echo "------------------"
+
+      # Upload artifacts so you can download run_summary, positions, etc.
+      - name: Upload .state artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-${{ github.run_number }}
+          path: |
+            .state/**
+          if-no-files-found: warn
+          retention-days: 7
