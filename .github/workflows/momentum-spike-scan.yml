@@ -25,12 +25,24 @@ jobs:
           pip install -r requirements.txt || true
           pip install pandas requests pyyaml matplotlib
 
-      # IMPORTANT: this matches your repo's real spike scanner
+      # Uses your existing real spike scanner
       - name: Run real spike scanner
         run: python tools/momentum_spike.py
 
       - name: Normalize & add schema columns
         run: python tools/csv_schema_fix.py .state/spike_candidates.csv
+
+      - name: Echo top 5 picks
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          try:
+              df = pd.read_csv(".state/spike_candidates_fixed.csv")
+              print("\\n=== Spike top 5 ===")
+              print(df.head(5).to_string(index=False))
+          except Exception as e:
+              print("No spike_candidates_fixed.csv yet:", e)
+          PY
 
       - name: Zip and upload CSV artifacts
         uses: actions/upload-artifact@v4
@@ -39,3 +51,4 @@ jobs:
           path: |
             .state/spike_candidates.csv
             .state/spike_candidates_fixed.csv
+          retention-days: 14
