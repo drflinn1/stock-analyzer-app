@@ -1,52 +1,40 @@
-name: Momentum — Spike Scan (hourly)
+name: Momentum — Spike Scan (Real)
 
 on:
-  schedule:
-    - cron: "10 * * * *"   # :10 each hour (after momentum scan)
   workflow_dispatch:
+  schedule:
+    - cron: "30 * * * *"   # every hour on the half-hour
 
 permissions:
   contents: write
 
 jobs:
-  spike_scan:
+  scan:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install requests pyyaml
+          pip install -r requirements.txt || true
+          pip install pandas yfinance matplotlib pyyaml requests
 
-      - name: Ensure .state
-        run: mkdir -p .state
+      - name: Run real spike scanner
+        run: python tools/spike_scan.py
 
-      # >>> run your spike scanner (placeholder script for now)
-      - name: Run spike scanner
-        run: python tools/mock_spike_scan.py
+      - name: Normalize & add schema columns
+        run: python tools/csv_schema_fix.py .state/spike_candidates.csv
 
-      - name: Normalize candidate CSV schema
-        run: python tools/csv_schema_fix.py
-
-      - name: List .state contents
-        run: ls -la .state || true
-
-      - name: Zip .state (spike)
-        run: |
-          STATE_ZIP="state-spike-${GITHUB_RUN_NUMBER}.zip"
-          (cd . && zip -r "$STATE_ZIP" .state >/dev/null)
-          ls -lh "$STATE_ZIP"
-
-      - name: Upload spike artifacts
+      - name: Zip and upload CSV artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: spike-${{ github.run_number }}
-          path: state-spike-${{ github.run_number }}.zip
-          retention-days: 7
+          name: spike_scan_outputs
+          path: |
+            .state/spike_candidates.csv
+            .state/spike_candidates_fixed.csv
