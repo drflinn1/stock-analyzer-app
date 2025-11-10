@@ -1,198 +1,174 @@
 #!/usr/bin/env python3
 """
-Sell Guard for Crypto — 1-Coin Rotation
+sell_guard.py
+Live/Dry sell-guard with:
+- Fixed STOP %
+- Fixed TAKE-PROFIT %
+- Trailing stop (arms after TRAIL_START_PCT gain, trails by TRAIL_BACKOFF_PCT)
+- Break-even stop (raises floor to entry once BE_TRIGGER_PCT gain seen)
+- Cooldown & no-rebuy support via state helpers (timestamps written by engine)
 
-Triggers:
-- STOP_PCT: sell if drop >= STOP_PCT since entry (any time).
-- TP_PCT:   sell if gain >= TP_PCT since entry.
-- SLOW_GAIN after WINDOW_MIN minutes: if gain < SLOW_GAIN_REQ → sell (rotate).
-
-Artifacts (written under .state/):
-- sell_log.md (append)
-- last_sell.json
-- run_summary.md (note appended)
-- positions.json (deleted on sell)
+This module is intentionally self-contained and side-effect free for logic.
+Execution (placing orders, writing files) is delegated to call-backs provided
+by the engine (crypto_engine.py).
 """
+
 from __future__ import annotations
-
-import json
-import os
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Callable, Dict, Optional, Tuple
+import json
+import time
+import math
 
-import ccxt
+STATE_DIR = Path(".state")
+TRAIL_STATE = STATE_DIR / "trail_state.json"
 
-# Optional Slack notifier (safe if missing)
-try:
-    from trader.notify import notify_slack  # type: ignore
-except Exception:
-    def notify_slack(_msg: str) -> None:
-        pass
+# ---------- small utils ----------
 
-STATE = Path(".state")
-STATE.mkdir(parents=True, exist_ok=True)
-POS_FILE = STATE / "positions.json"
-SELL_LOG_MD = STATE / "sell_log.md"
-LAST_SELL_JSON = STATE / "last_sell.json"
-SUMMARY_MD = STATE / "run_summary.md"
+def utc_now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
-
-def env_str(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return default if v is None else str(v).strip()
-
-
-def env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
+def _read_json(path: Path, default):
     try:
-        return float(v)
-    except (TypeError, ValueError):
-        return float(default)
-
-
-def _kraken():
-    key = env_str("KRAKEN_API_KEY", env_str("KRAKEN_KEY", ""))
-    sec = env_str("KRAKEN_API_SECRET", env_str("KRAKEN_SECRET", ""))
-    ex = ccxt.kraken({"apiKey": key, "secret": sec, "enableRateLimit": True})
-    ex.load_markets()
-    return ex, bool(key and sec)
-
-
-def _parse_when(s: str) -> Optional[datetime]:
-    try:
-        if "UTC" in s:
-            s = s.replace(" UTC", "")
-        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return json.loads(path.read_text())
     except Exception:
-        try:
-            return datetime.fromisoformat(s.replace("Z", "")).replace(tzinfo=timezone.utc)
-        except Exception:
-            return None
+        return default
+
+def _write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2))
+
+# ---------- config & state ----------
+
+@dataclass
+class GuardCfg:
+    stop_pct: float            # e.g., 1.0
+    tp_pct: float              # e.g., 5.0
+    trail_start_pct: float     # e.g., 3.0 (arm trailing after this gain)
+    trail_backoff_pct: float   # e.g., 0.8 (sell if drop >= this % from high)
+    be_trigger_pct: float      # e.g., 2.0 (raise stop to at least entry)
 
 
-def _append_summary_note(text: str) -> None:
-    try:
-        if SUMMARY_MD.exists():
-            SUMMARY_MD.write_text(SUMMARY_MD.read_text() + f"\n{text}\n")
-    except Exception:
-        pass
+@dataclass
+class Position:
+    pair: str
+    amount: float
+    entry_px: float            # average entry price
 
 
-def _append_sell_log(line: str) -> None:
-    header = (
-        "# Sell Log\n"
-        "When (UTC) | Pair | Amount | Entry | Price | Pct | Reason | Mode | OrderId\n"
-        "---|---|---:|---:|---:|---:|---|---|---\n"
-    )
-    if not SELL_LOG_MD.exists():
-        SELL_LOG_MD.write_text(header)
-    with SELL_LOG_MD.open("a") as f:
-        f.write(line + "\n")
+@dataclass
+class GuardDecision:
+    action: str                # "hold" | "sell"
+    reason: str
+    new_high: Optional[float] = None   # for external state update
 
+
+# ---------- trailing/break-even helpers ----------
+
+def _trail_state_get(pair: str) -> Dict[str, float]:
+    data = _read_json(TRAIL_STATE, {})
+    return data.get(pair, {"high": 0.0, "be_armed": False})
+
+def _trail_state_set(pair: str, high: float, be_armed: bool) -> None:
+    data = _read_json(TRAIL_STATE, {})
+    data[pair] = {"high": float(high), "be_armed": bool(be_armed)}
+    _write_json(TRAIL_STATE, data)
+
+def _pct_change(from_px: float, to_px: float) -> float:
+    if from_px <= 0.0:
+        return 0.0
+    return (to_px / from_px - 1.0) * 100.0
+
+
+# ---------- core logic ----------
+
+def evaluate_guard(pos: Position, cur_price: float, cfg: GuardCfg) -> GuardDecision:
+    """
+    Decide whether to sell or hold based on:
+      STOP%, TP%, Trailing stop (armed after start gain), Break-even.
+    """
+    # base floors/ceilings
+    stop_floor = pos.entry_px * (1.0 - cfg.stop_pct / 100.0)
+    tp_level  = pos.entry_px * (1.0 + cfg.tp_pct   / 100.0)
+
+    # trail state
+    t = _trail_state_get(pos.pair)
+    high = max(float(t.get("high", 0.0)), pos.entry_px, cur_price)
+    be_armed = bool(t.get("be_armed", False))
+
+    # update high-water mark
+    if cur_price > high:
+        high = cur_price
+
+    # arm BE (raise stop to at least entry) if gain reached
+    gain_pct = _pct_change(pos.entry_px, high)
+    if gain_pct >= cfg.be_trigger_pct:
+        be_armed = True
+        stop_floor = max(stop_floor, pos.entry_px)
+
+    # arm trailing once start gain reached
+    if gain_pct >= cfg.trail_start_pct:
+        trail_floor = high * (1.0 - cfg.trail_backoff_pct / 100.0)
+        stop_floor = max(stop_floor, trail_floor)
+
+    # decision
+    if cur_price <= stop_floor:
+        reason = []
+        if cur_price <= pos.entry_px * (1.0 - cfg.stop_pct / 100.0):
+            reason.append(f"STOP {cfg.stop_pct:.2f}% hit")
+        if cur_price <= high * (1.0 - cfg.trail_backoff_pct / 100.0) and gain_pct >= cfg.trail_start_pct:
+            reason.append(f"TRAIL {cfg.trail_backoff_pct:.2f}% from high")
+        if be_armed and cur_price <= pos.entry_px:
+            reason.append("BE floor")
+        rsn = " & ".join(reason) if reason else "Stop floor"
+        return GuardDecision(action="sell", reason=rsn, new_high=high)
+
+    if cur_price >= tp_level:
+        return GuardDecision(action="sell", reason=f"TP {cfg.tp_pct:.2f}% hit", new_high=high)
+
+    return GuardDecision(action="hold", reason="Hold", new_high=high)
+
+
+# ---------- execution wrapper (called by engine) ----------
 
 def run_sell_guard(
-    *,
-    dry_run: Optional[bool] = None,
-    tp_pct: Optional[float] = None,
-    stop_pct: Optional[float] = None,
-    window_min: Optional[int] = None,
-    slow_gain_req: Optional[float] = None,
-    **_kwargs,
-) -> Dict[str, Any]:
+    pos: Position,
+    cur_price: float,
+    cfg: GuardCfg,
+    mode: str,
+    place_sell_fn: Callable[[str, float, str], Tuple[bool, str]],
+    write_sell_artifacts_fn: Callable[[Dict], None],
+) -> Tuple[bool, str]:
     """
-    Returns: {"action": "hold"|"sold", "note": "..."}
+    Evaluates guard and, if needed, places a sell via the provided callback.
+
+    place_sell_fn(pair, amount, mode) -> (ok, order_id_or_msg)
+    write_sell_artifacts_fn(payload_dict) -> None     # engine logs MD/JSON, cooldown, etc.
+
+    Returns (did_sell, message)
     """
-    # Defaults from env if not provided
-    if dry_run is None:
-        dry_run = (env_str("DRY_RUN", "ON").upper() != "OFF")
-    tp = tp_pct if tp_pct is not None else env_float("TP_PCT", 5.0)
-    sl = stop_pct if stop_pct is not None else env_float("STOP_PCT", 1.0)
-    win = window_min if window_min is not None else int(env_float("WINDOW_MIN", 30.0))
-    slow_req = slow_gain_req if slow_gain_req is not None else env_float("SLOW_GAIN_REQ", 3.0)
+    decision = evaluate_guard(pos, cur_price, cfg)
+    _trail_state_set(pos.pair, decision.new_high or pos.entry_px, gain_reached(pos, decision.new_high or pos.entry_px, cfg))
 
-    if not POS_FILE.exists():
-        return {"action": "hold", "note": "No open position."}
+    if decision.action == "sell":
+        ok, oid = place_sell_fn(pos.pair, pos.amount, mode)
+        payload = {
+            "when": utc_now_str(),
+            "pair": pos.pair,
+            "amount": round(float(pos.amount), 8),
+            "entry": round(float(pos.entry_px), 8),
+            "price": round(float(cur_price), 8),
+            "pct": round(_pct_change(pos.entry_px, cur_price), 4),
+            "reason": decision.reason,
+            "mode": mode.upper(),
+            "order_id": oid,
+        }
+        write_sell_artifacts_fn(payload)
+        return ok, f"SOLD {pos.pair}: {decision.reason}"
+    else:
+        return False, decision.reason
 
-    pos = json.loads(POS_FILE.read_text())
-    pair = pos.get("pair")
-    amount = float(pos.get("amount", 0))
-    est_cost = float(pos.get("est_cost", 0))
-    when_s = pos.get("when", "")
 
-    if not pair or amount <= 0 or est_cost <= 0:
-        return {"action": "hold", "note": "Position file incomplete; skipping sell."}
-
-    entry = est_cost / amount
-    opened = _parse_when(when_s)
-    age_min = 0.0
-    if opened:
-        age_min = max(0.0, (datetime.now(timezone.utc) - opened).total_seconds() / 60.0)
-
-    ex, have_keys = _kraken()
-    try:
-        t = ex.fetch_ticker(pair)
-        price = t.get("last") or t.get("close") or t.get("bid") or t.get("ask")
-        price = float(price)
-    except Exception:
-        return {"action": "hold", "note": f"Could not fetch price for {pair}; holding."}
-
-    pct = (price / entry - 1.0) * 100.0
-
-    reason = None
-    if pct <= -abs(sl):
-        reason = f"STOP {sl:.2f}% hit"
-    elif pct >= abs(tp):
-        reason = f"TP {tp:.2f}% hit"
-    elif age_min >= float(win) and pct < slow_req:
-        reason = f"Slow gain (<{slow_req:.2f}% after {win}m)"
-
-    if not reason:
-        return {"action": "hold", "note": f"Holding {pair}: {pct:+.2f}% (age {age_min:.1f}m)."}
-
-    mode = "DRY" if (dry_run or not have_keys) else "LIVE"
-    order_id = "-"
-
-    try:
-        if mode == "LIVE":
-            order = ex.create_market_sell_order(pair, amount)
-            order_id = order.get("id", "-")
-    except ccxt.BaseError as e:
-        note = f"[SELL ERROR] {pair} amount={amount:.8f} @~{price:.8f}: {e}"
-        _append_summary_note(note)
-        notify_slack(note)
-        return {"action": "hold", "note": note}
-
-    when_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    line = (
-        f"{when_utc} | {pair} | {amount:.8f} | {entry:.8f} | {price:.8f} | "
-        f"{pct:.2f} | {reason} | {mode} | {order_id}"
-    )
-    _append_sell_log(line)
-
-    LAST_SELL_JSON.write_text(
-        json.dumps(
-            {
-                "when": when_utc,
-                "pair": pair,
-                "amount": round(amount, 8),
-                "entry": round(entry, 10),
-                "price": round(price, 10),
-                "pct": round(pct, 4),
-                "reason": reason,
-                "mode": mode,
-                "order_id": order_id,
-            },
-            indent=2,
-        )
-    )
-
-    try:
-        POS_FILE.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    msg = f"[{mode}] SOLD {pair}: {reason} at {price:.8f} (from {entry:.8f}, {pct:+.2f}%)."
-    _append_summary_note(msg)
-    notify_slack(msg)
-    return {"action": "sold", "note": msg}
+def gain_reached(pos: Position, high: float, cfg: GuardCfg) -> bool:
+    return _pct_change(pos.entry_px, high) >= cfg.be_trigger_pct
