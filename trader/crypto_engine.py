@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
 trader/crypto_engine.py — Kraken utilities (LIVE)
+
 Nov-10 fixes:
+• load_candidates() accepts either:
+  A) symbol,quote,rank
+  B) pair,score,pct24,usd_vol,ema_slope
 • Only trade USD-quoted pairs (skip EUR/USDT/etc.)
 • Correct market buy: use oflags=viqc and volume=<USD amount>
 """
@@ -26,27 +30,45 @@ def load_candidates(csv_path: Path = CANDIDATES_CSV) -> List[dict]:
     if not csv_path.exists():
         print("No candidates.csv found.")
         return rows
+
     with open(csv_path, newline="") as f:
         r = csv.DictReader(f)
+        headers = [h.strip().lower() for h in r.fieldnames or []]
+
+        # Schema A: symbol,quote,rank
+        schema_a = {"symbol", "quote"}
+        # Schema B: pair,score,pct24,...
+        schema_b = {"pair", "score"}
+
         for row in r:
-            sym = (row.get("symbol") or "").strip()
-            q = (row.get("quote") or "").strip()
-            if not sym:
+            out: Dict[str, str] = {}
+            if schema_a.issubset(headers):
+                s = (row.get("symbol") or "").strip()
+                if not s:
+                    continue
+                out["symbol"] = s
+                out["pair"] = s
+            elif schema_b.issubset(headers):
+                p = (row.get("pair") or "").strip()
+                if not p:
+                    continue
+                out["pair"] = p
+                out["symbol"] = p
+            else:
+                # Unknown schema; ignore row
                 continue
-            rows.append({"symbol": sym, "quote": q, "rank": row.get("rank")})
+            rows.append(out)
     return rows
 
 # ------------------------- Symbol helpers --------------------------
 def normalize_pair(s: str) -> str:
     """
-    Accept: 'EAT/USD', 'EATUSD', 'eatusd', 'EATUSDT', 'TERMEUR', etc.
+    Accept: 'EAT/USD', 'EATUSD', 'eatusd', 'EATUSDT', 'TERMEUR'
     Return: canonical Kraken pair without slash (e.g., 'EATUSD', 'SOLUSD').
     """
     s = s.strip().upper().replace("/", "")
-    # If it ends with a known quote, keep it; else default to USD
-    if s.endswith("USD") or s.endswith("EUR") or s.endswith("USDT"):
+    if s.endswith(("USD", "EUR", "USDT")):
         return s
-    # default to USD if raw asset given
     return s + "USD"
 
 def is_usd_pair(pair: str) -> bool:
@@ -57,7 +79,6 @@ def get_public_quote(pair: str) -> Optional[float]:
     """Return last trade price for a Kraken pair code (e.g., 'EATUSD')."""
     try:
         pair = normalize_pair(pair)
-        # Only quote USD pairs — others are irrelevant to this bot
         if not is_usd_pair(pair):
             return None
         resp = requests.get(f"{API_BASE}/0/public/Ticker?pair={pair}", timeout=12)
@@ -72,7 +93,6 @@ def get_public_quote(pair: str) -> Optional[float]:
 # --------------------------- Private API ---------------------------
 def _private_request(endpoint: str, payload: dict) -> dict:
     import hashlib, hmac, base64, urllib.parse
-
     nonce = str(int(time.time() * 1000))
     payload["nonce"] = nonce
     postdata = urllib.parse.urlencode(payload)
@@ -81,7 +101,6 @@ def _private_request(endpoint: str, payload: dict) -> dict:
     msg = path.encode() + sha
     sig = hmac.new(base64.b64decode(KRAKEN_SECRET), msg, hashlib.sha512)
     sig64 = base64.b64encode(sig.digest()).decode()
-
     headers = {
         "API-Key": KRAKEN_KEY,
         "API-Sign": sig64,
@@ -96,7 +115,7 @@ def _private_request(endpoint: str, payload: dict) -> dict:
 # ----------------------------- Orders ------------------------------
 def place_market_buy_usd(pair: str, usd_amount: float) -> str:
     """
-    LIVE MARKET BUY spending <usd_amount> of the quote currency (USD).
+    LIVE MARKET BUY spending <usd_amount> of USD (quote).
     Kraken rule: use oflags=viqc and set volume=<quote_currency_amount>.
     """
     pair = normalize_pair(pair)
