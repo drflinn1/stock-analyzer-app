@@ -1,20 +1,22 @@
 {
   "positions": {
-    "MELANIAUSD": {
-      "qty": 180.28846153846155,
-      "entry_price": 0.1664,
-      "txid": "{\"error\": [], \"result\": {\"txid\": [\"OLHJQB-2X5QL-SJQXGV\"], \"descr\": {\"order\": \"buy 30.00 MELANIAUSD @ market\"}}}",
-      "timestamp": "2025-11-11T02:01:58.084617+00:00"
+    "LSKUSD": {
+      "qty": 88.53389647021139,
+      "entry_price": 0.337159,
+      "txid": "O7FOLC-GEDAA-VXTFAV",
+      "timestamp": "2025-11-11T18:19:36.668157+00:00"
     }
   },
   "holding": [
-    "MELANIAUSD"
+    "LSKUSD"
   ],
   "buy_usd": 30.0,
   "tp_pct": 5.0,
   "sl_pct": 2.0,
   "num_candidates": 40,
-  "bought": null,
-  "notes": [],
-  "timestamp": "2025-11-11T17:48:43.428272+00:00"
+  "bought": "LSKUSD",
+  "notes": [
+    "used_est_qty_fallback"
+  ],
+  "timestamp": "2025-11-11T18:19:36.669058+00:00"
 }
