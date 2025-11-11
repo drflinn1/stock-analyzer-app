@@ -4,14 +4,14 @@ main.py — LIVE trading version (USD-only)
 1-Coin Rotation Bot (Kraken)
 
 Nov-10 fixes:
-• Accepts new scan CSV (pair,score,...) via engine
+• Accepts new scan CSV via engine
 • Auto-migrates legacy .state/positions.json formats
-• Always writes a run summary even on early exit
+• ALWAYS writes .state/run_summary.json and prints where they are
 • USD-only; market buys use viqc (volume is USD amount)
 """
 
 from __future__ import annotations
-import json, os, time
+import json, os, sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any
@@ -26,7 +26,7 @@ from trader.crypto_engine import (
 )
 
 STATE = Path(".state")
-STATE.mkdir(exist_ok=True)
+STATE.mkdir(parents=True, exist_ok=True)
 POS_FILE = STATE / "positions.json"
 SUMMARY_FILE = STATE / "run_summary.json"
 
@@ -37,22 +37,11 @@ SL_PCT  = float(os.getenv("SL_PCT", "2"))      # stop-loss %
 MIN_QUOTE = 1e-12
 
 def _migrate_positions(obj: Any) -> Dict[str, dict]:
-    """
-    Supported inputs:
-    1) {} or missing -> {}
-    2) Legacy flat dict like {"pair":"EAT/USD","amount":1237.75,"est_cost":80.49,"when":"..."}
-       -> {"EATUSD":{"qty":1237.75,"entry_price": est_cost/amount, "txid":"", "timestamp": when}}
-    3) Correct current schema -> pass-through
-    Anything else -> {}
-    """
     try:
         if not obj or not isinstance(obj, dict):
             return {}
-        # Current schema: first value is a dict with 'qty'
         if obj and all(isinstance(v, dict) and "qty" in v for v in obj.values()):
             return obj
-
-        # Legacy flat schema?
         if set(obj.keys()) >= {"pair", "amount", "est_cost"}:
             pair = normalize_pair(str(obj.get("pair", "")))
             qty = float(obj.get("amount", 0.0))
@@ -69,7 +58,6 @@ def _migrate_positions(obj: Any) -> Dict[str, dict]:
                     "timestamp": when,
                 }
             }
-        # Unrecognized -> empty
         return {}
     except Exception:
         return {}
@@ -82,22 +70,27 @@ def load_positions() -> dict:
             if fixed != raw:
                 POS_FILE.write_text(json.dumps(fixed, indent=2))
             return fixed
-        except Exception:
+        except Exception as e:
+            print(f"[WARN] Failed to read positions.json: {e}")
             return {}
     return {}
 
 def save_positions(d: dict):
-    POS_FILE.write_text(json.dumps(d, indent=2))
+    try:
+        POS_FILE.write_text(json.dumps(d, indent=2))
+        print(f"[STATE] Wrote positions → {POS_FILE.resolve()}")
+    except Exception as e:
+        print(f"[ERROR] Failed to write positions: {e}", file=sys.stderr)
 
 def log_summary(data: dict):
-    data["timestamp"] = datetime.now(timezone.utc).isoformat()
-    SUMMARY_FILE.write_text(json.dumps(data, indent=2))
+    try:
+        data["timestamp"] = datetime.now(timezone.utc).isoformat()
+        SUMMARY_FILE.write_text(json.dumps(data, indent=2))
+        print(f"[STATE] Wrote summary   → {SUMMARY_FILE.resolve()}")
+    except Exception as e:
+        print(f"[ERROR] Failed to write run summary: {e}", file=sys.stderr)
 
 def select_top_usd_candidate(candidates: list[dict]) -> tuple[str, float] | None:
-    """
-    Return (symbol, quote) for the first USD-quoted candidate that has a valid live quote.
-    Accepts 'EAT/USD', 'EATUSD', etc. Skips non-USD pairs.
-    """
     for row in candidates:
         raw = (row.get("symbol") or row.get("pair") or "").strip()
         if not raw:
@@ -111,14 +104,14 @@ def select_top_usd_candidate(candidates: list[dict]) -> tuple[str, float] | None
     return None
 
 def main():
-    started_at = datetime.now().isoformat()
-    positions = load_positions()
-    holding_syms = list(positions.keys())
-
+    print(f"[{datetime.now().isoformat()}] Starting LIVE rotation cycle…")
     candidates = load_candidates()
     notes = []
     if not candidates:
         notes.append("no_candidates_from_scan")
+
+    positions = load_positions()
+    holding_syms = list(positions.keys())
 
     # === SELL phase ===
     if holding_syms:
@@ -130,12 +123,10 @@ def main():
             entry_price = float(positions[sym]["entry_price"])
             change_pct = (quote - entry_price) / entry_price * 100
             print(f"Checking {sym}: {change_pct:.2f}% since entry.")
-
             if change_pct >= TP_PCT:
                 print(f"🎯 Take-profit hit ({change_pct:.2f}%) → SELLING")
                 place_market_sell_qty(sym, float(positions[sym]["qty"]))
                 del positions[sym]
-
             elif change_pct <= -SL_PCT:
                 print(f"🛑 Stop-loss hit ({change_pct:.2f}%) → SELLING")
                 place_market_sell_qty(sym, float(positions[sym]["qty"]))
@@ -144,7 +135,7 @@ def main():
                 print("Hold signal — still within range.")
 
     # === BUY phase ===
-    positions = load_positions()  # re-load if we sold
+    positions = load_positions()
     bought = None
     if not positions and candidates:
         picked = select_top_usd_candidate(candidates)
@@ -166,7 +157,6 @@ def main():
 
     # === Wrap-up (always write a summary) ===
     summary = {
-        "started_at": started_at,
         "positions": positions,
         "holding": list(positions.keys()),
         "buy_usd": BUY_USD,
