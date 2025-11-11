@@ -1,0 +1,23 @@
+name: Crypto — Reset Positions (bot state only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p .state
+          echo "{}" > .state/positions.json
+          date > .state/reset_flag.txt
+          echo "Reset positions.json to empty."
+      - uses: actions/upload-artifact@v4
+        with:
+          name: state-after-reset-${{ github.run_id }}
+          path: .state
+          retention-days: 7
