@@ -2,7 +2,7 @@ name: Crypto — 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # every hour, on the hour
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       DRY_RUN:
@@ -10,24 +10,26 @@ on:
         required: true
         default: "ON"
       BUY_USD:
-        description: "Per-buy USD (e.g., 15)"
+        description: "Per-buy USD (e.g., 30)"
         required: true
-        default: "15"
+        default: "30"
       TP_PCT:
-        description: "Take-profit % (e.g., 5)"
+        description: "Take-profit %"
         required: true
         default: "5"
       SL_PCT:
-        description: "Stop-loss % (e.g., 1)"
+        description: "Stop-loss %"
         required: true
         default: "1"
       WINDOW_MIN:
-        description: "Monitor window minutes (e.g., 60)"
+        description: "Monitor window minutes"
         required: true
         default: "60"
+      SLIP_PCT:
+        description: "Retry-through-book % if market is blocked (use 3–5)"
+        required: true
+        default: "3"
 
-# Prevent overlapping runs (schedule + manual). If a run is in progress and you click Run,
-# the in-progress one will be canceled and the new one starts.
 concurrency:
   group: crypto-rotation-${{ github.ref }}
   cancel-in-progress: true
@@ -38,23 +40,22 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     env:
       # Secrets
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-      # Repo-level vars (use your existing repo "Variables" if set)
+      # Vars and UI inputs
       UNIVERSE: ${{ vars.UNIVERSE }}
-      TRACKED_QUOTE: "USD"   # keep USD as the quote symbol
-
-      # UI overrides (workflow_dispatch) fall back to repo vars if desired
+      TRACKED_QUOTE: "USD"
       DRY_RUN: ${{ inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}
-      BUY_USD: ${{ inputs.BUY_USD || vars.BUY_USD || '15' }}
+      BUY_USD: ${{ inputs.BUY_USD || vars.BUY_USD || '30' }}
       TP_PCT: ${{ inputs.TP_PCT || vars.TP_PCT || '5' }}
       SL_PCT: ${{ inputs.SL_PCT || vars.SL_PCT || '1' }}
       WINDOW_MIN: ${{ inputs.WINDOW_MIN || vars.WINDOW_MIN || '60' }}
+      SLIP_PCT: ${{ inputs.SLIP_PCT || vars.SLIP_PCT || '3' }}
 
     steps:
       - name: Checkout
@@ -68,14 +69,21 @@ jobs:
       - name: Install deps (robust)
         run: |
           set -e
+          python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
-            python -m pip install --upgrade pip
             pip install -r requirements.txt
           else
-            python -m pip install --upgrade pip
-            # minimal deps your repo uses; keep requests explicit to avoid "ModuleNotFoundError: requests"
             pip install requests pyyaml matplotlib
           fi
+
+      - name: Ensure .state exists (and show tree before)
+        run: |
+          set -e
+          mkdir -p .state
+          echo "== repo tree (top) =="
+          ls -la
+          echo "== .state (pre-run) =="
+          ls -la .state || true
 
       - name: Echo critical env/vars
         run: |
@@ -85,6 +93,7 @@ jobs:
           echo "TP_PCT=${TP_PCT}"
           echo "SL_PCT=${SL_PCT}"
           echo "WINDOW_MIN=${WINDOW_MIN}"
+          echo "SLIP_PCT=${SLIP_PCT}"
           echo "UNIVERSE length: ${#UNIVERSE}"
 
       - name: Run bot (single-coin rotation)
@@ -92,9 +101,20 @@ jobs:
           set -e
           python main.py
 
+      - name: Show .state after run (debug)
+        run: |
+          echo "== .state (post-run) =="
+          ls -la .state || true
+          echo "== state (post-run, alt folder) =="
+          ls -la state || true
+          echo "== peek files =="
+          find . -maxdepth 2 -type f -name "*.json" -o -name "*.csv" -o -name "*.txt" | sed 's/^/ - /'
+
       - name: Upload .state artifacts
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
-          path: ./.state/**
+          path: |
+            ./.state/**
+            ./state/**
           if-no-files-found: warn
