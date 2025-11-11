@@ -1,80 +1,100 @@
-name: Crypto — Hourly 1-Coin Rotation (LIVE)
+name: Crypto — 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes
+    - cron: "0 * * * *"   # every hour, on the hour
   workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: "ON (simulate) or OFF (live)"
+        required: true
+        default: "ON"
+      BUY_USD:
+        description: "Per-buy USD (e.g., 15)"
+        required: true
+        default: "15"
+      TP_PCT:
+        description: "Take-profit % (e.g., 5)"
+        required: true
+        default: "5"
+      SL_PCT:
+        description: "Stop-loss % (e.g., 1)"
+        required: true
+        default: "1"
+      WINDOW_MIN:
+        description: "Monitor window minutes (e.g., 60)"
+        required: true
+        default: "60"
 
-# Prevent overlapping runs (avoids double-buys if a job is still running)
+# Prevent overlapping runs (schedule + manual). If a run is in progress and you click Run,
+# the in-progress one will be canceled and the new one starts.
 concurrency:
-  group: crypto-live-rotation
+  group: crypto-rotation-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  trade:
+  run:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      # Secrets
+      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
+      # Repo-level vars (use your existing repo "Variables" if set)
+      UNIVERSE: ${{ vars.UNIVERSE }}
+      TRACKED_QUOTE: "USD"   # keep USD as the quote symbol
+
+      # UI overrides (workflow_dispatch) fall back to repo vars if desired
+      DRY_RUN: ${{ inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}
+      BUY_USD: ${{ inputs.BUY_USD || vars.BUY_USD || '15' }}
+      TP_PCT: ${{ inputs.TP_PCT || vars.TP_PCT || '5' }}
+      SL_PCT: ${{ inputs.SL_PCT || vars.SL_PCT || '1' }}
+      WINDOW_MIN: ${{ inputs.WINDOW_MIN || vars.WINDOW_MIN || '60' }}
+
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps (robust)
         run: |
-          pip install requests matplotlib pyyaml
+          set -e
+          if [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+          else
+            python -m pip install --upgrade pip
+            # minimal deps your repo uses; keep requests explicit to avoid "ModuleNotFoundError: requests"
+            pip install requests pyyaml matplotlib
+          fi
 
-      - name: Echo critical env vars
+      - name: Echo critical env/vars
         run: |
-          echo "BUY_USD=${{ vars.BUY_USD }}"
-          echo "TP_PCT=${{ vars.TP_PCT }}"
-          echo "SL_PCT=${{ vars.SL_PCT }}"
-          echo "KRAKEN_API_KEY set? ${{ secrets.KRAKEN_API_KEY != '' }}"
-          echo "Mode: LIVE ✅"
+          echo "Branch: $GITHUB_REF"
+          echo "DRY_RUN=${DRY_RUN}"
+          echo "BUY_USD=${BUY_USD}"
+          echo "TP_PCT=${TP_PCT}"
+          echo "SL_PCT=${SL_PCT}"
+          echo "WINDOW_MIN=${WINDOW_MIN}"
+          echo "UNIVERSE length: ${#UNIVERSE}"
 
-      - name: Run live rotation bot
-        env:
-          BUY_USD: ${{ vars.BUY_USD }}
-          TP_PCT:  ${{ vars.TP_PCT }}
-          SL_PCT:  ${{ vars.SL_PCT }}
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-        run: python -u main.py
-
-      - name: Show .state contents (debug)
+      - name: Run bot (single-coin rotation)
         run: |
-          echo "== PWD ==" && pwd
-          echo "== ls -la ==" && ls -la
-          echo "== ls -la .state ==" && ls -la .state || true
-          echo "== run_summary.json ==" && (test -f .state/run_summary.json && sed -n '1,200p' .state/run_summary.json || echo "missing")
-          echo "== positions.json ==" && (test -f .state/positions.json && sed -n '1,200p' .state/positions.json || echo "missing")
+          set -e
+          python main.py
 
-      - name: Upload .state artifacts (wait for write)
-        if: always()
-        run: |
-          echo "Waiting up to 10s for .state files..."
-          for i in {1..10}; do
-            [ -f .state/run_summary.json ] && break || sleep 1
-          done
-          ls -la .state || true
-        shell: bash
-      - uses: actions/upload-artifact@v4
-        if: always()
+      - name: Upload .state artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: state-${{ github.run_number }}
-          path: .state/**
-          if-no-files-found: ignore
-
-      - name: Commit .state back to repo (persist positions)
-        if: always()
-        run: |
-          git config --global user.email "bot@users.noreply.github.com"
-          git config --global user.name "RotationBot"
-          git add .state/*.json || true
-          git commit -m "rot: update .state (positions/summary)" || true
-          git push || true
+          name: state-${{ github.run_id }}
+          path: ./.state/**
+          if-no-files-found: warn
