@@ -27,9 +27,9 @@ jobs:
       - name: Run USD-only momentum scan
         env:
           TOP_N: ${{ vars.TOP_N || 40 }}
-          MIN_USD_VOL: ${{ vars.MIN_USD_VOL || 25000 }}   # ignore illiquid
-          EXCLUDE: ${{ vars.EXCLUDE || 'USDT,USDC,DAI,FDUSD,PYUSD,TUSD,USD' }}  # bases to ignore
-          OHLC_INTERVAL: ${{ vars.OHLC_INTERVAL || 5 }}   # minutes
+          MIN_USD_VOL: ${{ vars.MIN_USD_VOL || 25000 }}
+          EXCLUDE: ${{ vars.EXCLUDE || 'USDT,USDC,DAI,FDUSD,PYUSD,TUSD,USD' }}
+          OHLC_INTERVAL: ${{ vars.OHLC_INTERVAL || 5 }}
         run: |
           python -u scripts/momentum_scan.py
 
@@ -38,15 +38,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: momentum_scan_outputs
-          path: |
-            .state/momentum_candidates.csv
+          path: .state/momentum_candidates.csv
 
       - name: Commit .state to repo (so trader can read next run)
         run: |
           set -e
           git config --global user.email "bot@users.noreply.github.com"
           git config --global user.name "MomentumScanBot"
-          mkdir -p .state
           git add .state/momentum_candidates.csv || true
           git commit -m "scan: update .state/momentum_candidates.csv (USD-only)" || true
           git push || true
