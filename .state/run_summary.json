@@ -14,9 +14,7 @@
   "tp_pct": 5.0,
   "sl_pct": 2.0,
   "num_candidates": 40,
-  "bought": "LSKUSD",
-  "notes": [
-    "used_est_qty_fallback"
-  ],
-  "timestamp": "2025-11-11T18:47:49.134720+00:00"
+  "bought": null,
+  "notes": [],
+  "timestamp": "2025-11-11T19:10:43.186870+00:00"
 }
