@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """
 trader/crypto_engine.py — Kraken utilities (LIVE)
-
-Nov-10 fixes:
-• load_candidates() accepts either:
-  A) symbol,quote,rank
-  B) pair,score,pct24,usd_vol,ema_slope
-• Only trade USD-quoted pairs (skip EUR/USDT/etc.)
-• Correct market buy: use oflags=viqc and volume=<USD amount>
+Fixes:
+• Market BUY returns txid; we then QueryOrders to capture exact filled qty (vol_exec).
+• SELL clips quantity by a tiny epsilon to avoid "Insufficient funds" on dust.
 """
 
 from __future__ import annotations
@@ -30,44 +26,20 @@ def load_candidates(csv_path: Path = CANDIDATES_CSV) -> List[dict]:
     if not csv_path.exists():
         print("No candidates.csv found.")
         return rows
-
     with open(csv_path, newline="") as f:
         r = csv.DictReader(f)
-        headers = [h.strip().lower() for h in r.fieldnames or []]
-
-        # Schema A: symbol,quote,rank
-        schema_a = {"symbol", "quote"}
-        # Schema B: pair,score,pct24,...
-        schema_b = {"pair", "score"}
-
         for row in r:
-            out: Dict[str, str] = {}
-            if schema_a.issubset(headers):
-                s = (row.get("symbol") or "").strip()
-                if not s:
-                    continue
-                out["symbol"] = s
-                out["pair"] = s
-            elif schema_b.issubset(headers):
-                p = (row.get("pair") or "").strip()
-                if not p:
-                    continue
-                out["pair"] = p
-                out["symbol"] = p
-            else:
-                # Unknown schema; ignore row
+            sym = (row.get("symbol") or row.get("pair") or "").strip()
+            q = (row.get("quote") or "").strip()
+            if not sym:
                 continue
-            rows.append(out)
+            rows.append({"symbol": sym, "quote": q, "rank": row.get("rank")})
     return rows
 
 # ------------------------- Symbol helpers --------------------------
 def normalize_pair(s: str) -> str:
-    """
-    Accept: 'EAT/USD', 'EATUSD', 'eatusd', 'EATUSDT', 'TERMEUR'
-    Return: canonical Kraken pair without slash (e.g., 'EATUSD', 'SOLUSD').
-    """
     s = s.strip().upper().replace("/", "")
-    if s.endswith(("USD", "EUR", "USDT")):
+    if s.endswith("USD") or s.endswith("EUR") or s.endswith("USDT"):
         return s
     return s + "USD"
 
@@ -76,7 +48,6 @@ def is_usd_pair(pair: str) -> bool:
 
 # --------------------------- Quotes --------------------------------
 def get_public_quote(pair: str) -> Optional[float]:
-    """Return last trade price for a Kraken pair code (e.g., 'EATUSD')."""
     try:
         pair = normalize_pair(pair)
         if not is_usd_pair(pair):
@@ -93,6 +64,7 @@ def get_public_quote(pair: str) -> Optional[float]:
 # --------------------------- Private API ---------------------------
 def _private_request(endpoint: str, payload: dict) -> dict:
     import hashlib, hmac, base64, urllib.parse
+
     nonce = str(int(time.time() * 1000))
     payload["nonce"] = nonce
     postdata = urllib.parse.urlencode(payload)
@@ -101,6 +73,7 @@ def _private_request(endpoint: str, payload: dict) -> dict:
     msg = path.encode() + sha
     sig = hmac.new(base64.b64decode(KRAKEN_SECRET), msg, hashlib.sha512)
     sig64 = base64.b64encode(sig.digest()).decode()
+
     headers = {
         "API-Key": KRAKEN_KEY,
         "API-Sign": sig64,
@@ -115,8 +88,9 @@ def _private_request(endpoint: str, payload: dict) -> dict:
 # ----------------------------- Orders ------------------------------
 def place_market_buy_usd(pair: str, usd_amount: float) -> str:
     """
-    LIVE MARKET BUY spending <usd_amount> of USD (quote).
-    Kraken rule: use oflags=viqc and set volume=<quote_currency_amount>.
+    LIVE MARKET BUY spending <usd_amount> of quote (USD).
+    Use oflags=viqc; volume=<USD amount>.
+    Returns the primary txid string.
     """
     pair = normalize_pair(pair)
     if not is_usd_pair(pair):
@@ -126,25 +100,56 @@ def place_market_buy_usd(pair: str, usd_amount: float) -> str:
         "pair": pair,
         "type": "buy",
         "ordertype": "market",
-        "volume": f"{Decimal(usd_amount):f}",  # Spend this much USD
+        "volume": f"{Decimal(usd_amount):f}",
         "oflags": "viqc",
         "userref": int(time.time()),
     }
     resp = _private_request("AddOrder", payload)
     if resp.get("error"):
         print("BUY error:", resp)
-    else:
-        print("BUY ok:", resp)
-    return json.dumps(resp)
+        return json.dumps(resp)
+
+    print("BUY ok:", resp)
+    txids = resp.get("result", {}).get("txid") or []
+    txid = txids[0] if txids else ""
+    return txid or json.dumps(resp)
+
+def query_order_filled_qty(txid: str, attempts: int = 6, sleep_s: float = 1.0) -> Optional[float]:
+    """
+    Poll QueryOrders for exact filled volume (vol_exec).
+    Returns float qty or None if unknown.
+    """
+    if not txid or txid.startswith("{"):  # not a plain txid, probably raw json
+        return None
+    for _ in range(attempts):
+        resp = _private_request("QueryOrders", {"txid": txid})
+        if resp.get("error"):
+            time.sleep(sleep_s)
+            continue
+        res = resp.get("result") or {}
+        od = res.get(txid) or {}
+        vol_exec = od.get("vol_exec")
+        try:
+            v = float(vol_exec)
+            if v > 0:
+                return v
+        except Exception:
+            pass
+        time.sleep(sleep_s)
+    return None
 
 def place_market_sell_qty(pair: str, qty: float) -> str:
-    """LIVE MARKET SELL by base-asset quantity."""
+    """
+    LIVE MARKET SELL by base-asset quantity.
+    We sell a hair less than recorded to avoid 'Insufficient funds' due to dust/fees.
+    """
     pair = normalize_pair(pair)
+    safe_qty = max(0.0, qty * 0.999)  # tiny epsilon
     payload = {
         "pair": pair,
         "type": "sell",
         "ordertype": "market",
-        "volume": f"{Decimal(qty):f}",
+        "volume": f"{Decimal(safe_qty):f}",
         "userref": int(time.time()),
     }
     resp = _private_request("AddOrder", payload)
