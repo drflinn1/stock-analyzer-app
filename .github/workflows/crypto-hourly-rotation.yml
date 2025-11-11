@@ -28,7 +28,7 @@ on:
       SLIP_PCT:
         description: "Retry-through-book % if market is blocked (use 3–5)"
         required: true
-        default: "3"
+        default: "5"   # more likely to fill than 3
 
 concurrency:
   group: crypto-rotation-${{ github.ref }}
@@ -47,7 +47,7 @@ jobs:
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-      # Vars and UI inputs
+      # Vars & UI overrides (UI > repo vars > default)
       UNIVERSE: ${{ vars.UNIVERSE }}
       TRACKED_QUOTE: "USD"
       DRY_RUN: ${{ inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}
@@ -55,7 +55,7 @@ jobs:
       TP_PCT: ${{ inputs.TP_PCT || vars.TP_PCT || '5' }}
       SL_PCT: ${{ inputs.SL_PCT || vars.SL_PCT || '1' }}
       WINDOW_MIN: ${{ inputs.WINDOW_MIN || vars.WINDOW_MIN || '60' }}
-      SLIP_PCT: ${{ inputs.SLIP_PCT || vars.SLIP_PCT || '3' }}
+      SLIP_PCT: ${{ inputs.SLIP_PCT || vars.SLIP_PCT || '5' }}
 
     steps:
       - name: Checkout
@@ -76,7 +76,7 @@ jobs:
             pip install requests pyyaml matplotlib
           fi
 
-      - name: Ensure .state exists (and show tree before)
+      - name: Ensure .state exists (pre-run tree)
         run: |
           set -e
           mkdir -p .state
@@ -105,16 +105,18 @@ jobs:
         run: |
           echo "== .state (post-run) =="
           ls -la .state || true
-          echo "== state (post-run, alt folder) =="
-          ls -la state || true
           echo "== peek files =="
-          find . -maxdepth 2 -type f -name "*.json" -o -name "*.csv" -o -name "*.txt" | sed 's/^/ - /'
+          find .state -type f -maxdepth 2 -printf " - %p\n" || true
+          # Guarantee we always have at least one file to upload
+          if [ -z "$(find .state -type f -maxdepth 2 2>/dev/null)" ]; then
+            echo "no .state files found; creating sentinel"
+            date > .state/_empty.txt
+          fi
 
-      - name: Upload .state artifacts
+      - name: Upload .state artifact (zip)
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
-          path: |
-            ./.state/**
-            ./state/**
+          path: ./.state/**/*     # use **/* (not just **) for GitHub glob
           if-no-files-found: warn
+          retention-days: 7
