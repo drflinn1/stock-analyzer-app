@@ -8,7 +8,7 @@ on:
       DRY_RUN:
         description: "ON (simulate) or OFF (live)"
         required: true
-        default: "ON"
+        default: "OFF"        # default to LIVE so the UI doesn't trick us
       BUY_USD:
         description: "Per-buy USD (e.g., 30)"
         required: true
@@ -47,22 +47,16 @@ jobs:
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-      # Universe + quote (if you use it later)
+      # Vars & UI overrides (UI > repo vars > default)
       UNIVERSE: ${{ vars.UNIVERSE }}
       TRACKED_QUOTE: "USD"
-
-      # Raw sources (for debugging where DRY_RUN came from)
-      RAW_INPUTS_DRY_RUN: ${{ inputs.DRY_RUN }}
-      RAW_VARS_DRY_RUN: ${{ vars.DRY_RUN }}
-      GITHUB_EVENT: ${{ github.event_name }}
-
-      # Effective knobs (UI input > repo vars > default)
-      DRY_RUN: ${{ inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}
+      DRY_RUN: ${{ inputs.DRY_RUN || vars.DRY_RUN || 'OFF' }}
       BUY_USD: ${{ inputs.BUY_USD || vars.BUY_USD || '30' }}
       TP_PCT: ${{ inputs.TP_PCT || vars.TP_PCT || '5' }}
       SL_PCT: ${{ inputs.SL_PCT || vars.SL_PCT || '1' }}
       WINDOW_MIN: ${{ inputs.WINDOW_MIN || vars.WINDOW_MIN || '60' }}
       SLIP_PCT: ${{ inputs.SLIP_PCT || vars.SLIP_PCT || '5' }}
+      DUST_MIN_USD: ${{ vars.DUST_MIN_USD || '0.50' }}
 
     steps:
       - name: Checkout
@@ -90,19 +84,15 @@ jobs:
           echo "== repo tree (top) ==" && ls -la
           echo "== .state (pre-run) ==" && ls -la .state || true
 
-      - name: Echo event + DRY_RUN resolution
+      - name: Echo critical env/vars
         run: |
-          echo "Event: ${GITHUB_EVENT}"
-          echo "inputs.DRY_RUN: '${RAW_INPUTS_DRY_RUN}'"
-          echo "vars.DRY_RUN  : '${RAW_VARS_DRY_RUN}'"
-
-          # Decide where it came from (for human-readable logs)
-          SRC="default('ON')"
-          if [ -n "${RAW_VARS_DRY_RUN}" ]; then SRC="repo VARS"; fi
-          if [ -n "${RAW_INPUTS_DRY_RUN}" ]; then SRC="workflow_dispatch INPUT"; fi
-
-          echo "Effective DRY_RUN: '${DRY_RUN}' (source: ${SRC})"
-          echo "BUY_USD=${BUY_USD}  TP_PCT=${TP_PCT}  SL_PCT=${SL_PCT}  WINDOW_MIN=${WINDOW_MIN}  SLIP_PCT=${SLIP_PCT}"
+          echo "Branch: $GITHUB_REF"
+          echo "DRY_RUN=${DRY_RUN}"
+          echo "BUY_USD=${BUY_USD}"
+          echo "TP_PCT=${TP_PCT}"
+          echo "SL_PCT=${SL_PCT}"
+          echo "WINDOW_MIN=${WINDOW_MIN}"
+          echo "SLIP_PCT=${SLIP_PCT}"
           echo "UNIVERSE length: ${#UNIVERSE}"
 
       - name: Run bot (single-coin rotation)
@@ -113,7 +103,7 @@ jobs:
       - name: Show .state after run (debug)
         run: |
           echo "== .state (post-run) ==" && ls -la .state || true
-          # Ensure artifact always exists (avoid 'no files found' warning)
+          # Guarantee we always have at least one file to upload
           if [ -z "$(find .state -type f -maxdepth 2 2>/dev/null)" ]; then
             echo "no .state files found; creating sentinel"
             date > .state/_empty.txt
@@ -123,6 +113,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
-          path: .state
+          path: .state          # <= simpler & reliable
           if-no-files-found: warn
           retention-days: 7
