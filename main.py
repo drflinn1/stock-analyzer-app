@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-main.py — LIVE trading version (USD-only)
+main.py — LIVE trading version (USD-only) with exact filled qty
 1-Coin Rotation Bot (Kraken)
 
-Nov-10 fixes:
-• Accepts new scan CSV via engine
-• Auto-migrates legacy .state/positions.json formats
-• ALWAYS writes .state/run_summary.json and prints where they are
-• USD-only; market buys use viqc (volume is USD amount)
+Key fix (Nov-11):
+• After BUY, query order to get exact filled quantity (vol_exec) and store it.
+• On SELL, use stored filled qty; still apply a tiny safety epsilon.
 """
 
 from __future__ import annotations
 import json, os, sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any
 
 from trader.crypto_engine import (
     load_candidates,
@@ -23,6 +21,7 @@ from trader.crypto_engine import (
     place_market_sell_qty,
     normalize_pair,
     is_usd_pair,
+    query_order_filled_qty,
 )
 
 STATE = Path(".state")
@@ -30,13 +29,12 @@ STATE.mkdir(parents=True, exist_ok=True)
 POS_FILE = STATE / "positions.json"
 SUMMARY_FILE = STATE / "run_summary.json"
 
-# === Environment Vars ===
 BUY_USD = float(os.getenv("BUY_USD", "25"))
-TP_PCT  = float(os.getenv("TP_PCT", "5"))      # take-profit %
-SL_PCT  = float(os.getenv("SL_PCT", "2"))      # stop-loss %
+TP_PCT  = float(os.getenv("TP_PCT", "5"))
+SL_PCT  = float(os.getenv("SL_PCT", "2"))
 MIN_QUOTE = 1e-12
 
-def _migrate_positions(obj: Any) -> Dict[str, dict]:
+def _migrate_positions(obj: Any) -> dict:
     try:
         if not obj or not isinstance(obj, dict):
             return {}
@@ -95,7 +93,7 @@ def select_top_usd_candidate(candidates: list[dict]) -> tuple[str, float] | None
         raw = (row.get("symbol") or row.get("pair") or "").strip()
         if not raw:
             continue
-        pair = normalize_pair(raw)  # -> EATUSD
+        pair = normalize_pair(raw)
         if not is_usd_pair(pair):
             continue
         q = get_public_quote(pair)
@@ -123,19 +121,18 @@ def main():
             entry_price = float(positions[sym]["entry_price"])
             change_pct = (quote - entry_price) / entry_price * 100
             print(f"Checking {sym}: {change_pct:.2f}% since entry.")
-            if change_pct >= TP_PCT:
-                print(f"🎯 Take-profit hit ({change_pct:.2f}%) → SELLING")
-                place_market_sell_qty(sym, float(positions[sym]["qty"]))
+            if change_pct >= TP_PCT or change_pct <= -SL_PCT:
+                reason = "TP" if change_pct >= TP_PCT else "SL"
+                print(f"{'🎯' if reason=='TP' else '🛑'} {reason} hit ({change_pct:.2f}%) → SELLING")
+                sell_qty = float(positions[sym]["qty"])
+                place_market_sell_qty(sym, sell_qty)  # internal epsilon applied
                 del positions[sym]
-            elif change_pct <= -SL_PCT:
-                print(f"🛑 Stop-loss hit ({change_pct:.2f}%) → SELLING")
-                place_market_sell_qty(sym, float(positions[sym]["qty"]))
-                del positions[sym]
+                save_positions(positions)
             else:
                 print("Hold signal — still within range.")
 
     # === BUY phase ===
-    positions = load_positions()
+    positions = load_positions()  # reload if sold
     bought = None
     if not positions and candidates:
         picked = select_top_usd_candidate(candidates)
@@ -143,11 +140,18 @@ def main():
             notes.append("no_valid_usd_candidate_with_quote")
         else:
             sym, quote = picked
-            qty = BUY_USD / quote
-            print(f"🟢 Buying {sym} for ${BUY_USD:.2f} (~{qty:.6f} units @ {quote:.10f})")
+            est_qty = BUY_USD / quote
+            print(f"🟢 Buying {sym} for ${BUY_USD:.2f} (~{est_qty:.6f} est units @ {quote:.10f})")
             txid = place_market_buy_usd(sym, BUY_USD)
+
+            # Query exact filled qty (poll briefly); fall back to estimate if not found
+            filled_qty = query_order_filled_qty(txid)
+            if filled_qty is None or filled_qty <= 0:
+                filled_qty = est_qty * 0.995  # safety fallback
+                notes.append("used_est_qty_fallback")
+
             positions[sym] = {
-                "qty": qty,
+                "qty": filled_qty,
                 "entry_price": quote,
                 "txid": txid,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -155,7 +159,7 @@ def main():
             save_positions(positions)
             bought = sym
 
-    # === Wrap-up (always write a summary) ===
+    # === Wrap-up ===
     summary = {
         "positions": positions,
         "holding": list(positions.keys()),
