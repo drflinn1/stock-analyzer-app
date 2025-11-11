@@ -3,16 +3,18 @@
 main.py — LIVE trading version (USD-only)
 1-Coin Rotation Bot (Kraken)
 
-Changes (Nov-10):
-• Only trades USD-quoted pairs
-• Walks candidates until a valid USD pair/quote is found
-• Kraken market-buy uses viqc (volume is USD spent)
+Nov-10 fixes:
+• Accepts new scan CSV (pair,score,...) via engine
+• Auto-migrates legacy .state/positions.json formats
+• Always writes a run summary even on early exit
+• USD-only; market buys use viqc (volume is USD amount)
 """
 
 from __future__ import annotations
 import json, os, time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict, Any
 
 from trader.crypto_engine import (
     load_candidates,
@@ -34,10 +36,52 @@ TP_PCT  = float(os.getenv("TP_PCT", "5"))      # take-profit %
 SL_PCT  = float(os.getenv("SL_PCT", "2"))      # stop-loss %
 MIN_QUOTE = 1e-12
 
+def _migrate_positions(obj: Any) -> Dict[str, dict]:
+    """
+    Supported inputs:
+    1) {} or missing -> {}
+    2) Legacy flat dict like {"pair":"EAT/USD","amount":1237.75,"est_cost":80.49,"when":"..."}
+       -> {"EATUSD":{"qty":1237.75,"entry_price": est_cost/amount, "txid":"", "timestamp": when}}
+    3) Correct current schema -> pass-through
+    Anything else -> {}
+    """
+    try:
+        if not obj or not isinstance(obj, dict):
+            return {}
+        # Current schema: first value is a dict with 'qty'
+        if obj and all(isinstance(v, dict) and "qty" in v for v in obj.values()):
+            return obj
+
+        # Legacy flat schema?
+        if set(obj.keys()) >= {"pair", "amount", "est_cost"}:
+            pair = normalize_pair(str(obj.get("pair", "")))
+            qty = float(obj.get("amount", 0.0))
+            est_cost = float(obj.get("est_cost", 0.0))
+            when = str(obj.get("when", datetime.now(timezone.utc).isoformat()))
+            entry_price = (est_cost / qty) if qty > 0 else None
+            if not pair or entry_price is None:
+                return {}
+            return {
+                pair: {
+                    "qty": qty,
+                    "entry_price": entry_price,
+                    "txid": "",
+                    "timestamp": when,
+                }
+            }
+        # Unrecognized -> empty
+        return {}
+    except Exception:
+        return {}
+
 def load_positions() -> dict:
     if POS_FILE.exists():
         try:
-            return json.loads(POS_FILE.read_text())
+            raw = json.loads(POS_FILE.read_text())
+            fixed = _migrate_positions(raw)
+            if fixed != raw:
+                POS_FILE.write_text(json.dumps(fixed, indent=2))
+            return fixed
         except Exception:
             return {}
     return {}
@@ -52,13 +96,13 @@ def log_summary(data: dict):
 def select_top_usd_candidate(candidates: list[dict]) -> tuple[str, float] | None:
     """
     Return (symbol, quote) for the first USD-quoted candidate that has a valid live quote.
-    Accepts symbol formats like EATUSD, EAT/USD. Rejects *EUR, *USDT, etc.
+    Accepts 'EAT/USD', 'EATUSD', etc. Skips non-USD pairs.
     """
     for row in candidates:
-        raw = (row.get("symbol") or "").strip()
+        raw = (row.get("symbol") or row.get("pair") or "").strip()
         if not raw:
             continue
-        pair = normalize_pair(raw)  # -> e.g., EATUSD / SOLUSD
+        pair = normalize_pair(raw)  # -> EATUSD
         if not is_usd_pair(pair):
             continue
         q = get_public_quote(pair)
@@ -67,21 +111,21 @@ def select_top_usd_candidate(candidates: list[dict]) -> tuple[str, float] | None
     return None
 
 def main():
-    print(f"[{datetime.now().isoformat()}] Starting LIVE rotation cycle…")
+    started_at = datetime.now().isoformat()
     positions = load_positions()
-    holding = list(positions.keys())
+    holding_syms = list(positions.keys())
 
     candidates = load_candidates()
+    notes = []
     if not candidates:
-        print("⚠️  No candidates found, aborting.")
-        return
+        notes.append("no_candidates_from_scan")
 
     # === SELL phase ===
-    if holding:
-        sym = holding[0]
+    if holding_syms:
+        sym = holding_syms[0]
         quote = get_public_quote(sym)
         if not quote:
-            print(f"⚠️ Unable to quote {sym} right now — holding.")
+            notes.append(f"no_quote_for_{sym}")
         else:
             entry_price = float(positions[sym]["entry_price"])
             change_pct = (quote - entry_price) / entry_price * 100
@@ -100,11 +144,12 @@ def main():
                 print("Hold signal — still within range.")
 
     # === BUY phase ===
-    positions = load_positions()  # re-load in case we sold above
-    if not positions:
+    positions = load_positions()  # re-load if we sold
+    bought = None
+    if not positions and candidates:
         picked = select_top_usd_candidate(candidates)
         if not picked:
-            print("⚠️  No valid USD candidate with a live quote — skipping buy this cycle.")
+            notes.append("no_valid_usd_candidate_with_quote")
         else:
             sym, quote = picked
             qty = BUY_USD / quote
@@ -117,19 +162,22 @@ def main():
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             save_positions(positions)
+            bought = sym
 
-    # === Wrap-up ===
+    # === Wrap-up (always write a summary) ===
     summary = {
+        "started_at": started_at,
         "positions": positions,
         "holding": list(positions.keys()),
         "buy_usd": BUY_USD,
         "tp_pct": TP_PCT,
         "sl_pct": SL_PCT,
         "num_candidates": len(candidates),
-        "notes": "USD-only trading; market buys use viqc (volume=USD)",
+        "bought": bought,
+        "notes": notes,
     }
     log_summary(summary)
-    print("✅ Cycle complete — LIVE orders active.")
+    print("✅ Cycle complete — LIVE orders path executed.")
 
 if __name__ == "__main__":
     main()
