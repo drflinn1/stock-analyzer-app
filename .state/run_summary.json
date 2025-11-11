@@ -13,8 +13,8 @@
   "buy_usd": 30.0,
   "tp_pct": 5.0,
   "sl_pct": 2.0,
-  "num_candidates": 10,
+  "num_candidates": 40,
   "bought": null,
   "notes": [],
-  "timestamp": "2025-11-11T03:11:26.080872+00:00"
+  "timestamp": "2025-11-11T04:39:30.842180+00:00"
 }
