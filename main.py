@@ -2,11 +2,13 @@
 """
 main.py — USD-only 1-Coin Rotation (Kraken)
 
-Additions:
-• FORCE_BUY_TOP (default ON) to ensure a buy when flat and a valid USD pick exists
-• SLIP_PCT + LIMIT IOC fallback when price-protection blocks market orders
-• Auto-sizes buy to available USD (USD_BAL - 0.50) to avoid InsufficientFunds
-• Verbose decision logs + always writes .state/run_summary.json
+Key features:
+• Portfolio reconciliation:
+    - Auto-sell any untracked USD-quoted coins >= DUST_MIN_USD
+    - NEW: Drop stale tracked positions if Kraken shows zero qty
+• BUY path with market (viqc spend USD) then LIMIT IOC fallback using SLIP_PCT
+• Auto-size buy to available USD (spend min(BUY_USD, USD_BAL - 0.50))
+• Verbose logs; always writes .state/run_summary.json
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from trader.crypto_engine import (
     normalize_pair,
     is_usd_pair,
     kraken_list_balances,
-    get_usd_balance,             # NEW
+    get_usd_balance,
     asset_to_usd_pair,
     base_from_pair,
     was_price_protection_block,
@@ -43,16 +45,16 @@ def _env_str(name: str, default: str) -> str:
     return default if v is None else v
 
 # === Tunables (UI input > repo vars > defaults via workflow env) ===
-BUY_USD     = _env_float("BUY_USD", 30.0)
-TP_PCT      = _env_float("TP_PCT", 5.0)
-SL_PCT      = _env_float("SL_PCT", 1.0)
-SLIP_PCT    = _env_float("SLIP_PCT", 5.0)
-WINDOW_MIN  = _env_float("WINDOW_MIN", 60.0)
-DRY_RUN     = _env_str("DRY_RUN", "ON").upper()         # "ON" simulate, "OFF" live
-FORCE_BUY_TOP = _env_str("FORCE_BUY_TOP", "ON").upper() # "ON" or "OFF"
+BUY_USD      = _env_float("BUY_USD", 30.0)
+TP_PCT       = _env_float("TP_PCT", 5.0)
+SL_PCT       = _env_float("SL_PCT", 1.0)
+SLIP_PCT     = _env_float("SLIP_PCT", 5.0)
+WINDOW_MIN   = _env_float("WINDOW_MIN", 60.0)
+DRY_RUN      = _env_str("DRY_RUN", "ON").upper()         # "ON" simulate, "OFF" live
+FORCE_BUY_TOP= _env_str("FORCE_BUY_TOP", "ON").upper()   # not used to force rotation, but kept for clarity
 
-MIN_QUOTE = 1e-12
-DUST_MIN_USD = _env_float("DUST_MIN_USD", 0.50)
+MIN_QUOTE     = 1e-12
+DUST_MIN_USD  = _env_float("DUST_MIN_USD", 0.50)
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -73,10 +75,6 @@ def log_summary(data: dict):
     SUMMARY_FILE.write_text(json.dumps(data, indent=2))
 
 def select_top_usd_candidate(candidates: List[dict]) -> Optional[Tuple[str, float]]:
-    """
-    Returns (pair, quote) for first USD-quoted candidate with a valid live quote.
-    Accepts 'EAT/USD', 'EATUSD', etc. Rejects *EUR, *USDT.
-    """
     for row in candidates:
         raw = (row.get("symbol") or row.get("pair") or "").strip()
         if not raw: continue
@@ -87,21 +85,25 @@ def select_top_usd_candidate(candidates: List[dict]) -> Optional[Tuple[str, floa
             return pair, q
     return None
 
-# ---------------- Portfolio Reconciliation (auto-sweep) -------------
+# ---------------- Portfolio Reconciliation ----------------
 def reconcile_portfolio(positions: Dict[str, dict]) -> Dict[str, dict]:
-    balances = kraken_list_balances()
+    balances = kraken_list_balances()  # {'USD': 149.81, 'LSK': 0, ...}
     tracked_bases = { base_from_pair(p) for p in positions.keys() }
+
     if not balances:
         print("ℹ️  No balances returned or API issue; skipping reconciliation.")
         return positions
 
     print("🧹 Reconciling portfolio vs positions.json …")
+    # A) SELL any *untracked* USD-quoted holdings >= dust
     for asset, qty in balances.items():
         if asset.upper() in ("USD", "ZUSD", "USDT", "EUR", "ZEUR"):
             continue
         qty = float(qty or 0.0)
         if qty <= 0: continue
-        if asset.upper() in tracked_bases:  # already managed
+
+        if asset.upper() in tracked_bases:
+            # managed by bot; skip here
             continue
 
         pair = asset_to_usd_pair(asset)
@@ -111,6 +113,7 @@ def reconcile_portfolio(positions: Dict[str, dict]) -> Dict[str, dict]:
         if not q:
             print(f"  ⚠️ Unable to quote {pair}; skip sweep.")
             continue
+
         usd_value = qty * q
         if usd_value >= DUST_MIN_USD:
             print(f"  ⚠️ Untracked: {asset} ≈ ${usd_value:.2f} → SELL")
@@ -123,24 +126,38 @@ def reconcile_portfolio(positions: Dict[str, dict]) -> Dict[str, dict]:
                     print(f"  SELL error for {pair}: {e}")
         else:
             print(f"  ℹ️ Ignoring tiny holding {asset} (${usd_value:.2f}).")
+
+    # B) NEW — drop *stale tracked* positions if Kraken shows zero qty
+    to_drop = []
+    for sym in list(positions.keys()):
+        base = base_from_pair(sym).upper()
+        live_qty = float(balances.get(base, 0.0) or 0.0)
+        if live_qty <= 1e-12:
+            print(f"  🔧 Stale tracked position detected ({sym}) but Kraken shows 0 — removing from positions.json")
+            to_drop.append(sym)
+    for sym in to_drop:
+        positions.pop(sym, None)
+    if to_drop:
+        save_positions(positions)
+
     return positions
 
 # ------------------------------ Main -------------------------------
 def main():
     print(f"[{datetime.now().isoformat()}] Start {('DRY' if DRY_RUN=='ON' else 'LIVE')} cycle")
-    print(f"BUY_USD={BUY_USD} TP_PCT={TP_PCT} SL_PCT={SL_PCT} SLIP_PCT={SLIP_PCT} WINDOW_MIN={WINDOW_MIN} FORCE_BUY_TOP={FORCE_BUY_TOP}")
+    print(f"BUY_USD={BUY_USD} TP_PCT={TP_PCT} SL_PCT={SL_PCT} SLIP_PCT={SLIP_PCT} WINDOW_MIN={WINDOW_MIN}")
 
     positions = load_positions()
     candidates = load_candidates()
     print(f"Loaded candidates: {len(candidates)}")
 
-    # Sweep leftovers
+    # Sweep leftovers & drop stale tracked
     try:
         positions = reconcile_portfolio(positions)
     except Exception as e:
         print(f"⚠️ Reconcile failed (continuing): {e}")
 
-    # SELL logic for current holding (TP/SL only; rotation-vs-better is separate feature)
+    # SELL logic for current holding (TP/SL)
     holding = list(positions.keys())
     if holding:
         sym = holding[0]
@@ -171,7 +188,7 @@ def main():
                 print("Hold — inside TP/SL band.")
 
     # BUY logic (when flat)
-    positions = load_positions()  # re-load in case we sold
+    positions = load_positions()  # re-load in case we sold or dropped stale
     reason = "unknown"
     if not positions:
         pick = select_top_usd_candidate(candidates)
@@ -224,7 +241,6 @@ def main():
         "sl_pct": SL_PCT,
         "slip_pct": SLIP_PCT,
         "window_min": WINDOW_MIN,
-        "force_buy_top": FORCE_BUY_TOP,
         "num_candidates": len(candidates),
         "notes": reason,
     }
