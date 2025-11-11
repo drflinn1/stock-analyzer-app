@@ -2,8 +2,13 @@ name: Crypto — Hourly 1-Coin Rotation (LIVE)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # every hour
+    - cron: "*/15 * * * *"   # every 15 minutes
   workflow_dispatch:
+
+# Prevent overlapping runs (avoids double-buys if a job is still running)
+concurrency:
+  group: crypto-live-rotation
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -49,12 +54,21 @@ jobs:
           echo "== run_summary.json ==" && (test -f .state/run_summary.json && sed -n '1,200p' .state/run_summary.json || echo "missing")
           echo "== positions.json ==" && (test -f .state/positions.json && sed -n '1,200p' .state/positions.json || echo "missing")
 
-      - name: Upload .state artifacts
+      - name: Upload .state artifacts (wait for write)
         if: always()
-        uses: actions/upload-artifact@v4
+        run: |
+          echo "Waiting up to 10s for .state files..."
+          for i in {1..10}; do
+            [ -f .state/run_summary.json ] && break || sleep 1
+          done
+          ls -la .state || true
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: state-${{ github.run_number }}
           path: .state/**
+          if-no-files-found: ignore
 
       - name: Commit .state back to repo (persist positions)
         if: always()
