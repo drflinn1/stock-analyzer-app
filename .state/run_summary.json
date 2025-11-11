@@ -1,0 +1,20 @@
+{
+  "positions": {
+    "MELANIAUSD": {
+      "qty": 180.28846153846155,
+      "entry_price": 0.1664,
+      "txid": "{\"error\": [], \"result\": {\"txid\": [\"OLHJQB-2X5QL-SJQXGV\"], \"descr\": {\"order\": \"buy 30.00 MELANIAUSD @ market\"}}}",
+      "timestamp": "2025-11-11T02:01:58.084617+00:00"
+    }
+  },
+  "holding": [
+    "MELANIAUSD"
+  ],
+  "buy_usd": 30.0,
+  "tp_pct": 5.0,
+  "sl_pct": 2.0,
+  "num_candidates": 10,
+  "bought": "MELANIAUSD",
+  "notes": [],
+  "timestamp": "2025-11-11T02:01:58.085323+00:00"
+}
