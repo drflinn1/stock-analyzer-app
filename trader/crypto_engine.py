@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-trader/crypto_engine.py — Kraken utilities (LIVE)
-• USD-only trading helpers
-• Market buy with oflags=viqc (spend USD)
-• Fallback LIMIT IOC buy using SLIP_PCT (qty computed from limit price)
-• Public quotes + Private orders + Balances
+Kraken helpers for USD-only rotation
+• Public quotes
+• Balances + USD balance helper
+• Market BUY (viqc)
+• LIMIT BUY IOC fallback
+• Market SELL by qty
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ KRAKEN_KEY = os.getenv("KRAKEN_API_KEY", "")
 KRAKEN_SECRET = os.getenv("KRAKEN_API_SECRET", "")
 API_BASE = "https://api.kraken.com"
 
-# ------------------------- CSV / Candidates -------------------------
+# ------------------------- CSV -------------------------
 def load_candidates(csv_path: Path = CANDIDATES_CSV) -> List[dict]:
     rows: List[dict] = []
     if not csv_path.exists():
@@ -37,12 +38,8 @@ def load_candidates(csv_path: Path = CANDIDATES_CSV) -> List[dict]:
             rows.append({"symbol": sym, "quote": q, "rank": row.get("rank")})
     return rows
 
-# ------------------------- Symbol helpers --------------------------
+# ------------------------- Symbols ---------------------
 def normalize_pair(s: str) -> str:
-    """
-    Accept: 'EAT/USD', 'EATUSD', 'eatusd', etc.
-    Return: canonical pair w/out slash, e.g., 'EATUSD', 'LSKUSD'.
-    """
     s = (s or "").strip().upper().replace("/", "")
     if s.endswith(("USD", "EUR", "USDT")):
         return s
@@ -53,14 +50,13 @@ def is_usd_pair(pair: str) -> bool:
 
 def base_from_pair(pair: str) -> str:
     pair = normalize_pair(pair)
-    return pair[:-3]  # strip 'USD'
+    return pair[:-3]
 
 def asset_to_usd_pair(asset: str) -> str:
     return f"{(asset or '').upper()}USD"
 
-# --------------------------- Public Quotes --------------------------
+# ------------------------- Public quote ----------------
 def get_public_quote(pair: str) -> Optional[float]:
-    """Return last trade price for a Kraken pair code (e.g., 'EATUSD')."""
     try:
         pair = normalize_pair(pair)
         if not is_usd_pair(pair):
@@ -74,7 +70,7 @@ def get_public_quote(pair: str) -> Optional[float]:
         print(f"Quote error for {pair}: {e}")
     return None
 
-# --------------------------- Private Core ---------------------------
+# -------------------- Private request core --------------
 def _private_request(endpoint: str, payload: dict) -> dict:
     if not KRAKEN_KEY or not KRAKEN_SECRET:
         return {"error": ["EAuth:Missing API key/secret"]}
@@ -99,19 +95,14 @@ def _private_request(endpoint: str, payload: dict) -> dict:
     except Exception:
         return {"error": ["EAPI:Invalid JSON"], "raw": r.text}
 
-# ----------------------------- Balances -----------------------------
+# ------------------------- Balances --------------------
 def _normalize_asset_code(a: str) -> str:
-    """Strip leading X/Z from Kraken asset codes (e.g., 'XXBT'->'XBT', 'ZUSD'->'USD')."""
     a = (a or "").strip().upper()
     if len(a) >= 2 and a[0] in ("X", "Z"):
         return a[1:]
     return a
 
 def kraken_list_balances() -> Dict[str, float]:
-    """
-    Return spot balances as { BASE_ASSET: qty }, excluding zeroes.
-    e.g., {'USD': 127.51, 'LSK': 94.60, 'MELANIA': 178.37}
-    """
     resp = _private_request("Balance", {})
     out: Dict[str, float] = {}
     if resp.get("error"):
@@ -122,31 +113,22 @@ def kraken_list_balances() -> Dict[str, float]:
             qty = float(v)
         except Exception:
             continue
-        if qty <= 0:
-            continue
+        if qty <= 0: continue
         out[_normalize_asset_code(k)] = qty
     return out
 
-# ----------------------- Price-Protection Check ---------------------
-def was_price_protection_block(resp: dict) -> bool:
-    """
-    Heuristic: detect Kraken price-protection blocking a market order.
-    It often appears as EOrder:Insufficient funds or price/viqc issues.
-    We'll treat *any* non-empty error as potential block for fallback.
-    """
-    errs = resp.get("error") or []
-    if not errs:
-        return False
-    # be permissive — trigger fallback on any order error
-    return True
+def get_usd_balance() -> float:
+    bal = kraken_list_balances()
+    # Kraken may expose USD as USD or ZUSD
+    return float(bal.get("USD", 0.0) or 0.0)
 
-# ----------------------------- Orders ------------------------------
+# -------------------- Price protection detect ----------
+def was_price_protection_block(resp: dict) -> bool:
+    errs = resp.get("error") or []
+    return bool(errs)  # permissive: any order error triggers fallback
+
+# --------------------------- Orders --------------------
 def place_market_buy_usd(pair: str, usd_amount: float, return_blocked: bool=False) -> Tuple[str, bool] | str:
-    """
-    LIVE MARKET BUY spending <usd_amount> of the quote currency (USD).
-    Kraken: set oflags=viqc and volume=<quote_currency_amount>.
-    If return_blocked=True -> returns (raw_json_str, blocked_bool)
-    """
     pair = normalize_pair(pair)
     if not is_usd_pair(pair):
         raise ValueError(f"Attempted USD buy on non-USD pair: {pair}")
@@ -155,7 +137,7 @@ def place_market_buy_usd(pair: str, usd_amount: float, return_blocked: bool=Fals
         "pair": pair,
         "type": "buy",
         "ordertype": "market",
-        "volume": f"{Decimal(usd_amount):f}",  # amount of USD to spend
+        "volume": f"{Decimal(usd_amount):f}",  # spend USD
         "oflags": "viqc",
         "userref": int(time.time()),
     }
@@ -167,9 +149,6 @@ def place_market_buy_usd(pair: str, usd_amount: float, return_blocked: bool=Fals
     return out
 
 def place_limit_buy_usd_ioc(pair: str, qty: float, limit_price: float) -> str:
-    """
-    LIMIT IOC BUY using qty derived from USD/price (no viqc on limit).
-    """
     pair = normalize_pair(pair)
     payload = {
         "pair": pair,
@@ -181,14 +160,11 @@ def place_limit_buy_usd_ioc(pair: str, qty: float, limit_price: float) -> str:
         "userref": int(time.time()),
     }
     resp = _private_request("AddOrder", payload)
-    if resp.get("error"):
-        print("LIMIT BUY error:", resp)
-    else:
-        print("LIMIT BUY ok:", resp)
+    if resp.get("error"): print("LIMIT BUY error:", resp)
+    else: print("LIMIT BUY ok:", resp)
     return json.dumps(resp)
 
 def place_market_sell_qty(pair: str, qty: float) -> str:
-    """LIVE MARKET SELL by base-asset quantity."""
     pair = normalize_pair(pair)
     payload = {
         "pair": pair,
@@ -198,8 +174,6 @@ def place_market_sell_qty(pair: str, qty: float) -> str:
         "userref": int(time.time()),
     }
     resp = _private_request("AddOrder", payload)
-    if resp.get("error"):
-        print("SELL error:", resp)
-    else:
-        print("SELL ok:", resp)
+    if resp.get("error"): print("SELL error:", resp)
+    else: print("SELL ok:", resp)
     return json.dumps(resp)
