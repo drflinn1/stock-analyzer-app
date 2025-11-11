@@ -28,7 +28,7 @@ on:
       SLIP_PCT:
         description: "Retry-through-book % if market is blocked (use 3–5)"
         required: true
-        default: "5"   # more likely to fill than 3
+        default: "5"
 
 concurrency:
   group: crypto-rotation-${{ github.ref }}
@@ -43,11 +43,8 @@ jobs:
     timeout-minutes: 25
 
     env:
-      # Secrets
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-
-      # Vars & UI overrides (UI > repo vars > default)
       UNIVERSE: ${{ vars.UNIVERSE }}
       TRACKED_QUOTE: "USD"
       DRY_RUN: ${{ inputs.DRY_RUN || vars.DRY_RUN || 'ON' }}
@@ -80,10 +77,8 @@ jobs:
         run: |
           set -e
           mkdir -p .state
-          echo "== repo tree (top) =="
-          ls -la
-          echo "== .state (pre-run) =="
-          ls -la .state || true
+          echo "== repo tree (top) ==" && ls -la
+          echo "== .state (pre-run) ==" && ls -la .state || true
 
       - name: Echo critical env/vars
         run: |
@@ -103,11 +98,7 @@ jobs:
 
       - name: Show .state after run (debug)
         run: |
-          echo "== .state (post-run) =="
-          ls -la .state || true
-          echo "== peek files =="
-          find .state -type f -maxdepth 2 -printf " - %p\n" || true
-          # Guarantee we always have at least one file to upload
+          echo "== .state (post-run) ==" && ls -la .state || true
           if [ -z "$(find .state -type f -maxdepth 2 2>/dev/null)" ]; then
             echo "no .state files found; creating sentinel"
             date > .state/_empty.txt
@@ -117,6 +108,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
-          path: ./.state/**/*     # use **/* (not just **) for GitHub glob
+          path: .state
           if-no-files-found: warn
           retention-days: 7
