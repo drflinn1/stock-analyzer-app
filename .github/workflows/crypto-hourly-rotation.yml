@@ -39,7 +39,15 @@ jobs:
           SL_PCT:  ${{ vars.SL_PCT }}
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-        run: python main.py
+        run: python -u main.py
+
+      - name: Show .state contents (debug)
+        run: |
+          echo "== PWD ==" && pwd
+          echo "== ls -la ==" && ls -la
+          echo "== ls -la .state ==" && ls -la .state || true
+          echo "== run_summary.json ==" && (test -f .state/run_summary.json && sed -n '1,200p' .state/run_summary.json || echo "missing")
+          echo "== positions.json ==" && (test -f .state/positions.json && sed -n '1,200p' .state/positions.json || echo "missing")
 
       - name: Upload .state artifacts
         if: always()
@@ -47,3 +55,12 @@ jobs:
         with:
           name: state-${{ github.run_number }}
           path: .state/**
+
+      - name: Commit .state back to repo (persist positions)
+        if: always()
+        run: |
+          git config --global user.email "bot@users.noreply.github.com"
+          git config --global user.name "RotationBot"
+          git add .state/*.json || true
+          git commit -m "rot: update .state (positions/summary)" || true
+          git push || true
