@@ -2,14 +2,15 @@
 """
 trader/crypto_engine.py — Kraken utilities (LIVE)
 • USD-only trading helpers
-• Correct market buy: oflags=viqc, volume=<USD>
-• Public quotes + Private orders + Balances (for reconciliation)
+• Market buy with oflags=viqc (spend USD)
+• Fallback LIMIT IOC buy using SLIP_PCT (qty computed from limit price)
+• Public quotes + Private orders + Balances
 """
 
 from __future__ import annotations
 import csv, os, time, json, hashlib, hmac, base64, urllib.parse
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from decimal import Decimal
 import requests
 
@@ -39,11 +40,10 @@ def load_candidates(csv_path: Path = CANDIDATES_CSV) -> List[dict]:
 # ------------------------- Symbol helpers --------------------------
 def normalize_pair(s: str) -> str:
     """
-    Accept: 'EAT/USD', 'EATUSD', 'eatusd', 'TERMEUR', etc.
+    Accept: 'EAT/USD', 'EATUSD', 'eatusd', etc.
     Return: canonical pair w/out slash, e.g., 'EATUSD', 'LSKUSD'.
     """
     s = (s or "").strip().upper().replace("/", "")
-    # if explicit quote provided, keep; else default USD
     if s.endswith(("USD", "EUR", "USDT")):
         return s
     return s + "USD"
@@ -101,10 +101,7 @@ def _private_request(endpoint: str, payload: dict) -> dict:
 
 # ----------------------------- Balances -----------------------------
 def _normalize_asset_code(a: str) -> str:
-    """
-    Kraken returns weird prefixes for some assets (e.g., 'XXBT', 'ZUSD').
-    Strip leading X/Z when followed by alpha letters to produce a simple base.
-    """
+    """Strip leading X/Z from Kraken asset codes (e.g., 'XXBT'->'XBT', 'ZUSD'->'USD')."""
     a = (a or "").strip().upper()
     if len(a) >= 2 and a[0] in ("X", "Z"):
         return a[1:]
@@ -130,11 +127,25 @@ def kraken_list_balances() -> Dict[str, float]:
         out[_normalize_asset_code(k)] = qty
     return out
 
+# ----------------------- Price-Protection Check ---------------------
+def was_price_protection_block(resp: dict) -> bool:
+    """
+    Heuristic: detect Kraken price-protection blocking a market order.
+    It often appears as EOrder:Insufficient funds or price/viqc issues.
+    We'll treat *any* non-empty error as potential block for fallback.
+    """
+    errs = resp.get("error") or []
+    if not errs:
+        return False
+    # be permissive — trigger fallback on any order error
+    return True
+
 # ----------------------------- Orders ------------------------------
-def place_market_buy_usd(pair: str, usd_amount: float) -> str:
+def place_market_buy_usd(pair: str, usd_amount: float, return_blocked: bool=False) -> Tuple[str, bool] | str:
     """
     LIVE MARKET BUY spending <usd_amount> of the quote currency (USD).
     Kraken: set oflags=viqc and volume=<quote_currency_amount>.
+    If return_blocked=True -> returns (raw_json_str, blocked_bool)
     """
     pair = normalize_pair(pair)
     if not is_usd_pair(pair):
@@ -144,15 +155,36 @@ def place_market_buy_usd(pair: str, usd_amount: float) -> str:
         "pair": pair,
         "type": "buy",
         "ordertype": "market",
-        "volume": f"{Decimal(usd_amount):f}",
+        "volume": f"{Decimal(usd_amount):f}",  # amount of USD to spend
         "oflags": "viqc",
         "userref": int(time.time()),
     }
     resp = _private_request("AddOrder", payload)
+    blocked = was_price_protection_block(resp)
+    out = json.dumps(resp)
+    if return_blocked:
+        return out, blocked
+    return out
+
+def place_limit_buy_usd_ioc(pair: str, qty: float, limit_price: float) -> str:
+    """
+    LIMIT IOC BUY using qty derived from USD/price (no viqc on limit).
+    """
+    pair = normalize_pair(pair)
+    payload = {
+        "pair": pair,
+        "type": "buy",
+        "ordertype": "limit",
+        "price": f"{Decimal(limit_price):f}",
+        "volume": f"{Decimal(qty):f}",
+        "timeinforce": "IOC",
+        "userref": int(time.time()),
+    }
+    resp = _private_request("AddOrder", payload)
     if resp.get("error"):
-        print("BUY error:", resp)
+        print("LIMIT BUY error:", resp)
     else:
-        print("BUY ok:", resp)
+        print("LIMIT BUY ok:", resp)
     return json.dumps(resp)
 
 def place_market_sell_qty(pair: str, qty: float) -> str:
