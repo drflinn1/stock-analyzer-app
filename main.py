@@ -1,55 +1,115 @@
 #!/usr/bin/env python3
 """
-sell_guard.py
-Simple, explicit sell-guard used by the rotation bot.
+main.py — LIVE trading version
+1-Coin Rotation Bot (Kraken)
 
-Rules (tunables via env in your workflow/vars):
-- Hard stop-loss SL_PCT (e.g., 1.0 means sell if drop >= 1.0 % from entry).
-- Take-profit TP_PCT (e.g., 5.0 means sell if gain >= 5.0 % from entry).
-- Slow-window rule: if gain < SLOW_GAIN_PCT within SLOW_WINDOW_MIN minutes since entry, sell.
-
-Exports:
-- evaluate_sell(entry_price: float,
-                current_price: float,
-                minutes_since_entry: float,
-                tp_pct: float,
-                sl_pct: float,
-                slow_gain_pct: float,
-                slow_window_min: float) -> dict
-  Returns: {"action": "HOLD"|"SELL", "reason": str, "pnl_pct": float}
+Logic:
+• Load latest momentum candidates
+• Check open positions (.state/positions.json)
+• If no position → buy top candidate
+• If holding → apply sell guard (TP/SL)
+• Always write run summary + KPI logs
 """
 
 from __future__ import annotations
+import json, os, time
+from datetime import datetime, timezone
+from pathlib import Path
 
-def _pct_change(now: float, entry: float) -> float:
-    return (now - entry) / entry * 100.0
+from trader.crypto_engine import (
+    load_candidates,
+    get_public_quote,
+    place_market_buy_usd,
+    place_market_sell_qty,
+)
 
+STATE = Path(".state")
+STATE.mkdir(exist_ok=True)
+POS_FILE = STATE / "positions.json"
+SUMMARY_FILE = STATE / "run_summary.json"
 
-def evaluate_sell(
-    entry_price: float,
-    current_price: float,
-    minutes_since_entry: float,
-    tp_pct: float = 5.0,
-    sl_pct: float = 1.0,
-    slow_gain_pct: float = 3.0,
-    slow_window_min: float = 60.0,
-) -> dict:
-    if entry_price <= 0 or current_price <= 0:
-        return {"action": "HOLD", "reason": "invalid price(s)", "pnl_pct": 0.0}
+# === Environment Vars ===
+BUY_USD = float(os.getenv("BUY_USD", "25"))
+TP_PCT  = float(os.getenv("TP_PCT", "5"))      # take-profit %
+SL_PCT  = float(os.getenv("SL_PCT", "2"))      # stop-loss %
+MIN_QUOTE = 0.0000001
 
-    pnl = _pct_change(current_price, entry_price)
+def load_positions() -> dict:
+    if POS_FILE.exists():
+        try:
+            return json.loads(POS_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
 
-    # 1) Hard stop first
-    if pnl <= -abs(sl_pct):
-        return {"action": "SELL", "reason": f"STOP {sl_pct:.2f}%", "pnl_pct": pnl}
+def save_positions(d: dict):
+    POS_FILE.write_text(json.dumps(d, indent=2))
 
-    # 2) Take-profit
-    if pnl >= abs(tp_pct):
-        return {"action": "SELL", "reason": f"TP {tp_pct:.2f}%", "pnl_pct": pnl}
+def log_summary(data: dict):
+    data["timestamp"] = datetime.now(timezone.utc).isoformat()
+    SUMMARY_FILE.write_text(json.dumps(data, indent=2))
 
-    # 3) Slow-window rule only if within the first window
-    if minutes_since_entry <= max(1.0, float(slow_window_min)):
-        if pnl < abs(slow_gain_pct):
-            return {"action": "SELL", "reason": f"SLOW < {slow_gain_pct:.2f}% in {slow_window_min:.0f}m", "pnl_pct": pnl}
+def main():
+    print(f"[{datetime.now().isoformat()}] Starting LIVE rotation cycle…")
+    positions = load_positions()
+    holding = list(positions.keys())
 
-    return {"action": "HOLD", "reason": "guard ok", "pnl_pct": pnl}
+    candidates = load_candidates()
+    if not candidates:
+        print("⚠️  No candidates found, aborting.")
+        return
+
+    # === SELL phase ===
+    if holding:
+        sym = holding[0]
+        quote = get_public_quote(sym)
+        entry_price = positions[sym]["entry_price"]
+        change_pct = (quote - entry_price) / entry_price * 100
+        print(f"Checking {sym}: {change_pct:.2f}% since entry.")
+
+        if change_pct >= TP_PCT:
+            print(f"🎯 Take-profit hit ({change_pct:.2f}%) → SELLING")
+            place_market_sell_qty(sym, positions[sym]["qty"])
+            del positions[sym]
+
+        elif change_pct <= -SL_PCT:
+            print(f"🛑 Stop-loss hit ({change_pct:.2f}%) → SELLING")
+            place_market_sell_qty(sym, positions[sym]["qty"])
+            del positions[sym]
+        else:
+            print("Hold signal — still within range.")
+
+    # === BUY phase ===
+    positions = load_positions()
+    if not positions:
+        top = candidates[0]
+        sym = top["symbol"]
+        quote = get_public_quote(sym)
+        if not quote or quote < MIN_QUOTE:
+            print(f"Invalid quote for {sym}, skipping buy.")
+        else:
+            qty = BUY_USD / quote
+            print(f"🟢 Buying {sym} for ${BUY_USD:.2f} ({qty:.6f} units @ {quote})")
+            txid = place_market_buy_usd(sym, BUY_USD)
+            positions[sym] = {
+                "qty": qty,
+                "entry_price": quote,
+                "txid": txid,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            save_positions(positions)
+
+    # === Wrap-up ===
+    summary = {
+        "positions": positions,
+        "holding": list(positions.keys()),
+        "buy_usd": BUY_USD,
+        "tp_pct": TP_PCT,
+        "sl_pct": SL_PCT,
+        "num_candidates": len(candidates),
+    }
+    log_summary(summary)
+    print("✅ Cycle complete — LIVE orders active.")
+
+if __name__ == "__main__":
+    main()
