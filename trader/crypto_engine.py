@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 """
-trader/crypto_engine.py — Kraken utilities
-LIVE version (market orders)
-
-Exports:
-- load_candidates()
-- get_public_quote(pair)
-- place_market_buy_usd(pair, usd_amount)
-- place_market_sell_qty(pair, qty)
+trader/crypto_engine.py — Kraken utilities (LIVE)
+Nov-10 fixes:
+• Only trade USD-quoted pairs (skip EUR/USDT/etc.)
+• Correct market buy: use oflags=viqc and volume=<USD amount>
 """
 
 from __future__ import annotations
-import csv, os, time
+import csv, os, time, json
 from pathlib import Path
 from typing import Dict, List, Optional
-import requests
-import json
 from decimal import Decimal
+import requests
 
 STATE_DIR = Path(".state")
 CANDIDATES_CSV = STATE_DIR / "momentum_candidates.csv"
@@ -25,69 +20,96 @@ KRAKEN_KEY = os.getenv("KRAKEN_API_KEY")
 KRAKEN_SECRET = os.getenv("KRAKEN_API_SECRET")
 API_BASE = "https://api.kraken.com"
 
-# ============================================================
+# ------------------------- CSV / Candidates -------------------------
 def load_candidates(csv_path: Path = CANDIDATES_CSV) -> List[dict]:
-    rows = []
+    rows: List[dict] = []
     if not csv_path.exists():
         print("No candidates.csv found.")
         return rows
     with open(csv_path, newline="") as f:
         r = csv.DictReader(f)
         for row in r:
-            if row.get("symbol") and row.get("quote"):
-                rows.append(row)
+            sym = (row.get("symbol") or "").strip()
+            q = (row.get("quote") or "").strip()
+            if not sym:
+                continue
+            rows.append({"symbol": sym, "quote": q, "rank": row.get("rank")})
     return rows
 
+# ------------------------- Symbol helpers --------------------------
 def normalize_pair(s: str) -> str:
-    s = s.replace("/", "")
-    if not s.endswith("USD"):
-        s += "USD"
-    return s
+    """
+    Accept: 'EAT/USD', 'EATUSD', 'eatusd', 'EATUSDT', 'TERMEUR', etc.
+    Return: canonical Kraken pair without slash (e.g., 'EATUSD', 'SOLUSD').
+    """
+    s = s.strip().upper().replace("/", "")
+    # If it ends with a known quote, keep it; else default to USD
+    if s.endswith("USD") or s.endswith("EUR") or s.endswith("USDT"):
+        return s
+    # default to USD if raw asset given
+    return s + "USD"
 
+def is_usd_pair(pair: str) -> bool:
+    return pair.endswith("USD")
+
+# --------------------------- Quotes --------------------------------
 def get_public_quote(pair: str) -> Optional[float]:
+    """Return last trade price for a Kraken pair code (e.g., 'EATUSD')."""
     try:
         pair = normalize_pair(pair)
-        resp = requests.get(f"{API_BASE}/0/public/Ticker?pair={pair}", timeout=10)
+        # Only quote USD pairs — others are irrelevant to this bot
+        if not is_usd_pair(pair):
+            return None
+        resp = requests.get(f"{API_BASE}/0/public/Ticker?pair={pair}", timeout=12)
         data = resp.json()
-        if "result" in data:
+        if "result" in data and data["result"]:
             result = list(data["result"].values())[0]
             return float(result["c"][0])
     except Exception as e:
         print(f"Quote error for {pair}: {e}")
     return None
 
-# ============================================================
-# --- LIVE order endpoints ---
+# --------------------------- Private API ---------------------------
 def _private_request(endpoint: str, payload: dict) -> dict:
-    """Kraken private REST (signed) request."""
-    import hashlib, hmac, base64
+    import hashlib, hmac, base64, urllib.parse
+
     nonce = str(int(time.time() * 1000))
     payload["nonce"] = nonce
-    post_data = "&".join([f"{k}={v}" for k, v in payload.items()])
-    sha = hashlib.sha256((nonce + post_data).encode()).digest()
-    import urllib.parse
+    postdata = urllib.parse.urlencode(payload)
+    sha = hashlib.sha256((nonce + postdata).encode()).digest()
     path = f"/0/private/{endpoint}"
-    hmac_msg = path.encode() + sha
-    signature = hmac.new(base64.b64decode(KRAKEN_SECRET), hmac_msg, hashlib.sha512)
-    sig_digest = base64.b64encode(signature.digest())
+    msg = path.encode() + sha
+    sig = hmac.new(base64.b64decode(KRAKEN_SECRET), msg, hashlib.sha512)
+    sig64 = base64.b64encode(sig.digest()).decode()
+
     headers = {
         "API-Key": KRAKEN_KEY,
-        "API-Sign": sig_digest.decode(),
+        "API-Sign": sig64,
+        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
     }
-    r = requests.post(API_BASE + path, headers=headers, data=payload, timeout=15)
-    return r.json()
+    r = requests.post(API_BASE + path, headers=headers, data=postdata, timeout=20)
+    try:
+        return r.json()
+    except Exception:
+        return {"error": ["EAPI:Invalid JSON"], "raw": r.text}
 
+# ----------------------------- Orders ------------------------------
 def place_market_buy_usd(pair: str, usd_amount: float) -> str:
-    """Place a live MARKET buy using given USD amount."""
+    """
+    LIVE MARKET BUY spending <usd_amount> of the quote currency (USD).
+    Kraken rule: use oflags=viqc and set volume=<quote_currency_amount>.
+    """
     pair = normalize_pair(pair)
+    if not is_usd_pair(pair):
+        raise ValueError(f"Attempted USD buy on non-USD pair: {pair}")
+
     payload = {
         "pair": pair,
         "type": "buy",
         "ordertype": "market",
-        "oflags": "fciq",
+        "volume": f"{Decimal(usd_amount):f}",  # Spend this much USD
+        "oflags": "viqc",
         "userref": int(time.time()),
-        "volume": "",  # Kraken auto-calculates when using cost
-        "cost": str(usd_amount),
     }
     resp = _private_request("AddOrder", payload)
     if resp.get("error"):
@@ -97,14 +119,14 @@ def place_market_buy_usd(pair: str, usd_amount: float) -> str:
     return json.dumps(resp)
 
 def place_market_sell_qty(pair: str, qty: float) -> str:
-    """Place a live MARKET sell by quantity."""
+    """LIVE MARKET SELL by base-asset quantity."""
     pair = normalize_pair(pair)
     payload = {
         "pair": pair,
         "type": "sell",
         "ordertype": "market",
-        "userref": int(time.time()),
         "volume": f"{Decimal(qty):f}",
+        "userref": int(time.time()),
     }
     resp = _private_request("AddOrder", payload)
     if resp.get("error"):
