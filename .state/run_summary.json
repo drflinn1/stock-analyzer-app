@@ -1,10 +1,10 @@
 {
   "positions": {
     "LSKUSD": {
-      "qty": 88.53389647021139,
-      "entry_price": 0.337159,
-      "txid": "O7FOLC-GEDAA-VXTFAV",
-      "timestamp": "2025-11-11T18:19:36.668157+00:00"
+      "qty": 94.00716155059852,
+      "entry_price": 0.317529,
+      "txid": "ONVROY-Z556F-37NP7S",
+      "timestamp": "2025-11-11T18:47:49.133882+00:00"
     }
   },
   "holding": [
@@ -18,5 +18,5 @@
   "notes": [
     "used_est_qty_fallback"
   ],
-  "timestamp": "2025-11-11T18:19:36.669058+00:00"
+  "timestamp": "2025-11-11T18:47:49.134720+00:00"
 }
