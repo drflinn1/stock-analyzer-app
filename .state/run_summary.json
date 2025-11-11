@@ -14,9 +14,6 @@
   "tp_pct": 5.0,
   "sl_pct": 2.0,
   "num_candidates": 40,
-  "bought": "LSKUSD",
-  "notes": [
-    "used_est_qty_fallback"
-  ],
-  "timestamp": "2025-11-11T20:34:13.951572+00:00"
+  "notes": "USD-only trading; viqc buys; portfolio reconciliation active",
+  "timestamp": "2025-11-11T20:49:54.408082+00:00"
 }
