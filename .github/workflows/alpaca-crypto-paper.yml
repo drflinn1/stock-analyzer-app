@@ -46,9 +46,9 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
-          else
-            pip install "alpaca-py>=0.31.0"
           fi
+          # Guarantee a modern Alpaca SDK regardless of requirements.txt contents
+          pip install -U "alpaca-py>=0.31.0"
 
       - name: Echo critical env/vars
         run: |
@@ -60,11 +60,11 @@ jobs:
 
       - name: Run bot
         env:
-          # Secrets you must add in your repo settings
+          # Secrets (paper):
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
 
-          # Inputs → env fallbacks for schedule runs
+          # Inputs → env for schedule/dispatch
           SYMBOL:   ${{ inputs.SYMBOL || 'BTC/USD' }}
           BUY_USD:  ${{ inputs.BUY_USD || '25' }}
           TP_PCT:   ${{ inputs.TP_PCT  || '5' }}
