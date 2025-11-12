@@ -1,353 +1,318 @@
 #!/usr/bin/env python3
 """
-main.py — 1-Coin Rotation
-- SELL first, then immediate same-run re-entry if possible
-- Flat cooldown override (COOLDOWN_MIN)
-- Robust pair normalization (handles 'LSK/USD' vs 'LSKUSD')
-- Kraken LIVE signer when DRY_RUN=OFF
+main.py — Crypto 1-Coin Rotation (safe HOLD on quote miss)
+
+Requirements:
+- trader/crypto_engine.py (with normalize_pair() and safe_quote())
+- ENV secrets: KRAKEN_KEY, KRAKEN_SECRET (for live)
+- ENV vars: DRY_RUN, BUY_USD, TP_PCT, STOP_PCT, WINDOW_MIN, ROTATE_WHEN_FULL, UNIVERSE_PICK
+
+Behavior:
+- If we can't fetch a valid quote for the target coin, HOLD the current position.
+- Only sell first when: TP/STOP hit OR we have a confirmed target quote for rotation.
+- Uses Kraken private AddOrder with `oflags=viqc` for USD-based market buys.
 """
 
 from __future__ import annotations
 
-import base64, hashlib, hmac, json, os, sys, time, urllib.parse
-from datetime import datetime, timedelta, timezone
+import base64
+import csv
+import hashlib
+import hmac
+import json
+import os
+import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple
 
 import requests
 
-# ----- Repo helpers
-try:
-    from trader.crypto_engine import (
-        CANDIDATES_CSV,
-        STATE_DIR,
-        load_candidates,
-        get_public_quote,
-        normalize_pair,
-    )
-except Exception as e:
-    print(f"[FATAL] Could not import trader.crypto_engine: {e}", file=sys.stderr)
-    sys.exit(1)
+from trader.crypto_engine import normalize_pair, safe_quote, load_candidates
 
-# ---------- ENV helpers ----------
-def env(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return v if v is not None and str(v).strip() != "" else default
+STATE_DIR = Path(".state")
+POS_FILE = STATE_DIR / "positions.json"
+SUMMARY_FILE = STATE_DIR / "run_summary.json"
 
-def parse_float_env(name: str, default: Optional[float]) -> Optional[float]:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    raw = raw.strip()
-    if raw == "" or raw.lower() in ("none", "null", "nan"):
-        return default
-    try:
-        return float(raw)
-    except Exception:
-        return default
+KRAKEN_API = "https://api.kraken.com/0"
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "rotation-bot/1.0"})
 
-DRY_RUN = env("DRY_RUN", "ON").upper()
-TP_PCT = parse_float_env("TP_PCT", 8.0) or 8.0
-STOP_PCT = parse_float_env("STOP_PCT", None)
-TRAIL_START_PCT = parse_float_env("TRAIL_START_PCT", None)
-TRAIL_PCT = parse_float_env("TRAIL_PCT", None)
-WINDOW_MIN = int(parse_float_env("WINDOW_MIN", 30) or 30)
-COOLDOWN_MIN = int(parse_float_env("COOLDOWN_MIN", 10) or 10)
-BUY_USD = float(parse_float_env("BUY_USD", 30.0) or 30.0)
-MAX_POSITIONS = int(parse_float_env("MAX_POSITIONS", 1) or 1)
-UNIVERSE_PICK = env("UNIVERSE_PICK", "AUTO").strip()
-QUOTE_CCY = env("QUOTE_CCY", "USD").upper()
+# ------------ ENV ------------
+def get_env(name: str, default: str) -> str:
+    v = os.environ.get(name)
+    return v if v is not None else default
 
-KRAKEN_KEY = env("KRAKEN_API_KEY")
-KRAKEN_SECRET = env("KRAKEN_API_SECRET")
+DRY_RUN = get_env("DRY_RUN", "OFF").upper()  # OFF or ON
+BUY_USD = float(get_env("BUY_USD", "30"))
+TP_PCT = float(get_env("TP_PCT", "8"))
+STOP_PCT = float(get_env("STOP_PCT", "4"))
+WINDOW_MIN = int(float(get_env("WINDOW_MIN", "15")))
+ROTATE_WHEN_FULL = get_env("ROTATE_WHEN_FULL", "true").lower() == "true"
+UNIVERSE_PICK = get_env("UNIVERSE_PICK", "").strip().upper()
 
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-POSITIONS_JSON = STATE_DIR / "positions.json"
-SUMMARY_JSON = STATE_DIR / "run_summary.json"
-LAST_FLAG = STATE_DIR / "this.flag"
+KRAKEN_KEY = os.environ.get("KRAKEN_KEY", "")
+KRAKEN_SECRET = os.environ.get("KRAKEN_SECRET", "")
 
-API_BASE = "https://api.kraken.com/0"
+# ------------ UTIL ------------
+def now_ts() -> int:
+    return int(time.time())
 
-# ---------- Kraken signing ----------
-def kraken_time() -> float:
-    try:
-        r = requests.get(f"{API_BASE}/public/Time", timeout=10)
-        r.raise_for_status()
-        return float(r.json()["result"]["unixtime"])
-    except Exception:
-        return time.time()
-
-def _kraken_sign(urlpath: str, data: Dict, secret_b64: str) -> str:
-    postdata = urllib.parse.urlencode(data)
-    sha256 = hashlib.sha256((str(data["nonce"]) + postdata).encode()).digest()
-    mac = hmac.new(base64.b64decode(secret_b64), urlpath.encode() + sha256, hashlib.sha512)
-    return base64.b64encode(mac.digest()).decode()
-
-def kraken_private(path: str, data: Dict) -> Dict:
-    if not KRAKEN_KEY or not KRAKEN_SECRET:
-        return {"error": ["EGeneral:Missing api key/secret"], "result": {}}
-    urlpath = f"/0/private/{path}"
-    url = f"{API_BASE}/private/{path}"
-    data = {**data, "nonce": int(time.time() * 1000)}
-    headers = {
-        "API-Key": KRAKEN_KEY,
-        "API-Sign": _kraken_sign(urlpath, data, KRAKEN_SECRET),
-        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-        "User-Agent": "rotation-bot",
-    }
-    r = requests.post(url, headers=headers, data=urllib.parse.urlencode(data), timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-def pair_to_kraken(sym: str) -> str:
-    return sym.replace("/", "")
-
-def place_market_order(pair: str, side: str, volume: float, dry_run: bool) -> Dict:
-    if dry_run or DRY_RUN == "ON":
-        return {"status": "dry", "pair": pair, "side": side, "volume": volume, "txid": "SIMULATED"}
-    try:
-        resp = kraken_private("AddOrder", {
-            "pair": pair_to_kraken(pair),
-            "type": side,
-            "ordertype": "market",
-            "volume": f"{volume:.8f}",
-            "oflags": "viqc",
-            "validate": False,
-        })
-        if resp.get("error"):
-            return {"status": "error", "note": ",".join(resp["error"]), "raw": resp}
-        txid_list = resp.get("result", {}).get("txid", [])
-        txid = txid_list[0] if isinstance(txid_list, list) and txid_list else ""
-        return {"status": "ok", "txid": txid, "raw": resp}
-    except Exception as e:
-        return {"status": "error", "note": f"Kraken order exception: {e}"}
-
-# ---------- JSON helpers ----------
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+def log(s: str) -> None:
+    print(s, flush=True)
 
 def read_json(path: Path, default):
     try:
-        if path.exists():
-            return json.loads(path.read_text())
-    except Exception as e:
-        print(f"[WARN] Failed to read {path}: {e}")
-    return default
+        return json.loads(path.read_text())
+    except Exception:
+        return default
 
 def write_json(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(obj, indent=2, sort_keys=True))
     tmp.replace(path)
 
-def load_positions() -> Dict:
-    return read_json(POSITIONS_JSON, {"positions": []})
+# ------------ KRAKEN PRIVATE API ------------
+def _kraken_sign(uri_path: str, data: Dict[str, str]) -> str:
+    # https://docs.kraken.com/rest/#section/Authentication
+    secret = base64.b64decode(KRAKEN_SECRET)
+    post_data = "&".join(f"{k}={v}" for k, v in data.items())
+    sha = hashlib.sha256((data["nonce"] + post_data).encode()).digest()
+    msg = uri_path.encode() + sha
+    mac = hmac.new(secret, msg, hashlib.sha512)
+    return base64.b64encode(mac.digest()).decode()
 
-def save_positions(positions: Dict) -> None:
-    write_json(POSITIONS_JSON, positions)
+def kraken_private(endpoint: str, data: Dict[str, str]) -> dict:
+    if not KRAKEN_KEY or not KRAKEN_SECRET:
+        raise RuntimeError("Missing KRAKEN_KEY/KRAKEN_SECRET")
+    uri_path = f"/private/{endpoint}"
+    url = f"{KRAKEN_API}{uri_path}"
+    data = dict(data)
+    data["nonce"] = str(int(time.time() * 1000))
+    headers = {
+        "API-Key": KRAKEN_KEY,
+        "API-Sign": _kraken_sign(uri_path, data),
+    }
+    r = SESSION.post(url, data=data, headers=headers, timeout=30)
+    r.raise_for_status()
+    j = r.json()
+    if j.get("error"):
+        raise RuntimeError(f"Kraken error: {j['error']}")
+    return j.get("result", {})
 
-def pct_change(a: float, b: float) -> float:
-    if a <= 0:
-        return 0.0
-    return (b - a) / a * 100.0
+def kraken_balance() -> Dict[str, float]:
+    if DRY_RUN == "ON":
+        return {}
+    res = kraken_private("Balance", {})
+    out = {}
+    for k, v in res.items():
+        try:
+            out[k] = float(v)
+        except Exception:
+            pass
+    return out
 
-# ---------- Pair helpers (fix) ----------
-def ensure_slash_pair(s: str, quote: str) -> str:
-    """Ensure 'BASE/QUOTE' format given a string that might be 'BASEQUOTE'."""
-    if "/" in s:
-        return s
-    if s.upper().endswith(quote):
-        base = s[: -len(quote)]
-        return f"{base}/{quote}"
-    return f"{s}/{quote}"
+def asset_code(base: str) -> str:
+    # Kraken sometimes uses 'X'/'Z' prefixes internally; this helper keeps it simple.
+    # For LSK, SOL, BTC etc this is fine.
+    return base
 
-def quote_forms(sym: str, quote: str) -> List[str]:
+def market_buy_quote_usd(pair_ws: str, usd_amount: float) -> str:
     """
-    Return possible representations the quote fetcher might accept.
-    e.g. 'LSK/USD' → ['LSK/USD','LSKUSD']
-         'LSKUSD'  → ['LSK/USD','LSKUSD']
+    Market buy spending USD (uses viqc).
+    Returns order txid.
     """
-    with_slash = ensure_slash_pair(sym, quote)
-    no_slash = with_slash.replace("/", "")
-    return [with_slash, no_slash]
+    base = pair_ws.split("/")[0]
+    paircode = f"{base}USD"  # e.g., LSKUSD
+    data = {
+        "pair": paircode,
+        "type": "buy",
+        "ordertype": "market",
+        "oflags": "viqc",  # spend quote currency
+        "volume": f"{usd_amount:.2f}",  # USD spend
+    }
+    if DRY_RUN == "ON":
+        log(f"[DRY] BUY {pair_ws} spending ${usd_amount:.2f}")
+        return "DRY_BUY"
+    res = kraken_private("AddOrder", data)
+    txid = ",".join(res.get("txid", [])) or "UNKNOWN"
+    log(f"[LIVE] BUY ok {pair_ws} ${usd_amount:.2f} (txid {txid})")
+    return txid
 
-# ---------- Core logic ----------
-def pick_target_symbol() -> Optional[str]:
-    print(f"[INFO] UNIVERSE_PICK={UNIVERSE_PICK}")
-    if UNIVERSE_PICK.upper() == "AUTO":
-        cands: List[Dict] = load_candidates(CANDIDATES_CSV)
-        print(f"[INFO] candidates_csv_exists={CANDIDATES_CSV.exists()} rows={len(cands) if cands else 0}")
-        if not cands:
-            print("[HOLD] No candidates available.")
-            return None
-        raw = cands[0].get("symbol") or cands[0].get("pair") or cands[0].get("Symbol")
-        print(f"[INFO] top candidate raw='{raw}'")
-        if not raw:
-            print("[HOLD] Candidate rows missing 'symbol' field.")
-            return None
-        norm = normalize_pair(raw)  # may return Kraken style (no slash)
-        target = ensure_slash_pair(norm, QUOTE_CCY)
-        print(f"[INFO] target normalized='{target}'")
-        return target
-    # explicit pick
-    norm = normalize_pair(UNIVERSE_PICK)
-    target = ensure_slash_pair(norm, QUOTE_CCY)
-    print(f"[INFO] target explicit='{target}'")
-    return target
+def market_sell_base_all(pair_ws: str, base_amount: float) -> str:
+    """
+    Market sell base units.
+    Returns order txid.
+    """
+    base = pair_ws.split("/")[0]
+    paircode = f"{base}USD"
+    data = {
+        "pair": paircode,
+        "type": "sell",
+        "ordertype": "market",
+        "volume": f"{base_amount:.10f}",
+    }
+    if DRY_RUN == "ON":
+        log(f"[DRY] SELL {pair_ws} qty={base_amount}")
+        return "DRY_SELL"
+    res = kraken_private("AddOrder", data)
+    txid = ",".join(res.get("txid", [])) or "UNKNOWN"
+    log(f"[LIVE] SELL ok {pair_ws} qty={base_amount} (txid {txid})")
+    return txid
 
-def get_quote_required(sym: str) -> Optional[float]:
-    # Try multiple forms until one returns a valid price
-    for form in quote_forms(sym, QUOTE_CCY):
-        px = get_public_quote(form)
-        if px is not None and px > 0:
-            print(f"[INFO] quote {form} ~ {px}")
-            return px
-        else:
-            print(f"[INFO] quote miss for {form}")
-    print(f"[HOLD] Invalid price for {sym}")
+# ------------ POSITION STATE ------------
+def read_position() -> Optional[dict]:
+    pos = read_json(POS_FILE, {})
+    return pos or None
+
+def write_position(pos: Optional[dict]) -> None:
+    if pos is None:
+        write_json(POS_FILE, {})
+    else:
+        write_json(POS_FILE, pos)
+
+# ------------ STRATEGY HELPERS ------------
+def pick_target_symbol(candidates: list[dict]) -> Optional[str]:
+    if UNIVERSE_PICK:
+        sym = normalize_pair(UNIVERSE_PICK)
+        return sym
+    # candidates already normalized by crypto_engine.load_candidates
+    for row in candidates:
+        sym = row.get("symbol", "")
+        if not sym:
+            continue
+        return normalize_pair(sym)
     return None
 
-def should_sell(entry_px: float, last_px: float, high_px: float | None = None) -> Tuple[bool, str]:
-    if TP_PCT and pct_change(entry_px, last_px) >= TP_PCT:
-        return True, f"TP hit (≥ {TP_PCT:.2f}%)"
-    if (STOP_PCT is not None) and pct_change(entry_px, last_px) <= -STOP_PCT:
-        return True, f"STOP hit (≤ -{STOP_PCT:.2f}%)"
-    if (TRAIL_START_PCT is not None) and (TRAIL_PCT is not None) and high_px:
-        if pct_change(entry_px, high_px) >= TRAIL_START_PCT and pct_change(high_px, last_px) <= -TRAIL_PCT:
-            return True, f"TRAIL hit (drop ≥ {TRAIL_PCT:.2f}% from high after +{TRAIL_START_PCT:.2f}%)"
-    return False, "Hold"
+def get_lot_size(base: str, balance: Dict[str, float]) -> float:
+    # Use on-chain balance; if not available (DRY), assume we just bought ~ BUY_USD / price
+    code = asset_code(base)
+    return balance.get(code, 0.0)
 
-def last_action_age_min() -> Optional[float]:
-    s = read_json(SUMMARY_JSON, {})
-    ts = s.get("last_action_time")
-    if not ts:
-        return None
-    try:
-        dt = datetime.fromisoformat(ts)
-        return (now_utc() - dt).total_seconds() / 60.0
-    except Exception:
-        return None
+def pct_change(cur: float, entry: float) -> float:
+    if entry <= 0:
+        return 0.0
+    return (cur - entry) / entry * 100.0
 
-def rotation_window_ok() -> bool:
-    age = last_action_age_min()
-    if age is None:
-        return True
-    return age >= WINDOW_MIN
+# ------------ RUN ------------
+def main() -> int:
+    STATE_DIR.mkdir(exist_ok=True)
 
-def cooldown_override_ok() -> bool:
-    age = last_action_age_min()
-    if age is None:
-        return True
-    return age >= COOLDOWN_MIN
+    # Load state
+    pos = read_position()  # {'symbol','entry','qty','cost','ts'}
+    candidates = load_candidates()
+    target_sym = pick_target_symbol(candidates)
 
-def mark_action_time() -> None:
-    s = read_json(SUMMARY_JSON, {})
-    s["last_action_time"] = now_utc().isoformat()
-    write_json(SUMMARY_JSON, s)
+    # Quotes
+    cur_sym = pos["symbol"] if pos else None
+    cur_price = safe_quote(cur_sym) if cur_sym else 0.0
+    tgt_price = safe_quote(target_sym) if target_sym else 0.0
 
-def market_buy(sym: str, usd_amount: float, dry: bool) -> Dict:
-    px = get_quote_required(sym)
-    if px is None:
-        return {"status": "error", "note": "No valid quote"}
-    vol = usd_amount / px
-    if usd_amount < 10.0 or vol <= 0:
-        return {"status": "error", "note": "Buy notional too small (min ~$10)"}
-    print(f"[TRADE] BUY attempt {sym} ${usd_amount} → vol≈{vol:.8f}")
-    res = place_market_order(sym, "buy", vol, dry)
-    return res | {"price": px, "volume": vol}
-
-def market_sell(sym: str, qty: float, dry: bool) -> Dict:
-    px = get_quote_required(sym)
-    if px is None:
-        return {"status": "error", "note": "No valid quote"}
-    print(f"[TRADE] SELL attempt {sym} qty={qty:.8f}")
-    res = place_market_order(sym, "sell", qty, dry)
-    return res | {"price": px}
-
-# ---------- Main ----------
-def main():
-    print(f"=== Start 1-Coin Rotation (DRY_RUN={DRY_RUN}) ===")
-    print(f"TP={TP_PCT}%  STOP={STOP_PCT}%  TRAIL={TRAIL_PCT}%@{TRAIL_START_PCT}%  WINDOW_MIN={WINDOW_MIN}  COOLDOWN_MIN={COOLDOWN_MIN}  BUY_USD={BUY_USD}")
-
-    pos_state = load_positions()
-    positions = pos_state.get("positions", [])
-    pos = positions[0] if positions else None
-
-    sold_this_run = False
-
-    # SELL FIRST
-    if pos:
-        sym = pos["symbol"]
-        entry_px = float(pos["entry_price"])
-        qty = float(pos["qty"])
-        high = float(pos.get("max_price", entry_px))
-        last_px = get_quote_required(sym)
-        if last_px is None:
-            print(f"[HOLD] {sym} no valid quote; skipping sell check.")
-        else:
-            if last_px > high:
-                pos["max_price"] = last_px
-                save_positions({"positions": [pos]})
-            do_sell, reason = should_sell(entry_px, last_px, pos.get("max_price"))
-            print(f"[EVAL] {sym} entry={entry_px:.6f} last={last_px:.6f} Δ={pct_change(entry_px,last_px):.2f}% → {reason}")
-            if do_sell:
-                resp = market_sell(sym, qty, DRY_RUN == "ON")
-                if resp.get("status") in ("dry", "ok"):
-                    print(f"[TRADE] SELL ok {sym} qty={qty:.8f} @~{resp.get('price')}")
-                    save_positions({"positions": []})
-                    mark_action_time()
-                    sold_this_run = True
-                else:
-                    print(f"[ERROR] SELL failed: {resp}")
-
-    # BUY (same-run re-entry; else window/cooldown)
-    holding_now = load_positions().get("positions", [])
-    if not holding_now and (len(holding_now) < MAX_POSITIONS):
-        age = last_action_age_min()
-        print(f"[INFO] last_action_age_min={None if age is None else round(age,2)}")
-        allow_buy = sold_this_run or rotation_window_ok() or cooldown_override_ok()
-        print(f"[INFO] allow_buy={allow_buy} (sold_this_run={sold_this_run}, window_ok={rotation_window_ok()}, cooldown_ok={cooldown_override_ok()})")
-        if allow_buy:
-            target = pick_target_symbol()
-            if target:
-                resp = market_buy(target, BUY_USD, DRY_RUN == "ON")
-                if resp.get("status") in ("dry", "ok"):
-                    px = resp.get("price")
-                    qty = resp.get("volume", BUY_USD / (px or 1))
-                    pos = {"symbol": target, "entry_price": px, "qty": qty, "entry_time": now_utc().isoformat(), "max_price": px}
-                    save_positions({"positions": [pos]})
-                    mark_action_time()
-                    print(f"[TRADE] {'Re-entry: ' if sold_this_run else ''}BUY ok {target} qty={qty:.8f} @~{px}")
-                else:
-                    print(f"[ERROR] BUY failed: {resp}")
-            else:
-                print("[HOLD] No target symbol resolved.")
-        else:
-            print(f"[HOLD] Not buying yet (window/cooldown). WINDOW_MIN={WINDOW_MIN} COOLDOWN_MIN={COOLDOWN_MIN}")
-    else:
-        if holding_now:
-            print("[STATE] Already holding; no new BUY.")
-        else:
-            print("[HOLD] Max positions reached; no new BUY.")
-
-    # Summary
-    out = {
-        "time_utc": datetime.now(timezone.utc).isoformat(),
+    # Summary shell
+    summary = {
+        "ts": now_ts(),
         "dry_run": DRY_RUN,
+        "window_min": WINDOW_MIN,
         "tp_pct": TP_PCT,
         "stop_pct": STOP_PCT,
-        "trail_start_pct": TRAIL_START_PCT,
-        "trail_pct": TRAIL_PCT,
-        "window_min": WINDOW_MIN,
-        "cooldown_min": COOLDOWN_MIN,
-        "buy_usd": BUY_USD,
+        "rotate_when_full": ROTATE_WHEN_FULL,
         "universe_pick": UNIVERSE_PICK,
-        "quote_ccy": QUOTE_CCY,
-        "positions": load_positions().get("positions", []),
-        "candidates_csv_exists": CANDIDATES_CSV.exists(),
+        "current": {"symbol": cur_sym, "price": cur_price},
+        "target": {"symbol": target_sym, "price": tgt_price},
+        "action": "HOLD",
+        "note": "",
     }
-    write_json(SUMMARY_JSON, out)
-    LAST_FLAG.write_text(str(kraken_time()))
-    print("=== End run ===")
+
+    # If no current position: try to BUY target only if we have a real quote
+    if not pos:
+        if target_sym and tgt_price > 0:
+            txid = market_buy_quote_usd(target_sym, BUY_USD)
+            entry = tgt_price
+            qty = 0.0
+            if DRY_RUN == "ON":
+                qty = BUY_USD / entry
+            else:
+                # in live we can't get exact qty from AddOrder response easily; approximate
+                qty = BUY_USD / entry
+            pos = {
+                "symbol": target_sym,
+                "entry": entry,
+                "qty": qty,
+                "cost": BUY_USD,
+                "ts": now_ts(),
+            }
+            write_position(pos)
+            summary.update({"action": "BUY", "note": f"Opened {target_sym} using ${BUY_USD:.2f}"})
+        else:
+            summary.update({"action": "HOLD", "note": "No valid target quote; staying in USD."})
+            write_position(None)
+        write_json(SUMMARY_FILE, summary)
+        log(json.dumps(summary, indent=2))
+        return 0
+
+    # With a current position: evaluate TP/STOP
+    entry = float(pos.get("entry", 0))
+    qty = float(pos.get("qty", 0))
+    cur_sym = pos["symbol"]
+    summary["current"]["symbol"] = cur_sym
+    summary["current"]["price"] = cur_price
+
+    if cur_price <= 0:
+        summary.update({"action": "HOLD", "note": f"Quote miss for {cur_sym}; hold."})
+        write_json(SUMMARY_FILE, summary)
+        log(json.dumps(summary, indent=2))
+        return 0
+
+    chg = pct_change(cur_price, entry)
+    # TAKE PROFIT
+    if chg >= TP_PCT:
+        txid = market_sell_base_all(cur_sym, qty)
+        write_position(None)
+        summary.update({"action": "SELL_TP", "note": f"TP hit {chg:.2f}% -> sold {cur_sym}"})
+        write_json(SUMMARY_FILE, summary)
+        log(json.dumps(summary, indent=2))
+        return 0
+
+    # STOP LOSS
+    if chg <= -abs(STOP_PCT):
+        txid = market_sell_base_all(cur_sym, qty)
+        write_position(None)
+        summary.update({"action": "SELL_SL", "note": f"STOP hit {chg:.2f}% -> sold {cur_sym}"})
+        write_json(SUMMARY_FILE, summary)
+        log(json.dumps(summary, indent=2))
+        return 0
+
+    # ROTATION (only if allowed and we actually have a target with a valid quote)
+    if ROTATE_WHEN_FULL:
+        if target_sym and normalize_pair(target_sym) != normalize_pair(cur_sym):
+            if tgt_price > 0:
+                # We have a valid target quote → rotate: sell current then buy target
+                sell_tx = market_sell_base_all(cur_sym, qty)
+                buy_tx = market_buy_quote_usd(target_sym, BUY_USD)
+                new_pos = {
+                    "symbol": target_sym,
+                    "entry": tgt_price,
+                    "qty": BUY_USD / tgt_price if tgt_price > 0 else 0.0,
+                    "cost": BUY_USD,
+                    "ts": now_ts(),
+                }
+                write_position(new_pos)
+                summary.update({"action": "ROTATE", "note": f"{cur_sym} -> {target_sym}"})
+                write_json(SUMMARY_FILE, summary)
+                log(json.dumps(summary, indent=2))
+                return 0
+            else:
+                summary.update({"action": "HOLD", "note": f"Target {target_sym} quote miss; hold {cur_sym}."})
+                write_json(SUMMARY_FILE, summary)
+                log(json.dumps(summary, indent=2))
+                return 0
+
+    # Default: HOLD
+    summary.update({"action": "HOLD", "note": f"Holding {cur_sym} ({chg:.2f}% vs entry)."})
+    write_json(SUMMARY_FILE, summary)
+    log(json.dumps(summary, indent=2))
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
