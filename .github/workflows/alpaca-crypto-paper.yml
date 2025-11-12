@@ -61,7 +61,8 @@ jobs:
       - name: Ensure .state directory exists
         run: mkdir -p .state
 
-      - name: Run bot
+      - name: Run bot and capture summary
+        id: runbot
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
@@ -70,14 +71,36 @@ jobs:
           TP_PCT:   ${{ inputs.TP_PCT  || '5' }}
           SL_PCT:   ${{ inputs.SL_PCT  || '2' }}
           DRY_RUN:  ${{ inputs.DRY_RUN || 'ON' }}
+        shell: bash
         run: |
-          python -u alpaca_crypto_paper.py
+          set -euo pipefail
+          # Run and tee output to a temp log
+          python -u alpaca_crypto_paper.py | tee /tmp/bot_log.txt
+
           echo "Post-run file check:"
           pwd
           ls -la .state || true
-          [ -f .state/run_summary.json ] && echo "STATE OK" || echo "STATE MISSING"
 
-      - name: Upload .state summary (final fix)
+          # If Python didn't write the summary, extract it from the log reliably.
+          if [ ! -f .state/run_summary.json ] || [ ! -s .state/run_summary.json ]; then
+            echo "No run_summary.json written by script — extracting from log…"
+            awk '
+              $0 ~ /^=== Alpaca Crypto Paper — Summary ===/ {capture=1; next}
+              capture {print}
+            ' /tmp/bot_log.txt > .state/run_summary.json || true
+          fi
+
+          # If still missing, write a minimal fallback so the artifact step always has a file
+          if [ ! -s .state/run_summary.json ]; then
+            echo '{"note":"fallback summary (script did not emit JSON)","ts":'$(date +%s)'}' > .state/run_summary.json
+          fi
+
+          echo "Final .state listing:"
+          ls -la .state
+          echo "Summary preview:"
+          head -n 50 .state/run_summary.json || true
+
+      - name: Upload .state summary (guaranteed)
         if: always()
         uses: actions/upload-artifact@v4
         with:
