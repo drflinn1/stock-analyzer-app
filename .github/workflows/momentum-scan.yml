@@ -2,49 +2,83 @@ name: Momentum — Scan (USD-only, commits .state)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes
+    - cron: "*/30 * * * *"   # every 30 minutes
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: momentum-scan-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          pip install requests
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas requests pyyaml matplotlib
+          fi
 
-      - name: Run USD-only momentum scan
-        env:
-          TOP_N: ${{ vars.TOP_N || 40 }}
-          MIN_USD_VOL: ${{ vars.MIN_USD_VOL || 25000 }}
-          EXCLUDE: ${{ vars.EXCLUDE || 'USDT,USDC,DAI,FDUSD,PYUSD,TUSD,USD' }}
-          OHLC_INTERVAL: ${{ vars.OHLC_INTERVAL || 5 }}
+      - name: Ensure .state exists
+        run: mkdir -p .state
+
+      # Your real scanner that writes .state/momentum_candidates.csv (USD pairs)
+      - name: Run momentum scan (USD-only)
         run: |
-          python -u scripts/momentum_scan.py
+          python tools/momentum_scan.py
 
-      - name: Upload scan outputs (artifact)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: momentum_scan_outputs
-          path: .state/momentum_candidates.csv
+      # Standardize schema so the rotation bot always has the columns it needs
+      - name: Normalize & add schema columns
+        run: |
+          python tools/csv_schema_fix.py .state/momentum_candidates.csv
 
-      - name: Commit .state to repo (so trader can read next run)
+      - name: Echo top 10
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          try:
+              df = pd.read_csv(".state/momentum_candidates_fixed.csv")
+              print(df.head(10).to_string(index=False))
+          except Exception as e:
+              print("No momentum_candidates_fixed.csv yet:", e)
+          PY
+
+      # Commit the refreshed CSVs so rotation sees them on the next run
+      - name: Commit & push updated .state
         run: |
           set -e
           git config --global user.email "bot@users.noreply.github.com"
-          git config --global user.name "MomentumScanBot"
-          git add .state/momentum_candidates.csv || true
-          git commit -m "scan: update .state/momentum_candidates.csv (USD-only)" || true
-          git push || true
+          git config --global user.name  "bot"
+          git add .state/*.csv || true
+          if git commit -m "bot: update .state (candidates)" ; then
+            git push
+          else
+            echo "Nothing to commit."
+          fi
+
+      # Reliable artifact upload (no warnings)
+      - name: Upload CSV artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: momentum-scan-${{ github.run_id }}
+          path: |
+            .state/momentum_candidates.csv
+            .state/momentum_candidates_fixed.csv
+          if-no-files-found: warn
+          retention-days: 14
