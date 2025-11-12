@@ -1,0 +1,92 @@
+name: Alpaca — Crypto Paper Rotation (BTC/ETH/SOL)
+
+on:
+  workflow_dispatch:
+    inputs:
+      UNIVERSE:
+        description: "Comma-separated (e.g., BTC/USD,ETH/USD,SOL/USD)"
+        required: true
+        default: "BTC/USD,ETH/USD,SOL/USD"
+      BUY_USD:
+        description: "USD notional to buy when flat or after rotate"
+        required: true
+        default: "25"
+      TP_PCT:
+        description: "Take-profit % (sell if >= +TP)"
+        required: true
+        default: "5"
+      SL_PCT:
+        description: "Stop-loss % (sell if <= -SL)"
+        required: true
+        default: "2"
+      ROTATE:
+        description: "ON to rotate to new winner if holding a different coin"
+        required: true
+        default: "ON"
+      DRY_RUN:
+        description: "ON = simulate; OFF = place PAPER orders"
+        required: true
+        default: "ON"
+  schedule:
+    - cron: "*/30 * * * *"  # every 30 minutes
+
+jobs:
+  paper_rotation:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          pip install -U "alpaca-py>=0.31.0"
+
+      - name: Ensure .state directory exists
+        run: mkdir -p .state
+
+      - name: Run rotation bot (capture summary)
+        id: runrot
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+
+          UNIVERSE: ${{ inputs.UNIVERSE || 'BTC/USD,ETH/USD,SOL/USD' }}
+          BUY_USD:  ${{ inputs.BUY_USD  || '25' }}
+          TP_PCT:   ${{ inputs.TP_PCT   || '5' }}
+          SL_PCT:   ${{ inputs.SL_PCT   || '2' }}
+          ROTATE:   ${{ inputs.ROTATE   || 'ON' }}
+          DRY_RUN:  ${{ inputs.DRY_RUN  || 'ON' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -u alpaca_crypto_rotation.py | tee /tmp/rot_log.txt
+
+          # If JSON missing (shouldn't be), create a fallback to satisfy artifact step
+          [ -s .state/run_summary.json ] || echo '{"note":"fallback"}' > .state/run_summary.json
+
+          echo "Files in .state:"
+          ls -la .state || true
+
+      - name: Upload .state (rotation)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpaca-rotation-state
+          path: |
+            .state/run_summary.json
+            .state/rotation_scores.csv
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
