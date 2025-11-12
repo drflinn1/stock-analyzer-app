@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-main.py — 1-Coin Rotation (immediate re-entry after sell) + LIVE Kraken signer
-- Re-buys immediately after a SELL in the same run (if candidate + quote ok)
-- WINDOW_MIN still applies when we didn't sell this run
-- Optional STOP/TRAIL handled safely even when blank
+main.py — 1-Coin Rotation with:
+- SELL first, then immediate same-run re-entry if possible
+- Flat cooldown override: if flat for >= COOLDOWN_MIN, allow BUY even if window not elapsed
+- Robust env parsing (STOP/TRAIL optional)
+- Kraken LIVE signer (uses KRAKEN_API_KEY/SECRET) when DRY_RUN=OFF
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from typing import Dict, Optional, Tuple, List
 
 import requests
 
-# ----- Local helpers from your repo
+# -------- Local helpers
 try:
     from trader.crypto_engine import (
         CANDIDATES_CSV,
@@ -28,7 +29,7 @@ except Exception as e:
     print(f"[FATAL] Could not import trader.crypto_engine: {e}", file=sys.stderr)
     sys.exit(1)
 
-# ---------- ENV helpers ----------
+# -------- ENV helpers
 def env(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return v if v is not None and str(v).strip() != "" else default
@@ -51,6 +52,7 @@ STOP_PCT = parse_float_env("STOP_PCT", None)
 TRAIL_START_PCT = parse_float_env("TRAIL_START_PCT", None)
 TRAIL_PCT = parse_float_env("TRAIL_PCT", None)
 WINDOW_MIN = int(parse_float_env("WINDOW_MIN", 30) or 30)
+COOLDOWN_MIN = int(parse_float_env("COOLDOWN_MIN", 10) or 10)  # <-- new override
 BUY_USD = float(parse_float_env("BUY_USD", 30.0) or 30.0)
 MAX_POSITIONS = int(parse_float_env("MAX_POSITIONS", 1) or 1)
 UNIVERSE_PICK = env("UNIVERSE_PICK", "AUTO").strip()
@@ -66,7 +68,7 @@ LAST_FLAG = STATE_DIR / "this.flag"
 
 API_BASE = "https://api.kraken.com/0"
 
-# ---------- Kraken signing ----------
+# -------- Kraken
 def kraken_time() -> float:
     try:
         r = requests.get(f"{API_BASE}/public/Time", timeout=10)
@@ -114,14 +116,13 @@ def place_market_order(pair: str, side: str, volume: float, dry_run: bool) -> Di
         })
         if resp.get("error"):
             return {"status": "error", "note": ",".join(resp["error"]), "raw": resp}
-        txid = ""
-        if isinstance(resp.get("result", {}).get("txid"), list) and resp["result"]["txid"]:
-            txid = resp["result"]["txid"][0]
+        txid_list = resp.get("result", {}).get("txid", [])
+        txid = txid_list[0] if isinstance(txid_list, list) and txid_list else ""
         return {"status": "ok", "txid": txid, "raw": resp}
     except Exception as e:
         return {"status": "error", "note": f"Kraken order exception: {e}"}
 
-# ---------- JSON state helpers ----------
+# -------- JSON helpers
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -144,29 +145,34 @@ def load_positions() -> Dict:
 def save_positions(positions: Dict) -> None:
     write_json(POSITIONS_JSON, positions)
 
-def pct_change(from_px: float, to_px: float) -> float:
-    if from_px <= 0:
+def pct_change(a: float, b: float) -> float:
+    if a <= 0:
         return 0.0
-    return (to_px - from_px) / from_px * 100.0
+    return (b - a) / a * 100.0
 
-# ---------- Core logic ----------
+# -------- Core logic
 def pick_target_symbol() -> Optional[str]:
+    print(f"[INFO] UNIVERSE_PICK={UNIVERSE_PICK}")
     if UNIVERSE_PICK.upper() == "AUTO":
-        cands: List[Dict] = load_candidates(CANDIDATES_CSV)  # pass Path
+        cands: List[Dict] = load_candidates(CANDIDATES_CSV)
+        print(f"[INFO] candidates_csv_exists={CANDIDATES_CSV.exists()} rows={len(cands) if cands else 0}")
         if not cands:
             print("[HOLD] No candidates available.")
             return None
         sym = cands[0].get("symbol") or cands[0].get("pair") or cands[0].get("Symbol")
+        print(f"[INFO] top candidate raw='{sym}'")
         if not sym:
             print("[HOLD] Candidate rows missing 'symbol' field.")
             return None
         sym = normalize_pair(sym)
         if "/" not in sym:
             sym = f"{sym}/{QUOTE_CCY}"
+        print(f"[INFO] target normalized='{sym}'")
         return sym
     pick = normalize_pair(UNIVERSE_PICK)
     if "/" not in pick:
         pick = f"{pick}/{QUOTE_CCY}"
+    print(f"[INFO] target explicit='{pick}'")
     return pick
 
 def get_quote_required(sym: str) -> Optional[float]:
@@ -174,10 +180,8 @@ def get_quote_required(sym: str) -> Optional[float]:
     if px is None or px <= 0:
         print(f"[HOLD] Invalid price for {sym}")
         return None
+    print(f"[INFO] quote {sym} ~ {px}")
     return px
-
-def can_open_new_position(positions: Dict) -> bool:
-    return len(positions.get("positions", [])) < MAX_POSITIONS
 
 def should_sell(entry_px: float, last_px: float, high_px: float | None = None) -> Tuple[bool, str]:
     if TP_PCT and pct_change(entry_px, last_px) >= TP_PCT:
@@ -189,16 +193,28 @@ def should_sell(entry_px: float, last_px: float, high_px: float | None = None) -
             return True, f"TRAIL hit (drop ≥ {TRAIL_PCT:.2f}% from high after +{TRAIL_START_PCT:.2f}%)"
     return False, "Hold"
 
-def rotation_window_ok() -> bool:
-    summary = read_json(SUMMARY_JSON, {})
-    t_str = summary.get("last_action_time")
-    if not t_str:
-        return True
+def last_action_age_min() -> Optional[float]:
+    s = read_json(SUMMARY_JSON, {})
+    ts = s.get("last_action_time")
+    if not ts:
+        return None
     try:
-        last_t = datetime.fromisoformat(t_str)
+        dt = datetime.fromisoformat(ts)
+        return (now_utc() - dt).total_seconds() / 60.0
     except Exception:
+        return None
+
+def rotation_window_ok() -> bool:
+    age = last_action_age_min()
+    if age is None:
         return True
-    return (now_utc() - last_t) >= timedelta(minutes=WINDOW_MIN)
+    return age >= WINDOW_MIN
+
+def cooldown_override_ok() -> bool:
+    age = last_action_age_min()
+    if age is None:
+        return True
+    return age >= COOLDOWN_MIN
 
 def mark_action_time() -> None:
     s = read_json(SUMMARY_JSON, {})
@@ -212,6 +228,7 @@ def market_buy(sym: str, usd_amount: float, dry: bool) -> Dict:
     vol = usd_amount / px
     if usd_amount < 10.0 or vol <= 0:
         return {"status": "error", "note": "Buy notional too small (min ~$10)"}
+    print(f"[TRADE] BUY attempt {sym} ${usd_amount} → vol≈{vol:.8f}")
     res = place_market_order(sym, "buy", vol, dry)
     return res | {"price": px, "volume": vol}
 
@@ -219,12 +236,13 @@ def market_sell(sym: str, qty: float, dry: bool) -> Dict:
     px = get_quote_required(sym)
     if px is None:
         return {"status": "error", "note": "No valid quote"}
+    print(f"[TRADE] SELL attempt {sym} qty={qty:.8f}")
     res = place_market_order(sym, "sell", qty, dry)
     return res | {"price": px}
 
 def main():
     print(f"=== Start 1-Coin Rotation (DRY_RUN={DRY_RUN}) ===")
-    print(f"TP={TP_PCT}%  STOP={STOP_PCT}%  TRAIL={TRAIL_PCT}%@{TRAIL_START_PCT}%  WINDOW_MIN={WINDOW_MIN}  BUY_USD={BUY_USD}")
+    print(f"TP={TP_PCT}%  STOP={STOP_PCT}%  TRAIL={TRAIL_PCT}%@{TRAIL_START_PCT}%  WINDOW_MIN={WINDOW_MIN}  COOLDOWN_MIN={COOLDOWN_MIN}  BUY_USD={BUY_USD}")
 
     pos_state = load_positions()
     positions = pos_state.get("positions", [])
@@ -257,50 +275,46 @@ def main():
                 else:
                     print(f"[ERROR] SELL failed: {resp}")
 
-    # ---- BUY (immediate re-entry allowed if sold this run) ----
+    # ---- BUY (immediate re-entry; else window/cooldown) ----
     holding_now = load_positions().get("positions", [])
-    if not holding_now and can_open_new_position({"positions": []}):
-        if sold_this_run or rotation_window_ok():
+    if not holding_now and (len(holding_now) < MAX_POSITIONS):
+        age = last_action_age_min()
+        print(f"[INFO] last_action_age_min={None if age is None else round(age,2)}")
+        allow_buy = sold_this_run or rotation_window_ok() or cooldown_override_ok()
+        print(f"[INFO] allow_buy={allow_buy} (sold_this_run={sold_this_run}, window_ok={rotation_window_ok()}, cooldown_ok={cooldown_override_ok()})")
+        if allow_buy:
             target = pick_target_symbol()
             if target:
-                px = get_quote_required(target)
-                if px:
-                    resp = market_buy(target, BUY_USD, DRY_RUN == "ON")
-                    if resp.get("status") in ("dry", "ok"):
-                        qty = resp.get("volume", BUY_USD / px)
-                        pos = {
-                            "symbol": target,
-                            "entry_price": px,
-                            "qty": qty,
-                            "entry_time": now_utc().isoformat(),
-                            "max_price": px,
-                        }
-                        save_positions({"positions": [pos]})
-                        mark_action_time()
-                        print(f"[TRADE] {'Re-entry: ' if sold_this_run else ''}BUY ok {target} qty={qty:.8f} @~{px}")
-                    else:
-                        print(f"[ERROR] BUY failed: {resp}")
+                resp = market_buy(target, BUY_USD, DRY_RUN == "ON")
+                if resp.get("status") in ("dry", "ok"):
+                    px = resp.get("price")
+                    qty = resp.get("volume", BUY_USD / (px or 1))
+                    pos = {"symbol": target, "entry_price": px, "qty": qty, "entry_time": now_utc().isoformat(), "max_price": px}
+                    save_positions({"positions": [pos]})
+                    mark_action_time()
+                    print(f"[TRADE] {'Re-entry: ' if sold_this_run else ''}BUY ok {target} qty={qty:.8f} @~{px}")
                 else:
-                    print(f"[HOLD] No valid quote for {target}; cannot buy.")
+                    print(f"[ERROR] BUY failed: {resp}")
             else:
                 print("[HOLD] No target symbol resolved.")
         else:
-            print(f"[HOLD] Rotation window active ({WINDOW_MIN}m); not opening new position yet.")
+            print(f"[HOLD] Not buying yet (window/cooldown). WINDOW_MIN={WINDOW_MIN} COOLDOWN_MIN={COOLDOWN_MIN}")
     else:
         if holding_now:
-            print("[STATE] Already holding a position; no new BUY.")
+            print("[STATE] Already holding; no new BUY.")
         else:
             print("[HOLD] Max positions reached; no new BUY.")
 
-    # ---- Summary ----
+    # ---- Summary
     out = {
-        "time_utc": now_utc().isoformat(),
+        "time_utc": datetime.now(timezone.utc).isoformat(),
         "dry_run": DRY_RUN,
         "tp_pct": TP_PCT,
         "stop_pct": STOP_PCT,
         "trail_start_pct": TRAIL_START_PCT,
         "trail_pct": TRAIL_PCT,
         "window_min": WINDOW_MIN,
+        "cooldown_min": COOLDOWN_MIN,
         "buy_usd": BUY_USD,
         "universe_pick": UNIVERSE_PICK,
         "quote_ccy": QUOTE_CCY,
