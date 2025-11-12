@@ -74,15 +74,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Run and tee output to a temp log
           python -u alpaca_crypto_paper.py | tee /tmp/bot_log.txt
 
           echo "Post-run file check:"
           pwd
           ls -la .state || true
 
-          # If Python didn't write the summary, extract it from the log reliably.
-          if [ ! -f .state/run_summary.json ] || [ ! -s .state/run_summary.json ]; then
+          # If script didn't write JSON, extract it from the log:
+          if [ ! -s .state/run_summary.json ]; then
             echo "No run_summary.json written by script — extracting from log…"
             awk '
               $0 ~ /^=== Alpaca Crypto Paper — Summary ===/ {capture=1; next}
@@ -90,7 +89,7 @@ jobs:
             ' /tmp/bot_log.txt > .state/run_summary.json || true
           fi
 
-          # If still missing, write a minimal fallback so the artifact step always has a file
+          # Minimal fallback to guarantee a file exists:
           if [ ! -s .state/run_summary.json ]; then
             echo '{"note":"fallback summary (script did not emit JSON)","ts":'$(date +%s)'}' > .state/run_summary.json
           fi
@@ -100,7 +99,7 @@ jobs:
           echo "Summary preview:"
           head -n 50 .state/run_summary.json || true
 
-      - name: Upload .state summary (guaranteed)
+      - name: Upload .state summary (hidden files allowed)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -109,5 +108,6 @@ jobs:
             .state/run_summary.json
             .state/*.csv
             .state/*.txt
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
