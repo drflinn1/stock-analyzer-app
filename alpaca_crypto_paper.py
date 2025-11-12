@@ -108,7 +108,8 @@ def main() -> int:
         return 1
 
     action = "HOLD"
-    order_id = None
+    order_id = None  # keep as str or None
+
     note = ""
 
     def place_market(side: OrderSide, notional_usd: Optional[float]=None, qty: Optional[float]=None):
@@ -132,7 +133,8 @@ def main() -> int:
         while True:
             try:
                 o = trading.submit_order(order_data=mo)
-                order_id = o.id
+                # Cast UUID to string so JSON serialization never fails
+                order_id = str(o.id) if getattr(o, "id", None) is not None else None
                 break
             except APIError as e:
                 retry += 1
@@ -193,7 +195,7 @@ def main() -> int:
                 note = f"SELL failed: {e}"
                 print(f"ERROR: {note}")
 
-    # Summary
+    # Prepare JSON-safe summary (ensure order_id is a string)
     summary = {
         "symbol": symbol,
         "mid_price": mid_price,
@@ -203,10 +205,11 @@ def main() -> int:
         "buy_usd": buy_usd,
         "dry_run": dry_run,
         "action": action,
-        "order_id": order_id,
+        "order_id": str(order_id) if order_id is not None else None,
         "note": note,
         "ts": int(time.time()),
     }
+
     print("\n=== Alpaca Crypto Paper — Summary ===")
     print(json.dumps(summary, indent=2, sort_keys=True))
 
