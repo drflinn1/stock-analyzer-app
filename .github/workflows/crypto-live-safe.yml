@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Ensure .state exists (and seed artifact file)
+      - name: Ensure .state exists (seed a file so artifact is never empty)
         run: |
           mkdir -p .state
           echo "ok $(date -u +'%Y-%m-%dT%H:%M:%SZ')" > .state/_keep.txt
@@ -39,28 +39,37 @@ jobs:
             pip install requests pandas numpy pyyaml matplotlib
           fi
 
-      - name: Echo env
+      - name: Echo env (raw; defaults handled in script)
         run: |
-          echo "DRY_RUN=${{ vars.DRY_RUN:-ON }}  BUY_USD=${{ vars.BUY_USD }}  TP=${{ vars.TP_PCT }}  STOP=${{ vars.SL_PCT }}"
-          echo "ROTATE=${{ vars.ROTATE_WHEN_FULL }}  PICK='${{ vars.UNIVERSE_PICK }}'"
+          echo "DRY_RUN=${{ vars.DRY_RUN }}"
+          echo "BUY_USD=${{ vars.BUY_USD }}"
+          echo "MIN_BUY_USD=${{ vars.MIN_BUY_USD }}"
+          echo "MAX_POSITIONS=${{ vars.MAX_POSITIONS }}"
+          echo "UNIVERSE_PICK='${{ vars.UNIVERSE_PICK }}'"
+          echo "TP_PCT=${{ vars.TP_PCT }}"
+          echo "SL_PCT=${{ vars.SL_PCT }}"
+          echo "TRAIL_PCT=${{ vars.TRAIL_PCT }}"
+          echo "WINDOW_MIN=${{ vars.WINDOW_MIN }}"
 
       - name: Run bot (single-file)
         env:
+          # Secrets
           KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          DRY_RUN:           ${{ vars.DRY_RUN }}
-          BUY_USD:           ${{ vars.BUY_USD }}
-          MIN_BUY_USD:       ${{ vars.MIN_BUY_USD }}
-          MAX_POSITIONS:     ${{ vars.MAX_POSITIONS }}
-          UNIVERSE_PICK:     ${{ vars.UNIVERSE_PICK }}
-          TP_PCT:            ${{ vars.TP_PCT }}
-          SL_PCT:            ${{ vars.SL_PCT }}
-          TRAIL_PCT:         ${{ vars.TRAIL_PCT }}
-          WINDOW_MIN:        ${{ vars.WINDOW_MIN }}
+          # Vars (may be empty; crypto_live_safe.py applies sane defaults)
+          DRY_RUN:       ${{ vars.DRY_RUN }}
+          BUY_USD:       ${{ vars.BUY_USD }}
+          MIN_BUY_USD:   ${{ vars.MIN_BUY_USD }}
+          MAX_POSITIONS: ${{ vars.MAX_POSITIONS }}
+          UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK }}
+          TP_PCT:        ${{ vars.TP_PCT }}
+          SL_PCT:        ${{ vars.SL_PCT }}
+          TRAIL_PCT:     ${{ vars.TRAIL_PCT }}
+          WINDOW_MIN:    ${{ vars.WINDOW_MIN }}
         run: |
           set -e
           python -u crypto_live_safe.py
-          # Guarantee a summary exists even if script didn’t create one
+          # Ensure a summary exists for the artifact
           [ -f .state/run_summary.json ] || echo '{"result":"ok"}' > .state/run_summary.json
 
       - name: Show state
@@ -79,7 +88,7 @@ jobs:
         with:
           name: crypto-live-state_${{ github.run_number }}
           path: .state
-          if-no-files-found: ignore     # suppresses the yellow warning
+          if-no-files-found: ignore
           retention-days: 7
 
       - name: Done
