@@ -1,16 +1,22 @@
 name: Momentum — Spike Scan (Real)
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "30 * * * *"   # every hour on the half-hour
+    - cron: "*/30 * * * *"   # every 30 minutes
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: momentum-spike-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,33 +28,55 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt || true
-          pip install pandas requests pyyaml matplotlib
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas requests pyyaml matplotlib
+          fi
+
+      - name: Ensure .state exists
+        run: mkdir -p .state
 
       # Uses your existing real spike scanner
       - name: Run real spike scanner
-        run: python tools/momentum_spike.py
+        run: |
+          python tools/momentum_spike.py
 
       - name: Normalize & add schema columns
-        run: python tools/csv_schema_fix.py .state/spike_candidates.csv
+        run: |
+          python tools/csv_schema_fix.py .state/spike_candidates.csv
 
-      - name: Echo top 5 picks
+      - name: Echo top 5 spikes
         run: |
           python - <<'PY'
           import pandas as pd
           try:
               df = pd.read_csv(".state/spike_candidates_fixed.csv")
-              print("\\n=== Spike top 5 ===")
+              print("\n=== Spike top 5 ===")
               print(df.head(5).to_string(index=False))
           except Exception as e:
               print("No spike_candidates_fixed.csv yet:", e)
           PY
 
-      - name: Zip and upload CSV artifacts
+      - name: Commit & push updated .state (optional)
+        run: |
+          set -e
+          git config --global user.email "bot@users.noreply.github.com"
+          git config --global user.name  "bot"
+          git add .state/*.csv || true
+          if git commit -m "bot: update .state (spike candidates)" ; then
+            git push
+          else
+            echo "Nothing to commit."
+          fi
+
+      - name: Upload spike CSV artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: spike_scan_outputs
+          name: spike-scan-${{ github.run_id }}
           path: |
             .state/spike_candidates.csv
             .state/spike_candidates_fixed.csv
+          if-no-files-found: warn
           retention-days: 14
