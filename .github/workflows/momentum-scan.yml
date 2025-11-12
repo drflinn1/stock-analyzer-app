@@ -1,21 +1,18 @@
-name: Momentum — Scan (USD-only, commits .state)
+name: Momentum — Scan
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes
+    # Runs every hour at :05 (adjust as you like)
+    - cron: "5 * * * *"
   workflow_dispatch:
 
+# Only what we need
 permissions:
-  contents: write
-
-concurrency:
-  group: momentum-scan-${{ github.ref }}
-  cancel-in-progress: true
+  contents: read
 
 jobs:
-  scan:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -26,59 +23,59 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps (lightweight fallback if no requirements.txt)
         run: |
-          python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install pandas requests pyyaml matplotlib
+            pip install --upgrade pip
+            pip install requests pandas
           fi
 
       - name: Ensure .state exists
         run: mkdir -p .state
 
-      # Your real scanner that writes .state/momentum_candidates.csv (USD pairs)
-      - name: Run momentum scan (USD-only)
+      - name: Echo env (debug)
         run: |
-          python tools/momentum_scan.py
+          echo "Branch: $GITHUB_REF_NAME"
+          echo "Repo : $GITHUB_REPOSITORY"
+          echo "Runner: $RUNNER_OS"
 
-      # Standardize schema so the rotation bot always has the columns it needs
-      - name: Normalize & add schema columns
+      - name: Run momentum scan (local)
+        # Keep this command identical to your repo’s scan script if different
         run: |
-          python tools/csv_schema_fix.py .state/momentum_candidates.csv
+          python -u trader/momentum_scan.py
 
-      - name: Echo top 10
+      - name: Show state after run (glob)
         run: |
-          python - <<'PY'
-          import pandas as pd
-          try:
-              df = pd.read_csv(".state/momentum_candidates_fixed.csv")
-              print(df.head(10).to_string(index=False))
-          except Exception as e:
-              print("No momentum_candidates_fixed.csv yet:", e)
-          PY
+          echo "=== .state contents ==="
+          ls -la .state || true
+          echo "=== root CSVs (if any) ==="
+          ls -la *.csv 2>/dev/null || true
 
-      # Commit the refreshed CSVs so rotation sees them on the next run
-      - name: Commit & push updated .state
+      - name: Echo upload manifest
+        shell: bash
         run: |
-          set -e
-          git config --global user.email "bot@users.noreply.github.com"
-          git config --global user.name  "bot"
-          git add .state/*.csv || true
-          if git commit -m "bot: update .state (candidates)" ; then
-            git push
-          else
-            echo "Nothing to commit."
+          shopt -s globstar nullglob dotglob
+          echo "Files that will be uploaded as artifacts:"
+          found=0
+          for f in .state/**; do
+            if [ -f "$f" ]; then
+              echo " - $f"
+              found=1
+            fi
+          done
+          if [ $found -eq 0 ]; then
+            echo " (none found; proceeding without warning)"
           fi
 
-      # Reliable artifact upload (no warnings)
-      - name: Upload CSV artifacts
+      - name: Upload .state artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: momentum-scan-${{ github.run_id }}
+          name: state-${{ github.run_id }}
           path: |
-            .state/momentum_candidates.csv
-            .state/momentum_candidates_fixed.csv
-          if-no-files-found: warn
-          retention-days: 14
+            .state/**
+          if-no-files-found: ignore     # <- removes the yellow warning
+          include-hidden-files: true
+          compression-level: 6
+          retention-days: 7
