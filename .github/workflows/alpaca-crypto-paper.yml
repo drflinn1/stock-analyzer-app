@@ -48,7 +48,6 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
-          # Ensure modern Alpaca SDK regardless of requirements.txt
           pip install -U "alpaca-py>=0.31.0"
 
       - name: Echo critical env/vars
@@ -59,17 +58,13 @@ jobs:
           echo "SL_PCT='${{ inputs.SL_PCT || '2' }}'"
           echo "DRY_RUN='${{ inputs.DRY_RUN || 'ON' }}'"
 
-      # ✅ Permanent fix: make sure .state exists before running
       - name: Ensure .state directory exists
         run: mkdir -p .state
 
       - name: Run bot
         env:
-          # Paper secrets
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
-
-          # Inputs → env for schedule/dispatch
           SYMBOL:   ${{ inputs.SYMBOL || 'BTC/USD' }}
           BUY_USD:  ${{ inputs.BUY_USD || '25' }}
           TP_PCT:   ${{ inputs.TP_PCT  || '5' }}
@@ -78,17 +73,19 @@ jobs:
         run: |
           python -u alpaca_crypto_paper.py
           echo "Post-run file check:"
-          ls -la .state || true
-          [ -f .state/run_summary.json ] && echo "STATE OK" || echo "STATE MISSING"
+          echo "PWD=$(pwd)"
+          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
+          ls -la "${GITHUB_WORKSPACE}/.state" || true
+          [ -f "${GITHUB_WORKSPACE}/.state/run_summary.json" ] && echo "STATE OK" || echo "STATE MISSING"
 
-      - name: Upload .state summary
+      - name: Upload .state summary (absolute paths)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: alpaca-paper-state
           path: |
-            .state/run_summary.json
-            .state/*.csv
-            .state/*.txt
+            ${{ github.workspace }}/.state/run_summary.json
+            ${{ github.workspace }}/.state/*.csv
+            ${{ github.workspace }}/.state/*.txt
           if-no-files-found: warn
           retention-days: 7
