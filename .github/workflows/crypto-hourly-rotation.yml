@@ -2,32 +2,26 @@ name: Crypto — 1-Coin Rotation (15m, TP 8%)
 
 on:
   schedule:
-    # Every 15 minutes (more frequent so you don't wait long)
     - cron: "*/15 * * * *"
   workflow_dispatch:
 
 permissions:
-  contents: read
-
-# Prevent overlapping runs if a previous job is still working
-concurrency:
-  group: crypto-rotation
-  cancel-in-progress: false
-
-# Defaults (override in Repo → Settings → Variables)
-env:
-  DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}           # Set DRY_RUN=OFF for live
-  TP_PCT: ${{ vars.TP_PCT || '8' }}              # Take-profit %
-  WINDOW_MIN: ${{ vars.WINDOW_MIN || '30' }}     # Rotation window minutes
-  BUY_USD: ${{ vars.BUY_USD || '30' }}           # Per-buy notional
-  MAX_POSITIONS: ${{ vars.MAX_POSITIONS || '1' }}
-  UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK || '' }}
-  QUOTE_CCY: ${{ vars.QUOTE_CCY || 'USD' }}
+  contents: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
+
+    env:
+      # ---- defaults (UI can override with Variables/Secrets) ----
+      DRY_RUN: "${{ vars.DRY_RUN || 'OFF' }}"
+      BUY_USD: "${{ vars.BUY_USD || '30' }}"
+      TP_PCT:  "${{ vars.TP_PCT  || '8'  }}"
+      STOP_PCT: "${{ vars.STOP_PCT || '4' }}"
+      WINDOW_MIN: "${{ vars.WINDOW_MIN || '15' }}"
+      ROTATE_WHEN_FULL: "${{ vars.ROTATE_WHEN_FULL || 'true' }}"
+      UNIVERSE_PICK: "${{ vars.UNIVERSE_PICK || '' }}"
 
     steps:
       - name: Checkout
@@ -38,15 +32,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install deps (lightweight fallback if no requirements.txt)
         run: |
-          set -e
-          if [ -f requirements.txt ]; then
-            python -m pip install --upgrade pip
+          if [[ -f requirements.txt ]]; then
+            python -m pip install -U pip
             pip install -r requirements.txt
           else
-            python -m pip install --upgrade pip
-            pip install requests pandas pyyaml matplotlib
+            pip install requests
           fi
 
       - name: Ensure .state exists
@@ -54,53 +46,74 @@ jobs:
 
       - name: Echo critical env/vars
         run: |
-          echo "DRY_RUN       = ${DRY_RUN}"
-          echo "TP_PCT        = ${TP_PCT}"
-          echo "WINDOW_MIN    = ${WINDOW_MIN}"
-          echo "BUY_USD       = ${BUY_USD}"
-          echo "MAX_POSITIONS = ${MAX_POSITIONS}"
-          echo "UNIVERSE_PICK = '${UNIVERSE_PICK}'"
-          echo "QUOTE_CCY     = ${QUOTE_CCY}"
+          echo "DRY_RUN   = $DRY_RUN"
+          echo "BUY_USD   = $BUY_USD"
+          echo "TP_PCT    = $TP_PCT"
+          echo "STOP_PCT  = $STOP_PCT"
+          echo "WINDOW_MIN= $WINDOW_MIN"
+          echo "ROTATE_WHEN_FULL = $ROTATE_WHEN_FULL"
+          echo "UNIVERSE_PICK    = '${UNIVERSE_PICK}'"
 
-      - name: Echo times (UTC vs local)
+      # NEW: soft backstop — if candidates are missing or empty, refresh them.
+      - name: Ensure candidates (quick refresh if missing/empty)
         run: |
-          echo "Now (UTC):   $(date -u)"
-          echo "Now (local): $(date)"
-
-      - name: Run rotation bot
-        env:
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-        run: |
-          python -u main.py
-
-      - name: Show .state after run
-        run: |
-          echo "=== .state contents ==="
-          ls -la .state || true
-
-      - name: Echo upload manifest
-        shell: bash
-        run: |
-          shopt -s globstar nullglob dotglob
-          echo "Files that will be uploaded as artifacts:"
-          found=0
-          for f in .state/**; do
-            if [ -f "$f" ]; then
-              echo " - $f"
-              found=1
-            fi
-          done
-          if [ $found -eq 0 ]; then
-            echo " (none found; proceeding without warning)"
+          need=0
+          if [[ ! -s ".state/momentum_candidates.csv" ]]; then
+            need=1
+          else
+            # make sure it has at least one non-header line
+            lines=$(wc -l < .state/momentum_candidates.csv || echo 0)
+            [[ "$lines" -lt 2 ]] && need=1 || true
           fi
 
-      - name: Upload .state artifacts
+          if [[ "$need" -eq 1 ]]; then
+            echo "[INFO] candidates missing/empty → refreshing via trader/momentum_scan.py"
+            python -u trader/momentum_scan.py || echo "[WARN] refresh failed; proceeding anyway (bot will HOLD on quote miss)."
+          else
+            echo "[INFO] candidates present."
+          fi
+
+      # OLD step used to bail – replaced by a soft log-only check.
+      - name: Soft check (log-only)
+        run: |
+          if [[ ! -s ".state/momentum_candidates.csv" ]]; then
+            echo "[WARN] No candidates available. main.py will decide to HOLD."
+          fi
+
+      - name: Show state pre-run (glob)
+        run: |
+          echo "---- .state contents ----"
+          ls -alh .state || true
+
+      - name: Run bot
+        env:
+          # pass through secrets if your main.py uses them
+          KRAKEN_KEY: ${{ secrets.KRAKEN_KEY }}
+          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET }}
+        run: |
+          set -e
+          python -u main.py
+
+      - name: Show state after run (glob)
+        if: always()
+        run: |
+          echo "---- .state contents ----"
+          ls -alh .state || true
+
+      - name: Upload .state manifest
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: state-${{ github.run_id }}
-          path: .state/**
-          include-hidden-files: true
-          if-no-files-found: ignore
-          compression-level: 6
-          retention-days: 7
+          name: rotation_state_${{ github.run_id }}
+          path: |
+            .state/**/*
+            !.state/*.lock
+
+      - name: Post Set up Python
+        if: always()
+        run: echo " "
+
+      - name: Post Checkout
+        if: always()
+        run: echo " "
+
