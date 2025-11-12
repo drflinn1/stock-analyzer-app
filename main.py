@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-main.py — 1-Coin Rotation with:
+main.py — 1-Coin Rotation
 - SELL first, then immediate same-run re-entry if possible
-- Flat cooldown override: if flat for >= COOLDOWN_MIN, allow BUY even if window not elapsed
-- Robust env parsing (STOP/TRAIL optional)
-- Kraken LIVE signer (uses KRAKEN_API_KEY/SECRET) when DRY_RUN=OFF
+- Flat cooldown override (COOLDOWN_MIN)
+- Robust pair normalization (handles 'LSK/USD' vs 'LSKUSD')
+- Kraken LIVE signer when DRY_RUN=OFF
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Dict, Optional, Tuple, List
 
 import requests
 
-# -------- Local helpers
+# ----- Repo helpers
 try:
     from trader.crypto_engine import (
         CANDIDATES_CSV,
@@ -29,7 +29,7 @@ except Exception as e:
     print(f"[FATAL] Could not import trader.crypto_engine: {e}", file=sys.stderr)
     sys.exit(1)
 
-# -------- ENV helpers
+# ---------- ENV helpers ----------
 def env(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return v if v is not None and str(v).strip() != "" else default
@@ -52,7 +52,7 @@ STOP_PCT = parse_float_env("STOP_PCT", None)
 TRAIL_START_PCT = parse_float_env("TRAIL_START_PCT", None)
 TRAIL_PCT = parse_float_env("TRAIL_PCT", None)
 WINDOW_MIN = int(parse_float_env("WINDOW_MIN", 30) or 30)
-COOLDOWN_MIN = int(parse_float_env("COOLDOWN_MIN", 10) or 10)  # <-- new override
+COOLDOWN_MIN = int(parse_float_env("COOLDOWN_MIN", 10) or 10)
 BUY_USD = float(parse_float_env("BUY_USD", 30.0) or 30.0)
 MAX_POSITIONS = int(parse_float_env("MAX_POSITIONS", 1) or 1)
 UNIVERSE_PICK = env("UNIVERSE_PICK", "AUTO").strip()
@@ -68,7 +68,7 @@ LAST_FLAG = STATE_DIR / "this.flag"
 
 API_BASE = "https://api.kraken.com/0"
 
-# -------- Kraken
+# ---------- Kraken signing ----------
 def kraken_time() -> float:
     try:
         r = requests.get(f"{API_BASE}/public/Time", timeout=10)
@@ -122,7 +122,7 @@ def place_market_order(pair: str, side: str, volume: float, dry_run: bool) -> Di
     except Exception as e:
         return {"status": "error", "note": f"Kraken order exception: {e}"}
 
-# -------- JSON helpers
+# ---------- JSON helpers ----------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -150,7 +150,27 @@ def pct_change(a: float, b: float) -> float:
         return 0.0
     return (b - a) / a * 100.0
 
-# -------- Core logic
+# ---------- Pair helpers (fix) ----------
+def ensure_slash_pair(s: str, quote: str) -> str:
+    """Ensure 'BASE/QUOTE' format given a string that might be 'BASEQUOTE'."""
+    if "/" in s:
+        return s
+    if s.upper().endswith(quote):
+        base = s[: -len(quote)]
+        return f"{base}/{quote}"
+    return f"{s}/{quote}"
+
+def quote_forms(sym: str, quote: str) -> List[str]:
+    """
+    Return possible representations the quote fetcher might accept.
+    e.g. 'LSK/USD' → ['LSK/USD','LSKUSD']
+         'LSKUSD'  → ['LSK/USD','LSKUSD']
+    """
+    with_slash = ensure_slash_pair(sym, quote)
+    no_slash = with_slash.replace("/", "")
+    return [with_slash, no_slash]
+
+# ---------- Core logic ----------
 def pick_target_symbol() -> Optional[str]:
     print(f"[INFO] UNIVERSE_PICK={UNIVERSE_PICK}")
     if UNIVERSE_PICK.upper() == "AUTO":
@@ -159,29 +179,32 @@ def pick_target_symbol() -> Optional[str]:
         if not cands:
             print("[HOLD] No candidates available.")
             return None
-        sym = cands[0].get("symbol") or cands[0].get("pair") or cands[0].get("Symbol")
-        print(f"[INFO] top candidate raw='{sym}'")
-        if not sym:
+        raw = cands[0].get("symbol") or cands[0].get("pair") or cands[0].get("Symbol")
+        print(f"[INFO] top candidate raw='{raw}'")
+        if not raw:
             print("[HOLD] Candidate rows missing 'symbol' field.")
             return None
-        sym = normalize_pair(sym)
-        if "/" not in sym:
-            sym = f"{sym}/{QUOTE_CCY}"
-        print(f"[INFO] target normalized='{sym}'")
-        return sym
-    pick = normalize_pair(UNIVERSE_PICK)
-    if "/" not in pick:
-        pick = f"{pick}/{QUOTE_CCY}"
-    print(f"[INFO] target explicit='{pick}'")
-    return pick
+        norm = normalize_pair(raw)  # may return Kraken style (no slash)
+        target = ensure_slash_pair(norm, QUOTE_CCY)
+        print(f"[INFO] target normalized='{target}'")
+        return target
+    # explicit pick
+    norm = normalize_pair(UNIVERSE_PICK)
+    target = ensure_slash_pair(norm, QUOTE_CCY)
+    print(f"[INFO] target explicit='{target}'")
+    return target
 
 def get_quote_required(sym: str) -> Optional[float]:
-    px = get_public_quote(sym)
-    if px is None or px <= 0:
-        print(f"[HOLD] Invalid price for {sym}")
-        return None
-    print(f"[INFO] quote {sym} ~ {px}")
-    return px
+    # Try multiple forms until one returns a valid price
+    for form in quote_forms(sym, QUOTE_CCY):
+        px = get_public_quote(form)
+        if px is not None and px > 0:
+            print(f"[INFO] quote {form} ~ {px}")
+            return px
+        else:
+            print(f"[INFO] quote miss for {form}")
+    print(f"[HOLD] Invalid price for {sym}")
+    return None
 
 def should_sell(entry_px: float, last_px: float, high_px: float | None = None) -> Tuple[bool, str]:
     if TP_PCT and pct_change(entry_px, last_px) >= TP_PCT:
@@ -240,6 +263,7 @@ def market_sell(sym: str, qty: float, dry: bool) -> Dict:
     res = place_market_order(sym, "sell", qty, dry)
     return res | {"price": px}
 
+# ---------- Main ----------
 def main():
     print(f"=== Start 1-Coin Rotation (DRY_RUN={DRY_RUN}) ===")
     print(f"TP={TP_PCT}%  STOP={STOP_PCT}%  TRAIL={TRAIL_PCT}%@{TRAIL_START_PCT}%  WINDOW_MIN={WINDOW_MIN}  COOLDOWN_MIN={COOLDOWN_MIN}  BUY_USD={BUY_USD}")
@@ -250,7 +274,7 @@ def main():
 
     sold_this_run = False
 
-    # ---- SELL FIRST ----
+    # SELL FIRST
     if pos:
         sym = pos["symbol"]
         entry_px = float(pos["entry_price"])
@@ -275,7 +299,7 @@ def main():
                 else:
                     print(f"[ERROR] SELL failed: {resp}")
 
-    # ---- BUY (immediate re-entry; else window/cooldown) ----
+    # BUY (same-run re-entry; else window/cooldown)
     holding_now = load_positions().get("positions", [])
     if not holding_now and (len(holding_now) < MAX_POSITIONS):
         age = last_action_age_min()
@@ -305,7 +329,7 @@ def main():
         else:
             print("[HOLD] Max positions reached; no new BUY.")
 
-    # ---- Summary
+    # Summary
     out = {
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "dry_run": DRY_RUN,
