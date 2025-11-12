@@ -41,10 +41,9 @@ jobs:
   paper_crypto:
     runs-on: ubuntu-latest
     env:
-      # Use YOUR existing secret names (Paper keys)
+      # your secret names (Paper keys)
       APCA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY }}
       APCA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET }}
-      # Prefer your ALPACA_BASE_URL if present; otherwise default to paper
       APCA_API_BASE: ${{ secrets.ALPACA_BASE_URL }}
       APCA_DATA_BASE: https://data.alpaca.markets
     steps:
@@ -59,7 +58,6 @@ jobs:
           pip install requests matplotlib
 
       - name: Normalize base URL (fallback to paper if empty)
-        id: norm
         run: |
           if [ -z "${APCA_API_BASE}" ]; then
             echo "APCA_API_BASE=https://paper-api.alpaca.markets" >> $GITHUB_ENV
@@ -107,7 +105,7 @@ jobs:
           PY
         continue-on-error: true
 
-      - name: Run bot and capture state
+      - name: Run bot and capture state (with order audit)
         id: runbot
         if: always()
         env:
@@ -128,9 +126,8 @@ jobs:
           import requests
           import matplotlib.pyplot as plt
 
-          def write_summary(d, fname="run_summary.json"):
-            open(fname,"w").write(json.dumps(d, indent=2))
-            print(json.dumps(d, indent=2))
+          def write_json(p, obj):
+            open(p,"w").write(json.dumps(obj, indent=2))
 
           # Stop early if auth failed
           try:
@@ -138,10 +135,10 @@ jobs:
           except Exception:
             pf = {"ok": True}
           if not pf.get("ok", True):
-            write_summary({
+            write_json("run_summary.json", {
               "action": "ERROR",
               "dry_run": True,
-              "note": "Alpaca auth failed. Ensure repo secrets ALPACA_API_KEY / ALPACA_API_SECRET are your PAPER keys.",
+              "note": "Alpaca auth failed. Ensure repo secrets ALPACA_API_KEY / ALPACA_API_SECRET are PAPER keys.",
               "preflight": pf
             })
             raise SystemExit(1)
@@ -183,6 +180,23 @@ jobs:
           def place_sell_all(symbol, qty):
             return post(f"{API}/v2/orders", {"symbol":symbol,"side":"sell","type":"market","time_in_force":"gtc","qty":str(qty)})
 
+          # helper to audit any order id
+          def audit_order(order_id):
+            try:
+              od = get(f"{API}/v2/orders/{order_id}")
+              write_json("last_order_detail.json", od)
+              return od
+            except Exception as e:
+              write_json("last_order_detail.json", {"error": str(e)})
+              return None
+
+          # dump last 20 orders (all statuses)
+          try:
+            dump = get(f"{API}/v2/orders", status="all", direction="desc", limit=20)
+            write_json("orders_dump.json", dump)
+          except Exception as e:
+            write_json("orders_dump.json", {"error": str(e)})
+
           pos = latest_position(S)
           action, order_id, note, mid = None, None, "", None
 
@@ -193,7 +207,11 @@ jobs:
             else:
               try:
                 od = place_buy_notional(S, BUY_USD)
-                order_id = od.get("id"); note = f"Entered {S} with ${BUY_USD:.2f} notional."
+                order_id = od.get("id")
+                # brief wait then audit the created order
+                time.sleep(2)
+                audit_order(order_id)
+                note = f"Entered {S} with ${BUY_USD:.2f} notional."
               except Exception as e:
                 note = f"BUY failed: {e}"
           else:
@@ -224,13 +242,17 @@ jobs:
               else:
                 try:
                   od = place_sell_all(S, qty)
-                  order_id = od.get("id"); note=f"Sold {qty} {S} — {sell_reason}."
+                  order_id = od.get("id")
+                  time.sleep(2)
+                  audit_order(order_id)
+                  note=f"Sold {qty} {S} — {sell_reason}."
                 except Exception as e:
                   note=f"SELL failed: {e}"
             else:
               action="HOLD"; note=f"Holding {S}. PnL {upnl_pct:.2f}%."
             mid = cur
 
+          # basic KPI artifacts
           kpi = {"tp_pct":TP_PCT,"sl_pct":SL_PCT,"early_drop_pct":E_DROP,"early_window_min":E_MIN}
           if pos:
             kpi.update({
@@ -241,21 +263,21 @@ jobs:
               "unrealized_plpc_pct": float(pos.get("unrealized_plpc", 0.0))*100.0,
             })
           try:
+            import matplotlib.pyplot as plt
             plt.figure(figsize=(4,3), dpi=200)
             plt.bar(["PnL %"], [kpi.get("unrealized_plpc_pct",0.0)])
             plt.axhline(0, linewidth=1); plt.title(f"{S} P&L% (now)"); plt.ylabel("%"); plt.tight_layout()
             plt.savefig("kpi_chart.png")
           except Exception: pass
 
-          open("position_snapshot.json","w").write(json.dumps(pos or {}, indent=2))
-          open("kpi_snapshot.json","w").write(json.dumps(kpi, indent=2))
-
+          write_json("position_snapshot.json", pos or {})
+          write_json("kpi_snapshot.json", kpi)
           run_summary = {
             "ts": int(time.time()), "symbol": S, "action": action, "dry_run": DRY,
             "buy_usd": BUY_USD, "tp_pct": TP_PCT, "sl_pct": SL_PCT,
             "order_id": order_id, "position_present": pos is not None, "mid_price": mid, "note": note
           }
-          write_summary(run_summary)
+          write_json("run_summary.json", run_summary)
           PY
 
       - name: Upload state summary (artifacts)
@@ -269,4 +291,6 @@ jobs:
             position_snapshot.json
             kpi_snapshot.json
             kpi_chart.png
+            orders_dump.json
+            last_order_detail.json
           if-no-files-found: warn
