@@ -1,0 +1,82 @@
+name: Alpaca — Crypto Paper (single-file)
+
+on:
+  workflow_dispatch:
+    inputs:
+      SYMBOL:
+        description: "Trading pair (e.g., BTC/USD, SOL/USD)"
+        required: true
+        default: "BTC/USD"
+      BUY_USD:
+        description: "USD notional to buy when flat"
+        required: true
+        default: "25"
+      TP_PCT:
+        description: "Take-profit %"
+        required: true
+        default: "5"
+      SL_PCT:
+        description: "Stop-loss %"
+        required: true
+        default: "2"
+      DRY_RUN:
+        description: "ON to simulate orders; OFF to place real PAPER orders"
+        required: true
+        default: "OFF"
+  schedule:
+    - cron: "*/30 * * * *"  # every 30 minutes
+
+jobs:
+  paper_crypto:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install "alpaca-py>=0.31.0"
+          fi
+
+      - name: Echo critical env/vars
+        run: |
+          echo "SYMBOL='${{ inputs.SYMBOL || 'BTC/USD' }}'"
+          echo "BUY_USD='${{ inputs.BUY_USD || '25' }}'"
+          echo "TP_PCT='${{ inputs.TP_PCT || '5' }}'"
+          echo "SL_PCT='${{ inputs.SL_PCT || '2' }}'"
+          echo "DRY_RUN='${{ inputs.DRY_RUN || 'OFF' }}'"
+
+      - name: Run bot
+        env:
+          # Secrets you must add in your repo settings
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+
+          # Inputs → env fallbacks for schedule runs
+          SYMBOL:   ${{ inputs.SYMBOL || 'BTC/USD' }}
+          BUY_USD:  ${{ inputs.BUY_USD || '25' }}
+          TP_PCT:   ${{ inputs.TP_PCT  || '5' }}
+          SL_PCT:   ${{ inputs.SL_PCT  || '2' }}
+          DRY_RUN:  ${{ inputs.DRY_RUN || 'OFF' }}
+        run: |
+          python -u alpaca_crypto_paper.py
+
+      - name: Upload .state summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpaca-paper-state
+          path: .state/*
+          if-no-files-found: ignore
