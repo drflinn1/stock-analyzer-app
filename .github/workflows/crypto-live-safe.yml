@@ -1,247 +1,48 @@
-name: Crypto Live — SAFE (DRY-RUN sanity)
+name: Crypto — Live Safe (single-file)
 
 on:
+  schedule:
+    - cron: "*/15 * * * *"
   workflow_dispatch:
-    inputs:
-      DRY_RUN:
-        description: "Override DRY_RUN for THIS run only (ON/OFF). Leave blank to use reset_guard.yaml or repo Variable."
-        required: false
-        default: ""
-  # schedule:
-  #   - cron: "*/15 * * * *"  # enable after sanity checks
 
 permissions:
   contents: read
-  actions: read
-  id-token: write
-
-concurrency:
-  group: crypto-live
-  cancel-in-progress: false
-
-env:
-  STATE_DIR: ".state"
-  GUARD_FILE: ".state/reset_guard.yaml"
-  POSITIONS_JSON: ".state/positions.json"
-  KPI_CSV: ".state/kpi_history.csv"
-  EXCHANGE: "${{ vars.CRYPTO_EXCHANGE || 'kraken' }}"
 
 jobs:
-  live:
-    name: Run SAFE (dry-run sanity)
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
+    timeout-minutes: 20
+    env:
+      DRY_RUN: "${{ vars.DRY_RUN || 'ON' }}"
+      BUY_USD: "${{ vars.BUY_USD || '30' }}"
+      TP_PCT: "${{ vars.TP_PCT || '8' }}"
+      STOP_PCT: "${{ vars.STOP_PCT || '4' }}"
+      ROTATE_WHEN_FULL: "${{ vars.ROTATE_WHEN_FULL || 'false' }}"
+      UNIVERSE_PICK: "${{ vars.UNIVERSE_PICK || 'LSK' }}"
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Ensure Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install minimal deps (skip if no requirements.txt)
-        shell: bash
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Install deps
+        run: pip install requests
+      - name: Ensure .state
+        run: mkdir -p .state
+      - name: Echo env
         run: |
-          if [[ -f requirements.txt ]]; then
-            pip install -r requirements.txt
-          else
-            python -m pip install --upgrade pip
-            pip install pyyaml pandas
-          fi
-
-      - name: Resolve guards (sanitize YAML → parse → fallback to repo Variables on error)
-        id: guards
-        shell: bash
-        run: |
-          python - << 'PY'
-          import os, sys, yaml, re
-
-          def env(k, d):
-            v = os.getenv(k)
-            return v if v not in (None, "") else d
-
-          # Safe defaults (September baseline)
-          config = {
-            "run_switch": env("RUN_SWITCH","ON"),
-            "dry_run": env("DRY_RUN","ON"),
-            "sizing": {
-              "min_buy_usd": env("MIN_BUY_USD","10"),
-              "min_sell_usd": env("MIN_SELL_USD","10"),
-              "reserve_cash_pct": env("RESERVE_CASH_PCT","5"),
-              "max_positions": env("MAX_POSITIONS","3"),
-              "max_buys_per_run": env("MAX_BUYS_PER_RUN","2"),
-            },
-            "universe": { "top_k": env("UNIVERSE_TOP_K","25") },
-            "rotation": {
-              "when_full": env("ROTATE_WHEN_FULL","true"),
-              "when_cash_short": env("ROTATE_WHEN_CASH_SHORT","true"),
-            },
-            "dust": {
-              "min_usd": env("DUST_MIN_USD","2"),
-              "skip_stables": env("DUST_SKIP_STABLES","true"),
-            }
-          }
-
-          gf = env("GUARD_FILE",".state/reset_guard.yaml")
-          parsed_from_file = False
-          if os.path.isfile(gf):
-            try:
-              raw = open(gf, "rb").read()
-              text = raw.decode("utf-8-sig", errors="ignore")
-              text = text.replace("\r\n","\n").replace("\r","\n")
-              trans = {
-                "\u2013":"-", "\u2014":"-",
-                "\u2018":"'", "\u2019":"'", "\u201c":'"', "\u201d":'"',
-                "\u00a0":" "
-              }
-              for a,b in trans.items(): text = text.replace(a,b)
-              text = text.replace("\t","  ")
-              text = re.sub(r"[\u0000-\u0008\u000b\u000c\u000e-\u001f]", "", text)
-
-              y = yaml.safe_load(text) or {}
-              def deep(dst, src):
-                for k,v in (src or {}).items():
-                  if isinstance(v, dict) and isinstance(dst.get(k), dict):
-                    deep(dst[k], v)
-                  else:
-                    dst[k] = str(v) if isinstance(v, bool) else v
-              deep(config, y)
-              parsed_from_file = True
-            except Exception as e:
-              print(f"note: failed to parse {gf}: {e}", file=sys.stderr)
-          else:
-            print(f"note: {gf} not found; using repo Variables/defaults.", file=sys.stderr)
-
-          # Allow workflow_dispatch override just for this run
-          dr_input = os.getenv("INPUT_DRY_RUN","").strip()
-          if dr_input:
-            config["dry_run"] = dr_input.upper()
-
-          # Normalize DRY_RUN
-          if str(config.get("dry_run","ON")).upper() not in ("ON","OFF"):
-            config["dry_run"] = "ON"
-
-          # Emit outputs (always exit 0)
-          outs = {
-            "RUN_SWITCH": config["run_switch"],
-            "DRY_RUN": config["dry_run"],
-            "MIN_BUY_USD": str(config["sizing"]["min_buy_usd"]),
-            "MIN_SELL_USD": str(config["sizing"]["min_sell_usd"]),
-            "RESERVE_CASH_PCT": str(config["sizing"]["reserve_cash_pct"]),
-            "MAX_POSITIONS": str(config["sizing"]["max_positions"]),
-            "MAX_BUYS_PER_RUN": str(config["sizing"]["max_buys_per_run"]),
-            "UNIVERSE_TOP_K": str(config["universe"]["top_k"]),
-            "ROTATE_WHEN_FULL": str(config["rotation"]["when_full"]),
-            "ROTATE_WHEN_CASH_SHORT": str(config["rotation"]["when_cash_short"]),
-            "DUST_MIN_USD": str(config["dust"]["min_usd"]),
-            "DUST_SKIP_STABLES": str(config["dust"]["skip_stables"]),
-            "SOURCE": "reset_guard.yaml" if parsed_from_file else "repo_variables",
-          }
-          for k,v in outs.items(): print(f"{k}={v}")
-          PY
-
-      - name: Prepare .state files
-        shell: bash
-        run: |
-          mkdir -p "${STATE_DIR}"
-          [[ -f "${POSITIONS_JSON}" ]] || echo "{}" > "${POSITIONS_JSON}"
-          [[ -f "${KPI_CSV}" ]] || echo "timestamp,base,bal_usd,pnl_day_usd,buys,sells,open_positions" > "${KPI_CSV}"
-
-      - name: Print SETTINGS summary
-        shell: bash
-        run: |
-          echo "----- SETTINGS -----"
-          echo "Source: ${{ steps.guards.outputs.SOURCE }}"
-          echo "Exchange: ${EXCHANGE}"
-          echo "RUN_SWITCH=${{ steps.guards.outputs.RUN_SWITCH }}"
-          echo "DRY_RUN=${{ steps.guards.outputs.DRY_RUN }}"
-          echo "MIN_BUY_USD=${{ steps.guards.outputs.MIN_BUY_USD }}"
-          echo "MIN_SELL_USD=${{ steps.guards.outputs.MIN_SELL_USD }}"
-          echo "DUST_MIN_USD=${{ steps.guards.outputs.DUST_MIN_USD }}  DUST_SKIP_STABLES=${{ steps.guards.outputs.DUST_SKIP_STABLES }}"
-          echo "RESERVE_CASH_PCT=${{ steps.guards.outputs.RESERVE_CASH_PCT }}"
-          echo "MAX_POSITIONS=${{ steps.guards.outputs.MAX_POSITIONS }}  MAX_BUYS_PER_RUN=${{ steps.guards.outputs.MAX_BUYS_PER_RUN }}"
-          echo "UNIVERSE_TOP_K=${{ steps.guards.outputs.UNIVERSE_TOP_K }}"
-          echo "ROTATE_WHEN_FULL=${{ steps.guards.outputs.ROTATE_WHEN_FULL }}  ROTATE_WHEN_CASH_SHORT=${{ steps.guards.outputs.ROTATE_WHEN_CASH_SHORT }}"
-          echo "--------------------"
-
-      # NEW: ensure THAW flag if scanner CSV exists so MomentumPulse activates
-      - name: Wire Momentum THAW (auto-flag if CSV present)
-        shell: bash
-        run: |
-          mkdir -p "${STATE_DIR}"
-          CSV_PATH=".state/spike_candidates.csv"
-          if [[ -s "$CSV_PATH" ]]; then
-            echo "Found $CSV_PATH (non-empty). Enabling THAW via ${STATE_DIR}/thaw.flag"
-            : > "${STATE_DIR}/thaw.flag"
-          else
-            echo "No $CSV_PATH found or empty. THAW will remain inactive unless momentum_candidates.csv exists."
-          fi
-
-      - name: Run bot (DRY-RUN safe)
+          echo "DRY_RUN=$DRY_RUN  BUY_USD=$BUY_USD  TP=$TP_PCT  STOP=$STOP_PCT  ROTATE=$ROTATE_WHEN_FULL  PICK='$UNIVERSE_PICK'"
+      - name: Run bot (single-file)
         env:
-          RUN_SWITCH: ${{ steps.guards.outputs.RUN_SWITCH }}
-          DRY_RUN: ${{ steps.guards.outputs.DRY_RUN }}
-          MIN_BUY_USD: ${{ steps.guards.outputs.MIN_BUY_USD }}
-          MIN_SELL_USD: ${{ steps.guards.outputs.MIN_SELL_USD }}
-          DUST_MIN_USD: ${{ steps.guards.outputs.DUST_MIN_USD }}
-          DUST_SKIP_STABLES: ${{ steps.guards.outputs.DUST_SKIP_STABLES }}
-          RESERVE_CASH_PCT: ${{ steps.guards.outputs.RESERVE_CASH_PCT }}
-          MAX_POSITIONS: ${{ steps.guards.outputs.MAX_POSITIONS }}
-          MAX_BUYS_PER_RUN: ${{ steps.guards.outputs.MAX_BUYS_PER_RUN }}
-          UNIVERSE_TOP_K: ${{ steps.guards.outputs.UNIVERSE_TOP_K }}
-          ROTATE_WHEN_FULL: ${{ steps.guards.outputs.ROTATE_WHEN_FULL }}
-          ROTATE_WHEN_CASH_SHORT: ${{ steps.guards.outputs.ROTATE_WHEN_CASH_SHORT }}
-          EXCHANGE: ${{ env.EXCHANGE }}
-          STATE_DIR: ${{ env.STATE_DIR }}
-          POSITIONS_JSON: ${{ env.POSITIONS_JSON }}
-          KPI_CSV: ${{ env.KPI_CSV }}
-          # --- Momentum Pulse / THAW ---
-          MOMENTUM_CSV_PATH: .state/spike_candidates.csv
-          MOMENTUM_MIN_COUNT: "1"
-          MOMENTUM_PULSE_ENABLE: "true"
-        shell: bash
+          KRAKEN_KEY: ${{ secrets.KRAKEN_KEY }}
+          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET }}
+        run: python -u crypto_live_safe.py
+      - name: Show state
+        if: always()
         run: |
-          if [[ -f "main.py" ]]; then
-            echo "Starting python main.py (exchange=${EXCHANGE}, DRY_RUN=$DRY_RUN)"
-            python -u main.py --mode crypto --exchange "${EXCHANGE}" || true
-          else
-            echo "warning: main.py not found at repo root. Skipping run step."
-          fi
-
-      - name: Append KPI/SUMMARY line if needed
-        shell: bash
-        run: |
-          python - << 'PY'
-          import os, csv, datetime as dt
-          kpi = os.getenv("KPI_CSV",".state/kpi_history.csv")
-          now = dt.datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
-          last = ""
-          if os.path.exists(kpi):
-            with open(kpi, newline="") as f:
-              rows = list(csv.reader(f))
-              if len(rows) > 1:
-                last = rows[-1][0]
-          if last[:10] != now[:10]:
-            with open(kpi, "a", newline="") as f:
-              csv.writer(f).writerow([now, "USD", "", "", "", "", ""])
-          PY
-
-      - name: Upload state artifact
+          ls -alh .state || true
+          [[ -f .state/run_summary.json ]] && cat .state/run_summary.json || true
+      - name: Upload state
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: state-after-run
-          path: |
-            .state/**
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Job summary
-        shell: bash
-        run: |
-          echo "### ✅ SAFE run complete" >> $GITHUB_STEP_SUMMARY
-          echo "- Source: **${{ steps.guards.outputs.SOURCE }}**" >> $GITHUB_STEP_SUMMARY
-          echo "- DRY_RUN: **${{ steps.guards.outputs.DRY_RUN }}**" >> $GITHUB_STEP_SUMMARY
-          echo "- Exchange: **${{ env.EXCHANGE }}**" >> $GITHUB_STEP_SUMMARY
-          echo "- Uploaded **state-after-run** artifact." >> $GITHUB_STEP_SUMMARY
+          name: state_${{ github.run_id }}
+          path: .state/**
