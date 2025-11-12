@@ -1,61 +1,32 @@
-name: Crypto — 1-Coin Rotation (LIVE-ready, ultra-defensive)
+name: Crypto — 1-Coin Rotation (30m, TP 8%)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes
+    # Every 30 minutes
+    - cron: "0,30 * * * *"
   workflow_dispatch:
-    inputs:
-      DRY_RUN:
-        description: "ON (simulate) or OFF (live)"
-        required: true
-        default: "ON"
-      BUY_USD:
-        description: "Per-buy USD (e.g., 30)"
-        required: true
-        default: "30"
-      TP_PCT:
-        description: "Take-profit %"
-        required: true
-        default: "8"     # was 5
-      SL_PCT:
-        description: "Stop-loss %"
-        required: true
-        default: "1"
-      WINDOW_MIN:
-        description: "Monitor window minutes"
-        required: true
-        default: "30"    # was 60
-      SLIP_PCT:
-        description: "Retry-through-book % if market is blocked (use 3–5)"
-        required: true
-        default: "5"
 
-concurrency:
-  group: crypto-rotation-${{ github.ref }}
-  cancel-in-progress: true
-
+# Only what’s needed for this job
 permissions:
   contents: read
+
+# Default env (repo Variables override these if set)
+env:
+  # Live/Dry toggle (repo Variables > these defaults)
+  DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}          # Set repo Variable DRY_RUN=OFF for live trading
+  TP_PCT: ${{ vars.TP_PCT || '8' }}             # Take-profit percent
+  WINDOW_MIN: ${{ vars.WINDOW_MIN || '30' }}    # Rotation window minutes
+  BUY_USD: ${{ vars.BUY_USD || '30' }}          # Per-buy notional
+  MAX_POSITIONS: ${{ vars.MAX_POSITIONS || '1' }}
+
+  # Optional filters (leave blank or set in repo Variables)
+  UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK || '' }}
+  QUOTE_CCY: ${{ vars.QUOTE_CCY || 'USD' }}
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-
-    env:
-      # Secrets
-      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-
-      # Vars & UI overrides (UI > repo vars > defaults below)
-      UNIVERSE: ${{ vars.UNIVERSE }}
-      TRACKED_QUOTE: "USD"
-      DRY_RUN:    ${{ inputs.DRY_RUN    || vars.DRY_RUN    || 'ON' }}
-      BUY_USD:    ${{ inputs.BUY_USD    || vars.BUY_USD    || '30' }}
-      TP_PCT:     ${{ inputs.TP_PCT     || vars.TP_PCT     || '8'  }}
-      SL_PCT:     ${{ inputs.SL_PCT     || vars.SL_PCT     || '1'  }}
-      WINDOW_MIN: ${{ inputs.WINDOW_MIN || vars.WINDOW_MIN || '30' }}
-      SLIP_PCT:   ${{ inputs.SLIP_PCT   || vars.SLIP_PCT   || '5'  }}
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -66,57 +37,66 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (robust)
+      - name: Install deps (requirements.txt if present; otherwise safe defaults)
         run: |
           set -e
-          python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
             pip install -r requirements.txt
           else
-            pip install requests pyyaml matplotlib
+            python -m pip install --upgrade pip
+            # keep in sync with your baseline
+            pip install requests pandas pyyaml matplotlib
           fi
 
-      - name: Ensure .state exists (pre-run tree)
-        run: |
-          set -e
-          mkdir -p .state
-          echo "== repo tree (top) =="
-          ls -la
-          echo "== .state (pre-run) =="
-          ls -la .state || true
+      - name: Ensure .state exists
+        run: mkdir -p .state
 
       - name: Echo critical env/vars
         run: |
-          echo "Branch: $GITHUB_REF"
-          echo "DRY_RUN=${DRY_RUN}"
-          echo "BUY_USD=${BUY_USD}"
-          echo "TP_PCT=${TP_PCT}"
-          echo "SL_PCT=${SL_PCT}"
-          echo "WINDOW_MIN=${WINDOW_MIN}"
-          echo "SLIP_PCT=${SLIP_PCT}"
-          echo "UNIVERSE length: ${#UNIVERSE}"
+          echo "DRY_RUN    = ${DRY_RUN}"
+          echo "TP_PCT     = ${TP_PCT}"
+          echo "WINDOW_MIN = ${WINDOW_MIN}"
+          echo "BUY_USD    = ${BUY_USD}"
+          echo "MAX_POSITIONS = ${MAX_POSITIONS}"
+          echo "UNIVERSE_PICK = '${UNIVERSE_PICK}'"
+          echo "QUOTE_CCY  = ${QUOTE_CCY}"
 
-      - name: Run bot (single-coin rotation)
+      - name: Run rotation bot
+        env:
+          # Kraken credentials from repo Secrets
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
-          set -e
-          python main.py
+          python -u main.py
 
-      - name: Show .state after run (debug)
+      - name: Show .state after run
         run: |
-          echo "== .state (post-run) =="
+          echo "=== .state contents ==="
           ls -la .state || true
-          echo "== peek files =="
-          find .state -type f -maxdepth 2 -printf " - %p\n" || true
-          # Guarantee at least one file so artifact step never warns
-          if [ -z "$(find .state -type f -maxdepth 2 2>/dev/null)" ]; then
-            echo "no .state files found; creating sentinel"
-            date > .state/_empty.txt
+
+      - name: Echo upload manifest
+        shell: bash
+        run: |
+          shopt -s globstar nullglob dotglob
+          echo "Files that will be uploaded as artifacts:"
+          found=0
+          for f in .state/**; do
+            if [ -f "$f" ]; then
+              echo " - $f"
+              found=1
+            fi
+          done
+          if [ $found -eq 0 ]; then
+            echo " (none found; proceeding without warning)"
           fi
 
-      - name: Upload .state artifact (zip)
+      - name: Upload .state artifacts
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
-          path: ./.state/**/*       # use **/* glob
-          if-no-files-found: warn
+          path: .state/**
+          include-hidden-files: true
+          if-no-files-found: ignore   # <- prevents the yellow warning
+          compression-level: 6
           retention-days: 7
