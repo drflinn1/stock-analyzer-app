@@ -2,13 +2,13 @@ name: Crypto — 1-Coin Rotation (LIVE-ready, ultra-defensive)
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "*/30 * * * *"   # every 30 minutes
   workflow_dispatch:
     inputs:
       DRY_RUN:
         description: "ON (simulate) or OFF (live)"
         required: true
-        default: "OFF"        # default to LIVE so the UI doesn't trick us
+        default: "ON"
       BUY_USD:
         description: "Per-buy USD (e.g., 30)"
         required: true
@@ -16,7 +16,7 @@ on:
       TP_PCT:
         description: "Take-profit %"
         required: true
-        default: "5"
+        default: "8"     # was 5
       SL_PCT:
         description: "Stop-loss %"
         required: true
@@ -24,7 +24,7 @@ on:
       WINDOW_MIN:
         description: "Monitor window minutes"
         required: true
-        default: "60"
+        default: "30"    # was 60
       SLIP_PCT:
         description: "Retry-through-book % if market is blocked (use 3–5)"
         required: true
@@ -47,16 +47,15 @@ jobs:
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-      # Vars & UI overrides (UI > repo vars > default)
+      # Vars & UI overrides (UI > repo vars > defaults below)
       UNIVERSE: ${{ vars.UNIVERSE }}
       TRACKED_QUOTE: "USD"
-      DRY_RUN: ${{ inputs.DRY_RUN || vars.DRY_RUN || 'OFF' }}
-      BUY_USD: ${{ inputs.BUY_USD || vars.BUY_USD || '30' }}
-      TP_PCT: ${{ inputs.TP_PCT || vars.TP_PCT || '5' }}
-      SL_PCT: ${{ inputs.SL_PCT || vars.SL_PCT || '1' }}
-      WINDOW_MIN: ${{ inputs.WINDOW_MIN || vars.WINDOW_MIN || '60' }}
-      SLIP_PCT: ${{ inputs.SLIP_PCT || vars.SLIP_PCT || '5' }}
-      DUST_MIN_USD: ${{ vars.DUST_MIN_USD || '0.50' }}
+      DRY_RUN:    ${{ inputs.DRY_RUN    || vars.DRY_RUN    || 'ON' }}
+      BUY_USD:    ${{ inputs.BUY_USD    || vars.BUY_USD    || '30' }}
+      TP_PCT:     ${{ inputs.TP_PCT     || vars.TP_PCT     || '8'  }}
+      SL_PCT:     ${{ inputs.SL_PCT     || vars.SL_PCT     || '1'  }}
+      WINDOW_MIN: ${{ inputs.WINDOW_MIN || vars.WINDOW_MIN || '30' }}
+      SLIP_PCT:   ${{ inputs.SLIP_PCT   || vars.SLIP_PCT   || '5'  }}
 
     steps:
       - name: Checkout
@@ -81,8 +80,10 @@ jobs:
         run: |
           set -e
           mkdir -p .state
-          echo "== repo tree (top) ==" && ls -la
-          echo "== .state (pre-run) ==" && ls -la .state || true
+          echo "== repo tree (top) =="
+          ls -la
+          echo "== .state (pre-run) =="
+          ls -la .state || true
 
       - name: Echo critical env/vars
         run: |
@@ -102,8 +103,11 @@ jobs:
 
       - name: Show .state after run (debug)
         run: |
-          echo "== .state (post-run) ==" && ls -la .state || true
-          # Guarantee we always have at least one file to upload
+          echo "== .state (post-run) =="
+          ls -la .state || true
+          echo "== peek files =="
+          find .state -type f -maxdepth 2 -printf " - %p\n" || true
+          # Guarantee at least one file so artifact step never warns
           if [ -z "$(find .state -type f -maxdepth 2 2>/dev/null)" ]; then
             echo "no .state files found; creating sentinel"
             date > .state/_empty.txt
@@ -113,6 +117,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_id }}
-          path: .state          # <= simpler & reliable
+          path: ./.state/**/*       # use **/* glob
           if-no-files-found: warn
           retention-days: 7
