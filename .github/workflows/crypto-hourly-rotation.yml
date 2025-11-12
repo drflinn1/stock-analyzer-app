@@ -1,25 +1,26 @@
-name: Crypto — 1-Coin Rotation (30m, TP 8%)
+name: Crypto — 1-Coin Rotation (15m, TP 8%)
 
 on:
   schedule:
-    # Every 30 minutes
-    - cron: "0,30 * * * *"
+    # Every 15 minutes (more frequent so you don't wait long)
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
-# Only what’s needed for this job
 permissions:
   contents: read
 
-# Default env (repo Variables override these if set)
-env:
-  # Live/Dry toggle (repo Variables > these defaults)
-  DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}          # Set repo Variable DRY_RUN=OFF for live trading
-  TP_PCT: ${{ vars.TP_PCT || '8' }}             # Take-profit percent
-  WINDOW_MIN: ${{ vars.WINDOW_MIN || '30' }}    # Rotation window minutes
-  BUY_USD: ${{ vars.BUY_USD || '30' }}          # Per-buy notional
-  MAX_POSITIONS: ${{ vars.MAX_POSITIONS || '1' }}
+# Prevent overlapping runs if a previous job is still working
+concurrency:
+  group: crypto-rotation
+  cancel-in-progress: false
 
-  # Optional filters (leave blank or set in repo Variables)
+# Defaults (override in Repo → Settings → Variables)
+env:
+  DRY_RUN: ${{ vars.DRY_RUN || 'ON' }}           # Set DRY_RUN=OFF for live
+  TP_PCT: ${{ vars.TP_PCT || '8' }}              # Take-profit %
+  WINDOW_MIN: ${{ vars.WINDOW_MIN || '30' }}     # Rotation window minutes
+  BUY_USD: ${{ vars.BUY_USD || '30' }}           # Per-buy notional
+  MAX_POSITIONS: ${{ vars.MAX_POSITIONS || '1' }}
   UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK || '' }}
   QUOTE_CCY: ${{ vars.QUOTE_CCY || 'USD' }}
 
@@ -37,7 +38,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (requirements.txt if present; otherwise safe defaults)
+      - name: Install deps
         run: |
           set -e
           if [ -f requirements.txt ]; then
@@ -45,7 +46,6 @@ jobs:
             pip install -r requirements.txt
           else
             python -m pip install --upgrade pip
-            # keep in sync with your baseline
             pip install requests pandas pyyaml matplotlib
           fi
 
@@ -54,17 +54,21 @@ jobs:
 
       - name: Echo critical env/vars
         run: |
-          echo "DRY_RUN    = ${DRY_RUN}"
-          echo "TP_PCT     = ${TP_PCT}"
-          echo "WINDOW_MIN = ${WINDOW_MIN}"
-          echo "BUY_USD    = ${BUY_USD}"
+          echo "DRY_RUN       = ${DRY_RUN}"
+          echo "TP_PCT        = ${TP_PCT}"
+          echo "WINDOW_MIN    = ${WINDOW_MIN}"
+          echo "BUY_USD       = ${BUY_USD}"
           echo "MAX_POSITIONS = ${MAX_POSITIONS}"
           echo "UNIVERSE_PICK = '${UNIVERSE_PICK}'"
-          echo "QUOTE_CCY  = ${QUOTE_CCY}"
+          echo "QUOTE_CCY     = ${QUOTE_CCY}"
+
+      - name: Echo times (UTC vs local)
+        run: |
+          echo "Now (UTC):   $(date -u)"
+          echo "Now (local): $(date)"
 
       - name: Run rotation bot
         env:
-          # Kraken credentials from repo Secrets
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
@@ -97,6 +101,6 @@ jobs:
           name: state-${{ github.run_id }}
           path: .state/**
           include-hidden-files: true
-          if-no-files-found: ignore   # <- prevents the yellow warning
+          if-no-files-found: ignore
           compression-level: 6
           retention-days: 7
