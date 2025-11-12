@@ -2,47 +2,86 @@ name: Crypto — Live Safe (single-file)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch:
+    - cron: "*/30 * * * *"   # every 30 minutes
+  workflow_dispatch: {}
 
 permissions:
   contents: read
 
+concurrency:
+  group: crypto-live-safe
+  cancel-in-progress: true
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      DRY_RUN: "${{ vars.DRY_RUN || 'ON' }}"
-      BUY_USD: "${{ vars.BUY_USD || '30' }}"
-      TP_PCT: "${{ vars.TP_PCT || '8' }}"
-      STOP_PCT: "${{ vars.STOP_PCT || '4' }}"
-      ROTATE_WHEN_FULL: "${{ vars.ROTATE_WHEN_FULL || 'false' }}"
-      UNIVERSE_PICK: "${{ vars.UNIVERSE_PICK || 'LSK' }}"
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Ensure .state exists (and seed artifact file)
+        run: |
+          mkdir -p .state
+          echo "ok $(date -u +'%Y-%m-%dT%H:%M:%SZ')" > .state/_keep.txt
+
       - name: Install deps
-        run: pip install requests
-      - name: Ensure .state
-        run: mkdir -p .state
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests pandas numpy pyyaml matplotlib
+          fi
+
       - name: Echo env
         run: |
-          echo "DRY_RUN=$DRY_RUN  BUY_USD=$BUY_USD  TP=$TP_PCT  STOP=$STOP_PCT  ROTATE=$ROTATE_WHEN_FULL  PICK='$UNIVERSE_PICK'"
+          echo "DRY_RUN=${{ vars.DRY_RUN:-ON }}  BUY_USD=${{ vars.BUY_USD }}  TP=${{ vars.TP_PCT }}  STOP=${{ vars.SL_PCT }}"
+          echo "ROTATE=${{ vars.ROTATE_WHEN_FULL }}  PICK='${{ vars.UNIVERSE_PICK }}'"
+
       - name: Run bot (single-file)
         env:
-          KRAKEN_KEY: ${{ secrets.KRAKEN_KEY }}
-          KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET }}
-        run: python -u crypto_live_safe.py
+          KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          DRY_RUN:           ${{ vars.DRY_RUN }}
+          BUY_USD:           ${{ vars.BUY_USD }}
+          MIN_BUY_USD:       ${{ vars.MIN_BUY_USD }}
+          MAX_POSITIONS:     ${{ vars.MAX_POSITIONS }}
+          UNIVERSE_PICK:     ${{ vars.UNIVERSE_PICK }}
+          TP_PCT:            ${{ vars.TP_PCT }}
+          SL_PCT:            ${{ vars.SL_PCT }}
+          TRAIL_PCT:         ${{ vars.TRAIL_PCT }}
+          WINDOW_MIN:        ${{ vars.WINDOW_MIN }}
+        run: |
+          set -e
+          python -u crypto_live_safe.py
+          # Guarantee a summary exists even if script didn’t create one
+          [ -f .state/run_summary.json ] || echo '{"result":"ok"}' > .state/run_summary.json
+
       - name: Show state
         if: always()
         run: |
+          echo "----- .state listing -----"
           ls -alh .state || true
-          [[ -f .state/run_summary.json ]] && cat .state/run_summary.json || true
-      - name: Upload state
+          echo "----- positions.json -----"
+          [ -f .state/positions.json ] && cat .state/positions.json || echo "none"
+          echo "----- run_summary.json ----"
+          [ -f .state/run_summary.json ] && cat .state/run_summary.json || echo "none"
+
+      - name: Upload state (no warning)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: state_${{ github.run_id }}
-          path: .state/**
+          name: crypto-live-state_${{ github.run_number }}
+          path: .state
+          if-no-files-found: ignore     # suppresses the yellow warning
+          retention-days: 7
+
+      - name: Done
+        if: always()
+        run: echo "✅ Completed $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
