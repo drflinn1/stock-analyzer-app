@@ -1,72 +1,67 @@
-name: Momentum — Spike Scan
+name: Momentum — Spike Scan (Kraken public)
 
 on:
   schedule:
-    # Runs every 30 minutes at :00 and :30 (adjust as you like)
-    - cron: "0,30 * * * *"
-  workflow_dispatch:
+    - cron: "*/15 * * * *"       # every 15 min
+  workflow_dispatch: {}
 
 permissions:
-  contents: read
+  contents: write                 # allow auto-commit of .state CSV
+  actions: read
+
+concurrency:
+  group: momentum-spike-scan
+  cancel-in-progress: true
 
 jobs:
-  run:
+  scan:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps (lightweight fallback if no requirements.txt)
+      - name: Ensure .state (seed keep file)
         run: |
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install --upgrade pip
-            pip install requests pandas
-          fi
+          mkdir -p .state
+          echo "scan $(date -u +'%Y-%m-%dT%H:%M:%SZ')" > .state/_keep.txt
 
-      - name: Ensure .state exists
-        run: mkdir -p .state
-
-      - name: Run spike scan (local)
-        # Keep this command identical to your repo’s spike script if different
+      - name: Install deps
         run: |
-          python -u trader/momentum_spike_scan.py
+          python -m pip install --upgrade pip
+          pip install requests
 
-      - name: Show state after run (glob)
+      - name: Run spike scan
         run: |
-          echo "=== .state contents ==="
-          ls -la .state || true
+          set -e
+          python -u spike_scan.py
+          echo "----- candidates -----"
+          cat .state/momentum_candidates.csv || true
+          echo "----- summary -----"
+          cat .state/scan_summary.json || true
 
-      - name: Echo upload manifest
-        shell: bash
-        run: |
-          shopt -s globstar nullglob dotglob
-          echo "Files that will be uploaded as artifacts:"
-          found=0
-          for f in .state/**; do
-            if [ -f "$f" ]; then
-              echo " - $f"
-              found=1
-            fi
-          done
-          if [ $found -eq 0 ]; then
-            echo " (none found; proceeding without warning)"
-          fi
-
-      - name: Upload .state artifacts
+      - name: Upload artifact (always)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: state-${{ github.run_id }}
-          path: |
-            .state/**
-          if-no-files-found: ignore     # <- removes the yellow warning
-          include-hidden-files: true
-          compression-level: 6
+          name: momentum_candidates_${{ github.run_number }}
+          path: .state
+          if-no-files-found: ignore
           retention-days: 7
+
+      - name: Commit CSV to repo (only if changed)
+        run: |
+          set -e
+          git config user.name  "runner-bot"
+          git config user.email "runner@users.noreply.github.com"
+          git add .state/momentum_candidates.csv .state/scan_summary.json || true
+          if ! git diff --cached --quiet; then
+            git commit -m "Update momentum_candidates.csv [${{ github.run_number }}]"
+            git push
+          else
+            echo "No changes to commit."
+          fi
