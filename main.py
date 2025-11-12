@@ -1,32 +1,21 @@
 #!/usr/bin/env python3
 """
 main.py — 1-Coin Rotation (immediate re-entry after sell) + LIVE Kraken signer
-
-What’s new:
-- Re-buy immediately after a SELL in the same run (if a valid candidate/quote exists)
-- Uses your momentum candidates CSV
-- Window (WINDOW_MIN) still applies when no SELL occurred this run
-- Canonical Kraken REST signing for LIVE market orders when DRY_RUN=OFF
+- Re-buys immediately after a SELL in the same run (if candidate + quote ok)
+- WINDOW_MIN still applies when we didn't sell this run
+- Optional STOP/TRAIL handled safely even when blank
 """
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
-import json
-import os
-import sys
-import time
-import urllib.parse
-from dataclasses import dataclass
+import base64, hashlib, hmac, json, os, sys, time, urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
 
 import requests
 
-# ---- Local helpers from your repo
+# ----- Local helpers from your repo
 try:
     from trader.crypto_engine import (
         CANDIDATES_CSV,
@@ -39,22 +28,31 @@ except Exception as e:
     print(f"[FATAL] Could not import trader.crypto_engine: {e}", file=sys.stderr)
     sys.exit(1)
 
-# ---------- ENV / Config ----------
+# ---------- ENV helpers ----------
 def env(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return v if v is not None and str(v).strip() != "" else default
 
+def parse_float_env(name: str, default: Optional[float]) -> Optional[float]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if raw == "" or raw.lower() in ("none", "null", "nan"):
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
 DRY_RUN = env("DRY_RUN", "ON").upper()
-TP_PCT = float(env("TP_PCT", "8"))
-STOP_PCT = float(env("STOP_PCT", ""))
-STOP_PCT = float(STOP_PCT) if str(STOP_PCT) not in ("", "None", "null") else None
-TRAIL_START_PCT = env("TRAIL_START_PCT", "")
-TRAIL_START_PCT = float(TRAIL_START_PCT) if TRAIL_START_PCT else None
-TRAIL_PCT = env("TRAIL_PCT", "")
-TRAIL_PCT = float(TRAIL_PCT) if TRAIL_PCT else None
-WINDOW_MIN = int(float(env("WINDOW_MIN", "30")))
-BUY_USD = float(env("BUY_USD", "30"))
-MAX_POSITIONS = int(env("MAX_POSITIONS", "1"))
+TP_PCT = parse_float_env("TP_PCT", 8.0) or 8.0
+STOP_PCT = parse_float_env("STOP_PCT", None)
+TRAIL_START_PCT = parse_float_env("TRAIL_START_PCT", None)
+TRAIL_PCT = parse_float_env("TRAIL_PCT", None)
+WINDOW_MIN = int(parse_float_env("WINDOW_MIN", 30) or 30)
+BUY_USD = float(parse_float_env("BUY_USD", 30.0) or 30.0)
+MAX_POSITIONS = int(parse_float_env("MAX_POSITIONS", 1) or 1)
 UNIVERSE_PICK = env("UNIVERSE_PICK", "AUTO").strip()
 QUOTE_CCY = env("QUOTE_CCY", "USD").upper()
 
@@ -68,7 +66,7 @@ LAST_FLAG = STATE_DIR / "this.flag"
 
 API_BASE = "https://api.kraken.com/0"
 
-# ---------- Kraken utilities (public/private) ----------
+# ---------- Kraken signing ----------
 def kraken_time() -> float:
     try:
         r = requests.get(f"{API_BASE}/public/Time", timeout=10)
@@ -79,10 +77,8 @@ def kraken_time() -> float:
 
 def _kraken_sign(urlpath: str, data: Dict, secret_b64: str) -> str:
     postdata = urllib.parse.urlencode(data)
-    # message = sha256(nonce + postdata) then HMAC-SHA512(urlpath + hash)
     sha256 = hashlib.sha256((str(data["nonce"]) + postdata).encode()).digest()
-    msg = urlpath.encode() + sha256
-    mac = hmac.new(base64.b64decode(secret_b64), msg, hashlib.sha512)
+    mac = hmac.new(base64.b64decode(secret_b64), urlpath.encode() + sha256, hashlib.sha512)
     return base64.b64encode(mac.digest()).decode()
 
 def kraken_private(path: str, data: Dict) -> Dict:
@@ -102,23 +98,20 @@ def kraken_private(path: str, data: Dict) -> Dict:
     return r.json()
 
 def pair_to_kraken(sym: str) -> str:
-    # 'LSK/USD' -> 'LSKUSD'
     return sym.replace("/", "")
 
 def place_market_order(pair: str, side: str, volume: float, dry_run: bool) -> Dict:
     if dry_run or DRY_RUN == "ON":
         return {"status": "dry", "pair": pair, "side": side, "volume": volume, "txid": "SIMULATED"}
-
     try:
-        data = {
+        resp = kraken_private("AddOrder", {
             "pair": pair_to_kraken(pair),
-            "type": side,                 # 'buy' or 'sell'
+            "type": side,
             "ordertype": "market",
             "volume": f"{volume:.8f}",
-            "oflags": "viqc",            # volume in quote currency calc
+            "oflags": "viqc",
             "validate": False,
-        }
-        resp = kraken_private("AddOrder", data)
+        })
         if resp.get("error"):
             return {"status": "error", "note": ",".join(resp["error"]), "raw": resp}
         txid = ""
@@ -159,7 +152,7 @@ def pct_change(from_px: float, to_px: float) -> float:
 # ---------- Core logic ----------
 def pick_target_symbol() -> Optional[str]:
     if UNIVERSE_PICK.upper() == "AUTO":
-        cands: List[Dict] = load_candidates(CANDIDATES_CSV)  # <-- pass Path (fix)
+        cands: List[Dict] = load_candidates(CANDIDATES_CSV)  # pass Path
         if not cands:
             print("[HOLD] No candidates available.")
             return None
@@ -171,7 +164,6 @@ def pick_target_symbol() -> Optional[str]:
         if "/" not in sym:
             sym = f"{sym}/{QUOTE_CCY}"
         return sym
-
     pick = normalize_pair(UNIVERSE_PICK)
     if "/" not in pick:
         pick = f"{pick}/{QUOTE_CCY}"
@@ -180,7 +172,7 @@ def pick_target_symbol() -> Optional[str]:
 def get_quote_required(sym: str) -> Optional[float]:
     px = get_public_quote(sym)
     if px is None or px <= 0:
-        print(f"[HOLD] Invalid price for {sym}")  # <-- typo fixed
+        print(f"[HOLD] Invalid price for {sym}")
         return None
     return px
 
@@ -193,8 +185,7 @@ def should_sell(entry_px: float, last_px: float, high_px: float | None = None) -
     if (STOP_PCT is not None) and pct_change(entry_px, last_px) <= -STOP_PCT:
         return True, f"STOP hit (≤ -{STOP_PCT:.2f}%)"
     if (TRAIL_START_PCT is not None) and (TRAIL_PCT is not None) and high_px:
-        gain_from_entry = pct_change(entry_px, high_px)
-        if gain_from_entry >= TRAIL_START_PCT and pct_change(high_px, last_px) <= -TRAIL_PCT:
+        if pct_change(entry_px, high_px) >= TRAIL_START_PCT and pct_change(high_px, last_px) <= -TRAIL_PCT:
             return True, f"TRAIL hit (drop ≥ {TRAIL_PCT:.2f}% from high after +{TRAIL_START_PCT:.2f}%)"
     return False, "Hold"
 
@@ -266,7 +257,7 @@ def main():
                 else:
                     print(f"[ERROR] SELL failed: {resp}")
 
-    # ---- BUY (allow immediate re-entry if sold this run) ----
+    # ---- BUY (immediate re-entry allowed if sold this run) ----
     holding_now = load_positions().get("positions", [])
     if not holding_now and can_open_new_position({"positions": []}):
         if sold_this_run or rotation_window_ok():
