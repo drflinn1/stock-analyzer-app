@@ -73,19 +73,18 @@ jobs:
         run: |
           python -u alpaca_crypto_paper.py
           echo "Post-run file check:"
-          echo "PWD=$(pwd)"
-          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
-          ls -la "${GITHUB_WORKSPACE}/.state" || true
-          [ -f "${GITHUB_WORKSPACE}/.state/run_summary.json" ] && echo "STATE OK" || echo "STATE MISSING"
+          pwd
+          ls -la .state || true
+          [ -f .state/run_summary.json ] && echo "STATE OK" || echo "STATE MISSING"
 
-      - name: Upload .state summary (absolute paths)
+      - name: Upload .state summary (final fix)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: alpaca-paper-state
           path: |
-            ${{ github.workspace }}/.state/run_summary.json
-            ${{ github.workspace }}/.state/*.csv
-            ${{ github.workspace }}/.state/*.txt
-          if-no-files-found: warn
+            .state/run_summary.json
+            .state/*.csv
+            .state/*.txt
+          if-no-files-found: error
           retention-days: 7
