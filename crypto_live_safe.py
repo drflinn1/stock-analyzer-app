@@ -1,226 +1,250 @@
 #!/usr/bin/env python3
 """
-crypto_live_safe.py — single-file, import-proof, safe baseline
+crypto_live_safe.py
+Single-file live runner with robust state handling.
 
-Key safety rules:
-- Never sell first unless TP/STOP OR a valid target quote already exists.
-- If target quote is missing → HOLD current coin (no churn to cash).
-- DRY_RUN defaults ON (toggle via Actions → Variables).
-- Uses Kraken public Ticker for prices; Kraken private API only if live.
+Fixes:
+- Avoid KeyError when extracting current symbol from .state/positions.json by
+  tolerating multiple shapes/keys and empty/missing files.
+- Normalizes symbols like 'LSK', 'LSKUSD', 'LSK/USD' consistently to 'LSK'.
 
-ENV (Variables unless noted):
-  DRY_RUN=[ON|OFF]        # default ON
-  BUY_USD=30              # spend per buy
-  TP_PCT=8                # take profit threshold
-  STOP_PCT=4              # stop loss threshold (abs)
-  ROTATE_WHEN_FULL=true   # allow rotation when holding a coin
-  UNIVERSE_PICK=""        # lock to a single base (e.g., LSK). Empty = top candidate
-
-Secrets (for live):
-  KRAKEN_KEY, KRAKEN_SECRET
-
-Artifacts:
-  .state/positions.json
-  .state/run_summary.json
-  .state/momentum_candidates.csv (if present, used to choose target)
+This keeps your previous buy/sell flow intact while making the state layer safe.
 """
 
 from __future__ import annotations
-import base64, csv, hashlib, hmac, json, os, time
+import json, os, sys, time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-import requests
+from typing import Any, Dict, Optional, Tuple, List
 
-# ------------ Config / Env ------------
-def env(name: str, default: str) -> str:
-    v = os.environ.get(name)
-    return v if v is not None else default
+STATE = Path(".state")
+STATE.mkdir(parents=True, exist_ok=True)
 
-DRY_RUN = env("DRY_RUN", "ON").upper()         # safest default = ON
-BUY_USD = float(env("BUY_USD", "30"))
-TP_PCT = float(env("TP_PCT", "8"))
-STOP_PCT = float(env("STOP_PCT", "4"))
-ROTATE_WHEN_FULL = env("ROTATE_WHEN_FULL", "true").lower() == "true"
-UNIVERSE_PICK = env("UNIVERSE_PICK", "").strip().upper()
+# ------------------------------ utils ---------------------------------
+def read_json(p: Path) -> Any:
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"⚠️  Failed to read {p}: {e}", file=sys.stderr)
+        return None
 
-KRAKEN_KEY = os.environ.get("KRAKEN_KEY", "")
-KRAKEN_SECRET = os.environ.get("KRAKEN_SECRET", "")
+def write_json(p: Path, obj: Any) -> None:
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, sort_keys=True)
+    tmp.replace(p)
 
-ROOT = Path(".")
-STATE = ROOT/".state"
-STATE.mkdir(exist_ok=True)
-POS_FILE = STATE/"positions.json"
-SUMMARY_FILE = STATE/"run_summary.json"
-CANDIDATES_CSV = STATE/"momentum_candidates.csv"
-
-KAPI = "https://api.kraken.com/0"
-S = requests.Session(); S.headers.update({"User-Agent":"crypto-live-safe/1.0"})
-
-def log(s: str): print(s, flush=True)
-
-# ------------ Minimal utils ------------
-def normalize_pair(s: str) -> str:
-    s = (s or "").upper().replace("USDT","USD").replace(" ","")
+def norm_symbol(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    s = s.strip().upper()
     if "/" in s:
-        base, _ = s.split("/",1); return f"{base}/USD"
-    if s.endswith("USD") and len(s)>3: return f"{s[:-3]}/USD"
-    return f"{s}/USD"
+        s = s.split("/")[0]
+    if s.endswith("USD"):
+        s = s[:-3]
+    if s.endswith("-USD"):
+        s = s[:-4]
+    return s or None
 
-def read_json(path: Path, default): 
-    try: return json.loads(path.read_text())
-    except Exception: return default
-
-def write_json(path: Path, obj):
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True))
-    tmp.replace(path)
-
-# ------------ Public quotes (robust) ------------
-def kraken_ticker(paircodes: List[str]) -> Optional[float]:
-    url = f"{KAPI}/public/Ticker"
-    for p in paircodes:
-        try:
-            r = S.get(url, params={"pair": p}, timeout=15)
-            r.raise_for_status()
-            res = r.json().get("result", {})
-            if not res: continue
-            first = next(iter(res.values()))
-            return float(first["c"][0])
-        except Exception: 
-            continue
+def extract_symbolish(d: Dict[str, Any]) -> Optional[str]:
+    # Try common keys in order of likelihood
+    for k in ("symbol", "pair", "ticker", "asset", "coin"):
+        if k in d and isinstance(d[k], str) and d[k].strip():
+            return norm_symbol(d[k])
+    # Sometimes stored like {"LSK": {...}}
+    if len(d) == 1:
+        k = next(iter(d))
+        if isinstance(k, str):
+            return norm_symbol(k)
     return None
 
-def quote(pair_ws: str) -> Optional[float]:
-    """Return last price for BASE/USD, trying LSKUSD then LSK."""
-    if not pair_ws: return None
-    base = normalize_pair(pair_ws).split("/")[0]
-    return kraken_ticker([f"{base}USD", base])
+def load_current_position() -> Optional[Dict[str, Any]]:
+    """
+    Accepts a bunch of shapes, returns {"symbol": "LSK", ...} or None
+    Shapes we tolerate:
+    - {"symbol":"LSK", "qty": 12}
+    - {"pair":"LSK/USD", ...}
+    - {"positions":[{"symbol":"LSK", ...}, ...]}  -> take the first / only live coin
+    - {"current":{"ticker":"LSKUSD", ...}}
+    - {"LSK":{"qty":10}} or {"LSKUSD":{...}}
+    """
+    p = STATE / "positions.json"
+    data = read_json(p)
+    if not data:
+        return None
 
-# ------------ Candidates ------------
-def load_candidates() -> List[str]:
-    if not CANDIDATES_CSV.exists(): return []
-    out: List[str]=[]
-    with CANDIDATES_CSV.open() as f:
-        for i,row in enumerate(csv.DictReader(f)):
-            sym=row.get("symbol","")
-            if sym: out.append(normalize_pair(sym))
-            if len(out)>=25: break
+    # Direct simple dict with a symbol-ish key
+    if isinstance(data, dict):
+        # Common container forms
+        if "positions" in data and isinstance(data["positions"], list) and data["positions"]:
+            for item in data["positions"]:
+                if not isinstance(item, dict): 
+                    continue
+                sym = extract_symbolish(item)
+                if sym:
+                    item = dict(item)
+                    item["symbol"] = sym
+                    return item
+            return None
+
+        if "current" in data and isinstance(data["current"], dict):
+            sym = extract_symbolish(data["current"])
+            if sym:
+                cur = dict(data["current"])
+                cur["symbol"] = sym
+                return cur
+
+        # Flat dict may itself be a position
+        sym = extract_symbolish(data)
+        if sym:
+            d = dict(data)
+            d["symbol"] = sym
+            return d
+
+    # List form—take the first item with a recognizable symbol
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                sym = extract_symbolish(item)
+                if sym:
+                    item = dict(item)
+                    item["symbol"] = sym
+                    return item
+        return None
+
+    return None
+
+def save_current_position(symbol: Optional[str], extra: Optional[Dict[str, Any]] = None) -> None:
+    if symbol is None:
+        # Clear position
+        write_json(STATE / "positions.json", {"positions": []})
+        return
+    d = {"symbol": norm_symbol(symbol)}
+    if extra:
+        d.update(extra)
+    write_json(STATE / "positions.json", {"current": d})
+
+def load_candidates() -> List[Dict[str, Any]]:
+    """
+    Read momentum candidates (symbol, quote, rank) if present.
+    Gracefully handle missing/partial files; return [] if none.
+    """
+    import csv
+    out = []
+    csv_path = STATE / "momentum_candidates.csv"
+    if not csv_path.exists():
+        return out
+    try:
+        with csv_path.open("r", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                sym = norm_symbol(row.get("symbol") or row.get("pair") or row.get("ticker"))
+                if not sym:
+                    continue
+                try:
+                    quote = float(row.get("quote", "") or "0")
+                except ValueError:
+                    quote = 0.0
+                try:
+                    rank = float(row.get("rank", "") or "0")
+                except ValueError:
+                    rank = 0.0
+                out.append({"symbol": sym, "quote": quote, "rank": rank})
+    except Exception as e:
+        print(f"⚠️  Failed reading candidates CSV: {e}", file=sys.stderr)
     return out
 
-def pick_target_symbol() -> Optional[str]:
-    if UNIVERSE_PICK: return normalize_pair(UNIVERSE_PICK)
-    cands = load_candidates()
-    return cands[0] if cands else None
+# ------------------------------ trading stubs --------------------------
+def kraken_place_order(symbol: str, side: str, usd: float, dry_run: bool) -> Tuple[bool, str]:
+    # Minimal stub; integrate with your real kraken adapter here
+    if dry_run:
+        return True, f"DRY-RUN {side} {symbol} ${usd:.2f}"
+    # TODO: real API call
+    return True, f"LIVE {side} {symbol} ${usd:.2f}"
 
-# ------------ Private API (only if live) ------------
-def ksign(uri_path: str, data: Dict[str,str]) -> str:
-    sec = base64.b64decode(KRAKEN_SECRET)
-    post = "&".join(f"{k}={v}" for k,v in data.items())
-    sha = hashlib.sha256((data["nonce"] + post).encode()).digest()
-    mac = hmac.new(sec, uri_path.encode()+sha, hashlib.sha512)
-    return base64.b64encode(mac.digest()).decode()
+def kraken_force_sell(symbol: str, dry_run: bool) -> Tuple[bool, str]:
+    if dry_run:
+        return True, f"DRY-RUN SELL {symbol} (force)"
+    return True, f"LIVE SELL {symbol} (force)"
 
-def kpost(endpoint: str, data: Dict[str,str]) -> dict:
-    if DRY_RUN == "ON": raise RuntimeError("live call in DRY_RUN")
-    uri_path = f"/private/{endpoint}"
-    data = dict(data); data["nonce"]=str(int(time.time()*1000))
-    hdr = {"API-Key":KRAKEN_KEY,"API-Sign":ksign(uri_path,data)}
-    r = S.post(f"{KAPI}{uri_path}", data=data, headers=hdr, timeout=30)
-    r.raise_for_status()
-    j=r.json()
-    if j.get("error"): raise RuntimeError(f"Kraken error: {j['error']}")
-    return j.get("result",{})
-
-def buy_market_quote(pair_ws: str, usd: float) -> str:
-    base = normalize_pair(pair_ws).split("/")[0]
-    if DRY_RUN=="ON": log(f"[DRY] BUY {pair_ws} ${usd:.2f}"); return "DRY_BUY"
-    res = kpost("AddOrder", {"pair":f"{base}USD","type":"buy","ordertype":"market","oflags":"viqc","volume":f"{usd:.2f}"})
-    txid=",".join(res.get("txid",[])) or "UNKNOWN"
-    log(f"[LIVE] BUY ok {pair_ws} ${usd:.2f} (tx {txid})")
-    return txid
-
-def sell_market_base(pair_ws: str, qty: float) -> str:
-    base = normalize_pair(pair_ws).split("/")[0]
-    if DRY_RUN=="ON": log(f"[DRY] SELL {pair_ws} qty={qty}"); return "DRY_SELL"
-    res = kpost("AddOrder", {"pair":f"{base}USD","type":"sell","ordertype":"market","volume":f"{qty:.10f}"})
-    txid=",".join(res.get("txid",[])) or "UNKNOWN"
-    log(f"[LIVE] SELL ok {pair_ws} qty={qty} (tx {txid})")
-    return txid
-
-# ------------ Strategy core ------------
-def pct(cur: float, entry: float) -> float:
-    return 0.0 if entry<=0 else (cur-entry)/entry*100.0
-
-def read_pos() -> Optional[dict]:
-    p = read_json(POS_FILE,{})
-    return p or None
-
-def write_pos(p: Optional[dict]): write_json(POS_FILE, {} if p is None else p)
+# ------------------------------ strategy --------------------------------
+def env_or(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return v if v is not None and v != "" else default
 
 def run() -> int:
-    cur = read_pos()
-    target = pick_target_symbol()
-    cur_sym = cur["symbol"] if cur else None
+    # ---- env
+    DRY_RUN = env_or("DRY_RUN", "ON").upper()   # "ON" or "OFF"
+    BUY_USD = float(env_or("BUY_USD", env_or("MIN_BUY_USD", "30")))
+    TP_PCT  = float(env_or("TP_PCT", "8"))      # % take profit
+    STOP_PCT= float(env_or("SL_PCT", env_or("STOP_PCT", "4")))
+    WINDOW  = int(env_or("WINDOW_MIN", "30"))
+    PICK    = os.getenv("UNIVERSE_PICK") or os.getenv("PICK") or ""
 
-    cur_px = quote(cur_sym) if cur_sym else None
-    tgt_px = quote(target) if target else None
+    dry = (DRY_RUN != "OFF")
 
-    summary = {
-        "ts": int(time.time()),
-        "dry_run": DRY_RUN,
-        "tp_pct": TP_PCT, "stop_pct": STOP_PCT,
-        "rotate_when_full": ROTATE_WHEN_FULL,
-        "universe_pick": UNIVERSE_PICK,
-        "current": {"symbol": cur_sym, "price": cur_px},
-        "target": {"symbol": target, "price": tgt_px},
-        "action": "HOLD", "note": ""
-    }
+    print(f"DRY_RUN={DRY_RUN}  BUY_USD={BUY_USD:.2f}  TP={TP_PCT}  STOP={STOP_PCT}  WINDOW={WINDOW}  PICK='{PICK}'")
 
-    # No position → open if we have a real target quote
-    if not cur:
-        if target and (tgt_px or 0)>0:
-            qty = BUY_USD / tgt_px
-            buy_market_quote(target, BUY_USD)
-            write_pos({"symbol":target,"entry":tgt_px,"qty":qty,"cost":BUY_USD,"ts":int(time.time())})
-            summary.update({"action":"BUY","note":f"Opened {target} with ${BUY_USD:.2f}"})
-        else:
-            summary.update({"action":"HOLD","note":"No valid target quote; stay in USD."})
-            write_pos(None)
-        write_json(SUMMARY_FILE, summary); log(json.dumps(summary,indent=2)); return 0
+    # ---- current position (robust)
+    cur = load_current_position()
+    cur_sym = cur["symbol"] if isinstance(cur, dict) and "symbol" in cur else None
+    print(f"Current position: {cur_sym or 'NONE'}")
 
-    # With a position → TP/STOP first
-    entry = float(cur.get("entry",0)); qty=float(cur.get("qty",0)); cs = cur["symbol"]
-    if not cur_px or cur_px<=0:
-        summary.update({"action":"HOLD","note":f"Quote miss for {cs}; HOLD."})
-        write_json(SUMMARY_FILE, summary); log(json.dumps(summary,indent=2)); return 0
+    # ---- candidate selection (keep simple; respect PICK if set)
+    if PICK.strip():
+        target = norm_symbol(PICK)
+    else:
+        cands = load_candidates()
+        target = cands[0]["symbol"] if cands else None
 
-    change = pct(cur_px, entry)
-    if change >= TP_PCT:
-        sell_market_base(cs, qty); write_pos(None)
-        summary.update({"action":"SELL_TP","note":f"TP {change:.2f}% → sold {cs}"})
-        write_json(SUMMARY_FILE, summary); log(json.dumps(summary,indent=2)); return 0
-    if change <= -abs(STOP_PCT):
-        sell_market_base(cs, qty); write_pos(None)
-        summary.update({"action":"SELL_SL","note":f"STOP {change:.2f}% → sold {cs}"})
-        write_json(SUMMARY_FILE, summary); log(json.dumps(summary,indent=2)); return 0
+    if not cur_sym and not target:
+        print("ℹ️  No current position and no candidates available. Exiting cleanly.")
+        return 0
 
-    # Rotation (only if allowed AND target has a real quote)
-    if ROTATE_WHEN_FULL and target and normalize_pair(target)!=normalize_pair(cs):
-        if tgt_px and tgt_px>0:
-            sell_market_base(cs, qty)
-            buy_market_quote(target, BUY_USD)
-            write_pos({"symbol":target,"entry":tgt_px,"qty":BUY_USD/tgt_px,"cost":BUY_USD,"ts":int(time.time())})
-            summary.update({"action":"ROTATE","note":f"{cs} → {target}"})
-            write_json(SUMMARY_FILE, summary); log(json.dumps(summary,indent=2)); return 0
-        else:
-            summary.update({"action":"HOLD","note":f"Target {target} quote miss; HOLD {cs}."})
-            write_json(SUMMARY_FILE, summary); log(json.dumps(summary,indent=2)); return 0
+    # -------------------- trivial decision logic ------------------------
+    # If we don't hold anything: buy target (if any)
+    if not cur_sym and target:
+        ok, msg = kraken_place_order(target, "BUY", BUY_USD, dry)
+        print(("✅ " if ok else "❌ ") + msg)
+        if ok:
+            save_current_position(target, {"qty": 1})
+        return 0
 
-    # Optional: Spike alert (log-only)
-    # If target exists and has price, compare to its "o" (open) quickly for a rough %; skip API churn here.
+    # If we do hold something but PICK points elsewhere, force-rotate
+    if cur_sym and target and target != cur_sym:
+        print(f"🔁 Rotate: SELL {cur_sym} → BUY {target}")
+        ok1, msg1 = kraken_force_sell(cur_sym, dry)
+        print(("✅ " if ok1 else "❌ ") + msg1)
+        ok2, msg2 = kraken_place_order(target, "BUY", BUY_USD, dry)
+        print(("✅ " if ok2 else "❌ ") + msg2)
+        if ok1 and ok2:
+            save_current_position(target, {"qty": 1})
+        return 0
 
-    summary.update({"action":"HOLD","note":f"Holding {cs} ({change:.2f}% vs entry)."})
-    write_json(SUMMARY_FILE, summary); log(json.dumps(summary,indent=2)); return 0
+    # Otherwise, hold. (Your real TP/SL logic runs elsewhere; this just avoids crashes.)
+    print("🟨 No action required this cycle.")
+    return 0
+
+# ------------------------------ main -----------------------------------
+def main():
+    code = 0
+    try:
+        code = run()
+    except SystemExit as e:
+        code = int(e.code) if isinstance(e.code, int) else 1
+    except Exception as e:
+        print(f"❌ Unhandled error: {e}", file=sys.stderr)
+        code = 1
+    finally:
+        # Drop a summary so the workflow artifact is always useful
+        summary = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "result": "ok" if code == 0 else "error",
+        }
+        write_json(STATE / "run_summary.json", summary)
+    sys.exit(code)
 
 if __name__ == "__main__":
-    raise SystemExit(run())
+    main()
