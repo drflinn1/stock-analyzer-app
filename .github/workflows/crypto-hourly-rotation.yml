@@ -14,7 +14,6 @@ jobs:
     timeout-minutes: 25
 
     env:
-      # ---- defaults (UI can override with Variables/Secrets) ----
       DRY_RUN: "${{ vars.DRY_RUN || 'OFF' }}"
       BUY_USD: "${{ vars.BUY_USD || '30' }}"
       TP_PCT:  "${{ vars.TP_PCT  || '8'  }}"
@@ -54,30 +53,15 @@ jobs:
           echo "ROTATE_WHEN_FULL = $ROTATE_WHEN_FULL"
           echo "UNIVERSE_PICK    = '${UNIVERSE_PICK}'"
 
-      # NEW: soft backstop — if candidates are missing or empty, refresh them.
       - name: Ensure candidates (quick refresh if missing/empty)
         run: |
           need=0
-          if [[ ! -s ".state/momentum_candidates.csv" ]]; then
-            need=1
-          else
-            # make sure it has at least one non-header line
-            lines=$(wc -l < .state/momentum_candidates.csv || echo 0)
-            [[ "$lines" -lt 2 ]] && need=1 || true
-          fi
-
+          [[ ! -s ".state/momentum_candidates.csv" ]] && need=1 || true
           if [[ "$need" -eq 1 ]]; then
-            echo "[INFO] candidates missing/empty → refreshing via trader/momentum_scan.py"
-            python -u trader/momentum_scan.py || echo "[WARN] refresh failed; proceeding anyway (bot will HOLD on quote miss)."
+            echo "[INFO] candidates missing/empty → refresh via trader/momentum_scan.py"
+            python -u trader/momentum_scan.py || echo "[WARN] refresh failed; proceeding anyway."
           else
             echo "[INFO] candidates present."
-          fi
-
-      # OLD step used to bail – replaced by a soft log-only check.
-      - name: Soft check (log-only)
-        run: |
-          if [[ ! -s ".state/momentum_candidates.csv" ]]; then
-            echo "[WARN] No candidates available. main.py will decide to HOLD."
           fi
 
       - name: Show state pre-run (glob)
@@ -85,20 +69,22 @@ jobs:
           echo "---- .state contents ----"
           ls -alh .state || true
 
+      # >>> NEW: make the 'trader' package importable
+      - name: Make package importable
+        run: echo "PYTHONPATH=$PWD" >> $GITHUB_ENV
+
       - name: Run bot
         env:
-          # pass through secrets if your main.py uses them
           KRAKEN_KEY: ${{ secrets.KRAKEN_KEY }}
           KRAKEN_SECRET: ${{ secrets.KRAKEN_SECRET }}
-        run: |
-          set -e
-          python -u main.py
+        run: python -u main.py
 
       - name: Show state after run (glob)
         if: always()
         run: |
           echo "---- .state contents ----"
           ls -alh .state || true
+          [[ -f .state/run_summary.json ]] && cat .state/run_summary.json || true
 
       - name: Upload .state manifest
         if: always()
@@ -116,4 +102,3 @@ jobs:
       - name: Post Checkout
         if: always()
         run: echo " "
-
