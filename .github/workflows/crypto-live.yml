@@ -1,61 +1,25 @@
-name: Crypto Live — September Baseline (15m DRY-RUN)
+name: Crypto — Live (single-file, PYTHONPATH fix)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch:
-    inputs:
-      DRY_RUN:
-        description: "ON or OFF (overrides repo default) — OFF = live for this run"
-        required: false
-        default: "ON"
-      RUN_BOT:
-        description: "ON to run bot step (turn OFF to only render KPI/artifacts)"
-        required: false
-        default: "ON"
+    # Every 30 minutes
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crypto-live-main
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
-    env:
-      # --- Behavior toggles ---
-      DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
-      RUN_BOT: ${{ inputs.RUN_BOT || 'ON' }}
-
-      # --- Exchange selection ---
-      EXCHANGE: kraken
-
-      # --- Repo Variables (with sane defaults) ---
-      MIN_BUY_USD:       ${{ vars.MIN_BUY_USD || '15' }}
-      MAX_POSITIONS:     ${{ vars.MAX_POSITIONS || '3' }}
-      MAX_BUYS_PER_RUN:  ${{ vars.MAX_BUYS_PER_RUN || '2' }}
-      UNIVERSE_TOP_K:    ${{ vars.UNIVERSE_TOP_K || '25' }}
-      RESERVE_CASH_PCT:  ${{ vars.RESERVE_CASH_PCT || '5' }}
-      ROTATE_WHEN_FULL:        ${{ vars.ROTATE_WHEN_FULL || 'true' }}
-      ROTATE_WHEN_CASH_SHORT:  ${{ vars.ROTATE_WHEN_CASH_SHORT || 'true' }}
-      DUST_MIN_USD:      ${{ vars.DUST_MIN_USD || '2' }}
-      DUST_SKIP_STABLES: ${{ vars.DUST_SKIP_STABLES || 'true' }}
-
-      # --- SELL logic knobs (optional repo Variables) ---
-      TAKE_PROFIT_PCT:   ${{ vars.TAKE_PROFIT_PCT || '3' }}
-      STOP_LOSS_PCT:     ${{ vars.STOP_LOSS_PCT || '4' }}
-      TRAILING_STOP_PCT: ${{ vars.TRAILING_STOP_PCT || '2' }}
-      TRAILING_ARM_PCT:  ${{ vars.TRAILING_ARM_PCT || '1.5' }}
-
-      # --- NEW: Restricted-market toggle ---
-      SKIP_RESTRICTED:   ${{ vars.SKIP_RESTRICTED || 'true' }}
-
-      # --- Kraken secrets (runtime) ---
-      KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-
-      PYTHONUNBUFFERED: "1"
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
+      # Shallow checkout is fine; we don't need history
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -63,47 +27,86 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
-          pip install ccxt pandas pyyaml matplotlib
-
-      - name: Sanity check secrets (no values shown)
-        run: |
-          python - << 'PY'
-          import os
-          print("Have KRAKEN_API_KEY:", bool(os.getenv("KRAKEN_API_KEY")))
-          print("Have KRAKEN_API_SECRET:", bool(os.getenv("KRAKEN_API_SECRET")))
-          print("SKIP_RESTRICTED =", os.getenv("SKIP_RESTRICTED"))
-          PY
-
-      - name: Run Crypto Engine
-        if: env.RUN_BOT == 'ON'
+      - name: Ensure .state exists
         run: |
           mkdir -p .state
-          python main.py
 
-      - name: Make KPI chart (optional)
+      - name: Install dependencies (requirements.txt or safe defaults)
         run: |
-          if [ -f tools/make_kpi_chart.py ]; then
-            python tools/make_kpi_chart.py --column bal_usd || true
+          set -e
+          if [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+          else
+            python -m pip install --upgrade pip
+            # Core libs your scripts have used across runs
+            pip install requests pandas numpy pyyaml matplotlib
           fi
 
-      - name: Ensure artifact folder
-        run: mkdir -p .state
+      - name: Echo key runtime vars (safe)
+        run: |
+          echo "Branch: $GITHUB_REF_NAME"
+          echo "Repo:   $GITHUB_REPOSITORY"
+          echo "----- Variables (non-secret) -----"
+          echo "DRY_RUN=${{ vars.DRY_RUN }}"
+          echo "BUY_USD=${{ vars.BUY_USD }}"
+          echo "MIN_BUY_USD=${{ vars.MIN_BUY_USD }}"
+          echo "MAX_POSITIONS=${{ vars.MAX_POSITIONS }}"
+          echo "UNIVERSE_PICK='${{ vars.UNIVERSE_PICK }}'"
+          echo "TP_PCT=${{ vars.TP_PCT }}"
+          echo "SL_PCT=${{ vars.SL_PCT }}"
+          echo "TRAIL_PCT=${{ vars.TRAIL_PCT }}"
+          echo "WINDOW_MIN=${{ vars.WINDOW_MIN }}"
+          echo "----------------------------------"
+          # Create a tiny run flag so we can see this job touched .state
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .state/last_job_start_utc.txt
 
-      - name: Upload artifacts
+      - name: Run main.py (module-safe: expose repo on PYTHONPATH)
+        env:
+          # Secrets (never echoed)
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
+          # Vars (ok to be empty; script should default sanely)
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          BUY_USD: ${{ vars.BUY_USD }}
+          MIN_BUY_USD: ${{ vars.MIN_BUY_USD }}
+          MAX_POSITIONS: ${{ vars.MAX_POSITIONS }}
+          UNIVERSE_PICK: ${{ vars.UNIVERSE_PICK }}
+          TP_PCT: ${{ vars.TP_PCT }}
+          SL_PCT: ${{ vars.SL_PCT }}
+          TRAIL_PCT: ${{ vars.TRAIL_PCT }}
+          WINDOW_MIN: ${{ vars.WINDOW_MIN }}
+        run: |
+          set -e
+          echo "🔹 Running Crypto Live main..."
+          # Critical fix: make 'trader' package importable
+          export PYTHONPATH="${{ github.workspace }}"
+          # Sensible fallbacks if some vars are blank (keeps things moving)
+          : "${DRY_RUN:=ON}"
+          : "${TP_PCT:=8}"          # default 8% take-profit if not set
+          : "${WINDOW_MIN:=30}"     # 30-min rotation window
+          python3 trader/main.py
+
+      - name: Show .state snapshot
+        if: always()
+        run: |
+          echo "Files in .state:"
+          ls -alh .state || true
+          echo "positions.json (if present):"
+          [ -f .state/positions.json ] && cat .state/positions.json || echo "no positions.json"
+          echo "run_summary.json (if present):"
+          [ -f .state/run_summary.json ] && cat .state/run_summary.json || echo "no run_summary.json"
+
+      - name: Upload .state artifacts (always)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: crypto-live-${{ github.run_number }}
-          path: |
-            .state/*
-          if-no-files-found: ignore
+          name: crypto-live-state_${{ github.run_id }}
+          path: .state
+          if-no-files-found: warn
 
-      - name: Slack notify (optional)
-        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      - name: Final cleanup
+        if: always()
         run: |
-          curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"STATUS=${{ job.status }}\"}" "$SLACK_WEBHOOK_URL"
+          echo "✅ Job complete."
