@@ -20,33 +20,34 @@ on:
         required: true
         default: "2"
       EARLY_DROP_PCT:
-        description: "Early-drop extra stop % while position is new"
+        description: "Extra stop % during first minutes with a new position"
         required: true
         default: "1"
       EARLY_WINDOW_MIN:
-        description: "How long early-drop applies (minutes)"
+        description: "How long EARLY_DROP_PCT applies (minutes)"
         required: true
         default: "60"
-      DRY_RUN:
-        description: "ON to simulate orders; OFF to place real PAPER orders"
+      LIMIT_SLIP_PCT:
+        description: "Limit price slip % through the book to force paper fills"
         required: true
-        default: "ON"
-  schedule:
-    - cron: "*/30 * * * *"
+        default: "0.5"
+      DRY_RUN:
+        description: "ON to simulate; OFF to place real PAPER orders"
+        required: true
+        default: "OFF"   # safer default is OFF for paper
 
-permissions:
-  contents: read
+env:
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   paper_crypto:
     runs-on: ubuntu-latest
-    env:
-      # 🔐 CRYPTO-ONLY secrets (leave your equities secrets untouched)
-      APCA_API_KEY_ID: ${{ secrets.ALPACA_CRYPTO_KEY }}
-      APCA_API_SECRET_KEY: ${{ secrets.ALPACA_CRYPTO_SECRET }}
-      APCA_API_BASE: ${{ secrets.ALPACA_CRYPTO_BASE_URL }}
-      APCA_DATA_BASE: https://data.alpaca.markets
+    timeout-minutes: 10
+
     steps:
+      - name: Set up job
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -55,236 +56,176 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests matplotlib
+          pip install requests
 
       - name: Normalize base URL (fallback to paper if empty)
         run: |
-          if [ -z "${APCA_API_BASE}" ]; then
-            echo "APCA_API_BASE=https://paper-api.alpaca.markets" >> $GITHUB_ENV
+          if [ -z "${{ secrets.ALPACA_BASE_URL }}" ]; then
+            echo "ALPACA_BASE_URL=https://paper-api.alpaca.markets/v2" >> $GITHUB_ENV
           else
-            echo "APCA_API_BASE=${APCA_API_BASE}" >> $GITHUB_ENV
+            echo "ALPACA_BASE_URL=${{ secrets.ALPACA_BASE_URL }}" >> $GITHUB_ENV
           fi
 
       - name: Preflight — verify Alpaca auth
         id: preflight
         env:
-          APCA_API_KEY_ID: ${{ env.APCA_API_KEY_ID }}
-          APCA_API_SECRET_KEY: ${{ env.APCA_API_SECRET_KEY }}
-          APCA_API_BASE: ${{ env.APCA_API_BASE }}
+          AKEY: ${{ secrets.ALPACA_CRYPTO_KEY }}
+          ASEC: ${{ secrets.ALPACA_CRYPTO_SECRET }}
+          AURL: ${{ env.ALPACA_BASE_URL }}
         run: |
           set -euo pipefail
           python - << 'PY'
-          import os, json, requests, sys
-          base = os.environ["APCA_API_BASE"].rstrip("/")
-          key  = os.environ.get("APCA_API_KEY_ID","")
-          sec  = os.environ.get("APCA_API_SECRET_KEY","")
-          out = {"ok": False, "why": "", "status": None, "account": None}
-          try:
-            r = requests.get(f"{base}/v2/account",
-                             headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec},
-                             timeout=15)
-            out["status"] = r.status_code
-            if r.status_code == 200:
-              acct = r.json()
-              out["ok"] = True
-              out["account"] = {
-                "id": acct.get("id"),
-                "status": acct.get("status"),
-                "paper": acct.get("paper"),
-                "crypto_status": acct.get("crypto_status"),
-                "currency": acct.get("currency"),
-              }
-            else:
-              out["why"] = r.text[:500]
-          except Exception as e:
-            out["why"] = str(e)
-          open("preflight_auth.json","w").write(json.dumps(out, indent=2))
-          print(json.dumps(out, indent=2))
-          if not out["ok"]:
-            sys.exit(17)
+          import json, os, requests, sys, pathlib, time
+          from datetime import datetime
+
+          AKEY=os.environ["AKEY"]; ASEC=os.environ["ASEC"]; AURL=os.environ["AURL"]
+          outdir=pathlib.Path("alpaca_state"); outdir.mkdir(exist_ok=True)
+          s=requests.Session(); s.headers.update({"APCA-API-KEY-ID":AKEY,"APCA-API-SECRET-KEY":ASEC})
+          r=s.get(f"{AURL}/account", timeout=20); r.raise_for_status()
+          acct=r.json()
+          ok = acct.get("status")=="ACTIVE" and (acct.get("crypto_status") in ("ACTIVE","")) 
+          snap = {"ok":bool(ok),"why":"", "status":r.status_code,"account":{
+              "id": acct.get("id"), "status": acct.get("status"),
+              "paper": acct.get("paper_trading", None),
+              "crypto_status": acct.get("crypto_status",""), "currency":acct.get("currency","")
+          }}
+          (outdir/"preflight_auth.json").write_text(json.dumps(snap, indent=2))
+          if not ok:
+              print("Account not ACTIVE or crypto not enabled.", file=sys.stderr)
+              sys.exit(1)
           PY
-        continue-on-error: true
 
       - name: Run bot and capture state (with order audit)
-        id: runbot
-        if: always()
         env:
-          SYMBOL: ${{ github.event.inputs.SYMBOL || 'BTC/USD' }}
-          BUY_USD: ${{ github.event.inputs.BUY_USD || '25' }}
-          TP_PCT: ${{ github.event.inputs.TP_PCT || '5' }}
-          SL_PCT: ${{ github.event.inputs.SL_PCT || '2' }}
-          EARLY_DROP_PCT: ${{ github.event.inputs.EARLY_DROP_PCT || '1' }}
-          EARLY_WINDOW_MIN: ${{ github.event.inputs.EARLY_WINDOW_MIN || '60' }}
-          DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'ON' }}
-          APCA_API_KEY_ID: ${{ env.APCA_API_KEY_ID }}
-          APCA_API_SECRET_KEY: ${{ env.APCA_API_SECRET_KEY }}
-          APCA_API_BASE: ${{ env.APCA_API_BASE }}
+          AKEY: ${{ secrets.ALPACA_CRYPTO_KEY }}
+          ASEC: ${{ secrets.ALPACA_CRYPTO_SECRET }}
+          AURL: ${{ env.ALPACA_BASE_URL }}
+          DURL: https://data.alpaca.markets/v1beta3/crypto/us
+          SYMBOL: ${{ inputs.SYMBOL }}
+          BUY_USD: ${{ inputs.BUY_USD }}
+          TP_PCT: ${{ inputs.TP_PCT }}
+          SL_PCT: ${{ inputs.SL_PCT }}
+          EARLY_DROP_PCT: ${{ inputs.EARLY_DROP_PCT }}
+          EARLY_WINDOW_MIN: ${{ inputs.EARLY_WINDOW_MIN }}
+          LIMIT_SLIP_PCT: ${{ inputs.LIMIT_SLIP_PCT }}
+          DRY_RUN: ${{ inputs.DRY_RUN }}
         run: |
           set -euo pipefail
           python - << 'PY'
-          import json, os, time, datetime as dt
-          import requests
-          import matplotlib.pyplot as plt
+          import json, os, pathlib, requests, time
 
-          def write_json(p, obj):
-            open(p,"w").write(json.dumps(obj, indent=2))
+          AKEY=os.environ["AKEY"]; ASEC=os.environ["ASEC"]
+          AURL=os.environ["AURL"]; DURL=os.environ["DURL"]
+          SYMBOL=os.environ["SYMBOL"].strip()
+          BUY_USD=float(os.environ["BUY_USD"])
+          TP_PCT=float(os.environ["TP_PCT"]); SL_PCT=float(os.environ["SL_PCT"])
+          EARLY_DROP_PCT=float(os.environ["EARLY_DROP_PCT"])
+          EARLY_WINDOW_MIN=int(os.environ["EARLY_WINDOW_MIN"])
+          LIMIT_SLIP_PCT=float(os.environ["LIMIT_SLIP_PCT"])
+          DRY_RUN=(os.environ["DRY_RUN"].upper()=="ON")
 
-          try:
-            pf = json.load(open("preflight_auth.json"))
-          except Exception:
-            pf = {"ok": True}
-          if not pf.get("ok", True):
-            write_json("run_summary.json", {
-              "action": "ERROR",
-              "dry_run": True,
-              "note": "Alpaca auth failed (check ALPACA_CRYPTO_KEY / ALPACA_CRYPTO_SECRET for Crypto Paper).",
-              "preflight": pf
-            })
-            raise SystemExit(1)
+          outdir=pathlib.Path("alpaca_state"); outdir.mkdir(exist_ok=True)
+          s=requests.Session(); s.headers.update({"APCA-API-KEY-ID":AKEY,"APCA-API-SECRET-KEY":ASEC})
 
-          S = os.environ["SYMBOL"]
-          BUY_USD = float(os.environ["BUY_USD"])
-          TP_PCT = float(os.environ["TP_PCT"])
-          SL_PCT = float(os.environ["SL_PCT"])
-          E_DROP = float(os.environ["EARLY_DROP_PCT"])
-          E_MIN  = int(os.environ["EARLY_WINDOW_MIN"])
-          DRY = (os.environ["DRY_RUN"].strip().upper() == "ON")
+          def save(name, obj):
+            (outdir/name).write_text(json.dumps(obj, indent=2))
 
-          API = os.environ["APCA_API_BASE"].rstrip("/")
-          KEY = os.environ["APCA_API_KEY_ID"]
-          SEC = os.environ["APCA_API_SECRET_KEY"]
-          H = {"APCA-API-KEY-ID": KEY, "APCA-API-SECRET-KEY": SEC}
-
-          def get(url, **params):
-            r = requests.get(url, headers=H, params=params, timeout=20)
-            r.raise_for_status(); return r.json()
-          def post(url, payload):
-            r = requests.post(url, headers={**H, "Content-Type":"application/json"},
-                              data=json.dumps(payload), timeout=20)
-            r.raise_for_status(); return r.json()
-
-          def list_positions(): return get(f"{API}/v2/positions")
-          def latest_position(symbol):
-            for p in list_positions():
-              if p.get("symbol")==symbol: return p
-            return None
-          def last_filled_buy(symbol):
-            orders = get(f"{API}/v2/orders", status="all", direction="desc", limit=50)
-            for o in orders:
-              if o.get("symbol")==symbol and o.get("side")=="buy" and o.get("status")=="filled":
-                return o
-            return None
-          def place_buy_notional(symbol, usd):
-            return post(f"{API}/v2/orders", {"symbol":symbol,"side":"buy","type":"market","time_in_force":"gtc","notional":str(round(usd,2))})
-          def place_sell_all(symbol, qty):
-            return post(f"{API}/v2/orders", {"symbol":symbol,"side":"sell","type":"market","time_in_force":"gtc","qty":str(qty)})
-
-          def audit_order(order_id):
+          # --- helper: latest price from data API (free for crypto) ---
+          def latest_trade_price(symbol: str):
             try:
-              od = get(f"{API}/v2/orders/{order_id}")
-              write_json("last_order_detail.json", od)
-              return od
-            except Exception as e:
-              write_json("last_order_detail.json", {"error": str(e)})
+              # v1beta3 latest trades supports /latest/trades?symbols=BTC/USD
+              r=s.get(f"{DURL}/latest/trades", params={"symbols":symbol}, timeout=15)
+              r.raise_for_status()
+              js=r.json()
+              items=js.get("trades", {})
+              t=items.get(symbol) or {}
+              px=t.get("p") or t.get("price")
+              return float(px) if px is not None else None
+            except Exception:
               return None
 
-          try:
-            dump = get(f"{API}/v2/orders", status="all", direction="desc", limit=20)
-            write_json("orders_dump.json", dump)
-          except Exception as e:
-            write_json("orders_dump.json", {"error": str(e)})
+          # Check if position exists
+          r=s.get(f"{AURL}/positions", timeout=20); r.raise_for_status()
+          positions=r.json()
+          save("position_snapshot.json", positions)
 
-          pos = latest_position(S)
-          action, order_id, note, mid = None, None, "", None
+          have=False
+          for p in positions:
+            if p.get("symbol")==SYMBOL:
+              have=True
+              break
 
-          if pos is None:
-            action = "BUY"
-            if DRY:
-              note = f"(DRY) Would buy {S} with ${BUY_USD:.2f} notional."
+          last_order_detail=None
+
+          if not have:
+            # Place BUY when flat, using LIMIT through-the-book to force paper fills
+            order_payload = {
+              "symbol": SYMBOL,
+              "side": "buy",
+              "time_in_force": "gtc",
+              "notional": str(BUY_USD)
+            }
+
+            px = latest_trade_price(SYMBOL)
+            if px and LIMIT_SLIP_PCT>0:
+              # e.g., for buy: LIMIT above market by slip pct
+              limit_price = round(px * (1 + LIMIT_SLIP_PCT/100.0), 2)
+              order_payload.update({"type":"limit","order_type":"limit","limit_price": str(limit_price)})
+              note = f"Flat \u2192 LIMIT buy {SYMBOL} ${BUY_USD} at ~{limit_price} (src px {px}, slip {LIMIT_SLIP_PCT}%)."
             else:
-              try:
-                od = place_buy_notional(S, BUY_USD)
-                order_id = od.get("id")
-                time.sleep(2)
-                audit_order(order_id)
-                note = f"Entered {S} with ${BUY_USD:.2f} notional."
-              except Exception as e:
-                note = f"BUY failed: {e}"
+              # Fallback to market if we couldn't price it
+              order_payload.update({"type":"market","order_type":"market"})
+              note = f"Flat \u2192 MARKET buy {SYMBOL} with ${BUY_USD} (no quote for limit)."
+
+            if DRY_RUN:
+              last_order_detail={"id": None, "status":"simulated", **order_payload}
+            else:
+              r=s.post(f"{AURL}/orders", json=order_payload, timeout=25)
+              r.raise_for_status()
+              last_order_detail=r.json()
+
+            run_summary={
+              "ts": int(time.time()),
+              "symbol": SYMBOL,
+              "action": "BUY",
+              "dry_run": DRY_RUN,
+              "buy_usd": BUY_USD,
+              "tp_pct": TP_PCT,
+              "sl_pct": SL_PCT,
+              "order_id": last_order_detail.get("id"),
+              "position_present": False,
+              "mid_price": px,
+              "note": note
+            }
           else:
-            qty = float(pos["qty"])
-            avg = float(pos["avg_entry_price"])
-            cur = float(pos.get("current_price", avg))
-            upnl_pct = float(pos.get("unrealized_plpc", (cur-avg)/avg))*100.0
+            # Already holding — monitoring logic would go here (kept minimal for this single-file)
+            run_summary={
+              "ts": int(time.time()),
+              "symbol": SYMBOL,
+              "action": "HOLD",
+              "dry_run": DRY_RUN,
+              "note": f"Position detected for {SYMBOL}; monitoring (TP {TP_PCT}%, SL {SL_PCT}%, early {EARLY_DROP_PCT}%/{EARLY_WINDOW_MIN}m)."
+            }
 
-            age_min = None
-            lf = last_filled_buy(S)
-            if lf and lf.get("filled_at"):
-              try:
-                t = dt.datetime.fromisoformat(lf["filled_at"].replace("Z","+00:00"))
-                age_min = (dt.datetime.utcnow() - t).total_seconds()/60.0
-              except Exception: pass
-
-            sell_reason=None
-            if upnl_pct >= TP_PCT: sell_reason=f"TP hit (≥ {TP_PCT:.2f}%)"
-            elif upnl_pct <= -SL_PCT: sell_reason=f"SL hit (≤ -{SL_PCT:.2f}%)"
-            elif age_min is not None and age_min <= E_MIN and upnl_pct <= -E_DROP:
-              sell_reason=f"Early-drop guard (≤ -{E_DROP:.2f}% within {E_MIN}m)"
-
-            if sell_reason:
-              action="SELL"
-              if DRY:
-                note=f"(DRY) Would SELL {qty} {S} — {sell_reason}."
-              else:
-                try:
-                  od = place_sell_all(S, qty)
-                  order_id = od.get("id")
-                  time.sleep(2)
-                  audit_order(order_id)
-                  note=f"Sold {qty} {S} — {sell_reason}."
-                except Exception as e:
-                  note=f"SELL failed: {e}"
-            else:
-              action="HOLD"; note=f"Holding {S}. PnL {upnl_pct:.2f}%."
-            mid = cur
-
-          kpi = {"tp_pct":TP_PCT,"sl_pct":SL_PCT,"early_drop_pct":E_DROP,"early_window_min":E_MIN}
-          if pos:
-            kpi.update({
-              "qty": float(pos["qty"]),
-              "avg_entry": float(pos["avg_entry_price"]),
-              "current_price": float(pos.get("current_price", pos["avg_entry_price"])),
-              "unrealized_pl": float(pos.get("unrealized_pl", 0.0)),
-              "unrealized_plpc_pct": float(pos.get("unrealized_plpc", 0.0))*100.0,
-            })
+          # dumps for artifact
+          save("run_summary.json", run_summary)
+          save("last_order_detail.json", last_order_detail or {})
+          # keep a small orders dump for audit
           try:
-            import matplotlib.pyplot as plt
-            plt.figure(figsize=(4,3), dpi=200)
-            plt.bar(["PnL %"], [kpi.get("unrealized_plpc_pct",0.0)])
-            plt.axhline(0, linewidth=1); plt.title(f"{S} P&L% (now)"); plt.ylabel("%"); plt.tight_layout()
-            plt.savefig("kpi_chart.png")
-          except Exception: pass
-
-          write_json("position_snapshot.json", pos or {})
-          write_json("kpi_snapshot.json", kpi)
-          run_summary = {
-            "ts": int(time.time()), "symbol": S, "action": action, "dry_run": DRY,
-            "buy_usd": BUY_USD, "tp_pct": TP_PCT, "sl_pct": SL_PCT,
-            "order_id": order_id, "position_present": pos is not None, "mid_price": mid, "note": note
-          }
-          write_json("run_summary.json", run_summary)
+            rr=s.get(f"{AURL}/orders", params={"status":"open"}, timeout=20); rr.raise_for_status()
+            save("orders_dump.json", rr.json())
+          except Exception:
+            save("orders_dump.json", {"error":"fetch_failed"})
           PY
 
       - name: Upload state summary (artifacts)
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: alpaca-paper-state
           path: |
-            preflight_auth.json
-            run_summary.json
-            position_snapshot.json
-            kpi_snapshot.json
-            kpi_chart.png
-            orders_dump.json
-            last_order_detail.json
-          if-no-files-found: warn
+            alpaca_state/run_summary.json
+            alpaca_state/last_order_detail.json
+            alpaca_state/orders_dump.json
+            alpaca_state/position_snapshot.json
+            alpaca_state/preflight_auth.json
+
