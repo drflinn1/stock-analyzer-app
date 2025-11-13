@@ -26,7 +26,7 @@ on:
       DRY_RUN:
         description: "ON = simulate; OFF = place PAPER orders"
         required: true
-        default: "OFF"
+        default: "ON"
   schedule:
     - cron: "*/30 * * * *"  # every 30 minutes
 
