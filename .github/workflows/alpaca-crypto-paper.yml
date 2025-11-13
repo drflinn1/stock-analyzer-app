@@ -78,7 +78,6 @@ jobs:
           set -euo pipefail
           python - << 'PY'
           import json, os, requests, sys, pathlib
-          from datetime import datetime
 
           AKEY = os.environ["AKEY"]
           ASEC = os.environ["ASEC"]
@@ -190,15 +189,24 @@ jobs:
           last_order_detail = None
 
           if not have:
-              # Place BUY when flat
+              # --- Build base order payload ---
               order_payload = {
                   "symbol": SYMBOL,
                   "side": "buy",
                   "time_in_force": "gtc",
-                  "notional": str(BUY_USD),
               }
 
               px = latest_trade_price(SYMBOL)
+              qty = None
+              if px:
+                  # Prefer qty for crypto so paper fills properly; 8 decimal places is plenty
+                  qty = BUY_USD / px
+                  order_payload["qty"] = f"{qty:.8f}"
+              else:
+                  # Fallback: no quote, use notional
+                  order_payload["notional"] = str(BUY_USD)
+
+              # --- Decide MARKET vs LIMIT ---
               if px and LIMIT_SLIP_PCT > 0:
                   # LIMIT order through the book
                   limit_price = round(px * (1 + LIMIT_SLIP_PCT / 100.0), 2)
@@ -208,8 +216,9 @@ jobs:
                       "limit_price": str(limit_price),
                   })
                   note = (
-                      f"Flat \u2192 LIMIT buy {SYMBOL} ${BUY_USD} "
-                      f"at ~{limit_price} (src px {px}, slip {LIMIT_SLIP_PCT}%)."
+                      f"Flat \u2192 LIMIT buy {SYMBOL} with ${BUY_USD} "
+                      f"(qty ~{qty:.8f} at limit ~{limit_price}, src px {px}, "
+                      f"slip {LIMIT_SLIP_PCT}%)."
                   )
               else:
                   # MARKET order (default when LIMIT_SLIP_PCT == 0)
@@ -217,7 +226,16 @@ jobs:
                       "type": "market",
                       "order_type": "market",
                   })
-                  note = f"Flat \u2192 MARKET buy {SYMBOL} with ${BUY_USD} (no/slip=0 quote for limit)."
+                  if qty is not None:
+                      note = (
+                          f"Flat \u2192 MARKET buy {SYMBOL} with ${BUY_USD} "
+                          f"(qty ~{qty:.8f}, mid px {px})."
+                      )
+                  else:
+                      note = (
+                          f"Flat \u2192 MARKET buy {SYMBOL} with ${BUY_USD} "
+                          f"(no quote, using notional)."
+                      )
 
               if DRY_RUN:
                   last_order_detail = {"id": None, "status": "simulated", **order_payload}
