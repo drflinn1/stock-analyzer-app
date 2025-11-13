@@ -41,10 +41,10 @@ jobs:
   paper_crypto:
     runs-on: ubuntu-latest
     env:
-      # your secret names (Paper keys)
-      APCA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY }}
-      APCA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET }}
-      APCA_API_BASE: ${{ secrets.ALPACA_BASE_URL }}
+      # 🔐 CRYPTO-ONLY secrets (leave your equities secrets untouched)
+      APCA_API_KEY_ID: ${{ secrets.ALPACA_CRYPTO_KEY }}
+      APCA_API_SECRET_KEY: ${{ secrets.ALPACA_CRYPTO_SECRET }}
+      APCA_API_BASE: ${{ secrets.ALPACA_CRYPTO_BASE_URL }}
       APCA_DATA_BASE: https://data.alpaca.markets
     steps:
       - name: Set up Python
@@ -129,7 +129,6 @@ jobs:
           def write_json(p, obj):
             open(p,"w").write(json.dumps(obj, indent=2))
 
-          # Stop early if auth failed
           try:
             pf = json.load(open("preflight_auth.json"))
           except Exception:
@@ -138,7 +137,7 @@ jobs:
             write_json("run_summary.json", {
               "action": "ERROR",
               "dry_run": True,
-              "note": "Alpaca auth failed. Ensure repo secrets ALPACA_API_KEY / ALPACA_API_SECRET are PAPER keys.",
+              "note": "Alpaca auth failed (check ALPACA_CRYPTO_KEY / ALPACA_CRYPTO_SECRET for Crypto Paper).",
               "preflight": pf
             })
             raise SystemExit(1)
@@ -180,7 +179,6 @@ jobs:
           def place_sell_all(symbol, qty):
             return post(f"{API}/v2/orders", {"symbol":symbol,"side":"sell","type":"market","time_in_force":"gtc","qty":str(qty)})
 
-          # helper to audit any order id
           def audit_order(order_id):
             try:
               od = get(f"{API}/v2/orders/{order_id}")
@@ -190,7 +188,6 @@ jobs:
               write_json("last_order_detail.json", {"error": str(e)})
               return None
 
-          # dump last 20 orders (all statuses)
           try:
             dump = get(f"{API}/v2/orders", status="all", direction="desc", limit=20)
             write_json("orders_dump.json", dump)
@@ -208,7 +205,6 @@ jobs:
               try:
                 od = place_buy_notional(S, BUY_USD)
                 order_id = od.get("id")
-                # brief wait then audit the created order
                 time.sleep(2)
                 audit_order(order_id)
                 note = f"Entered {S} with ${BUY_USD:.2f} notional."
@@ -220,7 +216,6 @@ jobs:
             cur = float(pos.get("current_price", avg))
             upnl_pct = float(pos.get("unrealized_plpc", (cur-avg)/avg))*100.0
 
-            # entry age
             age_min = None
             lf = last_filled_buy(S)
             if lf and lf.get("filled_at"):
@@ -252,7 +247,6 @@ jobs:
               action="HOLD"; note=f"Holding {S}. PnL {upnl_pct:.2f}%."
             mid = cur
 
-          # basic KPI artifacts
           kpi = {"tp_pct":TP_PCT,"sl_pct":SL_PCT,"early_drop_pct":E_DROP,"early_window_min":E_MIN}
           if pos:
             kpi.update({
