@@ -28,13 +28,13 @@ on:
         required: true
         default: "60"
       LIMIT_SLIP_PCT:
-        description: "Limit price slip % through the book to force paper fills"
+        description: "If >0 use LIMIT through the book; 0 = MARKET (fills fast on paper)"
         required: true
-        default: "0.5"
+        default: "0"
       DRY_RUN:
         description: "ON to simulate; OFF to place real PAPER orders"
         required: true
-        default: "OFF"   # safer default is OFF for paper
+        default: "OFF"   # OFF = real PAPER orders
 
 env:
   PYTHONUNBUFFERED: "1"
@@ -190,7 +190,7 @@ jobs:
           last_order_detail = None
 
           if not have:
-              # Place BUY when flat, using LIMIT through-the-book to force paper fills
+              # Place BUY when flat
               order_payload = {
                   "symbol": SYMBOL,
                   "side": "buy",
@@ -200,6 +200,7 @@ jobs:
 
               px = latest_trade_price(SYMBOL)
               if px and LIMIT_SLIP_PCT > 0:
+                  # LIMIT order through the book
                   limit_price = round(px * (1 + LIMIT_SLIP_PCT / 100.0), 2)
                   order_payload.update({
                       "type": "limit",
@@ -211,11 +212,12 @@ jobs:
                       f"at ~{limit_price} (src px {px}, slip {LIMIT_SLIP_PCT}%)."
                   )
               else:
+                  # MARKET order (default when LIMIT_SLIP_PCT == 0)
                   order_payload.update({
                       "type": "market",
                       "order_type": "market",
                   })
-                  note = f"Flat \u2192 MARKET buy {SYMBOL} with ${BUY_USD} (no quote for limit)."
+                  note = f"Flat \u2192 MARKET buy {SYMBOL} with ${BUY_USD} (no/slip=0 quote for limit)."
 
               if DRY_RUN:
                   last_order_detail = {"id": None, "status": "simulated", **order_payload}
