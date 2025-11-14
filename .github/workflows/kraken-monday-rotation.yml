@@ -66,7 +66,7 @@ jobs:
 
       - name: Run Kraken rotation bot
         run: |
-          python kraken_monday_rotation.py
+          python kraken_monday_main.py
 
       - name: Upload run state (positions + summary)
         if: always()
