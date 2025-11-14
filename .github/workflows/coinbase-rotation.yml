@@ -56,8 +56,9 @@ jobs:
           TP_PCT: ${{ inputs.TP_PCT || '5' }}
           SL_PCT: ${{ inputs.SL_PCT || '2' }}
           DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
-          COINBASE_API_KEY: ${{ secrets.COINBASE_API_KEY }}
-          COINBASE_API_SECRET: ${{ secrets.COINBASE_API_SECRET }}
+          # Map existing sandbox secrets into the env vars the bot expects
+          COINBASE_API_KEY: ${{ secrets.COINBASE_SANDBOX_KEY }}
+          COINBASE_API_SECRET: ${{ secrets.COINBASE_SANDBOX_SECRET }}
         run: |
           python coinbase_main.py
 
