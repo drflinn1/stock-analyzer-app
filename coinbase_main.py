@@ -6,21 +6,20 @@ Simple 1-coin rotation bot for Coinbase Advanced.
 Behavior
 --------
 - Tracks a single product (e.g. BTC-USD).
-- If flat -> buys using BUY_USD.
+- If flat  -> buys using BUY_USD.
 - If long  -> checks TP_PCT / SL_PCT and exits if hit.
 - State is stored in .state/coinbase_positions.json
 - DRY_RUN = ON  -> simulate buys/sells using public spot price.
-- DRY_RUN = OFF -> use Coinbase Advanced API Python SDK to place real orders
-                   (requires COINBASE_API_KEY and COINBASE_API_SECRET).
+- DRY_RUN = OFF -> place real market orders via Coinbase Advanced
+                   (COINBASE_API_KEY / COINBASE_API_SECRET).
 
-This is intentionally simple and safe. We can add momentum-scanning and
-multi-coin rotation later once Coinbase is fully stable.
+This is intentionally simple and safe. We can add momentum scanning
+and more advanced logic once Coinbase is fully stable.
 """
 
 from __future__ import annotations
 
 import json
-import math
 import os
 import sys
 import time
@@ -29,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import requests  # Used for public spot price (no auth required)
+import requests
 
 STATE_DIR = Path(".state")
 STATE_FILE = STATE_DIR / "coinbase_positions.json"
@@ -41,7 +40,7 @@ SUMMARY_FILE = STATE_DIR / "coinbase_run_summary.md"
 @dataclass
 class Position:
     product_id: str
-    side: str           # "LONG" for now
+    side: str           # "LONG"
     qty: float
     entry_price: float
     opened_at: float    # epoch seconds
@@ -60,11 +59,13 @@ class BotConfig:
 # ------------------------- Helpers ------------------------- #
 
 def log(msg: str) -> None:
+    """Print a timestamped log line."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"[{ts}] {msg}", flush=True)
 
 
 def load_position() -> Optional[Position]:
+    """Load existing position from disk, if any."""
     if not STATE_FILE.exists():
         return None
     try:
@@ -82,9 +83,9 @@ def load_position() -> Optional[Position]:
 
 
 def save_position(pos: Optional[Position]) -> None:
+    """Save or clear the position file."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if pos is None:
-        # Clear file
         if STATE_FILE.exists():
             STATE_FILE.unlink()
         return
@@ -92,6 +93,7 @@ def save_position(pos: Optional[Position]) -> None:
 
 
 def write_summary(lines: list[str]) -> None:
+    """Write a markdown summary for this run."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     SUMMARY_FILE.write_text("\n".join(lines))
 
@@ -174,8 +176,10 @@ def simulate_sell(cfg: BotConfig, pos: Position, price: float, reason: str) -> N
 
 def real_buy(cfg: BotConfig, price: float) -> Optional[Position]:
     """
-    Use Coinbase Advanced RESTClient to place a market buy.
-    Requires COINBASE_API_KEY and COINBASE_API_SECRET.
+    Place a REAL market BUY via Coinbase Advanced.
+
+    We treat any exception from the SDK as a failure.
+    If no exception is raised, we assume success and log the response.
     """
     api_key = os.getenv("COINBASE_API_KEY")
     api_secret = os.getenv("COINBASE_API_SECRET")
@@ -207,19 +211,16 @@ def real_buy(cfg: BotConfig, price: float) -> Optional[Position]:
         log(f"ERROR: Coinbase BUY failed: {e}")
         return None
 
-    # Parse response
-    success = bool(order.get("success"))
-    if not success:
-        log(f"ERROR: Coinbase BUY not successful: {order.get('error_response')}")
-        return None
+    # We don't depend on the structure of 'order' anymore; just log it.
+    try:
+        log(f"Coinbase BUY response: {order!r}")
+    except Exception:
+        log("Coinbase BUY response received (could not pretty-print).")
 
-    sr = order.get("success_response", {}) or {}
-    order_id = sr.get("order_id")
-    log(f"BUY order placed successfully, order_id={order_id}")
-
-    # We don't have fill info here in the simple path; use current price as entry
     qty = cfg.buy_usd / price if price > 0 else 0.0
     qty = round(qty, 8)
+
+    log(f"REAL BUY OK (assumed from no error) → qty={qty}")
     return Position(
         product_id=cfg.product_id,
         side="LONG",
@@ -230,6 +231,12 @@ def real_buy(cfg: BotConfig, price: float) -> Optional[Position]:
 
 
 def real_sell(cfg: BotConfig, pos: Position, price: float, reason: str) -> None:
+    """
+    Place a REAL market SELL via Coinbase Advanced.
+
+    Same pattern: if the SDK raises an exception, we log failure;
+    otherwise we assume success.
+    """
     api_key = os.getenv("COINBASE_API_KEY")
     api_secret = os.getenv("COINBASE_API_SECRET")
 
@@ -262,18 +269,15 @@ def real_sell(cfg: BotConfig, pos: Position, price: float, reason: str) -> None:
         log(f"ERROR: Coinbase SELL failed: {e}")
         return
 
-    success = bool(order.get("success"))
-    if not success:
-        log(f"ERROR: Coinbase SELL not successful: {order.get('error_response')}")
-        return
+    try:
+        log(f"Coinbase SELL response: {order!r}")
+    except Exception:
+        log("Coinbase SELL response received (could not pretty-print).")
 
-    sr = order.get("success_response", {}) or {}
-    order_id = sr.get("order_id")
     pnl = (price - pos.entry_price) * pos.qty
     pnl_pct = (price - pos.entry_price) / pos.entry_price * 100.0
-
     log(
-        f"SELL order placed successfully, order_id={order_id}, "
+        f"REAL SELL OK (assumed from no error) → "
         f"PnL ${pnl:.2f}, {pnl_pct:.2f}%"
     )
 
@@ -288,15 +292,17 @@ def run() -> int:
     lines.append(f"# Coinbase 1-Coin Rotation Run")
     lines.append(f"- Time: {datetime.fromtimestamp(cfg.now_ts, tz=timezone.utc)}")
     lines.append(f"- Product: {cfg.product_id}")
-    lines.append(f"- BUY_USD: {cfg.buy_usd}")
-    lines.append(f"- TP_PCT: {cfg.tp_pct}")
-    lines.append(f"- SL_PCT: {cfg.sl_pct}")
-    lines.append(f"- DRY_RUN: {'ON' if cfg.dry_run else 'OFF'}")
+    lines.append(f"  BUY_USD: {cfg.buy_usd}")
+    lines.append(f"  TP_PCT: {cfg.tp_pct}")
+    lines.append(f"  SL_PCT: {cfg.sl_pct}")
+    lines.append(f"  DRY_RUN: {'ON' if cfg.dry_run else 'OFF'}")
     lines.append("")
 
     log("Starting Coinbase 1-coin rotation run...")
-    log(f"Config: product_id={cfg.product_id}, BUY_USD={cfg.buy_usd}, "
-        f"TP_PCT={cfg.tp_pct}, SL_PCT={cfg.sl_pct}, DRY_RUN={'ON' if cfg.dry_run else 'OFF'}")
+    log(
+        f"Config: product_id={cfg.product_id}, BUY_USD={cfg.buy_usd}, "
+        f"TP_PCT={cfg.tp_pct}, SL_PCT={cfg.sl_pct}, DRY_RUN={'ON' if cfg.dry_run else 'OFF'}"
+    )
 
     price = fetch_spot_price(cfg.product_id)
     if price is None:
@@ -332,7 +338,8 @@ def run() -> int:
     # We have a position -> evaluate TP/SL
     log(
         f"Existing position: {pos.product_id} qty={pos.qty}, "
-        f"entry_price=${pos.entry_price:.2f}, opened_at={datetime.fromtimestamp(pos.opened_at, tz=timezone.utc)}"
+        f"entry_price=${pos.entry_price:.2f}, "
+        f"opened_at={datetime.fromtimestamp(pos.opened_at, tz=timezone.utc)}"
     )
 
     pnl_pct = (price - pos.entry_price) / pos.entry_price * 100.0
