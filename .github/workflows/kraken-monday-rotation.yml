@@ -51,14 +51,6 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # 🔹 NEW: restore previous .state from last run's artifact (if it exists)
-      - name: Restore previous run state (if exists)
-        uses: actions/download-artifact@v4
-        with:
-          name: kraken-rotation-state
-          path: .
-        continue-on-error: true
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
