@@ -1,0 +1,56 @@
+name: Coinbase — Sandbox Smoke Test (DRY_RUN safe)
+
+on:
+  workflow_dispatch:
+    inputs:
+      PRODUCT_ID:
+        description: "Trading pair (e.g., BTC-USD)"
+        required: true
+        default: "BTC-USD"
+      SIDE:
+        description: "BUY or SELL"
+        required: true
+        default: "BUY"
+      NOTIONAL_USD:
+        description: "USD notional to trade"
+        required: true
+        default: "10"
+      DRY_RUN:
+        description: "ON = preview only (sandbox), OFF = place sandbox order"
+        required: true
+        default: "ON"   # <= you asked for this
+
+jobs:
+  sandbox-test:
+    runs-on: ubuntu-latest
+
+    env:
+      # Wired to your existing GitHub VARIABLES.
+      # (Safe for sandbox; later we’ll move to secrets for live trading.)
+      COINBASE_SANDBOX_KEY: ${{ vars.COINBASE_SANDBOX_KEY }}
+      COINBASE_SANDBOX_SECRET: ${{ vars.COINBASE_SANDBOX_SECRET }}
+
+      # Inputs (with safe fallbacks)
+      PRODUCT_ID:  ${{ github.event.inputs.PRODUCT_ID || 'BTC-USD' }}
+      SIDE:        ${{ github.event.inputs.SIDE || 'BUY' }}
+      NOTIONAL_USD:${{ github.event.inputs.NOTIONAL_USD || '10' }}
+      DRY_RUN:     ${{ github.event.inputs.DRY_RUN || 'ON' }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run Coinbase Sandbox smoke test
+        run: |
+          echo "Running Coinbase Sandbox smoke test..."
+          python coinbase_sandbox.py
