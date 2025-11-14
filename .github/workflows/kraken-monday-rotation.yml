@@ -36,23 +36,28 @@ jobs:
     timeout-minutes: 20
 
     env:
-      # Label used by the script for pretty titles
       RUN_LABEL: "Kraken 1-Coin Rotation Run (Monday Baseline)"
 
-      # Inputs, with safe defaults for scheduled runs
       SYMBOL: ${{ github.event.inputs.SYMBOL || 'BTC/USD' }}
       BUY_USD: ${{ github.event.inputs.BUY_USD || '20' }}
       TP_PCT: ${{ github.event.inputs.TP_PCT || '8' }}
       SL_PCT: ${{ github.event.inputs.SL_PCT || '1' }}
       DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'ON' }}
 
-      # Kraken API creds (only actually used when DRY_RUN=OFF)
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      # 🔹 NEW: restore previous .state from last run's artifact (if it exists)
+      - name: Restore previous run state (if exists)
+        uses: actions/download-artifact@v4
+        with:
+          name: kraken-rotation-state
+          path: .
+        continue-on-error: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
