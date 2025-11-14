@@ -28,10 +28,10 @@ jobs:
       COINBASE_SANDBOX_KEY: ${{ vars.COINBASE_SANDBOX_KEY }}
       COINBASE_SANDBOX_SECRET: ${{ vars.COINBASE_SANDBOX_SECRET }}
 
-      PRODUCT_ID:  ${{ github.event.inputs.PRODUCT_ID }}
-      SIDE:        ${{ github.event.inputs.SIDE }}
-      NOTIONAL_USD:${{ github.event.inputs.NOTIONAL_USD }}
-      DRY_RUN:     ${{ github.event.inputs.DRY_RUN }}
+      PRODUCT_ID:   ${{ github.event.inputs.PRODUCT_ID }}
+      SIDE:         ${{ github.event.inputs.SIDE }}
+      NOTIONAL_USD: ${{ github.event.inputs.NOTIONAL_USD }}
+      DRY_RUN:      ${{ github.event.inputs.DRY_RUN }}
 
     steps:
       - name: Checkout repo
