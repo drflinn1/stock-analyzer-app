@@ -1,0 +1,72 @@
+name: Coinbase — 1-Coin Rotation (DRY_RUN safe)
+
+on:
+  schedule:
+    # Every 30 minutes
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      SYMBOL:
+        description: "Product ID (e.g., BTC-USD, ETH-USD)"
+        required: true
+        default: "BTC-USD"
+      BUY_USD:
+        description: "USD notional to buy when flat"
+        required: true
+        default: "10"
+      TP_PCT:
+        description: "Take-profit % (e.g., 5 = +5%)"
+        required: true
+        default: "5"
+      SL_PCT:
+        description: "Stop-loss % (e.g., 2 = -2%)"
+        required: true
+        default: "2"
+      DRY_RUN:
+        description: "ON = simulate, OFF = place real orders"
+        required: true
+        default: "ON"
+
+concurrency:
+  group: coinbase-1coin-rotation
+  cancel-in-progress: false
+
+jobs:
+  coinbase-rotation:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests coinbase-advanced-py
+
+      - name: Run Coinbase 1-coin rotation bot
+        env:
+          SYMBOL: ${{ inputs.SYMBOL || 'BTC-USD' }}
+          BUY_USD: ${{ inputs.BUY_USD || '10' }}
+          TP_PCT: ${{ inputs.TP_PCT || '5' }}
+          SL_PCT: ${{ inputs.SL_PCT || '2' }}
+          DRY_RUN: ${{ inputs.DRY_RUN || 'ON' }}
+          COINBASE_API_KEY: ${{ secrets.COINBASE_API_KEY }}
+          COINBASE_API_SECRET: ${{ secrets.COINBASE_API_SECRET }}
+        run: |
+          python coinbase_main.py
+
+      - name: Upload state & summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coinbase-rotation-state
+          path: |
+            .state/coinbase_positions.json
+            .state/coinbase_run_summary.md
+          if-no-files-found: ignore
