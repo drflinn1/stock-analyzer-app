@@ -14,12 +14,11 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Share .state with the rotation bot via the same cache key family
-      - name: Restore .state cache
+      - name: Restore shared .state cache (to reuse previous CSV/positions)
         uses: actions/cache/restore@v4
         with:
           path: .state
-          key: kraken-rotation-state-latest
+          key: kraken-rotation-state-${{ github.run_id }}
           restore-keys: |
             kraken-rotation-state-
 
@@ -36,19 +35,12 @@ jobs:
       - name: Build momentum candidates (Kraken 24h gainers)
         run: python tools/kraken_momentum_scan.py
 
-      - name: Save .state cache (for rotation bot)
+      - name: Save updated .state snapshot (with new momentum_candidates.csv)
         if: always()
         uses: actions/cache/save@v4
         with:
           path: .state
           key: kraken-rotation-state-${{ github.run_id }}
-
-      - name: Update stable alias
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: .state
-          key: kraken-rotation-state-latest
 
       - name: Upload momentum candidates
         if: always()
