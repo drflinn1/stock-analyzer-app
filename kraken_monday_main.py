@@ -31,9 +31,9 @@ Config via environment variables (all optional):
 
 Files written under .state/:
 
-    .state/kraken_monday_state.json  # persistent position state
-    .state/kraken_monday_run.json    # one-run summary (machine-readable)
-    .state/kraken_monday_run.md      # pretty markdown summary (for artifacts)
+    .state/kraken_positions.json       # persistent position state
+    .state/kraken_run_summary.json     # one-run summary (machine-readable)
+    .state/kraken_run_summary.md       # pretty markdown summary (for artifacts)
 
 Safe to run repeatedly; each run will:
     - Fetch price
@@ -63,9 +63,9 @@ from urllib.parse import urlencode
 STATE_DIR = Path(".state")
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-STATE_JSON = STATE_DIR / "kraken_monday_state.json"
-RUN_JSON = STATE_DIR / "kraken_monday_run.json"
-RUN_MD = STATE_DIR / "kraken_monday_run.md"
+STATE_JSON = STATE_DIR / "kraken_positions.json"
+RUN_JSON = STATE_DIR / "kraken_run_summary.json"
+RUN_MD = STATE_DIR / "kraken_run_summary.md"
 
 KRAKEN_API_BASE = "https://api.kraken.com"
 KRAKEN_API_VERSION = "0"
@@ -310,7 +310,7 @@ def run() -> None:
         write_run_outputs(summary)
         return
 
-    # Determine if we are in position (base on state +, in LIVE, wallet)
+    # Determine if we are in position (based on state +, in LIVE, wallet)
     api_key = os.getenv("KRAKEN_API_KEY", "").strip()
     api_secret = os.getenv("KRAKEN_API_SECRET", "").strip()
 
