@@ -1,9 +1,9 @@
 name: Kraken — 1-Coin Rotation (Monday Baseline)
 
 on:
-  # Run automatically every 30 minutes
+  # TEMP: run every 5 minutes so we can confirm scheduled runs.
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/5 * * * *"
   # Allow manual runs with custom inputs
   workflow_dispatch:
     inputs:
