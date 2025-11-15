@@ -6,21 +6,35 @@ on:
   workflow_dispatch:
     inputs:
       BUY_USD:
+        description: "USD notional to buy when flat"
         required: true
         default: "20"
       TP_PCT:
+        description: "Take-profit %"
         required: true
         default: "8"
       SL_PCT:
+        description: "Stop-loss %"
         required: true
         default: "2"
       SOFT_SL_PCT:
+        description: "Soft stop % for SG-2"
         required: true
         default: "1.0"
+      SLOW_GAIN_REQ:
+        description: "Stale rule gain requirement (%)"
+        required: true
+        default: "3.0"
+      STALE_MINUTES:
+        description: "Stale rule age in minutes"
+        required: true
+        default: "60"
       DRY_RUN:
+        description: "ON to simulate; OFF reserved for future live wiring"
         required: true
         default: "ON"
       UNIVERSE_PICK:
+        description: "Optional fixed symbol (e.g., LSK/USD). Leave blank for auto-gainer."
         required: false
         default: ""
 
@@ -30,16 +44,17 @@ jobs:
     timeout-minutes: 15
 
     env:
-      BUY_USD: ${{ github.event.inputs.BUY_USD || '20' }}
-      TP_PCT: ${{ github.event.inputs.TP_PCT || '8' }}
-      SL_PCT: ${{ github.event.inputs.SL_PCT || '2' }}
-      SOFT_SL_PCT: ${{ github.event.inputs.SOFT_SL_PCT || '1.0' }}
-      DRY_RUN: ${{ github.event.inputs.DRY_RUN || 'ON' }}
+      BUY_USD:       ${{ github.event.inputs.BUY_USD       || '20' }}
+      TP_PCT:        ${{ github.event.inputs.TP_PCT        || '8' }}
+      SL_PCT:        ${{ github.event.inputs.SL_PCT        || '2' }}
+      SOFT_SL_PCT:   ${{ github.event.inputs.SOFT_SL_PCT   || '1.0' }}
+      SLOW_GAIN_REQ: ${{ github.event.inputs.SLOW_GAIN_REQ || '3.0' }}
+      STALE_MINUTES: ${{ github.event.inputs.STALE_MINUTES || '60' }}
+      DRY_RUN:       ${{ github.event.inputs.DRY_RUN       || 'ON' }}
       UNIVERSE_PICK: ${{ github.event.inputs.UNIVERSE_PICK || '' }}
-      PYTHONPATH: ${{ github.workspace }}
+      PYTHONPATH:    ${{ github.workspace }}
 
     steps:
-
       - name: Checkout repo
         uses: actions/checkout@v4
 
@@ -54,7 +69,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
