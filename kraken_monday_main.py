@@ -2,7 +2,12 @@
 """
 kraken_monday_main.py
 ---------------------------------
-Kraken — 1-Coin Rotation (Monday Baseline) with SELL GUARD (SG-2).
+Kraken — 1-Coin Rotation (Monday Baseline)
+with:
+
+- SELL GUARD SG-2 (TP/SL + soft stop at -SOFT_SL_PCT)
+- 1-hour stale rule (time + weak gain → SELL)
+- Auto gainer rotation (pick next top candidate when flat/after SELL)
 
 Mode:
 - Single-position bot (one coin at a time).
@@ -11,19 +16,15 @@ Mode:
 - DRY_RUN = "ON" (default) simulates trades.
 - DRY_RUN = "OFF" reserved for future live-trading wiring.
 
-SELL GUARD (SG-2 behavior):
-- If PnL% >= TP_PCT           -> SELL (reason: TP)
-- Else if PnL% <= -SL_PCT     -> SELL (reason: SL)
-- Else if PnL% <= -SOFT_SL_PCT -> SELL (reason: DIP)
-  (SOFT_SL_PCT default is 1.0, i.e., -1%)
-
 Environment variables (strings):
-- BUY_USD      : notional USD per buy when flat   (e.g., "20")
-- TP_PCT       : take-profit percent              (e.g., "8")
-- SL_PCT       : hard stop-loss percent           (e.g., "2")
-- SOFT_SL_PCT  : SG-2 soft stop percent (default "1.0")
-- DRY_RUN      : "ON" (default) or "OFF"          ("OFF" reserved for live)
-- UNIVERSE_PICK: optional symbol override (e.g., "LSK/USD")
+- BUY_USD       : notional USD per buy when flat   (e.g., "20")
+- TP_PCT        : take-profit percent              (e.g., "8")
+- SL_PCT        : hard stop-loss percent           (e.g., "2")
+- SOFT_SL_PCT   : SG-2 soft stop percent           (e.g., "1.0" for -1%)
+- SLOW_GAIN_REQ : stale-rule required gain %       (e.g., "3.0" for +3%)
+- STALE_MINUTES : stale-rule age threshold (mins)  (e.g., "60")
+- DRY_RUN       : "ON" (default) or "OFF"          ("OFF" reserved for live)
+- UNIVERSE_PICK : optional symbol override (e.g., "LSK/USD")
 
 Outputs:
 - .state/positions.json: current simulated position (or absent if flat)
@@ -74,6 +75,10 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def minutes_between(start: datetime, end: datetime) -> float:
+    return (end - start).total_seconds() / 60.0
+
+
 def ensure_state_dir() -> None:
     STATE_DIR.mkdir(exist_ok=True)
 
@@ -114,7 +119,9 @@ def write_summary(summary: Dict[str, Any]) -> None:
     lines.append("")
     lines.append(f"**Timestamp (UTC):** {summary.get('timestamp_utc', 'unknown')}")
     lines.append(f"**Mode:** {'DRY-RUN' if summary.get('dry_run', True) else 'LIVE (reserved)'}")
-    lines.append(f"**Sell Guard Mode:** SG-2 (TP/SL + soft stop at -{summary.get('soft_sl_pct')}%)")
+    lines.append(
+        f"**Sell Guard Mode:** SG-2 (TP/SL + soft stop at -{summary.get('soft_sl_pct')}%)"
+    )
     lines.append("")
 
     lines.append("## Config")
@@ -122,6 +129,8 @@ def write_summary(summary: Dict[str, Any]) -> None:
     lines.append(f"- TP_PCT: {summary.get('TP_PCT')}%")
     lines.append(f"- SL_PCT: {summary.get('SL_PCT')}%")
     lines.append(f"- SOFT_SL_PCT: {summary.get('soft_sl_pct')}%")
+    lines.append(f"- SLOW_GAIN_REQ: {summary.get('SLOW_GAIN_REQ')}%")
+    lines.append(f"- STALE_MINUTES: {summary.get('STALE_MINUTES')}")
     lines.append(f"- UNIVERSE_PICK: {summary.get('UNIVERSE_PICK') or '(auto)'}")
     lines.append("")
 
@@ -131,8 +140,12 @@ def write_summary(summary: Dict[str, Any]) -> None:
     lines.append(f"- Current Price: {summary.get('current_price')}")
     lines.append(f"- Entry Price: {summary.get('entry_price')}")
     lines.append(f"- Position Units: {summary.get('units')}")
+    lines.append(f"- Position Age (min): {summary.get('position_age_minutes')}")
     lines.append(f"- Unrealized PnL %: {summary.get('pnl_pct')}")
     lines.append(f"- Sell Reason: {summary.get('sell_reason') or '(n/a)'}")
+    lines.append(f"- Next Symbol: {summary.get('next_symbol')}")
+    lines.append(f"- Next Entry Price: {summary.get('next_entry_price')}")
+    lines.append(f"- Next Units: {summary.get('next_units')}")
     lines.append("")
     lines.append(f"Notes: {summary.get('notes') or ''}".strip())
 
@@ -197,11 +210,14 @@ def decide_and_act() -> None:
     TP_PCT = float(os.getenv("TP_PCT", "8"))
     SL_PCT = float(os.getenv("SL_PCT", "2"))
     SOFT_SL_PCT = float(os.getenv("SOFT_SL_PCT", "1.0"))  # SG-2 soft stop (default 1%)
+    SLOW_GAIN_REQ = float(os.getenv("SLOW_GAIN_REQ", "3.0"))  # stale rule gain requirement
+    STALE_MINUTES = float(os.getenv("STALE_MINUTES", "60"))   # stale rule age in minutes
     UNIVERSE_PICK = os.getenv("UNIVERSE_PICK", "").strip() or None
     DRY_RUN_FLAG = os.getenv("DRY_RUN", "ON").strip().upper()
     DRY_RUN = DRY_RUN_FLAG != "OFF"  # anything except "OFF" is treated as DRY
 
-    now_iso = utc_now_iso()
+    now_utc = datetime.now(timezone.utc)
+    now_iso = now_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
     pos = load_position()
 
     # Determine symbol: if we already hold something, we guard that symbol.
@@ -219,14 +235,20 @@ def decide_and_act() -> None:
         "TP_PCT": TP_PCT,
         "SL_PCT": SL_PCT,
         "soft_sl_pct": SOFT_SL_PCT,
+        "SLOW_GAIN_REQ": SLOW_GAIN_REQ,
+        "STALE_MINUTES": STALE_MINUTES,
         "UNIVERSE_PICK": UNIVERSE_PICK,
         "symbol": symbol,
         "current_price": price,
         "entry_price": None,
         "units": None,
         "pnl_pct": None,
+        "position_age_minutes": None,
         "sell_reason": None,
         "action": "HOLD",
+        "next_symbol": None,
+        "next_entry_price": None,
+        "next_units": None,
         "notes": "",
     }
 
@@ -236,15 +258,17 @@ def decide_and_act() -> None:
         write_summary(base_summary)
         return
 
-    # If we already have a position: apply SELL GUARD (SG-2)
+    # If we already have a position: apply SELL GUARD + stale rule
     if pos is not None:
         entry = float(pos.entry_price)
         units = float(pos.units)
         pnl_pct = ((price - entry) / entry) * 100.0
+        age_minutes = minutes_between(pos.entry_dt, now_utc)
 
         base_summary["entry_price"] = entry
         base_summary["units"] = units
         base_summary["pnl_pct"] = round(pnl_pct, 4)
+        base_summary["position_age_minutes"] = round(age_minutes, 2)
 
         sell_reason: Optional[str] = None
         notes = []
@@ -264,38 +288,81 @@ def decide_and_act() -> None:
             sell_reason = "DIP"
             notes.append(f"Soft stop (SG-2): PnL {pnl_pct:.3f}% <= -{SOFT_SL_PCT}%")
 
+        # Stale rule: age threshold + weak gain
+        elif age_minutes >= STALE_MINUTES and pnl_pct < SLOW_GAIN_REQ:
+            sell_reason = "STALE"
+            notes.append(
+                f"Stale rule: Age {age_minutes:.1f} min >= {STALE_MINUTES} min "
+                f"and PnL {pnl_pct:.3f}% < {SLOW_GAIN_REQ}%."
+            )
+
         # Decide action based on sell_reason
         if sell_reason is None:
             # HOLD position
             base_summary["action"] = "HOLD"
             base_summary["sell_reason"] = None
-            notes.append("SELL GUARD: HOLD (no TP/SL/soft-stop hit).")
+            notes.append("SELL GUARD: HOLD (no TP/SL/soft-stop/stale hit).")
             base_summary["notes"] = " ".join(notes)
             write_summary(base_summary)
             return
 
-        # We are SELLING this run
+        # We are SELLING this run (and maybe rotating)
         base_summary["action"] = "SELL"
         base_summary["sell_reason"] = sell_reason
 
-        # Simulated execution
+        # Simulated execution of SELL
         if DRY_RUN:
-            # In DRY mode, just drop the position file and record the PnL.
             clear_position()
             notes.append(f"DRY-RUN: would SELL {units} {symbol} at {price}.")
         else:
             # Placeholder for future live-trading integration
-            # For now, we still behave as DRY but clearly label it.
             clear_position()
             notes.append(
                 "LIVE wiring not implemented yet; treated as DRY SELL (position cleared in .state)."
             )
 
+        # Auto gainer rotation (only if UNIVERSE_PICK is not forcing a symbol)
+        next_symbol = choose_symbol(UNIVERSE_PICK)
+        next_price: Optional[float] = None
+        next_units: Optional[float] = None
+
+        if next_symbol:
+            next_price = get_price(next_symbol)
+            if next_price is not None and next_price > 0:
+                next_units = round(BUY_USD / next_price, 8)
+                new_pos = Position(
+                    symbol=next_symbol,
+                    units=next_units,
+                    entry_price=next_price,
+                    entry_time=now_iso,
+                )
+                save_position(new_pos)
+                base_summary["action"] = "SELL+BUY"
+                base_summary["next_symbol"] = next_symbol
+                base_summary["next_entry_price"] = next_price
+                base_summary["next_units"] = next_units
+                if DRY_RUN:
+                    notes.append(
+                        f"Rotation: DRY-RUN would BUY ~{next_units} {next_symbol} "
+                        f"at {next_price} using ${BUY_USD}."
+                    )
+                else:
+                    notes.append(
+                        "Rotation: LIVE wiring not implemented yet; "
+                        "position stored in .state as if bought."
+                    )
+            else:
+                notes.append(
+                    f"Rotation skipped: no valid price for next symbol candidate ({next_symbol})."
+                )
+        else:
+            notes.append("Rotation skipped: no symbol available from universe.")
+
         base_summary["notes"] = " ".join(notes)
         write_summary(base_summary)
         return
 
-    # If we are FLAT: BUY a new position
+    # If we are FLAT: BUY a new position (auto gainer selection)
     units = round(BUY_USD / price, 8)
     new_pos = Position(
         symbol=symbol,
@@ -307,6 +374,7 @@ def decide_and_act() -> None:
     base_summary["entry_price"] = price
     base_summary["units"] = units
     base_summary["pnl_pct"] = 0.0  # new entry
+    base_summary["position_age_minutes"] = 0.0
     base_summary["action"] = "BUY"
     base_summary["sell_reason"] = None
 
