@@ -1,6 +1,10 @@
 name: Kraken — 1-Coin Rotation (Monday Baseline)
 
 on:
+  # Run automatically every 30 minutes
+  schedule:
+    - cron: "*/30 * * * *"
+  # Allow manual runs with custom inputs
   workflow_dispatch:
     inputs:
       BUY_USD:
@@ -18,19 +22,24 @@ on:
       DRY_RUN:
         description: "ON = simulate (no real orders), OFF = LIVE (place orders)"
         required: true
-        default: "ON"
+        default: "OFF"  # default for *manual* runs – you can change this per run
 
 jobs:
   kraken-rotation:
     runs-on: ubuntu-latest
 
     env:
-      # Trading config
       SYMBOL: "BTC/USD"
-      BUY_USD: ${{ inputs.BUY_USD }}
-      TP_PCT: ${{ inputs.TP_PCT }}
-      SL_PCT: ${{ inputs.SL_PCT }}
-      DRY_RUN: ${{ inputs.DRY_RUN }}
+
+      # For manual runs (workflow_dispatch), use the inputs.
+      # For scheduled runs, fall back to these safe defaults:
+      BUY_USD: ${{ github.event_name == 'workflow_dispatch' && inputs.BUY_USD || '20' }}
+      TP_PCT:  ${{ github.event_name == 'workflow_dispatch' && inputs.TP_PCT  || '8'  }}
+      SL_PCT:  ${{ github.event_name == 'workflow_dispatch' && inputs.SL_PCT  || '1'  }}
+
+      # For scheduled runs we want LIVE so it can manage your BTC.
+      # For manual runs you can override DRY_RUN to ON/OFF in the popup.
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.DRY_RUN || 'OFF' }}
 
       # Kraken API (only used when DRY_RUN=OFF)
       KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
