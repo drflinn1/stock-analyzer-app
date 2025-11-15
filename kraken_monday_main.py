@@ -1,516 +1,333 @@
 #!/usr/bin/env python3
 """
 kraken_monday_main.py
+---------------------------------
+Kraken — 1-Coin Rotation (Monday Baseline) with SELL GUARD (SG-2).
 
-Kraken 1-Coin Rotation (Monday Baseline) with DRY and LIVE modes.
+Mode:
+- Single-position bot (one coin at a time).
+- Uses .state/positions.json to track the open position.
+- Uses public quotes via trader.crypto_engine for pricing.
+- DRY_RUN = "ON" (default) simulates trades.
+- DRY_RUN = "OFF" reserved for future live-trading wiring.
 
-DRY_RUN = "ON"
-    - Simulate BTC/USD trades using local state only.
-    - No Kraken private API calls.
-    - Uses public ticker for price.
-    - Writes markdown + JSON so we can inspect behaviour safely.
+SELL GUARD (SG-2 behavior):
+- If PnL% >= TP_PCT           -> SELL (reason: TP)
+- Else if PnL% <= -SL_PCT     -> SELL (reason: SL)
+- Else if PnL% <= -SOFT_SL_PCT -> SELL (reason: DIP)
+  (SOFT_SL_PCT default is 1.0, i.e., -1%)
 
-DRY_RUN = "OFF"
-    - Uses Kraken private API (requires KRAKEN_API_KEY / KRAKEN_API_SECRET).
-    - Checks real BTC balance to decide if we are "in position".
-    - Uses local state file for entry_price / qty and syncs if needed.
-    - Applies TP_PCT / SL_PCT (take profit / stop loss).
-    - Sends real MARKET BUY/SELL orders.
-    - Writes markdown + JSON summary of every decision.
+Environment variables (strings):
+- BUY_USD      : notional USD per buy when flat   (e.g., "20")
+- TP_PCT       : take-profit percent              (e.g., "8")
+- SL_PCT       : hard stop-loss percent           (e.g., "2")
+- SOFT_SL_PCT  : SG-2 soft stop percent (default "1.0")
+- DRY_RUN      : "ON" (default) or "OFF"          ("OFF" reserved for live)
+- UNIVERSE_PICK: optional symbol override (e.g., "LSK/USD")
 
-Config via environment variables (all optional):
-
-    SYMBOL          (default "BTC/USD")
-    BUY_USD         (default "20")      # USD notional for new buys
-    TP_PCT          (default "8")       # take profit %
-    SL_PCT          (default "1")       # stop loss %
-    DRY_RUN         (default "ON")      # "ON" or "OFF"
-
-    KRAKEN_API_KEY      (required for DRY_RUN="OFF")
-    KRAKEN_API_SECRET   (required for DRY_RUN="OFF")
-
-Files written under .state/:
-
-    .state/kraken_positions.json       # persistent position state
-    .state/kraken_run_summary.json     # one-run summary (machine-readable)
-    .state/kraken_run_summary.md       # pretty markdown summary (for artifacts)
-
-Safe to run repeatedly; each run will:
-    - Fetch price
-    - Decide BUY / SELL / HOLD
-    - Execute behaviour depending on DRY_RUN
+Outputs:
+- .state/positions.json: current simulated position (or absent if flat)
+- .state/run_summary.md: human-readable run summary
 """
 
 from __future__ import annotations
 
-import base64
-import datetime as dt
-import hashlib
-import hmac
 import json
 import os
-import sys
-import time
 from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional, Dict, Any
 
-import requests
-from urllib.parse import urlencode
-
-# ---------- Basic config ----------
+from trader.crypto_engine import (
+    get_public_quote,
+    normalize_pair,
+    load_candidates,
+)
 
 STATE_DIR = Path(".state")
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-
-STATE_JSON = STATE_DIR / "kraken_positions.json"
-RUN_JSON = STATE_DIR / "kraken_run_summary.json"
-RUN_MD = STATE_DIR / "kraken_run_summary.md"
-
-KRAKEN_API_BASE = "https://api.kraken.com"
-KRAKEN_API_VERSION = "0"
-
-KRAKEN_MIN_NOTIONAL_USD = 10.0  # conservative min to avoid 'EOrder:Insufficient funds'
+POSITIONS_JSON = STATE_DIR / "positions.json"
+SUMMARY_MD = STATE_DIR / "run_summary.md"
 
 
-# ---------- Helper dataclasses ----------
+# ----------------------------
+# Data models
+# ----------------------------
 
 @dataclass
-class PositionState:
+class Position:
     symbol: str
-    status: str  # "flat" or "in_position"
-    qty: float
+    units: float
     entry_price: float
-    last_action: str
-    last_run: str
+    entry_time: str  # ISO 8601 string (UTC)
 
-    @classmethod
-    def empty(cls, symbol: str) -> "PositionState":
-        now = dt.datetime.utcnow().isoformat()
-        return cls(
-            symbol=symbol,
-            status="flat",
-            qty=0.0,
-            entry_price=0.0,
-            last_action="INIT_FLAT",
-            last_run=now,
-        )
+    @property
+    def entry_dt(self) -> datetime:
+        return datetime.fromisoformat(self.entry_time.replace("Z", "+00:00"))
 
 
-@dataclass
-class RunSummary:
-    time: str
-    symbol: str
-    buy_usd: float
-    tp_pct: float
-    sl_pct: float
-    dry_run: str
-    spot_price: float
-    status: str
-    action: str
-    pnl_pct: Optional[float] = None
-    notes: Optional[str] = None
+# ----------------------------
+# Helpers: file + time
+# ----------------------------
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-# ---------- Utility functions ----------
+def ensure_state_dir() -> None:
+    STATE_DIR.mkdir(exist_ok=True)
 
-def env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
-        return default
+
+def load_position() -> Optional[Position]:
+    if not POSITIONS_JSON.exists():
+        return None
     try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
-def load_state(symbol: str) -> PositionState:
-    if not STATE_JSON.exists():
-        return PositionState.empty(symbol)
-    try:
-        data = json.loads(STATE_JSON.read_text())
-        return PositionState(
-            symbol=data.get("symbol", symbol),
-            status=data.get("status", "flat"),
-            qty=float(data.get("qty", 0.0)),
-            entry_price=float(data.get("entry_price", 0.0)),
-            last_action=data.get("last_action", "INIT_LOAD"),
-            last_run=data.get("last_run", dt.datetime.utcnow().isoformat()),
+        data = json.loads(POSITIONS_JSON.read_text())
+        return Position(
+            symbol=data["symbol"],
+            units=float(data["units"]),
+            entry_price=float(data["entry_price"]),
+            entry_time=data["entry_time"],
         )
     except Exception:
-        # Corrupt state? Start flat but keep file around.
-        return PositionState.empty(symbol)
+        # Corrupt or unexpected file; treat as flat
+        return None
 
 
-def save_state(state: PositionState) -> None:
-    STATE_JSON.write_text(json.dumps(asdict(state), indent=2))
+def save_position(pos: Position) -> None:
+    ensure_state_dir()
+    POSITIONS_JSON.write_text(json.dumps(asdict(pos), indent=2))
 
 
-def write_run_outputs(summary: RunSummary) -> None:
-    # JSON
-    RUN_JSON.write_text(json.dumps(asdict(summary), indent=2))
-
-    # Markdown
-    lines = [
-        "# Kraken 1-Coin Rotation Run (Monday Baseline)",
-        "",
-        f"- Time: {summary.time}",
-        f"- Symbol: {summary.symbol}",
-        f"  BUY_USD: {summary.buy_usd}",
-        f"  TP_PCT: {summary.tp_pct}",
-        f"  SL_PCT: {summary.sl_pct}",
-        f"  DRY_RUN: {summary.dry_run}",
-        f"- Spot price: ${summary.spot_price:.2f}",
-        f"- Status: {summary.status}",
-        f"- Action: {summary.action}",
-    ]
-    if summary.pnl_pct is not None:
-        lines.append(f"- PnL: {summary.pnl_pct:.2f}%")
-    if summary.notes:
-        lines.append(f"- Notes: {summary.notes}")
-    RUN_MD.write_text("\n".join(lines))
-
-    # Also print to stdout so it shows in logs
-    print("\n".join(lines))
+def clear_position() -> None:
+    if POSITIONS_JSON.exists():
+        POSITIONS_JSON.unlink()
 
 
-def kraken_public_ticker_btcusd() -> float:
+def write_summary(summary: Dict[str, Any]) -> None:
     """
-    Fetches spot price for BTC/USD using Kraken's public ticker.
-
-    Kraken uses XBTUSD as the pair name; we grab the first result's c[0].
+    Write a readable run_summary.md summarizing what this run decided.
     """
-    url = f"{KRAKEN_API_BASE}/{KRAKEN_API_VERSION}/public/Ticker"
-    resp = requests.get(url, params={"pair": "XBTUSD"}, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("error"):
-        raise RuntimeError(f"Kraken public error: {data['error']}")
-    result = data["result"]
-    # Just pick the first key (usually "XXBTZUSD")
-    first_key = next(iter(result.keys()))
-    last_str = result[first_key]["c"][0]  # last trade price
-    return float(last_str)
+    ensure_state_dir()
+    lines = []
+    lines.append(f"# Kraken — 1-Coin Rotation (Monday Baseline)")
+    lines.append("")
+    lines.append(f"**Timestamp (UTC):** {summary.get('timestamp_utc', 'unknown')}")
+    lines.append(f"**Mode:** {'DRY-RUN' if summary.get('dry_run', True) else 'LIVE (reserved)'}")
+    lines.append(f"**Sell Guard Mode:** SG-2 (TP/SL + soft stop at -{summary.get('soft_sl_pct')}%)")
+    lines.append("")
+
+    lines.append("## Config")
+    lines.append(f"- BUY_USD: {summary.get('BUY_USD')}")
+    lines.append(f"- TP_PCT: {summary.get('TP_PCT')}%")
+    lines.append(f"- SL_PCT: {summary.get('SL_PCT')}%")
+    lines.append(f"- SOFT_SL_PCT: {summary.get('soft_sl_pct')}%")
+    lines.append(f"- UNIVERSE_PICK: {summary.get('UNIVERSE_PICK') or '(auto)'}")
+    lines.append("")
+
+    lines.append("## State / Decision")
+    lines.append(f"- Action: {summary.get('action')}")
+    lines.append(f"- Symbol: {summary.get('symbol')}")
+    lines.append(f"- Current Price: {summary.get('current_price')}")
+    lines.append(f"- Entry Price: {summary.get('entry_price')}")
+    lines.append(f"- Position Units: {summary.get('units')}")
+    lines.append(f"- Unrealized PnL %: {summary.get('pnl_pct')}")
+    lines.append(f"- Sell Reason: {summary.get('sell_reason') or '(n/a)'}")
+    lines.append("")
+    lines.append(f"Notes: {summary.get('notes') or ''}".strip())
+
+    SUMMARY_MD.write_text("\n".join(lines) + "\n")
 
 
-def kraken_private_request(
-    path: str,
-    data: Dict[str, Any],
-    api_key: str,
-    api_secret_b64: str,
-) -> Dict[str, Any]:
+# ----------------------------
+# Market helpers
+# ----------------------------
+
+def choose_symbol(universe_pick: Optional[str]) -> str:
     """
-    Minimal Kraken authenticated POST request.
-
-    path: e.g. "/0/private/Balance"
+    Choose which symbol to trade when flat.
+    Priority:
+    1) UNIVERSE_PICK if provided
+    2) Top candidate from .state/momentum_candidates.csv (by rank)
+    3) Fallback to BTC/USD
     """
-    nonce = str(int(time.time() * 1000))
-    data = {"nonce": nonce, **data}
-    postdata = urlencode(data)
-    # Message for HMAC: path + SHA256(nonce + postdata)
-    sha256 = hashlib.sha256((nonce + postdata).encode()).digest()
-    message = path.encode() + sha256
-    secret = base64.b64decode(api_secret_b64)
-    sig = hmac.new(secret, message, hashlib.sha512)
-    sig_b64 = base64.b64encode(sig.digest()).decode()
+    if universe_pick:
+        return normalize_pair(universe_pick)
 
-    headers = {
-        "API-Key": api_key,
-        "API-Sign": sig_b64,
+    # Try momentum candidates if available
+    try:
+        candidates = load_candidates()
+        if candidates:
+            # Expect fields: symbol, quote, rank — pick max rank as "best"
+            def rank_val(row: Dict[str, str]) -> float:
+                try:
+                    return float(row.get("rank", 0))
+                except Exception:
+                    return 0.0
+
+            best = max(candidates, key=rank_val)
+            sym = best.get("symbol") or "BTC/USD"
+            return normalize_pair(sym)
+    except Exception:
+        pass
+
+    # Ultimate fallback
+    return normalize_pair("BTC/USD")
+
+
+def get_price(symbol: str) -> Optional[float]:
+    """
+    Unified price getter using trader.crypto_engine public quote.
+    """
+    try:
+        return get_public_quote(symbol)
+    except Exception:
+        return None
+
+
+# ----------------------------
+# Core decision logic
+# ----------------------------
+
+def decide_and_act() -> None:
+    ensure_state_dir()
+
+    # ----- Read config from environment -----
+    BUY_USD = float(os.getenv("BUY_USD", "20"))
+    TP_PCT = float(os.getenv("TP_PCT", "8"))
+    SL_PCT = float(os.getenv("SL_PCT", "2"))
+    SOFT_SL_PCT = float(os.getenv("SOFT_SL_PCT", "1.0"))  # SG-2 soft stop (default 1%)
+    UNIVERSE_PICK = os.getenv("UNIVERSE_PICK", "").strip() or None
+    DRY_RUN_FLAG = os.getenv("DRY_RUN", "ON").strip().upper()
+    DRY_RUN = DRY_RUN_FLAG != "OFF"  # anything except "OFF" is treated as DRY
+
+    now_iso = utc_now_iso()
+    pos = load_position()
+
+    # Determine symbol: if we already hold something, we guard that symbol.
+    if pos:
+        symbol = normalize_pair(pos.symbol)
+    else:
+        symbol = choose_symbol(UNIVERSE_PICK)
+
+    price = get_price(symbol)
+
+    base_summary: Dict[str, Any] = {
+        "timestamp_utc": now_iso,
+        "dry_run": DRY_RUN,
+        "BUY_USD": BUY_USD,
+        "TP_PCT": TP_PCT,
+        "SL_PCT": SL_PCT,
+        "soft_sl_pct": SOFT_SL_PCT,
+        "UNIVERSE_PICK": UNIVERSE_PICK,
+        "symbol": symbol,
+        "current_price": price,
+        "entry_price": None,
+        "units": None,
+        "pnl_pct": None,
+        "sell_reason": None,
+        "action": "HOLD",
+        "notes": "",
     }
 
-    url = f"{KRAKEN_API_BASE}{path}"
-    resp = requests.post(url, data=data, headers=headers, timeout=15)
-    resp.raise_for_status()
-    payload = resp.json()
-    if payload.get("error"):
-        raise RuntimeError(f"Kraken private error: {payload['error']}")
-    return payload["result"]
-
-
-def kraken_get_btc_balance(api_key: str, api_secret_b64: str) -> float:
-    """
-    Return free BTC balance (XBT) on Kraken spot account.
-    """
-    result = kraken_private_request(
-        f"/{KRAKEN_API_VERSION}/private/Balance",
-        {},
-        api_key,
-        api_secret_b64,
-    )
-    # Spot BTC is usually under "XXBT" or "XBT"
-    for key in ("XXBT", "XBT"):
-        if key in result:
-            return float(result[key])
-    return 0.0
-
-
-def kraken_market_order(
-    side: str,
-    qty: float,
-    api_key: str,
-    api_secret_b64: str,
-) -> str:
-    """
-    Place a market order on BTC/USD (XBTUSD).
-
-    Returns: order description string from Kraken.
-    """
-    if qty <= 0:
-        raise ValueError("qty must be > 0 for live order")
-
-    result = kraken_private_request(
-        f"/{KRAKEN_API_VERSION}/private/AddOrder",
-        {
-            "pair": "XBTUSD",
-            "type": side,           # "buy" or "sell"
-            "ordertype": "market",
-            "volume": f"{qty:.8f}",
-        },
-        api_key,
-        api_secret_b64,
-    )
-    descr = result.get("descr", {})
-    order_descr = descr.get("order", "order sent")
-    return order_descr
-
-
-# ---------- Core logic ----------
-
-def run() -> None:
-    # Read config
-    symbol = os.getenv("SYMBOL", "BTC/USD")
-    buy_usd = env_float("BUY_USD", 20.0)
-    tp_pct = env_float("TP_PCT", 8.0)
-    sl_pct = env_float("SL_PCT", 1.0)
-    dry_run = os.getenv("DRY_RUN", "ON").strip().upper() or "ON"
-
-    now = dt.datetime.utcnow().isoformat()
-
-    # Load state
-    state = load_state(symbol)
-
-    # Fetch spot price
-    try:
-        price = kraken_public_ticker_btcusd()
-    except Exception as e:
-        # If we can't get a price, fail safely.
-        summary = RunSummary(
-            time=now,
-            symbol=symbol,
-            buy_usd=buy_usd,
-            tp_pct=tp_pct,
-            sl_pct=sl_pct,
-            dry_run=dry_run,
-            spot_price=0.0,
-            status=state.status,
-            action="HOLD (no price available)",
-            notes=f"Error fetching price: {e}",
-        )
-        write_run_outputs(summary)
+    # Handle missing/invalid price
+    if price is None or price <= 0:
+        base_summary["notes"] = "HOLD: invalid or missing price feed for symbol."
+        write_summary(base_summary)
         return
 
-    # Determine if we are in position (based on state +, in LIVE, wallet)
-    api_key = os.getenv("KRAKEN_API_KEY", "").strip()
-    api_secret = os.getenv("KRAKEN_API_SECRET", "").strip()
+    # If we already have a position: apply SELL GUARD (SG-2)
+    if pos is not None:
+        entry = float(pos.entry_price)
+        units = float(pos.units)
+        pnl_pct = ((price - entry) / entry) * 100.0
 
-    live_btc_balance = None
-    notes: list[str] = []
+        base_summary["entry_price"] = entry
+        base_summary["units"] = units
+        base_summary["pnl_pct"] = round(pnl_pct, 4)
 
-    if dry_run == "OFF":
-        if not api_key or not api_secret:
-            summary = RunSummary(
-                time=now,
-                symbol=symbol,
-                buy_usd=buy_usd,
-                tp_pct=tp_pct,
-                sl_pct=sl_pct,
-                dry_run=dry_run,
-                spot_price=price,
-                status=state.status,
-                action="HOLD (missing API keys)",
-                notes="KRAKEN_API_KEY / KRAKEN_API_SECRET not set; refusing to trade.",
-            )
-            write_run_outputs(summary)
+        sell_reason: Optional[str] = None
+        notes = []
+
+        # TP condition
+        if pnl_pct >= TP_PCT:
+            sell_reason = "TP"
+            notes.append(f"TP hit: PnL {pnl_pct:.3f}% >= {TP_PCT}%")
+
+        # Hard SL condition
+        elif pnl_pct <= -SL_PCT:
+            sell_reason = "SL"
+            notes.append(f"SL hit: PnL {pnl_pct:.3f}% <= -{SL_PCT}%")
+
+        # Soft SL (SG-2) condition
+        elif pnl_pct <= -SOFT_SL_PCT:
+            sell_reason = "DIP"
+            notes.append(f"Soft stop (SG-2): PnL {pnl_pct:.3f}% <= -{SOFT_SL_PCT}%")
+
+        # Decide action based on sell_reason
+        if sell_reason is None:
+            # HOLD position
+            base_summary["action"] = "HOLD"
+            base_summary["sell_reason"] = None
+            notes.append("SELL GUARD: HOLD (no TP/SL/soft-stop hit).")
+            base_summary["notes"] = " ".join(notes)
+            write_summary(base_summary)
             return
 
-        try:
-            live_btc_balance = kraken_get_btc_balance(api_key, api_secret)
-            notes.append(f"Live BTC balance: {live_btc_balance:.8f}")
-        except Exception as e:
-            summary = RunSummary(
-                time=now,
-                symbol=symbol,
-                buy_usd=buy_usd,
-                tp_pct=tp_pct,
-                sl_pct=sl_pct,
-                dry_run=dry_run,
-                spot_price=price,
-                status=state.status,
-                action="HOLD (error reading balance)",
-                notes=f"Error reading Kraken balance: {e}",
-            )
-            write_run_outputs(summary)
-            return
+        # We are SELLING this run
+        base_summary["action"] = "SELL"
+        base_summary["sell_reason"] = sell_reason
 
-        # Sync state with live wallet if they disagree materially
-        if live_btc_balance and live_btc_balance > 0.00001 and state.status == "flat":
-            # We have BTC on Kraken but state thinks we're flat — sync in.
-            state.status = "in_position"
-            state.qty = live_btc_balance
-            state.entry_price = price  # unknown true basis; use current spot
-            state.last_action = "SYNC_IN_POSITION_FROM_WALLET"
+        # Simulated execution
+        if DRY_RUN:
+            # In DRY mode, just drop the position file and record the PnL.
+            clear_position()
+            notes.append(f"DRY-RUN: would SELL {units} {symbol} at {price}.")
+        else:
+            # Placeholder for future live-trading integration
+            # For now, we still behave as DRY but clearly label it.
+            clear_position()
             notes.append(
-                "State was flat but live BTC balance > 0; "
-                "synced state to IN_POSITION using current price as entry."
-            )
-        elif (not live_btc_balance or live_btc_balance <= 0.00001) and state.status == "in_position":
-            # State thought we were in, but wallet has no BTC — sync flat.
-            state.status = "flat"
-            state.qty = 0.0
-            state.entry_price = 0.0
-            state.last_action = "SYNC_FLAT_FROM_WALLET"
-            notes.append(
-                "State was IN_POSITION but live BTC balance ~ 0; "
-                "synced state to FLAT."
+                "LIVE wiring not implemented yet; treated as DRY SELL (position cleared in .state)."
             )
 
-    # PnL if in position
-    pnl_pct = None
-    if state.status == "in_position" and state.entry_price > 0:
-        pnl_pct = (price - state.entry_price) / state.entry_price * 100.0
+        base_summary["notes"] = " ".join(notes)
+        write_summary(base_summary)
+        return
 
-    # Decide action
-    action = "HOLD"
-    if state.status == "in_position":
-        # Check TP / SL
-        if pnl_pct is not None and pnl_pct >= tp_pct:
-            action = f"SELL (TP hit: {pnl_pct:.2f}% >= {tp_pct}%)"
-        elif pnl_pct is not None and pnl_pct <= -sl_pct:
-            action = f"SELL (SL hit: {pnl_pct:.2f}% <= -{sl_pct}%)"
-        else:
-            action = "HOLD (in position; TP/SL not hit)"
-    else:
-        # Flat — decide if we can buy
-        notional = buy_usd
-        if notional < KRAKEN_MIN_NOTIONAL_USD:
-            action = (
-                f"HOLD (flat; BUY_USD={buy_usd} below Kraken min "
-                f"{KRAKEN_MIN_NOTIONAL_USD})"
-            )
-        else:
-            qty = buy_usd / price
-            action = f"BUY -> {symbol}, qty ~ {qty:.6f}, entry_price=${price:.2f}"
-
-    # Execute behaviour based on DRY_RUN
-    if dry_run == "ON":
-        # Simulated behaviour
-        if action.startswith("BUY ->"):
-            qty = buy_usd / price
-            state.status = "in_position"
-            state.qty = qty
-            state.entry_price = price
-            state.last_action = "SIM_BUY"
-        elif action.startswith("SELL (TP hit") or action.startswith("SELL (SL hit"):
-            # Simulated sell to flat
-            state.status = "flat"
-            state.qty = 0.0
-            state.entry_price = 0.0
-            state.last_action = "SIM_SELL"
-        else:
-            state.last_action = "SIM_HOLD"
-
-    else:
-        # LIVE trading
-        if action.startswith("BUY ->"):
-            qty = buy_usd / price
-            try:
-                order_descr = kraken_market_order(
-                    side="buy",
-                    qty=qty,
-                    api_key=api_key,
-                    api_secret_b64=api_secret,
-                )
-                notes.append(f"BUY order sent: {order_descr}")
-                state.status = "in_position"
-                state.qty = qty
-                state.entry_price = price
-                state.last_action = "LIVE_BUY"
-            except Exception as e:
-                notes.append(f"BUY failed: {e}")
-                action = f"HOLD (BUY failed: {e})"
-                state.last_action = "LIVE_BUY_FAILED"
-
-        elif action.startswith("SELL (TP hit") or action.startswith("SELL (SL hit"):
-            # Sell all BTC we think we hold
-            qty_to_sell = state.qty
-            if live_btc_balance is not None:
-                qty_to_sell = max(qty_to_sell, live_btc_balance)
-            if qty_to_sell <= 0.00001:
-                notes.append("No BTC to sell; skipping SELL.")
-                state.last_action = "LIVE_SELL_SKIPPED_NO_BALANCE"
-                action = "HOLD (no BTC to sell)"
-            else:
-                try:
-                    order_descr = kraken_market_order(
-                        side="sell",
-                        qty=qty_to_sell,
-                        api_key=api_key,
-                        api_secret_b64=api_secret,
-                    )
-                    notes.append(f"SELL order sent: {order_descr}")
-                    state.status = "flat"
-                    state.qty = 0.0
-                    state.entry_price = 0.0
-                    state.last_action = "LIVE_SELL"
-                except Exception as e:
-                    notes.append(f"SELL failed: {e}")
-                    action = f"HOLD (SELL failed: {e})"
-                    state.last_action = "LIVE_SELL_FAILED"
-        else:
-            state.last_action = "LIVE_HOLD"
-
-    state.last_run = now
-    save_state(state)
-
-    summary = RunSummary(
-        time=now,
+    # If we are FLAT: BUY a new position
+    units = round(BUY_USD / price, 8)
+    new_pos = Position(
         symbol=symbol,
-        buy_usd=buy_usd,
-        tp_pct=tp_pct,
-        sl_pct=sl_pct,
-        dry_run=dry_run,
-        spot_price=price,
-        status=state.status,
-        action=action,
-        pnl_pct=pnl_pct,
-        notes=" | ".join(notes) if notes else None,
+        units=units,
+        entry_price=price,
+        entry_time=now_iso,
     )
-    write_run_outputs(summary)
 
+    base_summary["entry_price"] = price
+    base_summary["units"] = units
+    base_summary["pnl_pct"] = 0.0  # new entry
+    base_summary["action"] = "BUY"
+    base_summary["sell_reason"] = None
+
+    notes = [f"Flat before run; opening new position in {symbol}."]
+    if DRY_RUN:
+        save_position(new_pos)
+        notes.append(f"DRY-RUN: would BUY ~{units} {symbol} at {price} using ${BUY_USD}.")
+    else:
+        # Placeholder for future live buy logic.
+        save_position(new_pos)
+        notes.append(
+            "LIVE wiring not implemented yet; position stored in .state as if bought."
+        )
+
+    base_summary["notes"] = " ".join(notes)
+    write_summary(base_summary)
+
+
+# ----------------------------
+# Entrypoint
+# ----------------------------
 
 if __name__ == "__main__":
-    try:
-        run()
-    except Exception as exc:
-        # Fail safely, with something in the artifacts/logs.
-        now = dt.datetime.utcnow().isoformat()
-        err_summary = RunSummary(
-            time=now,
-            symbol=os.getenv("SYMBOL", "BTC/USD"),
-            buy_usd=env_float("BUY_USD", 20.0),
-            tp_pct=env_float("TP_PCT", 8.0),
-            sl_pct=env_float("SL_PCT", 1.0),
-            dry_run=os.getenv("DRY_RUN", "ON").strip().upper() or "ON",
-            spot_price=0.0,
-            status="error",
-            action="HOLD (exception)",
-            notes=f"Unhandled error: {exc}",
-        )
-        write_run_outputs(err_summary)
-        # Also send traceback to logs
-        print("Unhandled exception:", file=sys.stderr)
-        import traceback
-
-        traceback.print_exc()
-        sys.exit(1)
+    decide_and_act()
