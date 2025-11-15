@@ -58,11 +58,11 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Restore previous .state
+      - name: Restore shared .state cache (positions + momentum CSV)
         uses: actions/cache/restore@v4
         with:
           path: .state
-          key: kraken-rotation-state-latest
+          key: kraken-rotation-state-${{ github.run_id }}
           restore-keys: |
             kraken-rotation-state-
 
@@ -79,19 +79,12 @@ jobs:
       - name: Run bot
         run: python kraken_monday_main.py
 
-      - name: Save new .state snapshot (rolling)
+      - name: Save updated .state snapshot
         if: always()
         uses: actions/cache/save@v4
         with:
           path: .state
           key: kraken-rotation-state-${{ github.run_id }}
-
-      - name: Save common stable alias for next restore
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: .state
-          key: kraken-rotation-state-latest
 
       - name: Upload state artifacts
         if: always()
