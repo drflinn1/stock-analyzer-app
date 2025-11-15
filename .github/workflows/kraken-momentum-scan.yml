@@ -1,0 +1,59 @@
+name: Kraken — Momentum Candidates Scan
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # Share .state with the rotation bot via the same cache key family
+      - name: Restore .state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: kraken-rotation-state-latest
+          restore-keys: |
+            kraken-rotation-state-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Build momentum candidates (Kraken 24h gainers)
+        run: python tools/kraken_momentum_scan.py
+
+      - name: Save .state cache (for rotation bot)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: kraken-rotation-state-${{ github.run_id }}
+
+      - name: Update stable alias
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: kraken-rotation-state-latest
+
+      - name: Upload momentum candidates
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: momentum-candidates
+          path: .state/momentum_candidates.csv
+          if-no-files-found: ignore
