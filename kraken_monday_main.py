@@ -1,401 +1,445 @@
 #!/usr/bin/env python3
 """
 kraken_monday_main.py
----------------------------------
+
 Kraken — 1-Coin Rotation (Monday Baseline)
-with:
 
-- SELL GUARD SG-2 (TP/SL + soft stop at -SOFT_SL_PCT)
-- 1-hour stale rule (time + weak gain → SELL)
-- Auto gainer rotation (pick next top candidate when flat/after SELL)
+Features (Nov 2025 baseline):
+- Single-position rotation bot.
+- Uses .state/momentum_candidates.csv for real Kraken 24h gainers.
+- SG-2 Sell Guard:
+    * Take-profit (TP_PCT)
+    * Hard stop-loss (SL_PCT)
+    * Soft stop at SOFT_SL_PCT (e.g. -1%)
+- Stale rule:
+    * If position age (minutes) >= STALE_MINUTES
+    * AND unrealized PnL % < SLOW_GAIN_REQ (e.g. 3%)
+      → SELL + rotate into best gainer.
+- Writes:
+    * .state/run_summary.md      (human summary)
+    * .state/positions.json      (simulated current position)
 
-Mode:
-- Single-position bot (one coin at a time).
-- Uses .state/positions.json to track the open position.
-- Uses public quotes via trader.crypto_engine for pricing.
-- DRY_RUN = "ON" (default) simulates trades.
-- DRY_RUN = "OFF" reserved for future live-trading wiring.
-
-Environment variables (strings):
-- BUY_USD       : notional USD per buy when flat   (e.g., "20")
-- TP_PCT        : take-profit percent              (e.g., "8")
-- SL_PCT        : hard stop-loss percent           (e.g., "2")
-- SOFT_SL_PCT   : SG-2 soft stop percent           (e.g., "1.0" for -1%)
-- SLOW_GAIN_REQ : stale-rule required gain %       (e.g., "3.0" for +3%)
-- STALE_MINUTES : stale-rule age threshold (mins)  (e.g., "60")
-- DRY_RUN       : "ON" (default) or "OFF"          ("OFF" reserved for live)
-- UNIVERSE_PICK : optional symbol override (e.g., "LSK/USD")
-
-Outputs:
-- .state/positions.json: current simulated position (or absent if flat)
-- .state/run_summary.md: human-readable run summary
+This file is DRY-RUN only by default. Live trading wiring is reserved
+for a later stage.
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, Any
-
-from trader.crypto_engine import (
-    get_public_quote,
-    normalize_pair,
-    load_candidates,
-)
+from typing import List, Optional, Dict
 
 STATE_DIR = Path(".state")
-POSITIONS_JSON = STATE_DIR / "positions.json"
-SUMMARY_MD = STATE_DIR / "run_summary.md"
+POS_PATH = STATE_DIR / "positions.json"
+CANDIDATES_CSV = STATE_DIR / "momentum_candidates.csv"
 
 
-# ----------------------------
-# Data models
-# ----------------------------
+# ---------- Helpers & models ----------
+
+
+def utc_now_iso() -> str:
+    """Return current UTC time in ISO8601 Z form, seconds precision."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_iso_z(s: str) -> datetime:
+    """Parse an ISO string with optional trailing Z into aware UTC datetime."""
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s).astimezone(timezone.utc)
+
 
 @dataclass
 class Position:
     symbol: str
     units: float
     entry_price: float
-    entry_time: str  # ISO 8601 string (UTC)
+    entry_time: str  # ISO string
 
     @property
-    def entry_dt(self) -> datetime:
-        return datetime.fromisoformat(self.entry_time.replace("Z", "+00:00"))
+    def age_minutes(self) -> float:
+        try:
+            t = parse_iso_z(self.entry_time)
+            delta = datetime.now(timezone.utc) - t
+            return delta.total_seconds() / 60.0
+        except Exception:
+            return 0.0
 
 
-# ----------------------------
-# Helpers: file + time
-# ----------------------------
+@dataclass
+class Candidate:
+    symbol: str
+    quote: float
+    rank: float
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+def load_env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return float(default)
+    try:
+        return float(v)
+    except ValueError:
+        return float(default)
 
 
-def minutes_between(start: datetime, end: datetime) -> float:
-    return (end - start).total_seconds() / 60.0
+def load_env_str(name: str, default: str) -> str:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    return v
 
 
 def ensure_state_dir() -> None:
     STATE_DIR.mkdir(exist_ok=True)
 
 
+# ---------- State I/O ----------
+
+
 def load_position() -> Optional[Position]:
-    if not POSITIONS_JSON.exists():
+    if not POS_PATH.exists():
         return None
     try:
-        data = json.loads(POSITIONS_JSON.read_text())
+        data = json.loads(POS_PATH.read_text())
         return Position(
             symbol=data["symbol"],
             units=float(data["units"]),
             entry_price=float(data["entry_price"]),
-            entry_time=data["entry_time"],
+            entry_time=str(data["entry_time"]),
         )
     except Exception:
-        # Corrupt or unexpected file; treat as flat
         return None
 
 
-def save_position(pos: Position) -> None:
-    ensure_state_dir()
-    POSITIONS_JSON.write_text(json.dumps(asdict(pos), indent=2))
-
-
-def clear_position() -> None:
-    if POSITIONS_JSON.exists():
-        POSITIONS_JSON.unlink()
-
-
-def write_summary(summary: Dict[str, Any]) -> None:
-    """
-    Write a readable run_summary.md summarizing what this run decided.
-    """
-    ensure_state_dir()
-    lines = []
-    lines.append(f"# Kraken — 1-Coin Rotation (Monday Baseline)")
-    lines.append("")
-    lines.append(f"**Timestamp (UTC):** {summary.get('timestamp_utc', 'unknown')}")
-    lines.append(f"**Mode:** {'DRY-RUN' if summary.get('dry_run', True) else 'LIVE (reserved)'}")
-    lines.append(
-        f"**Sell Guard Mode:** SG-2 (TP/SL + soft stop at -{summary.get('soft_sl_pct')}%)"
-    )
-    lines.append("")
-
-    lines.append("## Config")
-    lines.append(f"- BUY_USD: {summary.get('BUY_USD')}")
-    lines.append(f"- TP_PCT: {summary.get('TP_PCT')}%")
-    lines.append(f"- SL_PCT: {summary.get('SL_PCT')}%")
-    lines.append(f"- SOFT_SL_PCT: {summary.get('soft_sl_pct')}%")
-    lines.append(f"- SLOW_GAIN_REQ: {summary.get('SLOW_GAIN_REQ')}%")
-    lines.append(f"- STALE_MINUTES: {summary.get('STALE_MINUTES')}")
-    lines.append(f"- UNIVERSE_PICK: {summary.get('UNIVERSE_PICK') or '(auto)'}")
-    lines.append("")
-
-    lines.append("## State / Decision")
-    lines.append(f"- Action: {summary.get('action')}")
-    lines.append(f"- Symbol: {summary.get('symbol')}")
-    lines.append(f"- Current Price: {summary.get('current_price')}")
-    lines.append(f"- Entry Price: {summary.get('entry_price')}")
-    lines.append(f"- Position Units: {summary.get('units')}")
-    lines.append(f"- Position Age (min): {summary.get('position_age_minutes')}")
-    lines.append(f"- Unrealized PnL %: {summary.get('pnl_pct')}")
-    lines.append(f"- Sell Reason: {summary.get('sell_reason') or '(n/a)'}")
-    lines.append(f"- Next Symbol: {summary.get('next_symbol')}")
-    lines.append(f"- Next Entry Price: {summary.get('next_entry_price')}")
-    lines.append(f"- Next Units: {summary.get('next_units')}")
-    lines.append("")
-    lines.append(f"Notes: {summary.get('notes') or ''}".strip())
-
-    SUMMARY_MD.write_text("\n".join(lines) + "\n")
-
-
-# ----------------------------
-# Market helpers
-# ----------------------------
-
-def choose_symbol(universe_pick: Optional[str]) -> str:
-    """
-    Choose which symbol to trade when flat.
-    Priority:
-    1) UNIVERSE_PICK if provided
-    2) Top candidate from .state/momentum_candidates.csv (by rank)
-    3) Fallback to BTC/USD
-    """
-    if universe_pick:
-        return normalize_pair(universe_pick)
-
-    # Try momentum candidates if available
-    try:
-        candidates = load_candidates()
-        if candidates:
-            # Expect fields: symbol, quote, rank — pick max rank as "best"
-            def rank_val(row: Dict[str, str]) -> float:
-                try:
-                    return float(row.get("rank", 0))
-                except Exception:
-                    return 0.0
-
-            best = max(candidates, key=rank_val)
-            sym = best.get("symbol") or "BTC/USD"
-            return normalize_pair(sym)
-    except Exception:
-        pass
-
-    # Ultimate fallback
-    return normalize_pair("BTC/USD")
-
-
-def get_price(symbol: str) -> Optional[float]:
-    """
-    Unified price getter using trader.crypto_engine public quote.
-    """
-    try:
-        return get_public_quote(symbol)
-    except Exception:
-        return None
-
-
-# ----------------------------
-# Core decision logic
-# ----------------------------
-
-def decide_and_act() -> None:
-    ensure_state_dir()
-
-    # ----- Read config from environment -----
-    BUY_USD = float(os.getenv("BUY_USD", "20"))
-    TP_PCT = float(os.getenv("TP_PCT", "8"))
-    SL_PCT = float(os.getenv("SL_PCT", "2"))
-    SOFT_SL_PCT = float(os.getenv("SOFT_SL_PCT", "1.0"))  # SG-2 soft stop (default 1%)
-    SLOW_GAIN_REQ = float(os.getenv("SLOW_GAIN_REQ", "3.0"))  # stale rule gain requirement
-    STALE_MINUTES = float(os.getenv("STALE_MINUTES", "60"))   # stale rule age in minutes
-    UNIVERSE_PICK = os.getenv("UNIVERSE_PICK", "").strip() or None
-    DRY_RUN_FLAG = os.getenv("DRY_RUN", "ON").strip().upper()
-    DRY_RUN = DRY_RUN_FLAG != "OFF"  # anything except "OFF" is treated as DRY
-
-    now_utc = datetime.now(timezone.utc)
-    now_iso = now_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    pos = load_position()
-
-    # Determine symbol: if we already hold something, we guard that symbol.
-    if pos:
-        symbol = normalize_pair(pos.symbol)
-    else:
-        symbol = choose_symbol(UNIVERSE_PICK)
-
-    price = get_price(symbol)
-
-    base_summary: Dict[str, Any] = {
-        "timestamp_utc": now_iso,
-        "dry_run": DRY_RUN,
-        "BUY_USD": BUY_USD,
-        "TP_PCT": TP_PCT,
-        "SL_PCT": SL_PCT,
-        "soft_sl_pct": SOFT_SL_PCT,
-        "SLOW_GAIN_REQ": SLOW_GAIN_REQ,
-        "STALE_MINUTES": STALE_MINUTES,
-        "UNIVERSE_PICK": UNIVERSE_PICK,
-        "symbol": symbol,
-        "current_price": price,
-        "entry_price": None,
-        "units": None,
-        "pnl_pct": None,
-        "position_age_minutes": None,
-        "sell_reason": None,
-        "action": "HOLD",
-        "next_symbol": None,
-        "next_entry_price": None,
-        "next_units": None,
-        "notes": "",
+def save_position(pos: Optional[Position]) -> None:
+    if pos is None:
+        try:
+            POS_PATH.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    data = {
+        "symbol": pos.symbol,
+        "units": pos.units,
+        "entry_price": pos.entry_price,
+        "entry_time": pos.entry_time,
     }
+    POS_PATH.write_text(json.dumps(data, indent=2))
 
-    # Handle missing/invalid price
-    if price is None or price <= 0:
-        base_summary["notes"] = "HOLD: invalid or missing price feed for symbol."
-        write_summary(base_summary)
-        return
 
-    # If we already have a position: apply SELL GUARD + stale rule
-    if pos is not None:
-        entry = float(pos.entry_price)
-        units = float(pos.units)
-        pnl_pct = ((price - entry) / entry) * 100.0
-        age_minutes = minutes_between(pos.entry_dt, now_utc)
+def load_candidates() -> List[Candidate]:
+    """Load momentum candidates from CSV; fall back to empty list if missing."""
+    if not CANDIDATES_CSV.exists():
+        return []
+    out: List[Candidate] = []
+    try:
+        with CANDIDATES_CSV.open("r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    sym = row.get("symbol") or row.get("pair") or ""
+                    quote = float(row.get("quote", "0") or 0.0)
+                    rank = float(row.get("rank", "0") or 0.0)
+                    if sym and quote > 0:
+                        out.append(Candidate(symbol=sym.strip(), quote=quote, rank=rank))
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return out
 
-        base_summary["entry_price"] = entry
-        base_summary["units"] = units
-        base_summary["pnl_pct"] = round(pnl_pct, 4)
-        base_summary["position_age_minutes"] = round(age_minutes, 2)
 
-        sell_reason: Optional[str] = None
-        notes = []
+def price_map_from_candidates(cands: List[Candidate]) -> Dict[str, float]:
+    return {c.symbol: c.quote for c in cands}
 
-        # TP condition
-        if pnl_pct >= TP_PCT:
-            sell_reason = "TP"
-            notes.append(f"TP hit: PnL {pnl_pct:.3f}% >= {TP_PCT}%")
 
-        # Hard SL condition
-        elif pnl_pct <= -SL_PCT:
-            sell_reason = "SL"
-            notes.append(f"SL hit: PnL {pnl_pct:.3f}% <= -{SL_PCT}%")
+def choose_best_candidate(cands: List[Candidate]) -> Optional[Candidate]:
+    if not cands:
+        return None
+    # Higher rank is better
+    return sorted(cands, key=lambda c: c.rank, reverse=True)[0]
 
-        # Soft SL (SG-2) condition
-        elif pnl_pct <= -SOFT_SL_PCT:
-            sell_reason = "DIP"
-            notes.append(f"Soft stop (SG-2): PnL {pnl_pct:.3f}% <= -{SOFT_SL_PCT}%")
 
-        # Stale rule: age threshold + weak gain
-        elif age_minutes >= STALE_MINUTES and pnl_pct < SLOW_GAIN_REQ:
-            sell_reason = "STALE"
-            notes.append(
-                f"Stale rule: Age {age_minutes:.1f} min >= {STALE_MINUTES} min "
-                f"and PnL {pnl_pct:.3f}% < {SLOW_GAIN_REQ}%."
+def choose_rotation_target(
+    cands: List[Candidate],
+    universe_pick: str,
+    current_symbol: Optional[str] = None,
+) -> Optional[Candidate]:
+    """Choose next symbol to rotate into."""
+    if universe_pick:
+        # Universe override wins; try to find that symbol in candidates.
+        for c in cands:
+            if c.symbol == universe_pick:
+                return c
+        # If not found, still synthesize a candidate with quote from map if available.
+        pm = price_map_from_candidates(cands)
+        q = pm.get(universe_pick)
+        if q:
+            return Candidate(symbol=universe_pick, quote=q, rank=0.0)
+        return None
+
+    # Auto-gainer mode: choose highest-rank candidate, preferably not the current symbol.
+    if not cands:
+        return None
+
+    sorted_cands = sorted(cands, key=lambda c: c.rank, reverse=True)
+    for c in sorted_cands:
+        if current_symbol is None or c.symbol != current_symbol:
+            return c
+    # Fallback: just return top-ranked candidate
+    return sorted_cands[0]
+
+
+# ---------- Core decision logic ----------
+
+
+def main() -> None:
+    ensure_state_dir()
+
+    # Environment / config
+    buy_usd = load_env_float("BUY_USD", 20.0)
+    tp_pct = load_env_float("TP_PCT", 8.0)
+    sl_pct = load_env_float("SL_PCT", 2.0)
+    soft_sl_pct = load_env_float("SOFT_SL_PCT", 1.0)
+    slow_gain_req = load_env_float("SLOW_GAIN_REQ", 3.0)
+    stale_minutes = load_env_float("STALE_MINUTES", 60.0)
+    dry_run_flag = load_env_str("DRY_RUN", "ON").upper() != "OFF"
+    universe_pick_raw = load_env_str("UNIVERSE_PICK", "").strip()
+    universe_pick = universe_pick_raw if universe_pick_raw else ""
+
+    timestamp = utc_now_iso()
+
+    # Load state + candidates
+    position = load_position()
+    candidates = load_candidates()
+    price_map = price_map_from_candidates(candidates)
+
+    mode_str = "DRY-RUN" if dry_run_flag else "LIVE"
+    sell_guard_mode = f"SG-2 (TP/SL + soft stop at -{soft_sl_pct:.1f}%)"
+    universe_display = universe_pick if universe_pick else "(auto)"
+
+    # Decision variables to report
+    action = "HOLD"
+    symbol = position.symbol if position else None
+    current_price = None
+    entry_price = position.entry_price if position else None
+    pos_units = position.units if position else 0.0
+    pos_age_min = position.age_minutes if position else 0.0
+    pnl_pct = 0.0
+    sell_reason = "(n/a)"
+    next_symbol: Optional[str] = None
+    next_entry_price: Optional[float] = None
+    next_units: Optional[float] = None
+    notes: str = ""
+
+    # --------- Price lookup helpers ---------
+
+    def get_price(pair: str) -> Optional[float]:
+        p = price_map.get(pair)
+        if p is not None:
+            return p
+        # As a fallback, just return None; public API quote is handled elsewhere.
+        return None
+
+    # --------- Case 1: FLAT → BUY best gainer ---------
+
+    if position is None:
+        target = choose_rotation_target(candidates, universe_pick, current_symbol=None)
+        if target is None:
+            action = "HOLD"
+            symbol = None
+            notes = "No momentum candidates available; staying flat."
+        else:
+            symbol = target.symbol
+            current_price = target.quote
+            entry_price = current_price
+            pos_units = buy_usd / current_price if current_price > 0 else 0.0
+            pos_age_min = 0.0
+            action = "BUY"
+            sell_reason = "(n/a)"
+            next_symbol = "None"
+            next_entry_price = None
+            next_units = None
+            notes = (
+                f"Flat before run; opening new position in {symbol}. "
+                f"{mode_str}: would BUY ~{pos_units:.6f} {symbol} at {current_price:.6f} "
+                f"using ${buy_usd:.2f}."
             )
 
-        # Decide action based on sell_reason
-        if sell_reason is None:
-            # HOLD position
-            base_summary["action"] = "HOLD"
-            base_summary["sell_reason"] = None
-            notes.append("SELL GUARD: HOLD (no TP/SL/soft-stop/stale hit).")
-            base_summary["notes"] = " ".join(notes)
-            write_summary(base_summary)
-            return
-
-        # We are SELLING this run (and maybe rotating)
-        base_summary["action"] = "SELL"
-        base_summary["sell_reason"] = sell_reason
-
-        # Simulated execution of SELL
-        if DRY_RUN:
-            clear_position()
-            notes.append(f"DRY-RUN: would SELL {units} {symbol} at {price}.")
-        else:
-            # Placeholder for future live-trading integration
-            clear_position()
-            notes.append(
-                "LIVE wiring not implemented yet; treated as DRY SELL (position cleared in .state)."
+            # Simulated position update
+            new_pos = Position(
+                symbol=symbol,
+                units=pos_units,
+                entry_price=entry_price,
+                entry_time=timestamp,
             )
+            save_position(new_pos)
 
-        # Auto gainer rotation (only if UNIVERSE_PICK is not forcing a symbol)
-        next_symbol = choose_symbol(UNIVERSE_PICK)
-        next_price: Optional[float] = None
-        next_units: Optional[float] = None
+    # --------- Case 2: Already in a position ---------
 
-        if next_symbol:
-            next_price = get_price(next_symbol)
-            if next_price is not None and next_price > 0:
-                next_units = round(BUY_USD / next_price, 8)
-                new_pos = Position(
-                    symbol=next_symbol,
-                    units=next_units,
-                    entry_price=next_price,
-                    entry_time=now_iso,
-                )
-                save_position(new_pos)
-                base_summary["action"] = "SELL+BUY"
-                base_summary["next_symbol"] = next_symbol
-                base_summary["next_entry_price"] = next_price
-                base_summary["next_units"] = next_units
-                if DRY_RUN:
-                    notes.append(
-                        f"Rotation: DRY-RUN would BUY ~{next_units} {next_symbol} "
-                        f"at {next_price} using ${BUY_USD}."
-                    )
-                else:
-                    notes.append(
-                        "Rotation: LIVE wiring not implemented yet; "
-                        "position stored in .state as if bought."
-                    )
-            else:
-                notes.append(
-                    f"Rotation skipped: no valid price for next symbol candidate ({next_symbol})."
-                )
-        else:
-            notes.append("Rotation skipped: no symbol available from universe.")
-
-        base_summary["notes"] = " ".join(notes)
-        write_summary(base_summary)
-        return
-
-    # If we are FLAT: BUY a new position (auto gainer selection)
-    units = round(BUY_USD / price, 8)
-    new_pos = Position(
-        symbol=symbol,
-        units=units,
-        entry_price=price,
-        entry_time=now_iso,
-    )
-
-    base_summary["entry_price"] = price
-    base_summary["units"] = units
-    base_summary["pnl_pct"] = 0.0  # new entry
-    base_summary["position_age_minutes"] = 0.0
-    base_summary["action"] = "BUY"
-    base_summary["sell_reason"] = None
-
-    notes = [f"Flat before run; opening new position in {symbol}."]
-    if DRY_RUN:
-        save_position(new_pos)
-        notes.append(f"DRY-RUN: would BUY ~{units} {symbol} at {price} using ${BUY_USD}.")
     else:
-        # Placeholder for future live buy logic.
-        save_position(new_pos)
-        notes.append(
-            "LIVE wiring not implemented yet; position stored in .state as if bought."
-        )
+        symbol = position.symbol
+        entry_price = float(position.entry_price)
+        pos_units = float(position.units)
+        pos_age_min = position.age_minutes
 
-    base_summary["notes"] = " ".join(notes)
-    write_summary(base_summary)
+        current_price = get_price(symbol)
+        if current_price is None or current_price <= 0:
+            # No valid price → hold and log that sell guard is disabled
+            action = "HOLD"
+            pnl_pct = 0.0
+            sell_reason = "(n/a)"
+            notes = "SELL GUARD: HOLD (invalid or missing price; no TP/SL/soft-stop checks)."
+        else:
+            pnl_pct = (current_price - entry_price) / entry_price * 100.0
 
+            # ---- SG-2 Sell Guard ----
+            guard_reason: Optional[str] = None
+            if pnl_pct >= tp_pct:
+                guard_reason = "TP"
+            elif pnl_pct <= -sl_pct:
+                guard_reason = "SL"
+            elif pnl_pct <= -soft_sl_pct:
+                guard_reason = "SOFT_STOP"
 
-# ----------------------------
-# Entrypoint
-# ----------------------------
+            # ---- Stale Rule ----
+            stale_triggered = False
+            if stale_minutes > 0:
+                if pos_age_min >= stale_minutes and pnl_pct < slow_gain_req:
+                    stale_triggered = True
+
+            # Decide final action priority:
+            # 1) Sell Guard (TP / SL / soft) if hit.
+            # 2) Stale rule.
+            # 3) Otherwise HOLD.
+            if guard_reason is not None:
+                sell_reason = guard_reason
+                action = "SELL+BUY"
+
+                target = choose_rotation_target(candidates, universe_pick, current_symbol=symbol)
+                if target is None:
+                    # If no rotation target, just SELL and go flat.
+                    action = "SELL"
+                    next_symbol = "None"
+                    next_entry_price = None
+                    next_units = None
+                    notes = (
+                        f"SELL GUARD: {guard_reason}. {mode_str}: would SELL {pos_units:.6f} "
+                        f"{symbol} at {current_price:.6f}. No rotation target available; "
+                        "would stay flat."
+                    )
+                    save_position(None)
+                else:
+                    next_symbol = target.symbol
+                    next_entry_price = target.quote
+                    next_units = buy_usd / next_entry_price if next_entry_price > 0 else 0.0
+                    notes = (
+                        f"SELL GUARD: {guard_reason}. {mode_str}: would SELL {pos_units:.6f} "
+                        f"{symbol} at {current_price:.6f}. Rotation: {mode_str} would BUY "
+                        f"~{next_units:.6f} {next_symbol} at {next_entry_price:.6f} "
+                        f"using ${buy_usd:.2f}."
+                    )
+                    # Update simulated position to new symbol
+                    new_pos = Position(
+                        symbol=next_symbol,
+                        units=next_units,
+                        entry_price=next_entry_price,
+                        entry_time=timestamp,
+                    )
+                    save_position(new_pos)
+
+            elif stale_triggered:
+                sell_reason = "STALE"
+                action = "SELL+BUY"
+
+                target = choose_rotation_target(candidates, universe_pick, current_symbol=symbol)
+                if target is None:
+                    action = "SELL"
+                    next_symbol = "None"
+                    next_entry_price = None
+                    next_units = None
+                    notes = (
+                        f"Stale rule: Age {pos_age_min:.1f} min >= {stale_minutes:.1f} min "
+                        f"and PnL {pnl_pct:.3f}% < {slow_gain_req:.1f}%. "
+                        f"{mode_str}: would SELL {pos_units:.6f} {symbol} at {current_price:.6f}. "
+                        "No rotation target available; would stay flat."
+                    )
+                    save_position(None)
+                else:
+                    next_symbol = target.symbol
+                    next_entry_price = target.quote
+                    next_units = buy_usd / next_entry_price if next_entry_price > 0 else 0.0
+                    notes = (
+                        f"Stale rule: Age {pos_age_min:.1f} min >= {stale_minutes:.1f} min and "
+                        f"Pnl {pnl_pct:.3f}% < {slow_gain_req:.1f}%. "
+                        f"{mode_str}: would SELL {pos_units:.6f} {symbol} at {current_price:.6f}. "
+                        f"Rotation: {mode_str} would BUY ~{next_units:.6f} {next_symbol} "
+                        f"at {next_entry_price:.6f} using ${buy_usd:.2f}."
+                    )
+                    new_pos = Position(
+                        symbol=next_symbol,
+                        units=next_units,
+                        entry_price=next_entry_price,
+                        entry_time=timestamp,
+                    )
+                    save_position(new_pos)
+
+            else:
+                action = "HOLD"
+                sell_reason = "(n/a)"
+                notes = "SELL GUARD: HOLD (no TP/SL/soft-stop hit, no stale rule trigger)."
+                # Leave position unchanged
+
+    # ---------- Write run_summary.md ----------
+
+    run_lines: List[str] = []
+    run_lines.append("Kraken — 1-Coin Rotation (Monday Baseline)")
+    run_lines.append("")
+    run_lines.append(f"Timestamp (UTC): {timestamp}")
+    run_lines.append(f"Mode: {mode_str}")
+    run_lines.append(f"Sell Guard Mode: {sell_guard_mode}")
+    run_lines.append("")
+    run_lines.append("Config")
+    run_lines.append("")
+    run_lines.append(f"- BUY_USD: {buy_usd:.1f}")
+    run_lines.append(f"- TP_PCT: {tp_pct:.1f}%")
+    run_lines.append(f"- SL_PCT: {sl_pct:.1f}%")
+    run_lines.append(f"- SOFT_SL_PCT: {soft_sl_pct:.1f}%")
+    run_lines.append(f"- SLOW_GAIN_REQ: {slow_gain_req:.1f}%")
+    run_lines.append(f"- STALE_MINUTES: {stale_minutes:.1f}")
+    run_lines.append(f"- UNIVERSE_PICK: {universe_display}")
+    run_lines.append("")
+    run_lines.append("State / Decision")
+    run_lines.append("")
+    run_lines.append(f"- Action: {action}")
+    run_lines.append(f"- Symbol: {symbol or 'None'}")
+    run_lines.append(f"- Current Price: {current_price:.6f}" if current_price else "- Current Price: (n/a)")
+    run_lines.append(f"- Entry Price: {entry_price:.6f}" if entry_price else "- Entry Price: (n/a)")
+    run_lines.append(f"- Position Units: {pos_units}")
+    run_lines.append(f"- Position Age (min): {pos_age_min:.2f}")
+    run_lines.append(f"- Unrealized PnL %: {pnl_pct:.3f}")
+    run_lines.append(f"- Sell Reason: {sell_reason}")
+    run_lines.append(f"- Next Symbol: {next_symbol if next_symbol is not None else 'None'}")
+    run_lines.append(
+        f"- Next Entry Price: {next_entry_price:.6f}"
+        if next_entry_price is not None
+        else "- Next Entry Price: None"
+    )
+    run_lines.append(
+        f"- Next Units: {next_units}"
+        if next_units is not None
+        else "- Next Units: None"
+    )
+    run_lines.append(f"Notes: {notes}")
+
+    run_summary_path = STATE_DIR / "run_summary.md"
+    run_summary_path.write_text("\n".join(run_lines))
+
 
 if __name__ == "__main__":
-    decide_and_act()
+    main()
