@@ -2,7 +2,8 @@ name: Kraken — 1-Coin Rotation (Monday Baseline)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    # Run automatically every 15 minutes (was every 30)
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       BUY_USD:
@@ -78,7 +79,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
+      # ⛔️ IMPORTANT FIX:
+      # Only sync from live Kraken when NOT in DRY_RUN.
       - name: Sync .state positions with live Kraken balances (read-only)
+        if: env.DRY_RUN != 'ON'
         run: python tools/kraken_position_sync.py
 
       - name: Run bot
