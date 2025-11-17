@@ -1,4 +1,19 @@
-# .github/workflows/kraken-live-rotation.yml
+# =====================================================================================
+#  ⚠⚠⚠  WARNING — LIVE KRAKEN TRADING WORKFLOW  ⚠⚠⚠
+#
+#  - This workflow sends REAL ORDERS to Kraken when run.
+#  - DRY_RUN is HARD-CODED to "OFF" in this file.
+#  - Default BUY_USD is SMALL ($5), but it is still REAL MONEY.
+#
+#  SAFETY TIPS:
+#    * Only run this manually from the "Actions" tab.
+#    * DOUBLE-CHECK: BUY_USD, symbol, and your Kraken balances first.
+#    * NEVER add a schedule: block here unless you are 100% sure.
+#
+#  If you just want to SIMULATE trades, use:
+#    → "Kraken — 1-Coin Rotation (Monday Baseline)" (DRY-RUN)
+# =====================================================================================
+
 name: Kraken — 1-Coin Rotation (LIVE)
 
 on:
@@ -50,6 +65,7 @@ jobs:
 
       # 🚨 IMPORTANT: LIVE MODE
       DRY_RUN:       "OFF"
+      LIVE_MODE:     "YES_REAL_MONEY"
 
       UNIVERSE_PICK: ${{ github.event.inputs.UNIVERSE_PICK || '' }}
       PYTHONPATH:    ${{ github.workspace }}
@@ -77,6 +93,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install requests
+
+      # Big, loud console warning before doing anything LIVE.
+      - name: ⚠ PRINT LIVE TRADING WARNING
+        run: |
+          echo "============================================================"
+          echo "   WARNING: YOU ARE RUNNING THE LIVE KRAKEN ROTATION BOT"
+          echo "   DRY_RUN = ${DRY_RUN}"
+          echo "   LIVE_MODE = ${LIVE_MODE}"
+          echo "   BUY_USD = ${BUY_USD}"
+          echo "   TP_PCT = ${TP_PCT}, SL_PCT = ${SL_PCT}, SOFT_SL_PCT = ${SOFT_SL_PCT}"
+          echo "   STALE_MINUTES = ${STALE_MINUTES}, SLOW_GAIN_REQ = ${SLOW_GAIN_REQ}"
+          echo "   UNIVERSE_PICK = '${UNIVERSE_PICK}'"
+          echo ""
+          echo "   If this was a mistake, CANCEL THE JOB NOW in GitHub Actions."
+          echo "============================================================"
 
       # In LIVE mode we ALWAYS sync with real Kraken balances.
       - name: Sync .state positions with live Kraken balances (read-only)
