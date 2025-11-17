@@ -3,12 +3,12 @@
 #
 #  - This workflow sends REAL ORDERS to Kraken when run.
 #  - DRY_RUN is HARD-CODED to "OFF" in this file.
-#  - Default BUY_USD is SMALL ($5), but it is still REAL MONEY.
+#  - BUY_USD uses LIVE MONEY (default $30 below).
 #
 #  SAFETY TIPS:
-#    * Only run this manually from the "Actions" tab.
+#    * Only keep the schedule below if you are comfortable with fully automatic trading.
+#    * To PAUSE the bot, comment out the "schedule:" block or disable this workflow.
 #    * DOUBLE-CHECK: BUY_USD, symbol, and your Kraken balances first.
-#    * NEVER add a schedule: block here unless you are 100% sure.
 #
 #  If you just want to SIMULATE trades, use:
 #    → "Kraken — 1-Coin Rotation (Monday Baseline)" (DRY-RUN)
@@ -17,13 +17,15 @@
 name: Kraken — 1-Coin Rotation (LIVE)
 
 on:
-  # Manual only for now – no schedule until you're ready.
+  # Runs automatically every 30 minutes, plus manual runs on demand.
+  schedule:
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       BUY_USD:
         description: "USD notional to buy when flat (LIVE money!)"
         required: true
-        default: "5"
+        default: "30"
       TP_PCT:
         description: "Take-profit %"
         required: true
@@ -55,8 +57,8 @@ jobs:
     timeout-minutes: 15
 
     env:
-      # Live config
-      BUY_USD:       ${{ github.event.inputs.BUY_USD       || '5' }}
+      # Live config (scheduled runs use these defaults when no inputs exist)
+      BUY_USD:       ${{ github.event.inputs.BUY_USD       || '30' }}
       TP_PCT:        ${{ github.event.inputs.TP_PCT        || '8' }}
       SL_PCT:        ${{ github.event.inputs.SL_PCT        || '2' }}
       SOFT_SL_PCT:   ${{ github.event.inputs.SOFT_SL_PCT   || '1.0' }}
