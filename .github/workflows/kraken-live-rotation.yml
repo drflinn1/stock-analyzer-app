@@ -3,12 +3,12 @@
 #
 #  - This workflow sends REAL ORDERS to Kraken when run.
 #  - DRY_RUN is HARD-CODED to "OFF" in this file.
-#  - BUY_USD uses LIVE MONEY (default $30 below).
+#  - Default BUY_USD is SMALL ($5), but it is still REAL MONEY.
 #
 #  SAFETY TIPS:
-#    * Only keep the schedule below if you are comfortable with fully automatic trading.
-#    * To PAUSE the bot, comment out the "schedule:" block or disable this workflow.
+#    * This file NOW HAS A SCHEDULE and will run automatically.
 #    * DOUBLE-CHECK: BUY_USD, symbol, and your Kraken balances first.
+#    * If you ever want to pause it, DISABLE this workflow in GitHub Actions.
 #
 #  If you just want to SIMULATE trades, use:
 #    → "Kraken — 1-Coin Rotation (Monday Baseline)" (DRY-RUN)
@@ -17,15 +17,17 @@
 name: Kraken — 1-Coin Rotation (LIVE)
 
 on:
-  # Runs automatically every 30 minutes, plus manual runs on demand.
+  # LIVE schedule — runs every 30 minutes
   schedule:
     - cron: "*/30 * * * *"
+
+  # Manual runs still allowed with custom inputs
   workflow_dispatch:
     inputs:
       BUY_USD:
         description: "USD notional to buy when flat (LIVE money!)"
         required: true
-        default: "30"
+        default: "5"
       TP_PCT:
         description: "Take-profit %"
         required: true
@@ -57,8 +59,8 @@ jobs:
     timeout-minutes: 15
 
     env:
-      # Live config (scheduled runs use these defaults when no inputs exist)
-      BUY_USD:       ${{ github.event.inputs.BUY_USD       || '30' }}
+      # Live config
+      BUY_USD:       ${{ github.event.inputs.BUY_USD       || '5' }}
       TP_PCT:        ${{ github.event.inputs.TP_PCT        || '8' }}
       SL_PCT:        ${{ github.event.inputs.SL_PCT        || '2' }}
       SOFT_SL_PCT:   ${{ github.event.inputs.SOFT_SL_PCT   || '1.0' }}
@@ -97,7 +99,7 @@ jobs:
           pip install requests
 
       # Big, loud console warning before doing anything LIVE.
-      - name: ⚠ PRINT LIVE TRADING WARNING
+      - name: "⚠ PRINT LIVE TRADING WARNING"
         run: |
           echo "============================================================"
           echo "   WARNING: YOU ARE RUNNING THE LIVE KRAKEN ROTATION BOT"
