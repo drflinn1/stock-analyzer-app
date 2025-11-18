@@ -1,8 +1,6 @@
 {
-  "LSKUSD": {
-    "qty": 88.04348787890407,
-    "entry_price": 0.339037,
-    "txid": "OSGWCG-36IAQ-MFZGJR",
-    "timestamp": "2025-11-11T20:34:13.950693+00:00"
-  }
+  "symbol": "SOL/USD",
+  "units": 0.05805,
+  "entry_price": 140.39,
+  "entry_time": "2025-11-18T20:50:00Z"
 }
