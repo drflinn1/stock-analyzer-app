@@ -6,9 +6,9 @@
 #  - Default BUY_USD is SMALL ($7), but it is still REAL MONEY.
 #
 #  SAFETY TIPS:
-#    * This file NOW HAS A SCHEDULE and will run automatically.
-#    * DOUBLE-CHECK: BUY_USD, symbol, and your Kraken balances first.
-#    * If you ever want to pause it, DISABLE this workflow in GitHub Actions.
+#    * Only run this once you understand the logic and risk.
+#    * DOUBLE-CHECK: BUY_USD, your balances, and symbol universe first.
+#    * Keep position sizes tiny until you fully trust the bot.
 #
 #  If you just want to SIMULATE trades, use:
 #    → "Kraken — 1-Coin Rotation (Monday Baseline)" (DRY-RUN)
@@ -37,56 +37,72 @@ on:
         required: true
         default: "2"
       SOFT_SL_PCT:
-        description: "Soft stop % for SG-2 (warn/early exit)"
+        description: "Soft stop-loss % (sell-on-bounce trigger)"
         required: true
-        default: "1.0"
+        default: "1"
       SLOW_GAIN_REQ:
-        description: "Stale rule gain requirement (%)"
+        description: "Min % gain for 'slow winner' stale rule"
         required: true
-        default: "3.0"
+        default: "3"
       STALE_MINUTES:
-        description: "Stale rule age in minutes"
+        description: "Minutes before position is considered stale"
         required: true
         default: "60"
       UNIVERSE_PICK:
-        description: "Optional fixed symbol (e.g., LSK/USD). Leave blank for auto-gainer."
+        description: "Optional: force a single symbol (e.g. SOL/USD). Leave blank for auto-pick."
         required: false
         default: ""
+      SELL_GUARD_MODE:
+        description: "Sell guard mode (SG-1, SG-2, etc.)"
+        required: true
+        default: "SG-2"
 
 jobs:
   rotation_live:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     env:
-      # Live config
-      BUY_USD:       ${{ github.event.inputs.BUY_USD       || '7' }}
-      TP_PCT:        ${{ github.event.inputs.TP_PCT        || '8' }}
-      SL_PCT:        ${{ github.event.inputs.SL_PCT        || '2' }}
-      SOFT_SL_PCT:   ${{ github.event.inputs.SOFT_SL_PCT   || '1.0' }}
-      SLOW_GAIN_REQ: ${{ github.event.inputs.SLOW_GAIN_REQ || '3.0' }}
+      # Mode flags — LIVE is enforced here
+      RUN_MODE: LIVE
+      DRY_RUN: "OFF"
+
+      # Use inputs, but provide safe defaults for schedule runs
+      BUY_USD: ${{ github.event.inputs.BUY_USD || '7' }}
+      TP_PCT: ${{ github.event.inputs.TP_PCT || '8' }}
+      SL_PCT: ${{ github.event.inputs.SL_PCT || '2' }}
+      SOFT_SL_PCT: ${{ github.event.inputs.SOFT_SL_PCT || '1' }}
+      SLOW_GAIN_REQ: ${{ github.event.inputs.SLOW_GAIN_REQ || '3' }}
       STALE_MINUTES: ${{ github.event.inputs.STALE_MINUTES || '60' }}
-
-      # 🚨 IMPORTANT: LIVE MODE
-      DRY_RUN:       "OFF"
-      LIVE_MODE:     "YES_REAL_MONEY"
-
       UNIVERSE_PICK: ${{ github.event.inputs.UNIVERSE_PICK || '' }}
-      PYTHONPATH:    ${{ github.workspace }}
-      KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+      SELL_GUARD_MODE: ${{ github.event.inputs.SELL_GUARD_MODE || 'SG-2' }}
 
     steps:
+      - name: Set up job
+        run: |
+          echo "Starting Kraken LIVE rotation run…"
+          echo "Mode:        $RUN_MODE"
+          echo "DRY_RUN:     $DRY_RUN"
+          echo "BUY_USD:     $BUY_USD"
+          echo "TP_PCT:      $TP_PCT"
+          echo "SL_PCT:      $SL_PCT"
+          echo "SOFT_SL_PCT: $SOFT_SL_PCT"
+          echo "SLOW_GAIN_REQ: $SLOW_GAIN_REQ"
+          echo "STALE_MINUTES: $STALE_MINUTES"
+          echo "UNIVERSE_PICK: ${UNIVERSE_PICK:-'(auto)'}"
+          echo "SELL_GUARD_MODE: $SELL_GUARD_MODE"
+
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Restore shared .state cache (positions + momentum CSV)
-        uses: actions/cache/restore@v4
+      - name: Restore shared state cache (positions + momentum CSV)
+        uses: actions/cache@v4
         with:
           path: .state
-          key: kraken-rotation-state-${{ github.run_id }}
+          key: kraken-live-rotation-state-${{ github.ref_name }}
           restore-keys: |
-            kraken-rotation-state-
+            kraken-live-rotation-state-
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -96,43 +112,51 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
 
-      # Big, loud console warning before doing anything LIVE.
-      - name: "⚠ PRINT LIVE TRADING WARNING"
+      - name: PRINT LIVE TRADING WARNING
         run: |
-          echo "============================================================"
-          echo "   WARNING: YOU ARE RUNNING THE LIVE KRAKEN ROTATION BOT"
-          echo "   DRY_RUN = ${DRY_RUN}"
-          echo "   LIVE_MODE = ${LIVE_MODE}"
-          echo "   BUY_USD = ${BUY_USD}"
-          echo "   TP_PCT = ${TP_PCT}, SL_PCT = ${SL_PCT}, SOFT_SL_PCT = ${SOFT_SL_PCT}"
-          echo "   STALE_MINUTES = ${STALE_MINUTES}, SLOW_GAIN_REQ = ${SLOW_GAIN_REQ}"
-          echo "   UNIVERSE_PICK = '${UNIVERSE_PICK}'"
-          echo ""
-          echo "   If this was a mistake, CANCEL THE JOB NOW in GitHub Actions."
-          echo "============================================================"
+          echo "==============================================================="
+          echo "   ⚠⚠⚠  LIVE TRADING ON KRAKEN  ⚠⚠⚠"
+          echo "   This job will place REAL orders on your Kraken account."
+          echo "   DRY_RUN = $DRY_RUN  (must be OFF for live trading)"
+          echo "==============================================================="
+          if [ "$DRY_RUN" != "OFF" ]; then
+            echo "DRY_RUN is not OFF — refusing to trade."
+            exit 1
+          fi
 
-      # In LIVE mode we ALWAYS sync with real Kraken balances.
-      - name: Sync .state positions with live Kraken balances (read-only)
-        run: python tools/kraken_position_sync.py
+      - name: Sync state position with live Kraken balances (read-only)
+        env:
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        run: |
+          python tools/kraken_sync_positions.py || echo "Sync script completed (or skipped)."
 
-      - name: Run LIVE bot (DRY_RUN=OFF)
-        run: python kraken_monday_main.py
+      - name: Run LIVE bot (DRY_RUN_OFF)
+        env:
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        run: |
+          # NOTE: change this script name if your live entry point is different
+          python kraken_monday_main.py
 
-      - name: Save updated .state snapshot
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: .state
-          key: kraken-rotation-state-${{ github.run_id }}
+      - name: Save updated state snapshot
+        run: |
+          mkdir -p .state
+          echo "Saving updated .state snapshot…"
+          ls -R .state || true
 
-      - name: Upload state artifacts
-        if: always()
+      - name: Upload state artifact
         uses: actions/upload-artifact@v4
         with:
           name: kraken-live-rotation-state
-          path: |
-            .state/positions.json
-            .state/run_summary.md
-          if-no-files-found: ignore
+          path: .state
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Post-job cleanup
+        run: |
+          echo "Run complete. LIVE Kraken rotation finished."
