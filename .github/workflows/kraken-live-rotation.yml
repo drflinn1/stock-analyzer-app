@@ -3,7 +3,7 @@
 #
 #  - This workflow sends REAL ORDERS to Kraken when run.
 #  - DRY_RUN is HARD-CODED to "OFF" in this file.
-#  - Default BUY_USD is SMALL ($5), but it is still REAL MONEY.
+#  - Default BUY_USD is SMALL ($7), but it is still REAL MONEY.
 #
 #  SAFETY TIPS:
 #    * This file NOW HAS A SCHEDULE and will run automatically.
@@ -27,7 +27,7 @@ on:
       BUY_USD:
         description: "USD notional to buy when flat (LIVE money!)"
         required: true
-        default: "5"
+        default: "7"
       TP_PCT:
         description: "Take-profit %"
         required: true
@@ -60,7 +60,7 @@ jobs:
 
     env:
       # Live config
-      BUY_USD:       ${{ github.event.inputs.BUY_USD       || '5' }}
+      BUY_USD:       ${{ github.event.inputs.BUY_USD       || '7' }}
       TP_PCT:        ${{ github.event.inputs.TP_PCT        || '8' }}
       SL_PCT:        ${{ github.event.inputs.SL_PCT        || '2' }}
       SOFT_SL_PCT:   ${{ github.event.inputs.SOFT_SL_PCT   || '1.0' }}
