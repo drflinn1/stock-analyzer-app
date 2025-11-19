@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone
 
-from trader.kraken_api import KrakenTradeAPI
+from kraken_api import KrakenTradeAPI
 from trader.crypto_engine import (
     load_candidates,
     get_public_quote,
