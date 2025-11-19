@@ -124,10 +124,20 @@ jobs:
       # Save .state snapshot (for debugging / continuity)
       # ---------------------------------------------------------
       - name: Save updated state snapshot
+        env:
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
-          mkdir -p .state
-          echo "Contents of .state after run:"
-          ls -R .state || echo "(no state files)"
+          # This script is observation-only: it reads balances and writes:
+          #   .state/positions.json
+          #   .state/run_summary.md
+          # If it fails, we log a message but DO NOT fail the whole job.
+          if [ -f trader/kraken_live_state.py ]; then
+            echo "Running trader/kraken_live_state.py to snapshot LIVE state…"
+            python trader/kraken_live_state.py || echo "live-state snapshot failed (non-fatal)."
+          else
+            echo "trader/kraken_live_state.py not found — skipping state snapshot."
+          fi
 
       # ---------------------------------------------------------
       # Upload state artifact
