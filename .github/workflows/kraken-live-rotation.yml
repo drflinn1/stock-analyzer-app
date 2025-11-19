@@ -66,15 +66,15 @@ jobs:
           echo "*******************************************************"
           echo "***   LIVE KRAKEN 1-COIN ROTATION — REAL MONEY      ***"
           echo "*******************************************************"
-          echo "RUN_MODE      = $RUN_MODE"
-          echo "DRY_RUN       = $DRY_RUN"
-          echo "BUY_USD       = $BUY_USD"
-          echo "TP_PCT        = $TP_PCT"
-          echo "SL_PCT        = $SL_PCT"
-          echo "SOFT_SL_PCT   = $SOFT_SL_PCT"
-          echo "SLOW_GAIN_REQ = $SLOW_GAIN_REQ"
-          echo "STALE_MINUTES = $STALE_MINUTES"
-          echo "UNIVERSE_PICK = ${UNIVERSE_PICK:-'(auto)'}"
+          echo "RUN_MODE        = $RUN_MODE"
+          echo "DRY_RUN         = $DRY_RUN"
+          echo "BUY_USD         = $BUY_USD"
+          echo "TP_PCT          = $TP_PCT"
+          echo "SL_PCT          = $SL_PCT"
+          echo "SOFT_SL_PCT     = $SOFT_SL_PCT"
+          echo "SLOW_GAIN_REQ   = $SLOW_GAIN_REQ"
+          echo "STALE_MINUTES   = $STALE_MINUTES"
+          echo "UNIVERSE_PICK   = ${UNIVERSE_PICK:-'(auto)'}"
           echo "SELL_GUARD_MODE = $SELL_GUARD_MODE"
           echo "*******************************************************"
           if [ "$DRY_RUN" != "OFF" ]; then
@@ -116,28 +116,25 @@ jobs:
           RUN_MODE: ${{ env.RUN_MODE }}
           DRY_RUN: ${{ env.DRY_RUN }}
         run: |
-          # NOTE: if your live entry script has a different name,
-          # change this line to match (e.g. python kraken_live_main.py)
-          python kraken_monday_main.py
+          # LIVE entry script:
+          #   - reads real Kraken balances
+          #   - writes .state/positions.json
+          #   - executes SELL + BUY rotation
+          #   - writes .state/run_summary.md
+          python kraken_live_main.py
 
       # ---------------------------------------------------------
       # Save .state snapshot (for debugging / continuity)
       # ---------------------------------------------------------
       - name: Save updated state snapshot
-        env:
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
-          # This script is observation-only: it reads balances and writes:
-          #   .state/positions.json
-          #   .state/run_summary.md
-          # If it fails, we log a message but DO NOT fail the whole job.
-          if [ -f trader/kraken_live_state.py ]; then
-            echo "Running trader/kraken_live_state.py to snapshot LIVE state…"
-            python trader/kraken_live_state.py || echo "live-state snapshot failed (non-fatal)."
-          else
-            echo "trader/kraken_live_state.py not found — skipping state snapshot."
-          fi
+          mkdir -p .state
+          echo "Contents of .state after run:"
+          ls -R .state || echo "(no state files)"
+          echo
+          echo "Expected key files (if present):"
+          echo "  .state/positions.json"
+          echo "  .state/run_summary.md"
 
       # ---------------------------------------------------------
       # Upload state artifact
@@ -146,6 +143,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: kraken-live-rotation-state
-          path: .state
+          path: .state/**
           if-no-files-found: warn
           retention-days: 7
