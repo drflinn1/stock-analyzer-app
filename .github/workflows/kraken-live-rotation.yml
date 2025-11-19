@@ -70,7 +70,7 @@ jobs:
           echo "Repo root is $GITHUB_WORKSPACE"
           export PYTHONPATH="$GITHUB_WORKSPACE:$PYTHONPATH"
           echo "PYTHONPATH=$PYTHONPATH"
-          python -m trader.kraken_live_main
+          python trader.kraken_live_main.py
 
       - name: Save state snapshot
         if: always()
