@@ -19,6 +19,9 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
+      # Make sure Python can find the trader package
+      PYTHONPATH: .
+
       # Mode flags
       RUN_MODE: LIVE
       DRY_RUN: "OFF"
