@@ -3,146 +3,132 @@
 #
 #  - This workflow sends REAL ORDERS to Kraken when run.
 #  - DRY_RUN is HARD-CODED to "OFF" in this file.
-#  - Default BUY_USD is SMALL ($7), but it is still REAL MONEY.
+#  - Default BUY_USD is SMALL ($5), but it is still REAL MONEY.
 #
-#  For DRY-RUN testing, use the Monday Baseline workflow instead.
+#  SAFETY TIPS:
+#    * Only run this manually from the "Actions" tab.
+#    * DOUBLE-CHECK: BUY_USD, TP_PCT, SL_PCT, and your Kraken balances first.
+#    * NEVER add a schedule: block here unless you are 100% sure.
+#
+#  If you just want to SIMULATE trades, use:
+#    → "Kraken — 1-Coin Rotation (Monday Baseline)" (DRY-RUN)
 # =====================================================================================
 
 name: Kraken — 1-Coin Rotation (LIVE)
 
 on:
-  # Manual runs only while we’re validating LIVE behavior
+  # Manual only for now – no schedule until you're ready.
   workflow_dispatch:
+    inputs:
+      BUY_USD:
+        description: "USD notional to buy when flat"
+        required: true
+        default: "5"
+      TP_PCT:
+        description: "Take-profit %"
+        required: true
+        default: "8"
+      SL_PCT:
+        description: "Stop-loss %"
+        required: true
+        default: "2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kraken-live-rotation
+  cancel-in-progress: false
 
 jobs:
-  rotation_live:
+  live-rotation:
+    name: Run Kraken LIVE 1-Coin Rotation
     runs-on: ubuntu-latest
-
-    env:
-      # Make sure Python can find the trader package
-      PYTHONPATH: .
-
-      # Mode flags
-      RUN_MODE: LIVE
-      DRY_RUN: "OFF"
-
-      # Small, safe defaults for now
-      BUY_USD: "7"
-      TP_PCT: "8"
-      SL_PCT: "2"
-      SOFT_SL_PCT: "1"
-      SLOW_GAIN_REQ: "3"
-      STALE_MINUTES: "60"
-      UNIVERSE_PICK: ""
-      SELL_GUARD_MODE: "SG-2"
+    timeout-minutes: 20
 
     steps:
-      # ---------------------------------------------------------
-      # Checkout repo
-      # ---------------------------------------------------------
+      # -------------------------------
+      # 1) Get repo
+      # -------------------------------
       - name: Get repo
         uses: actions/checkout@v4
 
-      # ---------------------------------------------------------
-      # Setup Python
-      # ---------------------------------------------------------
-      - name: Setup Python
-        uses: actions/setup-python@v4
+      # -------------------------------
+      # 2) Set up Python
+      # -------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ---------------------------------------------------------
-      # Install dependencies
-      # ---------------------------------------------------------
-      - name: Install dependencies
+      # -------------------------------
+      # 3) Install dependencies
+      # -------------------------------
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
+          else
+            # Fallback (should normally not be needed)
+            pip install requests python-dotenv pandas ta matplotlib
           fi
 
-      # ---------------------------------------------------------
-      # Print LIVE warning
-      # ---------------------------------------------------------
-      - name: PRINT LIVE TRADING WARNING
-        run: |
-          echo "*******************************************************"
-          echo "***   LIVE KRAKEN 1-COIN ROTATION — REAL MONEY      ***"
-          echo "*******************************************************"
-          echo "RUN_MODE        = $RUN_MODE"
-          echo "DRY_RUN         = $DRY_RUN"
-          echo "BUY_USD         = $BUY_USD"
-          echo "TP_PCT          = $TP_PCT"
-          echo "SL_PCT          = $SL_PCT"
-          echo "SOFT_SL_PCT     = $SOFT_SL_PCT"
-          echo "SLOW_GAIN_REQ   = $SLOW_GAIN_REQ"
-          echo "STALE_MINUTES   = $STALE_MINUTES"
-          echo "UNIVERSE_PICK   = ${UNIVERSE_PICK:-'(auto)'}"
-          echo "SELL_GUARD_MODE = $SELL_GUARD_MODE"
-          echo "*******************************************************"
-          if [ "$DRY_RUN" != "OFF" ]; then
-            echo "DRY_RUN must be OFF for this workflow. Aborting."
-            exit 1
-          fi
+      # -------------------------------
+      # 4) Restore previous LIVE state (optional)
+      # -------------------------------
+      - name: Restore previous LIVE state (if exists)
+        uses: actions/download-artifact@v4
+        with:
+          name: kraken-live-rotation-state
+          path: .state
+        continue-on-error: true
 
-      # ---------------------------------------------------------
-      # OPTIONAL: sync with a live-positions script if it exists
-      # (Won't fail the job if the file is missing)
-      # ---------------------------------------------------------
+      # -------------------------------
+      # 5) Optional: sync with live Kraken balances
+      # -------------------------------
       - name: Sync position with live Kraken balances (optional)
-        env:
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           if [ -f trader/kraken_live_positions.py ]; then
-            echo "Found trader/kraken_live_positions.py — running sync…"
+            echo "Found trader/kraken_live_positions.py – syncing live balances..."
+            export PYTHONPATH="$GITHUB_WORKSPACE:$PYTHONPATH"
             python trader/kraken_live_positions.py
           else
             echo "No trader/kraken_live_positions.py found — skipping sync step."
           fi
 
-      # ---------------------------------------------------------
-      # Run LIVE bot (this is your main live entry)
-      # ---------------------------------------------------------
+      # -------------------------------
+      # 6) RUN LIVE BOT  (DRY_RUN = OFF)
+      # -------------------------------
       - name: Run live bot (LIVE, DRY_RUN=OFF)
         env:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          BUY_USD: ${{ env.BUY_USD }}
-          TP_PCT: ${{ env.TP_PCT }}
-          SL_PCT: ${{ env.SL_PCT }}
-          SOFT_SL_PCT: ${{ env.SOFT_SL_PCT }}
-          SLOW_GAIN_REQ: ${{ env.SLOW_GAIN_REQ }}
-          STALE_MINUTES: ${{ env.STALE_MINUTES }}
-          UNIVERSE_PICK: ${{ env.UNIVERSE_PICK }}
-          SELL_GUARD_MODE: ${{ env.SELL_GUARD_MODE }}
-          RUN_MODE: ${{ env.RUN_MODE }}
-          DRY_RUN: ${{ env.DRY_RUN }}
+          BUY_USD: ${{ inputs.BUY_USD }}
+          TP_PCT: ${{ inputs.TP_PCT }}
+          SL_PCT: ${{ inputs.SL_PCT }}
+          DRY_RUN: "OFF"
         run: |
-          # LIVE entry script:
-          #   - reads real Kraken balances
-          #   - writes .state/positions.json
-          #   - executes SELL + BUY rotation
-          #   - writes .state/run_summary.md
+          set -e
+          echo "Repo root is: $GITHUB_WORKSPACE"
+          echo "PYTHONPATH before: $PYTHONPATH"
+          export PYTHONPATH="$GITHUB_WORKSPACE:$PYTHONPATH"
+          echo "PYTHONPATH after:  $PYTHONPATH"
           python kraken_live_main.py
 
-      # ---------------------------------------------------------
-      # Save .state snapshot (for debugging / continuity)
-      # ---------------------------------------------------------
+      # -------------------------------
+      # 7) Ensure .state exists / update snapshot
+      # -------------------------------
       - name: Save updated state snapshot
+        if: always()
         run: |
           mkdir -p .state
-          echo "Contents of .state after run:"
-          ls -R .state || echo "(no state files)"
-          echo
-          echo "Expected key files (if present):"
-          echo "  .state/positions.json"
-          echo "  .state/run_summary.md"
+          echo "Last LIVE run finished at $(date -u)" > .state/last_live_run.txt
 
-      # ---------------------------------------------------------
-      # Upload state artifact
-      # ---------------------------------------------------------
-      - name: Upload state artifact
+      # -------------------------------
+      # 8) Upload LIVE state artifact
+      # -------------------------------
+      - name: Upload LIVE rotation state
         uses: actions/upload-artifact@v4
         with:
           name: kraken-live-rotation-state
