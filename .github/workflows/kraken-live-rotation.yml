@@ -1,36 +1,60 @@
 # =====================================================================================
 #  ⚠⚠⚠  WARNING — LIVE KRAKEN TRADING WORKFLOW  ⚠⚠⚠
+#
+#  - This workflow sends REAL ORDERS to Kraken when run.
+#  - DRY_RUN is HARD-CODED to "OFF" in this file.
+#  - Default BUY_USD is SMALL ($5), but it is still REAL MONEY.
+#
+#  SAFETY TIPS:
+#    * Only run this manually from the "Actions" tab.
+#    * DOUBLE-CHECK: BUY_USD, TP/SL, and your Kraken balances first.
+#    * NEVER add a schedule block unless you are 100% sure.
+#
+#  If you just want to SIMULATE trades, use your DRY-RUN workflow instead.
 # =====================================================================================
 
 name: Kraken — 1-Coin Rotation (LIVE)
 
 on:
+  # Manual only – no schedule for LIVE
   workflow_dispatch:
     inputs:
       BUY_USD:
-        description: "USD to buy when flat"
+        description: "USD notional to buy when flat"
         required: true
         default: "5"
       TP_PCT:
-        description: "Take-profit %"
+        description: "Take-profit % (e.g., 8 = 8%)"
         required: true
         default: "8"
       SL_PCT:
-        description: "Stop-loss %"
+        description: "Stop-loss % (e.g., 1 = 1%)"
         required: true
-        default: "2"
-
-permissions:
-  contents: read
-
-concurrency:
-  group: kraken-live-rotation
-  cancel-in-progress: false
+        default: "1"
 
 jobs:
   live-rotation:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+
+    # Only one LIVE run at a time
+    concurrency:
+      group: kraken-live-rotation
+      cancel-in-progress: false
+
+    env:
+      PYTHONUNBUFFERED: "1"
+
+      # Inputs from the manual dispatch
+      BUY_USD: ${{ github.event.inputs.BUY_USD }}
+      TP_PCT: ${{ github.event.inputs.TP_PCT }}
+      SL_PCT: ${{ github.event.inputs.SL_PCT }}
+
+      # Kraken API credentials (must be set in repo secrets)
+      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+
+      # Safety flag – this file is LIVE-only
+      DRY_RUN: "OFF"
 
     steps:
       - name: Checkout repo
@@ -47,41 +71,16 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install requests python-dotenv pandas ta matplotlib
+            # Fallback in case requirements.txt is missing
+            pip install requests python-dotenv
           fi
 
-      - name: Restore previous LIVE state
-        uses: actions/download-artifact@v4
-        with:
-          name: kraken-live-rotation-state
-          path: .state
-        continue-on-error: true
-
-      - name: Run LIVE bot (DRY_RUN=OFF)
-        env:
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          BUY_USD: ${{ inputs.BUY_USD }}
-          TP_PCT: ${{ inputs.TP_PCT }}
-          SL_PCT: ${{ inputs.SL_PCT }}
-          DRY_RUN: "OFF"
+      - name: Run LIVE rotation bot
         run: |
-          set -e
-          echo "Repo root is $GITHUB_WORKSPACE"
-          export PYTHONPATH="$GITHUB_WORKSPACE:$PYTHONPATH"
-          echo "PYTHONPATH=$PYTHONPATH"
-          python kraken_live_main.py
-
-      - name: Save state snapshot
-        if: always()
-        run: |
-          mkdir -p .state
-          echo "Last LIVE run $(date -u)" > .state/last_live_run.txt
-
-      - name: Upload LIVE rotation state
-        uses: actions/upload-artifact@v4
-        with:
-          name: kraken-live-rotation-state
-          path: .state/**
-          if-no-files-found: warn
-          retention-days: 7
+          echo "🚨 LIVE MODE: DRY_RUN=${DRY_RUN} 🚨"
+          echo "BUY_USD=${BUY_USD}, TP_PCT=${TP_PCT}, SL_PCT=${SL_PCT}"
+          python kraken_live_main.py \
+            --buy-usd "${BUY_USD}" \
+            --tp-pct "${TP_PCT}" \
+            --sl-pct "${SL_PCT}" \
+            --dry-run "${DRY_RUN}"
