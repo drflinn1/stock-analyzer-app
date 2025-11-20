@@ -7,7 +7,7 @@
 #
 #  SAFETY TIPS:
 #    * Only run this manually from the "Actions" tab.
-#    * DOUBLE-CHECK: BUY_USD, TP/SL, and your Kraken balances first.
+#    * DOUBLE-CHECK: SYMBOL, BUY_USD, TP/SL, and your Kraken balances first.
 #    * NEVER add a schedule block unless you are 100% sure.
 #
 #  If you just want to SIMULATE trades, use your DRY-RUN workflow instead.
@@ -19,6 +19,10 @@ on:
   # Manual only – no schedule for LIVE
   workflow_dispatch:
     inputs:
+      SYMBOL:
+        description: "Trading pair (e.g., SOL/USD, TRX/USD)"
+        required: true
+        default: "SOL/USD"
       BUY_USD:
         description: "USD notional to buy when flat"
         required: true
@@ -45,12 +49,13 @@ jobs:
       PYTHONUNBUFFERED: "1"
 
       # Inputs from the manual dispatch
+      SYMBOL:  ${{ github.event.inputs.SYMBOL }}
       BUY_USD: ${{ github.event.inputs.BUY_USD }}
-      TP_PCT: ${{ github.event.inputs.TP_PCT }}
-      SL_PCT: ${{ github.event.inputs.SL_PCT }}
+      TP_PCT:  ${{ github.event.inputs.TP_PCT }}
+      SL_PCT:  ${{ github.event.inputs.SL_PCT }}
 
       # Kraken API credentials (must be set in repo secrets)
-      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+      KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
       KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
       # Safety flag – this file is LIVE-only
@@ -78,9 +83,6 @@ jobs:
       - name: Run LIVE rotation bot
         run: |
           echo "🚨 LIVE MODE: DRY_RUN=${DRY_RUN} 🚨"
+          echo "SYMBOL=${SYMBOL}"
           echo "BUY_USD=${BUY_USD}, TP_PCT=${TP_PCT}, SL_PCT=${SL_PCT}"
-          python kraken_live_main.py \
-            --buy-usd "${BUY_USD}" \
-            --tp-pct "${TP_PCT}" \
-            --sl-pct "${SL_PCT}" \
-            --dry-run "${DRY_RUN}"
+          python kraken_live_main.py
