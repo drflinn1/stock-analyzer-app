@@ -147,16 +147,35 @@ def get_usd_balance(balances: dict) -> float:
     return 0.0
 
 
-def pick_symbol_from_csv(path: str = "momentum_candidates.csv") -> Optional[str]:
-    """Pick the best symbol (lowest rank) from momentum_candidates.csv."""
-    if not os.path.exists(path):
-        print(f"[WARN] CSV not found: {path}")
+def pick_symbol_from_csv() -> Optional[str]:
+    """
+    Pick the best symbol (lowest rank) from momentum_candidates CSV.
+
+    We support both:
+      - .state/momentum_candidates.csv  (what the scan currently writes)
+      - momentum_candidates.csv         (older location, or manual export)
+    """
+    candidate_paths = [
+        ".state/momentum_candidates.csv",
+        "momentum_candidates.csv",
+    ]
+
+    csv_path = None
+    for path in candidate_paths:
+        if os.path.exists(path):
+            csv_path = path
+            break
+
+    if not csv_path:
+        print(f"[WARN] No momentum_candidates CSV found in {candidate_paths}")
         return None
+
+    print(f"[INFO] Using momentum candidates from: {csv_path}")
 
     best_symbol = None
     best_rank = None
 
-    with open(path, newline="") as f:
+    with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             symbol = row.get("symbol")
@@ -175,7 +194,7 @@ def pick_symbol_from_csv(path: str = "momentum_candidates.csv") -> Optional[str]
     if best_symbol:
         print(f"[INFO] Picked top candidate from CSV: {best_symbol} (rank={best_rank})")
     else:
-        print("[WARN] No valid rows in momentum_candidates.csv")
+        print("[WARN] No valid rows in momentum_candidates CSV")
 
     return best_symbol
 
