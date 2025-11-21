@@ -1,4 +1,3 @@
-# .github/workflows/kraken-monday-rotation.yml
 # =============================================================================
 #  Kraken — 1-Coin Rotation (Monday Baseline v2, DRY-RUN default)
 #
@@ -82,8 +81,14 @@ jobs:
           echo "Running momentum scan to refresh momentum_candidates.csv..."
           # This matches your existing kraken-momentum-scan workflow
           python tools/kraken_momentum_scan.py
-          echo "==== Top of momentum_candidates.csv ===="
-          head -n 20 momentum_candidates.csv || echo "No CSV generated?"
+          echo "==== Top of momentum_candidates.csv (.state or root) ===="
+          if [ -f .state/momentum_candidates.csv ]; then
+            head -n 20 .state/momentum_candidates.csv
+          elif [ -f momentum_candidates.csv ]; then
+            head -n 20 momentum_candidates.csv
+          else
+            echo "No CSV generated?"
+          fi
 
       - name: Run Monday rotation bot
         run: |
