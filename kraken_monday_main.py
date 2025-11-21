@@ -5,22 +5,22 @@ import hashlib
 import hmac
 import base64
 import urllib.parse
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
 
 import requests
 
 
 # =============================================================================
-#  Kraken — 1-Coin Rotation (Monday Baseline v2)
+#  Kraken — 1-Coin Rotation (Monday Baseline v3 — Pure Rotation, C1)
 #
-#  Uses momentum_candidates.csv:
-#    columns: symbol, quote, rank
-#  Picks the best row (lowest rank), then:
-#
-#    * If flat in that symbol:
-#        BUY ~BUY_USD worth (DRY_RUN respected)
-#    * If already long:
-#        check PnL vs TP_PCT / SL_PCT and SELL when hit
+#  Behavior:
+#    * Reads BUY_USD, TP_PCT, SL_PCT, DRY_RUN from env.
+#    * Reads momentum_candidates.csv (.state or root) and picks best symbol.
+#    * NEW: Scans your balances and SELLS every non-USD asset that is NOT
+#           the current top candidate (pure 1-coin rotation).
+#    * For the top symbol:
+#         - If flat  -> BUY ~BUY_USD worth (DRY_RUN respected).
+#         - If long  -> TP/SL check, SELL when hit.
 #
 #  Env vars (from YAML):
 #    KRAKEN_API_KEY, KRAKEN_API_SECRET
@@ -61,6 +61,9 @@ class KrakenTradeAPI:
     # ---------- public helpers ----------
 
     def get_ticker_price(self, symbol: str) -> float:
+        """
+        Get the last trade price for a symbol like 'SOL/USD'.
+        """
         pair = symbol.replace("/", "").upper()
         url = f"{self.base_url}/0/public/Ticker"
         resp = requests.get(url, params={"pair": pair}, timeout=20)
@@ -102,14 +105,20 @@ class KrakenTradeAPI:
 
 
 # =============================================================================
-#  Helpers: position inference, balances, CSV selection
+#  Helpers: position inference, balances, CSV selection, rotation sweep
 # =============================================================================
 
 
 def infer_position_from_trades(
     trades: dict, symbol: str
 ) -> Tuple[float, Optional[float]]:
-    """Return (net_position_units, avg_entry_price) for this symbol."""
+    """
+    Return (net_position_units, avg_entry_price) for this symbol.
+
+    We match on a loose basis:
+      - symbol 'LSK/USD' -> pair_code 'LSKUSD'
+      - trade 'pair' fields like 'LSKUSD' or 'XLSKZUSD' will both match.
+    """
     pair_code = symbol.replace("/", "").upper()
     net_vol = 0.0
     net_cost = 0.0
@@ -119,8 +128,12 @@ def infer_position_from_trades(
         if pair_code not in pair:
             continue
 
-        vol = float(t.get("vol", 0.0))
-        cost = float(t.get("cost", 0.0))
+        try:
+            vol = float(t.get("vol", 0.0))
+            cost = float(t.get("cost", 0.0))
+        except (TypeError, ValueError):
+            continue
+
         side = t.get("type")
 
         if side == "buy":
@@ -142,7 +155,7 @@ def get_usd_balance(balances: dict) -> float:
         if key in balances:
             try:
                 return float(balances[key])
-            except ValueError:
+            except (TypeError, ValueError):
                 continue
     return 0.0
 
@@ -209,6 +222,111 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
+def normalize_base_from_balance_key(key: str) -> Optional[str]:
+    """
+    Convert Kraken balance keys to a base asset code.
+
+    Examples:
+      'ZUSD'  -> 'USD'
+      'USD'   -> 'USD'
+      'XXBT'  -> 'XBT'
+      'XTRX'  -> 'TRX'
+      'SOL'   -> 'SOL'
+    """
+    if not key:
+        return None
+
+    # USD special-cased
+    if key.upper() in ("USD", "ZUSD"):
+        return "USD"
+
+    k = key.upper()
+
+    # Many crypto assets are prefixed with X or Z (e.g. XXBT, XTRX, ZETH)
+    if k.startswith(("X", "Z")) and len(k) > 3:
+        k = k[1:]  # strip one leading char -> XXBT -> XBT, XTRX -> TRX
+
+    return k
+
+
+def sweep_non_top_positions(
+    api: KrakenTradeAPI,
+    balances: Dict[str, str],
+    top_symbol: str,
+    dry_run: str,
+    min_balance: float = 1e-8,
+) -> None:
+    """
+    PURE ROTATION (C1):
+      - For every non-USD asset with a valid <BASE>/USD pair
+        and non-trivial balance:
+          * If it's NOT the top_symbol, SELL it.
+
+    Example:
+      top_symbol = 'MIRA/USD'
+      balances -> LSK, TRX, SOL, ACT, etc.
+      => we will try to SELL all of those except MIRA.
+    """
+    top_base = top_symbol.split("/")[0].upper()
+    print("\n[ROTATION] Sweeping non-top positions...")
+    print(f"[ROTATION] Top candidate this run: {top_symbol}")
+
+    for asset_key, raw_balance in balances.items():
+        base = normalize_base_from_balance_key(asset_key)
+        if not base:
+            continue
+
+        # Skip USD balances
+        if base == "USD":
+            continue
+
+        # Skip the current top base asset (we'll handle it separately)
+        if base == top_base:
+            continue
+
+        try:
+            bal = float(raw_balance)
+        except (TypeError, ValueError):
+            continue
+
+        if bal <= min_balance:
+            continue
+
+        candidate_symbol = f"{base}/USD"
+
+        # Verify that this asset has a valid USD pair on Kraken.
+        try:
+            price = api.get_ticker_price(candidate_symbol)
+        except Exception:
+            # No valid pair or some issue; ignore this asset.
+            continue
+
+        est_value = bal * price
+        print(
+            f"[ROTATION] Found non-top position: {asset_key} "
+            f"({candidate_symbol}) bal={bal:.8f} (~{est_value:.2f} USD)"
+        )
+
+        if dry_run == "ON":
+            print(
+                f"[DRY RUN] Would SELL {bal:.8f} {base} at market "
+                f"({candidate_symbol}) as part of rotation."
+            )
+            continue
+
+        print(
+            f"[LIVE] Rotating out of {base} ({candidate_symbol}) "
+            f"by selling {bal:.8f} units at market..."
+        )
+        try:
+            result = api.market_sell_all(candidate_symbol, bal)
+            print(f"[LIVE] SELL result for {candidate_symbol}: {result}")
+        except Exception as e:
+            print(
+                f"[ERROR] Failed to SELL {candidate_symbol} during rotation sweep: {e}"
+            )
+
+
 # =============================================================================
 #  Main rotation logic
 # =============================================================================
@@ -226,7 +344,7 @@ def main() -> None:
     dry_run = os.environ.get("DRY_RUN", "ON").upper()
 
     print("============================================================")
-    print("  Kraken — 1-Coin Rotation (Monday Baseline v2)")
+    print("  Kraken — 1-Coin Rotation (Monday Baseline v3 — Pure Rotation, C1)")
     print("------------------------------------------------------------")
     print(f"BUY_USD : {buy_usd}")
     print(f"TP_PCT  : {tp_pct}")
@@ -241,13 +359,21 @@ def main() -> None:
 
     api = KrakenTradeAPI(api_key, api_secret)
 
-    # Balances / trades
+    # Balances & trades
     balances = api.get_balance()
     usd_balance = get_usd_balance(balances)
     trades_result = api.get_trades_history()
     trades = trades_result.get("trades", {})
-    position_size, avg_entry = infer_position_from_trades(trades, symbol)
 
+    # -------------------------------------------------------------------------
+    # 1) PURE ROTATION SWEEP — sell everything that isn't the top candidate
+    # -------------------------------------------------------------------------
+    sweep_non_top_positions(api, balances, symbol, dry_run)
+
+    # -------------------------------------------------------------------------
+    # 2) Now handle the top candidate: either BUY if flat or TP/SL if long
+    # -------------------------------------------------------------------------
+    position_size, avg_entry = infer_position_from_trades(trades, symbol)
     price = api.get_ticker_price(symbol)
 
     print(f"\nSelected symbol       : {symbol}")
@@ -259,8 +385,10 @@ def main() -> None:
 
     is_flat = position_size <= 1e-8
 
+    # CASE 1: FLAT -> BUY top candidate
     if is_flat:
-        print("\n[STATE] Flat in this symbol.")
+        print("\n[STATE] Flat in this symbol (after rotation sweep).")
+
         if usd_balance < buy_usd * 1.02:
             print("Not enough USD to buy; skipping.")
             return
@@ -277,8 +405,8 @@ def main() -> None:
         print("BUY result:", result)
         return
 
-    # Already long -> TP/SL check
-    print("\n[STATE] Long position detected for this symbol.")
+    # CASE 2: LONG -> TP/SL check on the top candidate
+    print("\n[STATE] Long position detected for this symbol (top candidate).")
     if not avg_entry:
         print("Cannot compute avg entry; holding position.")
         return
@@ -294,7 +422,7 @@ def main() -> None:
         return
 
     reason = "TP" if take_profit else "SL"
-    print(f"{reason} condition met -> will SELL all.")
+    print(f"{reason} condition met -> will SELL all of {symbol}.")
 
     if dry_run == "ON":
         print(f"[DRY RUN] Would SELL {position_size:.8f} units at market.")
