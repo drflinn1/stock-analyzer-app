@@ -11,7 +11,7 @@ import requests
 
 
 # =============================================================================
-#  Kraken — 1-Coin Rotation (LIVE v3 — Rotation with Guards)
+#  Kraken — 1-Coin Rotation (Monday Baseline v3 — Rotation with Guards)
 #
 #  Behavior:
 #    * Reads BUY_USD, TP_PCT, SL_PCT, DRY_RUN from env.
@@ -26,6 +26,8 @@ import requests
 #    * For the top symbol:
 #         - If flat  -> BUY ~BUY_USD worth.
 #         - If long  -> TP/SL check, SELL when hit.
+#           NEW: After a LIVE TP/SL SELL, immediately tries to BUY the
+#                (possibly updated) top candidate again in the same run.
 #
 #  Env vars (from YAML):
 #    KRAKEN_API_KEY, KRAKEN_API_SECRET
@@ -117,7 +119,8 @@ class KrakenTradeAPI:
 
 
 def infer_position_from_trades(
-    trades: dict, symbol: str
+    trades: dict,
+    symbol: str
 ) -> Tuple[float, Optional[float]]:
     """
     Return (net_position_units, avg_entry_price) for this symbol.
@@ -265,9 +268,8 @@ def sweep_non_top_positions(
     min_balance: float = 1e-8,
 ) -> None:
     """
-    Rotation sweep with guards (C1 + C2-style tweaks):
-
-      - For every non-USD asset with a valid <BASE>/USD pair and non-trivial
+    Rotation sweep with guards:
+       - For every non-USD asset with a valid <BASE>/USD pair and non-trivial
         balance:
           * If est_value < MIN_ROTATION_USD      -> skip (dust).
           * If unrealized PnL >= MIN_PNL_TO_KEEP -> keep as winner.
@@ -367,6 +369,55 @@ def sweep_non_top_positions(
             )
 
 
+def reenter_after_exit(
+    api: KrakenTradeAPI,
+    previous_symbol: str,
+    buy_usd: float,
+    dry_run: str,
+) -> None:
+    """
+    After a LIVE TP/SL exit, try to BUY the (possibly updated) top candidate
+    again in the same run.
+
+    - Re-reads the momentum CSV (in case the list changed).
+    - Uses current USD balance (after the sell).
+    """
+    if dry_run == "ON":
+        # Should never be called with DRY_RUN=ON, but guard anyway.
+        print("[RE-ENTRY] DRY_RUN is ON; not placing a second order.")
+        return
+
+    print("\n[RE-ENTRY] Refreshing balances and top candidate for re-entry...")
+
+    # Re-pick in case the candidate list changed.
+    new_symbol = pick_symbol_from_csv() or previous_symbol
+
+    balances = api.get_balance()
+    usd_balance = get_usd_balance(balances)
+    price = api.get_ticker_price(new_symbol)
+
+    print(f"[RE-ENTRY] Top candidate : {new_symbol}")
+    print(f"[RE-ENTRY] USD balance   : {usd_balance:.6f}")
+    print(f"[RE-ENTRY] Target BUY_USD: {buy_usd:.2f}")
+
+    # Slight cushion so we don't error out on tiny fee differences.
+    if usd_balance < buy_usd * 1.02:
+        print("[RE-ENTRY] Not enough USD to re-enter; staying in cash.")
+        return
+
+    volume = buy_usd / price
+    print(
+        f"[RE-ENTRY] LIVE BUY: {volume:.8f} units of {new_symbol} "
+        f"(~{buy_usd:.2f} USD at {price:.6f})."
+    )
+
+    try:
+        result = api.market_buy(new_symbol, volume)
+        print("[RE-ENTRY] BUY result:", result)
+    except Exception as e:
+        print(f"[RE-ENTRY][ERROR] Failed to BUY {new_symbol}: {e}")
+
+
 # =============================================================================
 #  Main rotation logic
 # =============================================================================
@@ -384,7 +435,7 @@ def main() -> None:
     dry_run = os.environ.get("DRY_RUN", "ON").upper()
 
     print("============================================================")
-    print("  Kraken — 1-Coin Rotation (LIVE v3 — Rotation with Guards)")
+    print("  Kraken — 1-Coin Rotation (Monday Baseline v3 — Rotation with Guards)")
     print("------------------------------------------------------------")
     print(f"BUY_USD : {buy_usd}")
     print(f"TP_PCT  : {tp_pct}")
@@ -471,6 +522,10 @@ def main() -> None:
     print("[LIVE] Sending MARKET SELL...")
     result = api.market_sell_all(symbol, position_size)
     print("SELL result:", result)
+
+    # NEW: After exiting, immediately try to buy the top candidate again
+    # in the same RUN (using fresh CSV + balances).
+    reenter_after_exit(api, symbol, buy_usd, dry_run)
 
 
 if __name__ == "__main__":
