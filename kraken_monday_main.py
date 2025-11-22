@@ -11,20 +11,27 @@ import requests
 
 
 # =============================================================================
-#  Kraken — 1-Coin Rotation (Monday Baseline v3 — Pure Rotation, C1)
+#  Kraken — 1-Coin Rotation (Monday Baseline v3 — Rotation with Guards)
 #
 #  Behavior:
 #    * Reads BUY_USD, TP_PCT, SL_PCT, DRY_RUN from env.
 #    * Reads momentum_candidates.csv (.state or root) and picks best symbol.
-#    * NEW: Scans your balances and SELLS every non-USD asset that is NOT
-#           the current top candidate (pure 1-coin rotation).
+#    * Rotation sweep:
+#         - Scans your balances.
+#         - For every non-USD asset that is NOT the top candidate:
+#             • Skips tiny "dust" positions (< MIN_ROTATION_USD).
+#             • If it has a trade history and PnL >= MIN_PNL_TO_KEEP,
+#               keeps it as a winner.
+#             • Otherwise, SELLs it (DRY_RUN respected).
 #    * For the top symbol:
-#         - If flat  -> BUY ~BUY_USD worth (DRY_RUN respected).
+#         - If flat  -> BUY ~BUY_USD worth.
 #         - If long  -> TP/SL check, SELL when hit.
 #
 #  Env vars (from YAML):
 #    KRAKEN_API_KEY, KRAKEN_API_SECRET
 #    BUY_USD, TP_PCT, SL_PCT, DRY_RUN
+#    MIN_ROTATION_USD   (default 1.0)  – minimum est USD to rotate a coin
+#    MIN_PNL_TO_KEEP    (default 3.0)  – keep winners above this % gain
 # =============================================================================
 
 
@@ -254,22 +261,35 @@ def sweep_non_top_positions(
     balances: Dict[str, str],
     top_symbol: str,
     dry_run: str,
+    trades: Dict[str, dict],
     min_balance: float = 1e-8,
 ) -> None:
     """
-    PURE ROTATION (C1):
-      - For every non-USD asset with a valid <BASE>/USD pair
-        and non-trivial balance:
-          * If it's NOT the top_symbol, SELL it.
+    Rotation sweep with guards (C1 + C2-style tweaks):
+
+      - For every non-USD asset with a valid <BASE>/USD pair and non-trivial
+        balance:
+          * If est_value < MIN_ROTATION_USD      -> skip (dust).
+          * If unrealized PnL >= MIN_PNL_TO_KEEP -> keep as winner.
+          * Else                                 -> SELL (or DRY-RUN log).
 
     Example:
       top_symbol = 'MIRA/USD'
-      balances -> LSK, TRX, SOL, ACT, etc.
-      => we will try to SELL all of those except MIRA.
+      balances  -> LSK, TRX, SOL, ACT, etc.
+      => we may sell losers / flat coins, but keep winners & dust.
     """
     top_base = top_symbol.split("/")[0].upper()
+
+    min_rotation_usd = env_float("MIN_ROTATION_USD", 1.0)
+    min_pnl_to_keep = env_float("MIN_PNL_TO_KEEP", 3.0)
+
     print("\n[ROTATION] Sweeping non-top positions...")
-    print(f"[ROTATION] Top candidate this run: {top_symbol}")
+    print(f"[ROTATION] Top candidate this run : {top_symbol}")
+    print(f"[ROTATION] MIN_ROTATION_USD       : {min_rotation_usd:.2f} USD")
+    print(
+        f"[ROTATION] MIN_PNL_TO_KEEP        : {min_pnl_to_keep:.2f}% "
+        f"(winners above this are kept)"
+    )
 
     for asset_key, raw_balance in balances.items():
         base = normalize_base_from_balance_key(asset_key)
@@ -280,7 +300,7 @@ def sweep_non_top_positions(
         if base == "USD":
             continue
 
-        # Skip the current top base asset (we'll handle it separately)
+        # Skip the current top base asset (handled separately)
         if base == top_base:
             continue
 
@@ -302,6 +322,31 @@ def sweep_non_top_positions(
             continue
 
         est_value = bal * price
+
+        # Dust filter: don't bother rotating tiny scraps.
+        if est_value < min_rotation_usd:
+            print(
+                f"[ROTATION] Skipping {candidate_symbol}: "
+                f"~{est_value:.2f} USD < MIN_ROTATION_USD ({min_rotation_usd:.2f})."
+            )
+            continue
+
+        # Check PnL for this symbol to decide whether to keep a winner.
+        pos_size, avg_entry = infer_position_from_trades(trades, candidate_symbol)
+        pnl_pct = None
+        if pos_size > 1e-8 and avg_entry:
+            pnl_pct = (price - avg_entry) / avg_entry * 100.0
+            print(
+                f"[ROTATION] {candidate_symbol}: pos={pos_size:.8f}, "
+                f"avg_entry={avg_entry:.6f}, PnL={pnl_pct:.2f}%"
+            )
+            if pnl_pct >= min_pnl_to_keep:
+                print(
+                    f"[ROTATION] Winner above {min_pnl_to_keep:.2f}% PnL → "
+                    f"keeping {candidate_symbol}, no rotation."
+                )
+                continue
+
         print(
             f"[ROTATION] Found non-top position: {asset_key} "
             f"({candidate_symbol}) bal={bal:.8f} (~{est_value:.2f} USD)"
@@ -344,7 +389,7 @@ def main() -> None:
     dry_run = os.environ.get("DRY_RUN", "ON").upper()
 
     print("============================================================")
-    print("  Kraken — 1-Coin Rotation (Monday Baseline v3 — Pure Rotation, C1)")
+    print("  Kraken — 1-Coin Rotation (Monday Baseline v3 — Rotation with Guards)")
     print("------------------------------------------------------------")
     print(f"BUY_USD : {buy_usd}")
     print(f"TP_PCT  : {tp_pct}")
@@ -366,9 +411,9 @@ def main() -> None:
     trades = trades_result.get("trades", {})
 
     # -------------------------------------------------------------------------
-    # 1) PURE ROTATION SWEEP — sell everything that isn't the top candidate
+    # 1) ROTATION SWEEP — sell non-top coins (with dust + winner guards)
     # -------------------------------------------------------------------------
-    sweep_non_top_positions(api, balances, symbol, dry_run)
+    sweep_non_top_positions(api, balances, symbol, dry_run, trades)
 
     # -------------------------------------------------------------------------
     # 2) Now handle the top candidate: either BUY if flat or TP/SL if long
