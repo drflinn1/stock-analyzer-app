@@ -1,64 +1,59 @@
-# =====================================================================================
-#  ⚠⚠⚠  WARNING — LIVE KRAKEN TRADING WORKFLOW (Rotation v3)  ⚠⚠⚠
+# .github/workflows/kraken-live-rotation.yml
 #
-#  - This workflow sends REAL ORDERS to Kraken when it runs.
-#  - DRY_RUN is HARD-CODED to "OFF" in this file.
-#  - Default BUY_USD is SMALL ($5), but it is still REAL MONEY.
+#  ⚠⚠⚠  WARNING — LIVE KRAKEN TRADING WORKFLOW  ⚠⚠⚠
 #
-#  SAFETY TIPS:
-#    * Only enable this schedule if you really want it trading 24/7.
-#    * DOUBLE-CHECK: BUY_USD, TP/SL, and your Kraken balances first.
-#    * If you just want to SIMULATE trades, use the Monday Baseline DRY bot.
-# =====================================================================================
+#  - This workflow sends REAL MARKET ORDERS to Kraken.
+#  - It reuses the Monday Baseline v3 "Rotation with Guards" logic
+#    (dust filter + keep strong winners).
+#
+#  Behavior:
+#    * Every 30 minutes, it will:
+#        - Run the momentum scan to refresh .state/momentum_candidates.csv
+#        - Run kraken_live_main.py with DRY_RUN=OFF (REAL trades)
+#    * You can also run it manually with custom BUY_USD / TP_PCT / SL_PCT.
+#
+#  SAFETY:
+#    - BUY_USD default is small ($5).
+#    - MIN_ROTATION_USD and MIN_PNL_TO_KEEP are also configurable.
+#    - If you want DRY runs, use the Monday Baseline workflow instead.
 
 name: Kraken — 1-Coin Rotation (LIVE v3)
 
 on:
-  # Run automatically every 30 minutes (you can change this cron if needed)
+  # 🔁 LIVE schedule – runs every 30 minutes
   schedule:
     - cron: "*/30 * * * *"
 
-  # Allow manual runs with custom inputs
+  # ▶ Manual runs with overrides
   workflow_dispatch:
     inputs:
       BUY_USD:
-        description: "USD notional to buy when flat (LIVE money)"
-        required: true
+        description: "USD notional to buy when flat (default 5)"
+        required: false
         default: "5"
       TP_PCT:
         description: "Take-profit % (e.g., 8 = 8%)"
-        required: true
+        required: false
         default: "8"
       SL_PCT:
         description: "Stop-loss % (e.g., 1 = 1%)"
-        required: true
+        required: false
         default: "1"
-
-concurrency:
-  group: kraken-live-rotation
-  cancel-in-progress: false
+      MIN_ROTATION_USD:
+        description: "Min USD value to rotate a coin (dust filter)"
+        required: false
+        default: "1.0"
+      MIN_PNL_TO_KEEP:
+        description: "Keep winners above this % gain"
+        required: false
+        default: "3.0"
 
 jobs:
-  rotation:
+  live-rotation:
     runs-on: ubuntu-latest
-
-    env:
-      # LIVE secret keys
-      KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-      KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-
-      # Defaults for scheduled runs (no UI inputs)
-      BUY_USD: "5"
-      TP_PCT: "8"
-      SL_PCT: "1"
-
-      # LIVE ONLY — no simulation in this workflow
-      DRY_RUN: "OFF"
+    timeout-minutes: 15
 
     steps:
-      - name: Set up job
-        run: echo "Starting Kraken LIVE rotation v3 job..."
-
       - name: Checkout repo
         uses: actions/checkout@v4
 
@@ -69,52 +64,45 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install requests pandas
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
 
-      # ----------------------------------------------------------------------
-      # 1) Build momentum candidates (Kraken 24h gainers)
-      #    This mirrors your Monday Baseline momentum scan step.
-      # ----------------------------------------------------------------------
+      # Same scan as Monday Baseline – writes .state/momentum_candidates.csv
       - name: Build momentum candidates (Kraken 24h gainers)
         run: |
           echo "Running momentum scan to refresh momentum_candidates.csv..."
-          mkdir -p .state
-          # This should match your existing scan script.
           python tools/kraken_momentum_scan.py
-          echo "==== Top of .state/momentum_candidates.csv ===="
-          if [ -f ".state/momentum_candidates.csv" ]; then
-            head -n 20 .state/momentum_candidates.csv
-          elif [ -f "momentum_candidates.csv" ]; then
-            head -n 20 momentum_candidates.csv
-          else
-            echo "No momentum_candidates CSV generated."
-          fi
+        env:
+          # Public-only scan, but keep keys available if script ever uses them
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-      # ----------------------------------------------------------------------
-      # 2) Run LIVE rotation bot (kraken_live_main.py)
-      #    For manual runs, we override BUY_USD / TP / SL from inputs.
-      # ----------------------------------------------------------------------
       - name: Run LIVE rotation bot
         env:
-          KRAKEN_API_KEY: ${{ env.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ env.KRAKEN_API_SECRET }}
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
-          # For manual workflow_dispatch runs, prefer the UI values.
-          BUY_USD: ${{ github.event.inputs.BUY_USD || env.BUY_USD }}
-          TP_PCT: ${{ github.event.inputs.TP_PCT || env.TP_PCT }}
-          SL_PCT: ${{ github.event.inputs.SL_PCT || env.SL_PCT }}
+          # For scheduled runs, github.event.inputs.* is empty → fall back to defaults.
+          BUY_USD:          ${{ github.event.inputs.BUY_USD        || '5'   }}
+          TP_PCT:           ${{ github.event.inputs.TP_PCT         || '8'   }}
+          SL_PCT:           ${{ github.event.inputs.SL_PCT         || '1'   }}
+          MIN_ROTATION_USD: ${{ github.event.inputs.MIN_ROTATION_USD || '1.0' }}
+          MIN_PNL_TO_KEEP:  ${{ github.event.inputs.MIN_PNL_TO_KEEP  || '3.0' }}
 
-          # Always LIVE for this workflow
+          # LIVE MODE ONLY for this workflow
           DRY_RUN: "OFF"
+
         run: |
           echo "============================================================"
-          echo " LIVE MODE: DRY_RUN=${DRY_RUN}"
-          echo " BUY_USD : ${BUY_USD}"
-          echo " TP_PCT  : ${TP_PCT}"
-          echo " SL_PCT  : ${SL_PCT}"
+          echo "  Kraken — 1-Coin Rotation (LIVE v3 — Rotation with Guards)"
+          echo "------------------------------------------------------------"
+          echo "  BUY_USD=${BUY_USD}"
+          echo "  TP_PCT=${TP_PCT}"
+          echo "  SL_PCT=${SL_PCT}"
+          echo "  MIN_ROTATION_USD=${MIN_ROTATION_USD}"
+          echo "  MIN_PNL_TO_KEEP=${MIN_PNL_TO_KEEP}"
+          echo "  DRY_RUN=${DRY_RUN}"
           echo "============================================================"
-          python kraken_live_main.py
 
-      - name: Complete job
-        run: echo "Kraken LIVE rotation v3 run completed."
+          python kraken_live_main.py
