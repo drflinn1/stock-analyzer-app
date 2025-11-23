@@ -434,6 +434,7 @@ def main() -> None:
     api_key = os.environ.get("KRAKEN_API_KEY", "").strip()
     api_secret = os.environ.get("KRAKEN_API_SECRET", "").strip()
     if not api_key or not api_secret:
+        # Config issue: let this stop the job so you notice.
         raise SystemExit("Missing KRAKEN_API_KEY or KRAKEN_API_SECRET")
 
     # A1 tuning defaults
@@ -536,5 +537,28 @@ def main() -> None:
     reenter_after_exit(api, symbol, buy_usd, dry_run)
 
 
+def safe_main() -> None:
+    """
+    Wrapper so Kraken/network glitches don't fail the GitHub Actions job.
+
+    - Config errors (missing API keys) still raise SystemExit so you notice.
+    - All other exceptions are logged, but swallowed.
+    """
+    try:
+        main()
+    except SystemExit as e:
+        # Keep config errors fatal so they don't go unnoticed.
+        print(f"[FATAL] SystemExit: {e}")
+        raise
+    except Exception as e:
+        print("[ERROR] Unhandled exception in Kraken LIVE bot:", e)
+        try:
+            import traceback
+            traceback.print_exc()
+        except Exception:
+            pass
+        print("[ERROR] Exception swallowed so GitHub Actions step stays green.")
+
+
 if __name__ == "__main__":
-    main()
+    safe_main()
