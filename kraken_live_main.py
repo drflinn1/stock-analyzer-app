@@ -70,6 +70,7 @@ class KrakenTradeAPI:
         resp.raise_for_status()
         js = resp.json()
         if js.get("error"):
+            # Bubble up Kraken errors as RuntimeError so callers can handle/log
             raise RuntimeError(f"Kraken error: {js['error']}")
         return js["result"]
 
@@ -128,6 +129,7 @@ def infer_position_from_trades(
     trades: dict,
     symbol: str
 ) -> Tuple[float, Optional[float]]:
+
     """
     Return (net_position_units, avg_entry_price) for this symbol.
 
@@ -434,7 +436,6 @@ def main() -> None:
     api_key = os.environ.get("KRAKEN_API_KEY", "").strip()
     api_secret = os.environ.get("KRAKEN_API_SECRET", "").strip()
     if not api_key or not api_secret:
-        # Config issue: let this stop the job so you notice.
         raise SystemExit("Missing KRAKEN_API_KEY or KRAKEN_API_SECRET")
 
     # A1 tuning defaults
@@ -537,26 +538,24 @@ def main() -> None:
     reenter_after_exit(api, symbol, buy_usd, dry_run)
 
 
-def safe_main() -> None:
-    """
-    Wrapper so Kraken/network glitches don't fail the GitHub Actions job.
+# =============================================================================
+#  Safe wrapper so GitHub Actions step does not fail on runtime errors
+# =============================================================================
 
-    - Config errors (missing API keys) still raise SystemExit so you notice.
-    - All other exceptions are logged, but swallowed.
-    """
+
+def safe_main() -> None:
+    import traceback
+
     try:
         main()
     except SystemExit as e:
-        # Keep config errors fatal so they don't go unnoticed.
-        print(f"[FATAL] SystemExit: {e}")
+        # For real config problems (missing secrets, etc.) still fail the step.
+        code = getattr(e, "code", 1) or 1
+        print(f"[EXIT] SystemExit in Kraken LIVE bot: {e} (code={code})")
         raise
     except Exception as e:
-        print("[ERROR] Unhandled exception in Kraken LIVE bot:", e)
-        try:
-            import traceback
-            traceback.print_exc()
-        except Exception:
-            pass
+        print(f"[ERROR] Unhandled exception in Kraken LIVE bot: {e}")
+        traceback.print_exc()
         print("[ERROR] Exception swallowed so GitHub Actions step stays green.")
 
 
