@@ -26,14 +26,20 @@ import requests
 #    * For the top symbol:
 #         - If flat  -> BUY ~BUY_USD worth.
 #         - If long  -> TP/SL check, SELL when hit.
-#           NEW: After a LIVE TP/SL SELL, immediately tries to BUY the
-#                (possibly updated) top candidate again in the same run.
+#           After a LIVE TP/SL SELL, immediately tries to BUY the
+#           (possibly updated) top candidate again in the same run.
+#
+#  Default tuning (A1):
+#    BUY_USD          = 7.0   – modest position size
+#    TP_PCT           = 12.0  – bigger winners
+#    SL_PCT           = 1.0   – small loss
+#    MIN_ROTATION_USD = 2.0   – ignore tiny dust positions
+#    MIN_PNL_TO_KEEP  = 10.0  – keep only strong winners
 #
 #  Env vars (from YAML):
 #    KRAKEN_API_KEY, KRAKEN_API_SECRET
 #    BUY_USD, TP_PCT, SL_PCT, DRY_RUN
-#    MIN_ROTATION_USD   (default 1.0)  – minimum est USD to rotate a coin
-#    MIN_PNL_TO_KEEP    (default 3.0)  – keep winners above this % gain
+#    MIN_ROTATION_USD, MIN_PNL_TO_KEEP
 # =============================================================================
 
 
@@ -277,8 +283,9 @@ def sweep_non_top_positions(
     """
     top_base = top_symbol.split("/")[0].upper()
 
-    min_rotation_usd = env_float("MIN_ROTATION_USD", 1.0)
-    min_pnl_to_keep = env_float("MIN_PNL_TO_KEEP", 3.0)
+    # A1 tuning defaults: 2 USD dust, 10% winner threshold
+    min_rotation_usd = env_float("MIN_ROTATION_USD", 2.0)
+    min_pnl_to_keep = env_float("MIN_PNL_TO_KEEP", 10.0)
 
     print("\n[ROTATION] Sweeping non-top positions...")
     print(f"[ROTATION] Top candidate this run : {top_symbol}")
@@ -429,8 +436,9 @@ def main() -> None:
     if not api_key or not api_secret:
         raise SystemExit("Missing KRAKEN_API_KEY or KRAKEN_API_SECRET")
 
-    buy_usd = env_float("BUY_USD", 20.0)
-    tp_pct = env_float("TP_PCT", 8.0)
+    # A1 tuning defaults
+    buy_usd = env_float("BUY_USD", 7.0)
+    tp_pct = env_float("TP_PCT", 12.0)
     sl_pct = env_float("SL_PCT", 1.0)
     dry_run = os.environ.get("DRY_RUN", "ON").upper()
 
@@ -523,7 +531,7 @@ def main() -> None:
     result = api.market_sell_all(symbol, position_size)
     print("SELL result:", result)
 
-    # NEW: After exiting, immediately try to buy the top candidate again
+    # After exiting, immediately try to buy the top candidate again
     # in the same RUN (using fresh CSV + balances).
     reenter_after_exit(api, symbol, buy_usd, dry_run)
 
