@@ -11,7 +11,7 @@ import requests
 
 
 # =============================================================================
-#  Kraken — 1-Coin Rotation (Monday Baseline v3 — Rotation with Guards)
+#  Kraken — 1-Coin Rotation (Monday Baseline v3 — Rotation with Guards, A1)
 #
 #  Behavior:
 #    * Reads BUY_USD, TP_PCT, SL_PCT, DRY_RUN from env.
@@ -29,17 +29,18 @@ import requests
 #           After a LIVE TP/SL SELL, immediately tries to BUY the
 #           (possibly updated) top candidate again in the same run.
 #
-#  Default tuning (A1):
-#    BUY_USD          = 7.0   – modest position size
-#    TP_PCT           = 12.0  – bigger winners
-#    SL_PCT           = 1.0   – small loss
-#    MIN_ROTATION_USD = 2.0   – ignore tiny dust positions
-#    MIN_PNL_TO_KEEP  = 10.0  – keep only strong winners
+#  A1 default tuning:
+#    BUY_USD           = 7.0   – modest position size
+#    TP_PCT            = 12.0  – bigger winners
+#    SL_PCT            = 1.0   – small loss
+#    MIN_ROTATION_USD  = 2.0   – ignore tiny dust positions in the sweep
+#    MIN_PNL_TO_KEEP   = 10.0  – keep only strong winners
+#    MIN_NOTIONAL_USD  = 2.0   – minimum trade notional; below this, skip SELL
 #
 #  Env vars (from YAML):
 #    KRAKEN_API_KEY, KRAKEN_API_SECRET
 #    BUY_USD, TP_PCT, SL_PCT, DRY_RUN
-#    MIN_ROTATION_USD, MIN_PNL_TO_KEEP
+#    MIN_ROTATION_USD, MIN_PNL_TO_KEEP, MIN_NOTIONAL_USD
 # =============================================================================
 
 
@@ -70,7 +71,6 @@ class KrakenTradeAPI:
         resp.raise_for_status()
         js = resp.json()
         if js.get("error"):
-            # Bubble up Kraken errors as RuntimeError so caller can log them
             raise RuntimeError(f"Kraken error: {js['error']}")
         return js["result"]
 
@@ -391,6 +391,7 @@ def reenter_after_exit(
     - Uses current USD balance (after the sell).
     """
     if dry_run == "ON":
+        # Should never be called with DRY_RUN=ON, but guard anyway.
         print("[RE-ENTRY] DRY_RUN is ON; not placing a second order.")
         return
 
@@ -434,15 +435,13 @@ def main() -> None:
     api_key = os.environ.get("KRAKEN_API_KEY", "").strip()
     api_secret = os.environ.get("KRAKEN_API_SECRET", "").strip()
     if not api_key or not api_secret:
-        print("Missing KRAKEN_API_KEY or KRAKEN_API_SECRET; cannot trade.")
-        return
+        raise SystemExit("Missing KRAKEN_API_KEY or KRAKEN_API_SECRET")
 
     # A1 tuning defaults
     buy_usd = env_float("BUY_USD", 7.0)
     tp_pct = env_float("TP_PCT", 12.0)
     sl_pct = env_float("SL_PCT", 1.0)
-    # Reuse the same dust/min-order threshold for the top coin TP/SL exit
-    min_rotation_usd = env_float("MIN_ROTATION_USD", 2.0)
+    min_notional_usd = env_float("MIN_NOTIONAL_USD", 2.0)
     dry_run = os.environ.get("DRY_RUN", "ON").upper()
 
     print("============================================================")
@@ -451,7 +450,7 @@ def main() -> None:
     print(f"BUY_USD          : {buy_usd}")
     print(f"TP_PCT           : {tp_pct}")
     print(f"SL_PCT           : {sl_pct}")
-    print(f"MIN_ROTATION_USD : {min_rotation_usd}")
+    print(f"MIN_NOTIONAL_USD : {min_notional_usd}")
     print(f"DRY_RUN          : {dry_run}")
     print("============================================================")
 
@@ -479,14 +478,12 @@ def main() -> None:
     position_size, avg_entry = infer_position_from_trades(trades, symbol)
     price = api.get_ticker_price(symbol)
 
-    print(f"\nSelected symbol           : {symbol}")
-    print(f"Current price             : {price:.6f} USD")
-    print(f"USD balance               : {usd_balance:.6f}")
-    print(f"Inferred position         : {position_size:.8f} units")
-    est_value = position_size * price
-    print(f"Estimated position value  : {est_value:.2f} USD")
+    print(f"\nSelected symbol       : {symbol}")
+    print(f"Current price         : {price:.6f} USD")
+    print(f"USD balance           : {usd_balance:.6f}")
+    print(f"Inferred position     : {position_size:.8f} units")
     if avg_entry:
-        print(f"Average entry price       : {avg_entry:.6f} USD")
+        print(f"Average entry price   : {avg_entry:.6f} USD")
 
     is_flat = position_size <= 1e-8
 
@@ -527,41 +524,51 @@ def main() -> None:
         return
 
     reason = "TP" if take_profit else "SL"
-    print(f"{reason} condition met -> will SELL all of {symbol}.")
+    print(f"{reason} condition met on {symbol}.")
 
-    # NEW: don't try to sell if the position is below our dust / min-order size
-    if est_value < min_rotation_usd:
+    # ---- NEW: check against Kraken minimum notional BEFORE selling ----
+    position_est_usd = position_size * price
+    if position_est_usd < min_notional_usd:
         print(
-            f"[TP/SL] Skipping SELL for {symbol}: "
-            f"~{est_value:.2f} USD < MIN_ROTATION_USD ({min_rotation_usd:.2f}). "
-            f"Treating as dust to avoid Kraken 'volume minimum not met' errors."
+            f"[SIZE GUARD] {symbol} position is ~{position_est_usd:.2f} USD "
+            f"< MIN_NOTIONAL_USD ({min_notional_usd:.2f}). "
+            f"Treating as dust — no SELL order will be sent."
         )
         return
+
+    print(
+        f"Will SELL all of {symbol}: size={position_size:.8f} "
+        f"(~{position_est_usd:.2f} USD)."
+    )
 
     if dry_run == "ON":
         print(f"[DRY RUN] Would SELL {position_size:.8f} units at market.")
         return
 
     print("[LIVE] Sending MARKET SELL...")
-    result = api.market_sell_all(symbol, position_size)
-    print("SELL result:", result)
+    try:
+        result = api.market_sell_all(symbol, position_size)
+        print("SELL result:", result)
+    except Exception as e:
+        # Log but don't crash the whole workflow
+        print(
+            "[BOT ERROR] Unhandled exception while selling in LIVE bot: "
+            f"{e}"
+        )
+        print(
+            "[BOT ERROR] Exception swallowed so GitHub Actions step can "
+            "remain green."
+        )
+        return
 
     # After exiting, immediately try to buy the top candidate again
     # in the same RUN (using fresh CSV + balances).
     reenter_after_exit(api, symbol, buy_usd, dry_run)
 
 
-# =============================================================================
-#  Hard-safe wrapper – never re-raises, so exit code stays 0
-# =============================================================================
-
-
 if __name__ == "__main__":
-    import traceback
-
     try:
         main()
     except Exception as e:
+        # Extra safety net so the step doesn't hard-fail
         print(f"[BOT ERROR] Unhandled exception in Kraken LIVE bot: {e}")
-        traceback.print_exc()
-        print("[BOT ERROR] Exception swallowed so GitHub step should remain green.")
