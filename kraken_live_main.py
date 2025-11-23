@@ -19,7 +19,7 @@ import requests
 #    * Rotation sweep:
 #         - Scans your balances.
 #         - For every non-USD asset that is NOT the top candidate:
-#             • Skips tiny "dust" positions (< MIN_ROTATION_USD).
+#             • Skips tiny "dust" positions (< dust_threshold USD).
 #             • If it has a trade history and PnL >= MIN_PNL_TO_KEEP,
 #               keeps it as a winner.
 #             • Otherwise, SELLs it (DRY_RUN respected).
@@ -29,18 +29,23 @@ import requests
 #           After a LIVE TP/SL SELL, immediately tries to BUY the
 #           (possibly updated) top candidate again in the same run.
 #
-#  A1 default tuning:
-#    BUY_USD           = 7.0   – modest position size
-#    TP_PCT            = 12.0  – bigger winners
-#    SL_PCT            = 1.0   – small loss
-#    MIN_ROTATION_USD  = 2.0   – ignore tiny dust positions in the sweep
-#    MIN_PNL_TO_KEEP   = 10.0  – keep only strong winners
-#    MIN_NOTIONAL_USD  = 2.0   – minimum trade notional; below this, skip SELL
+#  A1 tuning defaults:
+#    BUY_USD          = 10.0  – modest position size
+#    TP_PCT           = 10.0  – decent winners
+#    SL_PCT           = 1.0   – small loss
+#    MIN_ROTATION_USD = 2.0   – ignore tiny dust positions
+#    MIN_PNL_TO_KEEP  = 10.0  – keep only strong winners
+#
+#  Extra guard:
+#    We also enforce an approximate minimum trade size:
+#      min_trade_usd = max(5.0, 0.5 * BUY_USD)
+#    Any SELL whose estimated USD value is below this is treated as dust
+#    so we don't trigger Kraken's "volume minimum not met" error.
 #
 #  Env vars (from YAML):
 #    KRAKEN_API_KEY, KRAKEN_API_SECRET
 #    BUY_USD, TP_PCT, SL_PCT, DRY_RUN
-#    MIN_ROTATION_USD, MIN_PNL_TO_KEEP, MIN_NOTIONAL_USD
+#    MIN_ROTATION_USD, MIN_PNL_TO_KEEP
 # =============================================================================
 
 
@@ -278,7 +283,7 @@ def sweep_non_top_positions(
     Rotation sweep with guards:
        - For every non-USD asset with a valid <BASE>/USD pair and non-trivial
         balance:
-          * If est_value < MIN_ROTATION_USD      -> skip (dust).
+          * If est_value < dust_threshold        -> skip (dust).
           * If unrealized PnL >= MIN_PNL_TO_KEEP -> keep as winner.
           * Else                                 -> SELL (or DRY-RUN log).
     """
@@ -288,12 +293,21 @@ def sweep_non_top_positions(
     min_rotation_usd = env_float("MIN_ROTATION_USD", 2.0)
     min_pnl_to_keep = env_float("MIN_PNL_TO_KEEP", 10.0)
 
+    # For safety, also enforce approximate minimum trade size.
+    buy_usd = env_float("BUY_USD", 10.0)
+    min_trade_usd = max(5.0, 0.5 * buy_usd)
+    dust_threshold = max(min_rotation_usd, min_trade_usd)
+
     print("\n[ROTATION] Sweeping non-top positions...")
     print(f"[ROTATION] Top candidate this run : {top_symbol}")
     print(f"[ROTATION] MIN_ROTATION_USD       : {min_rotation_usd:.2f} USD")
     print(
         f"[ROTATION] MIN_PNL_TO_KEEP        : {min_pnl_to_keep:.2f}% "
         f"(winners above this are kept)"
+    )
+    print(
+        f"[ROTATION] Effective dust threshold: {dust_threshold:.2f} USD "
+        f"(max(MIN_ROTATION_USD, min_trade_usd))"
     )
 
     for asset_key, raw_balance in balances.items():
@@ -328,17 +342,16 @@ def sweep_non_top_positions(
 
         est_value = bal * price
 
-        # Dust filter: don't bother rotating tiny scraps.
-        if est_value < min_rotation_usd:
+        # Dust + min-trade filter: don't bother rotating tiny scraps.
+        if est_value < dust_threshold:
             print(
                 f"[ROTATION] Skipping {candidate_symbol}: "
-                f"~{est_value:.2f} USD < MIN_ROTATION_USD ({min_rotation_usd:.2f})."
+                f"~{est_value:.2f} USD < dust_threshold ({dust_threshold:.2f})."
             )
             continue
 
         # Check PnL for this symbol to decide whether to keep a winner.
         pos_size, avg_entry = infer_position_from_trades(trades, candidate_symbol)
-        pnl_pct = None
         if pos_size > 1e-8 and avg_entry:
             pnl_pct = (price - avg_entry) / avg_entry * 100.0
             print(
@@ -438,20 +451,22 @@ def main() -> None:
         raise SystemExit("Missing KRAKEN_API_KEY or KRAKEN_API_SECRET")
 
     # A1 tuning defaults
-    buy_usd = env_float("BUY_USD", 7.0)
-    tp_pct = env_float("TP_PCT", 12.0)
+    buy_usd = env_float("BUY_USD", 10.0)
+    tp_pct = env_float("TP_PCT", 10.0)
     sl_pct = env_float("SL_PCT", 1.0)
-    min_notional_usd = env_float("MIN_NOTIONAL_USD", 2.0)
     dry_run = os.environ.get("DRY_RUN", "ON").upper()
+
+    # min trade threshold used for top symbol SELLs
+    min_trade_usd = max(5.0, 0.5 * buy_usd)
 
     print("============================================================")
     print("  Kraken — 1-Coin Rotation (Monday Baseline v3 — Rotation with Guards)")
     print("------------------------------------------------------------")
-    print(f"BUY_USD          : {buy_usd}")
-    print(f"TP_PCT           : {tp_pct}")
-    print(f"SL_PCT           : {sl_pct}")
-    print(f"MIN_NOTIONAL_USD : {min_notional_usd}")
-    print(f"DRY_RUN          : {dry_run}")
+    print(f"BUY_USD       : {buy_usd}")
+    print(f"TP_PCT        : {tp_pct}")
+    print(f"SL_PCT        : {sl_pct}")
+    print(f"DRY_RUN       : {dry_run}")
+    print(f"MIN_TRADE_USD : {min_trade_usd:.2f}")
     print("============================================================")
 
     symbol = pick_symbol_from_csv()
@@ -485,11 +500,23 @@ def main() -> None:
     if avg_entry:
         print(f"Average entry price   : {avg_entry:.6f} USD")
 
+    # If the current position is extremely small, treat it as dust (no SELL).
+    est_position_usd = position_size * price
+    if position_size > 0 and est_position_usd < min_trade_usd:
+        print(
+            f"[STATE] Live position is ≈{est_position_usd:.2f} USD "
+            f"< min_trade_usd ({min_trade_usd:.2f}); treating as dust "
+            f"→ no SELL order will be sent."
+        )
+        # For the rest of the logic, treat as flat so we can re-enter later.
+        position_size = 0.0
+        avg_entry = None
+
     is_flat = position_size <= 1e-8
 
     # CASE 1: FLAT -> BUY top candidate
     if is_flat:
-        print("\n[STATE] Flat in this symbol (after rotation sweep).")
+        print("\n[STATE] Flat in this symbol (after rotation sweep / dust check).")
 
         if usd_balance < buy_usd * 1.02:
             print("Not enough USD to buy; skipping.")
@@ -524,42 +551,15 @@ def main() -> None:
         return
 
     reason = "TP" if take_profit else "SL"
-    print(f"{reason} condition met on {symbol}.")
-
-    # ---- NEW: check against Kraken minimum notional BEFORE selling ----
-    position_est_usd = position_size * price
-    if position_est_usd < min_notional_usd:
-        print(
-            f"[SIZE GUARD] {symbol} position is ~{position_est_usd:.2f} USD "
-            f"< MIN_NOTIONAL_USD ({min_notional_usd:.2f}). "
-            f"Treating as dust — no SELL order will be sent."
-        )
-        return
-
-    print(
-        f"Will SELL all of {symbol}: size={position_size:.8f} "
-        f"(~{position_est_usd:.2f} USD)."
-    )
+    print(f"{reason} condition met -> will SELL all of {symbol}.")
 
     if dry_run == "ON":
         print(f"[DRY RUN] Would SELL {position_size:.8f} units at market.")
         return
 
     print("[LIVE] Sending MARKET SELL...")
-    try:
-        result = api.market_sell_all(symbol, position_size)
-        print("SELL result:", result)
-    except Exception as e:
-        # Log but don't crash the whole workflow
-        print(
-            "[BOT ERROR] Unhandled exception while selling in LIVE bot: "
-            f"{e}"
-        )
-        print(
-            "[BOT ERROR] Exception swallowed so GitHub Actions step can "
-            "remain green."
-        )
-        return
+    result = api.market_sell_all(symbol, position_size)
+    print("SELL result:", result)
 
     # After exiting, immediately try to buy the top candidate again
     # in the same RUN (using fresh CSV + balances).
@@ -570,5 +570,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # Extra safety net so the step doesn't hard-fail
-        print(f"[BOT ERROR] Unhandled exception in Kraken LIVE bot: {e}")
+        print(f"[BOT ERROR] Unhandled exception in Kraken LIVE bot: {e!r}")
+        print("[BOT ERROR] Exception swallowed so GitHub step should remain green.")
