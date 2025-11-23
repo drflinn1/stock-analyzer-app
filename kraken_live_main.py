@@ -407,6 +407,7 @@ def reenter_after_exit(
     print(f"[RE-ENTRY] USD balance   : {usd_balance:.6f}")
     print(f"[RE-ENTRY] Target BUY_USD: {buy_usd:.2f}")
 
+    # Slight cushion so we don't error out on tiny fee differences.
     if usd_balance < buy_usd * 1.02:
         print("[RE-ENTRY] Not enough USD to re-enter; staying in cash.")
         return
@@ -440,15 +441,18 @@ def main() -> None:
     buy_usd = env_float("BUY_USD", 7.0)
     tp_pct = env_float("TP_PCT", 12.0)
     sl_pct = env_float("SL_PCT", 1.0)
+    # Reuse the same dust/min-order threshold for the top coin TP/SL exit
+    min_rotation_usd = env_float("MIN_ROTATION_USD", 2.0)
     dry_run = os.environ.get("DRY_RUN", "ON").upper()
 
     print("============================================================")
     print("  Kraken — 1-Coin Rotation (Monday Baseline v3 — Rotation with Guards)")
     print("------------------------------------------------------------")
-    print(f"BUY_USD : {buy_usd}")
-    print(f"TP_PCT  : {tp_pct}")
-    print(f"SL_PCT  : {sl_pct}")
-    print(f"DRY_RUN : {dry_run}")
+    print(f"BUY_USD          : {buy_usd}")
+    print(f"TP_PCT           : {tp_pct}")
+    print(f"SL_PCT           : {sl_pct}")
+    print(f"MIN_ROTATION_USD : {min_rotation_usd}")
+    print(f"DRY_RUN          : {dry_run}")
     print("============================================================")
 
     symbol = pick_symbol_from_csv()
@@ -475,12 +479,14 @@ def main() -> None:
     position_size, avg_entry = infer_position_from_trades(trades, symbol)
     price = api.get_ticker_price(symbol)
 
-    print(f"\nSelected symbol       : {symbol}")
-    print(f"Current price         : {price:.6f} USD")
-    print(f"USD balance           : {usd_balance:.6f}")
-    print(f"Inferred position     : {position_size:.8f} units")
+    print(f"\nSelected symbol           : {symbol}")
+    print(f"Current price             : {price:.6f} USD")
+    print(f"USD balance               : {usd_balance:.6f}")
+    print(f"Inferred position         : {position_size:.8f} units")
+    est_value = position_size * price
+    print(f"Estimated position value  : {est_value:.2f} USD")
     if avg_entry:
-        print(f"Average entry price   : {avg_entry:.6f} USD")
+        print(f"Average entry price       : {avg_entry:.6f} USD")
 
     is_flat = position_size <= 1e-8
 
@@ -522,6 +528,15 @@ def main() -> None:
 
     reason = "TP" if take_profit else "SL"
     print(f"{reason} condition met -> will SELL all of {symbol}.")
+
+    # NEW: don't try to sell if the position is below our dust / min-order size
+    if est_value < min_rotation_usd:
+        print(
+            f"[TP/SL] Skipping SELL for {symbol}: "
+            f"~{est_value:.2f} USD < MIN_ROTATION_USD ({min_rotation_usd:.2f}). "
+            f"Treating as dust to avoid Kraken 'volume minimum not met' errors."
+        )
+        return
 
     if dry_run == "ON":
         print(f"[DRY RUN] Would SELL {position_size:.8f} units at market.")
