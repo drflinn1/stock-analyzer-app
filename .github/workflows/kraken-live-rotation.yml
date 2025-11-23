@@ -12,10 +12,14 @@
 #        - Run kraken_live_main.py with DRY_RUN=OFF (REAL trades)
 #    * You can also run it manually with custom BUY_USD / TP_PCT / SL_PCT.
 #
-#  SAFETY:
-#    - BUY_USD default is small ($5).
-#    - MIN_ROTATION_USD and MIN_PNL_TO_KEEP are also configurable.
-#    - If you want DRY runs, use the Monday Baseline workflow instead.
+#  A1 Tuning Defaults:
+#    BUY_USD          = 7.0   – modest position size
+#    TP_PCT           = 12.0  – bigger winners
+#    SL_PCT           = 1.0   – small loss
+#    MIN_ROTATION_USD = 2.0   – ignore tiny dust positions
+#    MIN_PNL_TO_KEEP  = 10.0  – keep only strong winners
+#
+#  If you want DRY runs, use the Monday Baseline workflow instead.
 
 name: Kraken — 1-Coin Rotation (LIVE v3)
 
@@ -28,13 +32,13 @@ on:
   workflow_dispatch:
     inputs:
       BUY_USD:
-        description: "USD notional to buy when flat (default 5)"
+        description: "USD notional to buy when flat (default 7)"
         required: false
-        default: "5"
+        default: "7"
       TP_PCT:
-        description: "Take-profit % (e.g., 8 = 8%)"
+        description: "Take-profit % (e.g., 12 = 12%)"
         required: false
-        default: "8"
+        default: "12"
       SL_PCT:
         description: "Stop-loss % (e.g., 1 = 1%)"
         required: false
@@ -42,11 +46,11 @@ on:
       MIN_ROTATION_USD:
         description: "Min USD value to rotate a coin (dust filter)"
         required: false
-        default: "1.0"
+        default: "2.0"
       MIN_PNL_TO_KEEP:
         description: "Keep winners above this % gain"
         required: false
-        default: "3.0"
+        default: "10.0"
 
 jobs:
   live-rotation:
@@ -84,18 +88,18 @@ jobs:
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
 
           # For scheduled runs, github.event.inputs.* is empty → fall back to defaults.
-          BUY_USD:          ${{ github.event.inputs.BUY_USD          || '5'   }}
-          TP_PCT:           ${{ github.event.inputs.TP_PCT           || '8'   }}
-          SL_PCT:           ${{ github.event.inputs.SL_PCT           || '1'   }}
-          MIN_ROTATION_USD: ${{ github.event.inputs.MIN_ROTATION_USD || '1.0' }}
-          MIN_PNL_TO_KEEP:  ${{ github.event.inputs.MIN_PNL_TO_KEEP  || '3.0' }}
+          BUY_USD:          ${{ github.event.inputs.BUY_USD          || '7'    }}
+          TP_PCT:           ${{ github.event.inputs.TP_PCT           || '12'   }}
+          SL_PCT:           ${{ github.event.inputs.SL_PCT           || '1'    }}
+          MIN_ROTATION_USD: ${{ github.event.inputs.MIN_ROTATION_USD || '2.0'  }}
+          MIN_PNL_TO_KEEP:  ${{ github.event.inputs.MIN_PNL_TO_KEEP  || '10.0' }}
 
           # LIVE MODE ONLY for this workflow
           DRY_RUN: "OFF"
 
         run: |
           echo "============================================================"
-          echo "  Kraken — 1-Coin Rotation (LIVE v3 — Rotation with Guards)"
+          echo "  Kraken — 1-Coin Rotation (LIVE v3 — Rotation with Guards, A1 tuning)"
           echo "------------------------------------------------------------"
           echo "  BUY_USD=${BUY_USD}"
           echo "  TP_PCT=${TP_PCT}"
