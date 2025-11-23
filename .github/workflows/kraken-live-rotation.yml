@@ -7,7 +7,7 @@
 #    (dust filter + keep strong winners).
 #
 #  Behavior:
-#    * Every 30 minutes, it will:
+#    * Every 15 minutes, it will:
 #        - Run the momentum scan to refresh .state/momentum_candidates.csv
 #        - Run kraken_live_main.py with DRY_RUN=OFF (REAL trades)
 #    * You can also run it manually with custom BUY_USD / TP_PCT / SL_PCT.
@@ -24,9 +24,9 @@
 name: Kraken — 1-Coin Rotation (LIVE v3)
 
 on:
-  # 🔁 LIVE schedule – runs every 30 minutes
+  # 🔁 LIVE schedule – runs every 15 minutes
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/15 * * * *"
 
   # ▶ Manual runs with overrides
   workflow_dispatch:
