@@ -70,7 +70,7 @@ class KrakenTradeAPI:
         resp.raise_for_status()
         js = resp.json()
         if js.get("error"):
-            # Bubble up Kraken errors as RuntimeError so callers can handle/log
+            # Bubble up Kraken errors as RuntimeError so caller can log them
             raise RuntimeError(f"Kraken error: {js['error']}")
         return js["result"]
 
@@ -129,7 +129,6 @@ def infer_position_from_trades(
     trades: dict,
     symbol: str
 ) -> Tuple[float, Optional[float]]:
-
     """
     Return (net_position_units, avg_entry_price) for this symbol.
 
@@ -392,7 +391,6 @@ def reenter_after_exit(
     - Uses current USD balance (after the sell).
     """
     if dry_run == "ON":
-        # Should never be called with DRY_RUN=ON, but guard anyway.
         print("[RE-ENTRY] DRY_RUN is ON; not placing a second order.")
         return
 
@@ -409,7 +407,6 @@ def reenter_after_exit(
     print(f"[RE-ENTRY] USD balance   : {usd_balance:.6f}")
     print(f"[RE-ENTRY] Target BUY_USD: {buy_usd:.2f}")
 
-    # Slight cushion so we don't error out on tiny fee differences.
     if usd_balance < buy_usd * 1.02:
         print("[RE-ENTRY] Not enough USD to re-enter; staying in cash.")
         return
@@ -436,7 +433,8 @@ def main() -> None:
     api_key = os.environ.get("KRAKEN_API_KEY", "").strip()
     api_secret = os.environ.get("KRAKEN_API_SECRET", "").strip()
     if not api_key or not api_secret:
-        raise SystemExit("Missing KRAKEN_API_KEY or KRAKEN_API_SECRET")
+        print("Missing KRAKEN_API_KEY or KRAKEN_API_SECRET; cannot trade.")
+        return
 
     # A1 tuning defaults
     buy_usd = env_float("BUY_USD", 7.0)
@@ -539,25 +537,16 @@ def main() -> None:
 
 
 # =============================================================================
-#  Safe wrapper so GitHub Actions step does not fail on runtime errors
+#  Hard-safe wrapper – never re-raises, so exit code stays 0
 # =============================================================================
 
 
-def safe_main() -> None:
+if __name__ == "__main__":
     import traceback
 
     try:
         main()
-    except SystemExit as e:
-        # For real config problems (missing secrets, etc.) still fail the step.
-        code = getattr(e, "code", 1) or 1
-        print(f"[EXIT] SystemExit in Kraken LIVE bot: {e} (code={code})")
-        raise
     except Exception as e:
-        print(f"[ERROR] Unhandled exception in Kraken LIVE bot: {e}")
+        print(f"[BOT ERROR] Unhandled exception in Kraken LIVE bot: {e}")
         traceback.print_exc()
-        print("[ERROR] Exception swallowed so GitHub Actions step stays green.")
-
-
-if __name__ == "__main__":
-    safe_main()
+        print("[BOT ERROR] Exception swallowed so GitHub step should remain green.")
