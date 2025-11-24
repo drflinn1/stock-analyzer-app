@@ -5,9 +5,7 @@ import hashlib
 import hmac
 import base64
 import urllib.parse
-from typing import Tuple, Optional, Dict
-import json
-from pathlib import Path
+from typing import Tuple, Optional, Dict, Iterable
 
 import requests
 
@@ -26,11 +24,10 @@ import requests
 #               keeps it as a winner.
 #             • Otherwise, SELLs it (DRY_RUN respected).
 #    * For the top symbol:
-#         - If flat  -> BUY ~BUY_USD worth (respecting cooldown).
-#         - If long  -> TP/SL/SPike-fade check, SELL when hit.
-#           After a LIVE TP/SL/SPIKE-FADE SELL, it can try to BUY the
-#           (possibly updated) top candidate again in the same run,
-#           respecting the cooldown timer.
+#         - If flat  -> BUY ~BUY_USD worth.
+#         - If long  -> TP/SL check, SELL when hit.
+#           After a LIVE TP/SL SELL, immediately tries to BUY the
+#           (possibly updated) top candidate again in the same run.
 #
 #  Default tuning (A1):
 #    BUY_USD          = 7.0   – modest position size
@@ -39,49 +36,18 @@ import requests
 #    MIN_ROTATION_USD = 2.0   – ignore tiny dust positions
 #    MIN_PNL_TO_KEEP  = 10.0  – keep only strong winners
 #
-#  Spike / cooldown tuning (B & C):
-#    SPIKE_ARM_PCT        = 8.0   – consider it a spike once PnL ≥ 8%
-#    SPIKE_FADE_DROP_PCT  = 3.0   – if PnL falls ≥3% from max after arm → SELL
-#    COOLDOWN_MINUTES     = 60.0  – after a SELL, avoid rebuying same coin
-#
 #  Env vars (from YAML):
 #    KRAKEN_API_KEY, KRAKEN_API_SECRET
 #    BUY_USD, TP_PCT, SL_PCT, DRY_RUN
 #    MIN_ROTATION_USD, MIN_PNL_TO_KEEP
-#    SPIKE_ARM_PCT, SPIKE_FADE_DROP_PCT, COOLDOWN_MINUTES
 # =============================================================================
 
 
-STATE_DIR = Path(".state")
-SPIKE_STATE_PATH = STATE_DIR / "spike_state.json"
-COOLDOWN_STATE_PATH = STATE_DIR / "cooldown_state.json"
-
-
-def ensure_state_dir() -> None:
-    try:
-        STATE_DIR.mkdir(exist_ok=True)
-    except Exception:
-        # Non-fatal: just run without extra state if this fails.
-        pass
-
-
-def load_json_state(path: Path, default):
-    try:
-        if path.exists():
-            with path.open("r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        return default
-    return default
-
-
-def save_json_state(path: Path, data) -> None:
-    try:
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(data, f)
-    except Exception:
-        # Don't crash trading just because state can't be written.
-        pass
+# Substrings we treat as "this symbol is restricted for you"
+RESTRICTED_ERROR_SUBSTRINGS = (
+    "EAccount:Invalid permissions",
+    "trading restricted",
+)
 
 
 class KrakenTradeAPI:
@@ -217,13 +183,17 @@ def get_usd_balance(balances: dict) -> float:
     return 0.0
 
 
-def pick_symbol_from_csv() -> Optional[str]:
+def pick_symbol_from_csv(
+    exclude: Optional[Iterable[str]] = None
+) -> Optional[str]:
     """
     Pick the best symbol (lowest rank) from momentum_candidates CSV.
 
     We support both:
       - .state/momentum_candidates.csv  (what the scan currently writes)
       - momentum_candidates.csv         (older location, or manual export)
+
+    If 'exclude' is provided, any symbol in that iterable is skipped.
     """
     candidate_paths = [
         ".state/momentum_candidates.csv",
@@ -240,7 +210,11 @@ def pick_symbol_from_csv() -> Optional[str]:
         print(f"[WARN] No momentum_candidates CSV found in {candidate_paths}")
         return None
 
+    exclude_set = set(exclude or [])
+
     print(f"[INFO] Using momentum candidates from: {csv_path}")
+    if exclude_set:
+        print(f"[INFO] Excluding symbols: {sorted(exclude_set)}")
 
     best_symbol = None
     best_rank = None
@@ -252,6 +226,8 @@ def pick_symbol_from_csv() -> Optional[str]:
             rank_str = row.get("rank")
             if not symbol or rank_str is None:
                 continue
+            if symbol in exclude_set:
+                continue
             try:
                 rank = float(rank_str)
             except ValueError:
@@ -262,7 +238,10 @@ def pick_symbol_from_csv() -> Optional[str]:
                 best_symbol = symbol
 
     if best_symbol:
-        print(f"[INFO] Picked top candidate from CSV: {best_symbol} (rank={best_rank})")
+        print(
+            f"[INFO] Picked top candidate from CSV: "
+            f"{best_symbol} (rank={best_rank})"
+        )
     else:
         print("[WARN] No valid rows in momentum_candidates CSV")
 
@@ -312,7 +291,6 @@ def sweep_non_top_positions(
     top_symbol: str,
     dry_run: str,
     trades: Dict[str, dict],
-    cooldowns: Dict[str, float],
     min_balance: float = 1e-8,
 ) -> None:
     """
@@ -412,8 +390,6 @@ def sweep_non_top_positions(
         try:
             result = api.market_sell_all(candidate_symbol, bal)
             print(f"[LIVE] SELL result for {candidate_symbol}: {result}")
-            # Start cooldown on this symbol so we don't immediately rebuy it.
-            cooldowns[candidate_symbol] = time.time()
         except Exception as e:
             print(
                 f"[ERROR] Failed to SELL {candidate_symbol} during rotation sweep: {e}"
@@ -425,16 +401,14 @@ def reenter_after_exit(
     previous_symbol: str,
     buy_usd: float,
     dry_run: str,
-    cooldowns: Dict[str, float],
-    cooldown_minutes: float,
 ) -> None:
     """
-    After a LIVE TP/SL/SPIKE-FADE exit, try to BUY the (possibly updated)
-    top candidate again in the same run.
+    After a LIVE TP/SL exit, try to BUY the (possibly updated) top candidate
+    again in the same run.
 
     - Re-reads the momentum CSV (in case the list changed).
     - Uses current USD balance (after the sell).
-    - Respects cooldown: won't immediately re-enter a coin we just sold.
+    - Skips symbols that are region-restricted for this account.
     """
     if dry_run == "ON":
         # Should never be called with DRY_RUN=ON, but guard anyway.
@@ -443,45 +417,75 @@ def reenter_after_exit(
 
     print("\n[RE-ENTRY] Refreshing balances and top candidate for re-entry...")
 
-    # Re-pick in case the candidate list changed.
-    new_symbol = pick_symbol_from_csv() or previous_symbol
+    excluded: set[str] = set()
 
-    # Respect cooldown if we just sold this same symbol.
-    now_ts = time.time()
-    cd_secs = cooldown_minutes * 60.0
-    last_sell = cooldowns.get(new_symbol)
-    if last_sell is not None and (now_ts - last_sell) < cd_secs:
-        remaining = int(cd_secs - (now_ts - last_sell))
+    # first candidate: from CSV, fallback to previous symbol
+    candidate = pick_symbol_from_csv(exclude=excluded) or previous_symbol
+
+    while True:
+        balances = api.get_balance()
+        usd_balance = get_usd_balance(balances)
+
+        if not candidate:
+            print("[RE-ENTRY] No candidate symbol available; staying in cash.")
+            return
+
+        try:
+            price = api.get_ticker_price(candidate)
+        except Exception as e:
+            print(f"[RE-ENTRY] Failed to fetch price for {candidate}: {e}")
+            excluded.add(candidate)
+            candidate = pick_symbol_from_csv(exclude=excluded) or previous_symbol
+            if candidate in excluded:
+                print(
+                    "[RE-ENTRY] No alternate candidate after price failures; "
+                    "staying in cash."
+                )
+                return
+            continue
+
+        print(f"[RE-ENTRY] Top candidate : {candidate}")
+        print(f"[RE-ENTRY] USD balance   : {usd_balance:.6f}")
+        print(f"[RE-ENTRY] Target BUY_USD: {buy_usd:.2f}")
+
+        if usd_balance < buy_usd * 1.02:
+            print("[RE-ENTRY] Not enough USD to re-enter; staying in cash.")
+            return
+
+        volume = buy_usd / price
         print(
-            f"[RE-ENTRY] Cooldown active for {new_symbol} "
-            f"({remaining} seconds left) → staying flat."
+            f"[RE-ENTRY] LIVE BUY: {volume:.8f} units of {candidate} "
+            f"(~{buy_usd:.2f} USD at {price:.6f})."
         )
-        return
 
-    balances = api.get_balance()
-    usd_balance = get_usd_balance(balances)
-    price = api.get_ticker_price(new_symbol)
+        try:
+            result = api.market_buy(candidate, volume)
+            print("[RE-ENTRY] BUY result:", result)
+            return
+        except Exception as e:
+            msg = str(e)
+            if any(s in msg for s in RESTRICTED_ERROR_SUBSTRINGS):
+                print(
+                    f"[RE-ENTRY] BUY blocked for {candidate} due to "
+                    f"permissions/restrictions: {msg}"
+                )
+                excluded.add(candidate)
+                new_candidate = pick_symbol_from_csv(exclude=excluded) or previous_symbol
+                if not new_candidate or new_candidate in excluded:
+                    print(
+                        "[RE-ENTRY] No alternate candidate after skipping "
+                        "restricted symbols; staying in cash."
+                    )
+                    return
+                print(
+                    f"[RE-ENTRY] Skipping restricted symbol and trying next "
+                    f"candidate: {new_candidate}"
+                )
+                candidate = new_candidate
+                continue
 
-    print(f"[RE-ENTRY] Top candidate : {new_symbol}")
-    print(f"[RE-ENTRY] USD balance   : {usd_balance:.6f}")
-    print(f"[RE-ENTRY] Target BUY_USD: {buy_usd:.2f}")
-
-    # Slight cushion so we don't error out on tiny fee differences.
-    if usd_balance < buy_usd * 1.02:
-        print("[RE-ENTRY] Not enough USD to re-enter; staying in cash.")
-        return
-
-    volume = buy_usd / price
-    print(
-        f"[RE-ENTRY] LIVE BUY: {volume:.8f} units of {new_symbol} "
-        f"(~{buy_usd:.2f} USD at {price:.6f})."
-    )
-
-    try:
-        result = api.market_buy(new_symbol, volume)
-        print("[RE-ENTRY] BUY result:", result)
-    except Exception as e:
-        print(f"[RE-ENTRY][ERROR] Failed to BUY {new_symbol}: {e}")
+            print(f"[RE-ENTRY][ERROR] Failed to BUY {candidate}: {e}")
+            return
 
 
 # =============================================================================
@@ -490,8 +494,6 @@ def reenter_after_exit(
 
 
 def main() -> None:
-    ensure_state_dir()
-
     api_key = os.environ.get("KRAKEN_API_KEY", "").strip()
     api_secret = os.environ.get("KRAKEN_API_SECRET", "").strip()
     if not api_key or not api_secret:
@@ -503,21 +505,13 @@ def main() -> None:
     sl_pct = env_float("SL_PCT", 1.0)
     dry_run = os.environ.get("DRY_RUN", "ON").upper()
 
-    # B & C tuning
-    spike_arm_pct = env_float("SPIKE_ARM_PCT", 8.0)
-    spike_fade_drop_pct = env_float("SPIKE_FADE_DROP_PCT", 3.0)
-    cooldown_minutes = env_float("COOLDOWN_MINUTES", 60.0)
-
     print("============================================================")
     print("  Kraken — 1-Coin Rotation (Monday Baseline v3 — Rotation with Guards)")
     print("------------------------------------------------------------")
-    print(f"BUY_USD           : {buy_usd}")
-    print(f"TP_PCT            : {tp_pct}")
-    print(f"SL_PCT            : {sl_pct}")
-    print(f"SPIKE_ARM_PCT     : {spike_arm_pct}")
-    print(f"SPIKE_FADE_DROP   : {spike_fade_drop_pct}")
-    print(f"COOLDOWN_MINUTES  : {cooldown_minutes}")
-    print(f"DRY_RUN           : {dry_run}")
+    print(f"BUY_USD : {buy_usd}")
+    print(f"TP_PCT  : {tp_pct}")
+    print(f"SL_PCT  : {sl_pct}")
+    print(f"DRY_RUN : {dry_run}")
     print("============================================================")
 
     symbol = pick_symbol_from_csv()
@@ -526,10 +520,6 @@ def main() -> None:
         return
 
     api = KrakenTradeAPI(api_key, api_secret)
-
-    # Load persistent spike + cooldown state
-    spike_state: Dict[str, Dict[str, float]] = load_json_state(SPIKE_STATE_PATH, {})
-    cooldowns: Dict[str, float] = load_json_state(COOLDOWN_STATE_PATH, {})
 
     # Balances & trades
     balances = api.get_balance()
@@ -540,13 +530,10 @@ def main() -> None:
     # -------------------------------------------------------------------------
     # 1) ROTATION SWEEP — sell non-top coins (with dust + winner guards)
     # -------------------------------------------------------------------------
-    sweep_non_top_positions(api, balances, symbol, dry_run, trades, cooldowns)
-
-    # Save cooldowns potentially updated by sweep
-    save_json_state(COOLDOWN_STATE_PATH, cooldowns)
+    sweep_non_top_positions(api, balances, symbol, dry_run, trades)
 
     # -------------------------------------------------------------------------
-    # 2) Now handle the top candidate: either BUY if flat or TP/SL/SPIKE-FADE if long
+    # 2) Now handle the top candidate: either BUY if flat or TP/SL if long
     # -------------------------------------------------------------------------
     position_size, avg_entry = infer_position_from_trades(trades, symbol)
     price = api.get_ticker_price(symbol)
@@ -560,41 +547,82 @@ def main() -> None:
 
     is_flat = position_size <= 1e-8
 
-    # CASE 1: FLAT -> BUY top candidate (respect cooldown)
+    # CASE 1: FLAT -> BUY top candidate (with skip-on-restricted logic)
     if is_flat:
         print("\n[STATE] Flat in this symbol (after rotation sweep).")
 
-        now_ts = time.time()
-        cd_secs = cooldown_minutes * 60.0
-        last_sell = cooldowns.get(symbol)
-        if last_sell is not None and (now_ts - last_sell) < cd_secs:
-            remaining = int(cd_secs - (now_ts - last_sell))
+        excluded: set[str] = set()
+        current_symbol = symbol
+
+        while True:
+            # Refresh balances & price in case previous attempts changed anything
+            balances = api.get_balance()
+            usd_balance = get_usd_balance(balances)
+
+            try:
+                current_price = api.get_ticker_price(current_symbol)
+            except Exception as e:
+                print(f"[LIVE] Failed to fetch price for {current_symbol}: {e}")
+                excluded.add(current_symbol)
+                next_symbol = pick_symbol_from_csv(exclude=excluded)
+                if not next_symbol:
+                    print(
+                        "[LIVE] No alternate candidate after price failures; "
+                        "staying in USD."
+                    )
+                    return
+                print(
+                    f"[LIVE] Switching candidate due to price failure: "
+                    f"{current_symbol} → {next_symbol}"
+                )
+                current_symbol = next_symbol
+                continue
+
+            if usd_balance < buy_usd * 1.02:
+                print("Not enough USD to buy; skipping.")
+                return
+
+            volume = buy_usd / current_price
             print(
-                f"[COOLDOWN] Recently sold {symbol}; {remaining}s left on cooldown. "
-                "Skipping BUY this run."
+                f"Planned BUY: {volume:.8f} units of {current_symbol} "
+                f"(~{buy_usd:.2f} USD at {current_price:.6f})."
             )
-            return
 
-        if usd_balance < buy_usd * 1.02:
-            print("Not enough USD to buy; skipping.")
-            return
+            if dry_run == "ON":
+                print("[DRY RUN] Would place MARKET BUY now.")
+                return
 
-        volume = buy_usd / price
-        print(f"Planned BUY: {volume:.8f} units (~{buy_usd} USD).")
+            print("[LIVE] Sending MARKET BUY...")
+            try:
+                result = api.market_buy(current_symbol, volume)
+                print("BUY result:", result)
+                return
+            except Exception as e:
+                msg = str(e)
+                if any(s in msg for s in RESTRICTED_ERROR_SUBSTRINGS):
+                    print(
+                        f"[LIVE] BUY blocked for {current_symbol} due to "
+                        f"permissions/restrictions: {msg}"
+                    )
+                    excluded.add(current_symbol)
+                    next_symbol = pick_symbol_from_csv(exclude=excluded)
+                    if not next_symbol:
+                        print(
+                            "[LIVE] No alternate candidate after skipping "
+                            "restricted symbols; staying in USD."
+                        )
+                        return
+                    print(
+                        f"[LIVE] Skipping restricted symbol and trying next "
+                        f"candidate: {next_symbol}"
+                    )
+                    current_symbol = next_symbol
+                    continue
 
-        if dry_run == "ON":
-            print("[DRY RUN] Would place MARKET BUY now.")
-            return
+                print(f"[LIVE][ERROR] Failed to BUY {current_symbol}: {e}")
+                return
 
-        print("[LIVE] Sending MARKET BUY...")
-        try:
-            result = api.market_buy(symbol, volume)
-            print("BUY result:", result)
-        except Exception as e:
-            print(f"[ERROR] Failed to BUY {symbol}: {e}")
-        return
-
-    # CASE 2: LONG -> TP/SL/SPIKE-FADE check on the top candidate
+    # CASE 2: LONG -> TP/SL check on the top candidate
     print("\n[STATE] Long position detected for this symbol (top candidate).")
     if not avg_entry:
         print("Cannot compute avg entry; holding position.")
@@ -603,35 +631,14 @@ def main() -> None:
     pnl_pct = (price - avg_entry) / avg_entry * 100.0
     print(f"Unrealized PnL: {pnl_pct:.2f}%")
 
-    # Maintain per-symbol spike max PnL
-    sym_state = spike_state.get(symbol, {})
-    max_pnl = float(sym_state.get("max_pnl", pnl_pct))
-    if pnl_pct > max_pnl:
-        max_pnl = pnl_pct
-        sym_state["max_pnl"] = max_pnl
-        spike_state[symbol] = sym_state
-        save_json_state(SPIKE_STATE_PATH, spike_state)
-
-    print(f"[SPIKE] Max PnL seen for {symbol}: {max_pnl:.2f}%")
-
     take_profit = pnl_pct >= tp_pct
     stop_loss = pnl_pct <= -sl_pct
 
-    # Spike-fade condition: once we've seen a decent spike, if PnL falls off enough, exit.
-    spike_armed = max_pnl >= spike_arm_pct
-    spike_fade = spike_armed and (pnl_pct <= (max_pnl - spike_fade_drop_pct))
-
-    if not (take_profit or stop_loss or spike_fade):
-        print("No TP/SL or spike-fade condition hit; holding.")
+    if not (take_profit or stop_loss):
+        print("Neither TP nor SL hit; holding.")
         return
 
-    if take_profit:
-        reason = "TP"
-    elif stop_loss:
-        reason = "SL"
-    else:
-        reason = "SPIKE_FADE"
-
+    reason = "TP" if take_profit else "SL"
     print(f"{reason} condition met -> will SELL all of {symbol}.")
 
     if dry_run == "ON":
@@ -639,23 +646,12 @@ def main() -> None:
         return
 
     print("[LIVE] Sending MARKET SELL...")
-    try:
-        result = api.market_sell_all(symbol, position_size)
-        print("SELL result:", result)
-        # Reset spike state on exit so a new trade starts fresh.
-        if symbol in spike_state:
-            del spike_state[symbol]
-            save_json_state(SPIKE_STATE_PATH, spike_state)
-        # Start cooldown from this SELL moment.
-        cooldowns[symbol] = time.time()
-        save_json_state(COOLDOWN_STATE_PATH, cooldowns)
-    except Exception as e:
-        print(f"[ERROR] Failed to SELL {symbol}: {e}")
-        return
+    result = api.market_sell_all(symbol, position_size)
+    print("SELL result:", result)
 
     # After exiting, immediately try to buy the top candidate again
-    # in the same RUN (using fresh CSV + balances) if cooldown allows.
-    reenter_after_exit(api, symbol, buy_usd, dry_run, cooldowns, cooldown_minutes)
+    # in the same RUN (using fresh CSV + balances, with restricted-skip logic).
+    reenter_after_exit(api, symbol, buy_usd, dry_run)
 
 
 if __name__ == "__main__":
