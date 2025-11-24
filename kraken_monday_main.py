@@ -1,4 +1,4 @@
-def momentum_scan(api):
+ef momentum_scan(api):
     import time
     import numpy as np
 
