@@ -6,12 +6,14 @@ import hmac
 import base64
 import urllib.parse
 from typing import Tuple, Optional, Dict
+import json
+from pathlib import Path
 
 import requests
 
 
 # =============================================================================
-#  Kraken — 1-Coin Rotation (Monday Baseline v3 — Rotation with Guards, A1)
+#  Kraken — 1-Coin Rotation (Monday Baseline v3 — Rotation with Guards)
 #
 #  Behavior:
 #    * Reads BUY_USD, TP_PCT, SL_PCT, DRY_RUN from env.
@@ -19,34 +21,67 @@ import requests
 #    * Rotation sweep:
 #         - Scans your balances.
 #         - For every non-USD asset that is NOT the top candidate:
-#             • Skips tiny "dust" positions (< dust_threshold USD).
+#             • Skips tiny "dust" positions (< MIN_ROTATION_USD).
 #             • If it has a trade history and PnL >= MIN_PNL_TO_KEEP,
 #               keeps it as a winner.
 #             • Otherwise, SELLs it (DRY_RUN respected).
 #    * For the top symbol:
-#         - If flat  -> BUY ~BUY_USD worth.
-#         - If long  -> TP/SL check, SELL when hit.
-#           After a LIVE TP/SL SELL, immediately tries to BUY the
-#           (possibly updated) top candidate again in the same run.
+#         - If flat  -> BUY ~BUY_USD worth (respecting cooldown).
+#         - If long  -> TP/SL/SPike-fade check, SELL when hit.
+#           After a LIVE TP/SL/SPIKE-FADE SELL, it can try to BUY the
+#           (possibly updated) top candidate again in the same run,
+#           respecting the cooldown timer.
 #
-#  A1 tuning defaults:
-#    BUY_USD          = 10.0  – modest position size
-#    TP_PCT           = 10.0  – decent winners
+#  Default tuning (A1):
+#    BUY_USD          = 7.0   – modest position size
+#    TP_PCT           = 12.0  – bigger winners
 #    SL_PCT           = 1.0   – small loss
 #    MIN_ROTATION_USD = 2.0   – ignore tiny dust positions
 #    MIN_PNL_TO_KEEP  = 10.0  – keep only strong winners
 #
-#  Extra guard:
-#    We also enforce an approximate minimum trade size:
-#      min_trade_usd = max(5.0, 0.5 * BUY_USD)
-#    Any SELL whose estimated USD value is below this is treated as dust
-#    so we don't trigger Kraken's "volume minimum not met" error.
+#  Spike / cooldown tuning (B & C):
+#    SPIKE_ARM_PCT        = 8.0   – consider it a spike once PnL ≥ 8%
+#    SPIKE_FADE_DROP_PCT  = 3.0   – if PnL falls ≥3% from max after arm → SELL
+#    COOLDOWN_MINUTES     = 60.0  – after a SELL, avoid rebuying same coin
 #
 #  Env vars (from YAML):
 #    KRAKEN_API_KEY, KRAKEN_API_SECRET
 #    BUY_USD, TP_PCT, SL_PCT, DRY_RUN
 #    MIN_ROTATION_USD, MIN_PNL_TO_KEEP
+#    SPIKE_ARM_PCT, SPIKE_FADE_DROP_PCT, COOLDOWN_MINUTES
 # =============================================================================
+
+
+STATE_DIR = Path(".state")
+SPIKE_STATE_PATH = STATE_DIR / "spike_state.json"
+COOLDOWN_STATE_PATH = STATE_DIR / "cooldown_state.json"
+
+
+def ensure_state_dir() -> None:
+    try:
+        STATE_DIR.mkdir(exist_ok=True)
+    except Exception:
+        # Non-fatal: just run without extra state if this fails.
+        pass
+
+
+def load_json_state(path: Path, default):
+    try:
+        if path.exists():
+            with path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        return default
+    return default
+
+
+def save_json_state(path: Path, data) -> None:
+    try:
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        # Don't crash trading just because state can't be written.
+        pass
 
 
 class KrakenTradeAPI:
@@ -277,13 +312,14 @@ def sweep_non_top_positions(
     top_symbol: str,
     dry_run: str,
     trades: Dict[str, dict],
+    cooldowns: Dict[str, float],
     min_balance: float = 1e-8,
 ) -> None:
     """
     Rotation sweep with guards:
        - For every non-USD asset with a valid <BASE>/USD pair and non-trivial
         balance:
-          * If est_value < dust_threshold        -> skip (dust).
+          * If est_value < MIN_ROTATION_USD      -> skip (dust).
           * If unrealized PnL >= MIN_PNL_TO_KEEP -> keep as winner.
           * Else                                 -> SELL (or DRY-RUN log).
     """
@@ -293,21 +329,12 @@ def sweep_non_top_positions(
     min_rotation_usd = env_float("MIN_ROTATION_USD", 2.0)
     min_pnl_to_keep = env_float("MIN_PNL_TO_KEEP", 10.0)
 
-    # For safety, also enforce approximate minimum trade size.
-    buy_usd = env_float("BUY_USD", 10.0)
-    min_trade_usd = max(5.0, 0.5 * buy_usd)
-    dust_threshold = max(min_rotation_usd, min_trade_usd)
-
     print("\n[ROTATION] Sweeping non-top positions...")
     print(f"[ROTATION] Top candidate this run : {top_symbol}")
     print(f"[ROTATION] MIN_ROTATION_USD       : {min_rotation_usd:.2f} USD")
     print(
         f"[ROTATION] MIN_PNL_TO_KEEP        : {min_pnl_to_keep:.2f}% "
         f"(winners above this are kept)"
-    )
-    print(
-        f"[ROTATION] Effective dust threshold: {dust_threshold:.2f} USD "
-        f"(max(MIN_ROTATION_USD, min_trade_usd))"
     )
 
     for asset_key, raw_balance in balances.items():
@@ -342,16 +369,17 @@ def sweep_non_top_positions(
 
         est_value = bal * price
 
-        # Dust + min-trade filter: don't bother rotating tiny scraps.
-        if est_value < dust_threshold:
+        # Dust filter: don't bother rotating tiny scraps.
+        if est_value < min_rotation_usd:
             print(
                 f"[ROTATION] Skipping {candidate_symbol}: "
-                f"~{est_value:.2f} USD < dust_threshold ({dust_threshold:.2f})."
+                f"~{est_value:.2f} USD < MIN_ROTATION_USD ({min_rotation_usd:.2f})."
             )
             continue
 
         # Check PnL for this symbol to decide whether to keep a winner.
         pos_size, avg_entry = infer_position_from_trades(trades, candidate_symbol)
+        pnl_pct = None
         if pos_size > 1e-8 and avg_entry:
             pnl_pct = (price - avg_entry) / avg_entry * 100.0
             print(
@@ -384,6 +412,8 @@ def sweep_non_top_positions(
         try:
             result = api.market_sell_all(candidate_symbol, bal)
             print(f"[LIVE] SELL result for {candidate_symbol}: {result}")
+            # Start cooldown on this symbol so we don't immediately rebuy it.
+            cooldowns[candidate_symbol] = time.time()
         except Exception as e:
             print(
                 f"[ERROR] Failed to SELL {candidate_symbol} during rotation sweep: {e}"
@@ -395,13 +425,16 @@ def reenter_after_exit(
     previous_symbol: str,
     buy_usd: float,
     dry_run: str,
+    cooldowns: Dict[str, float],
+    cooldown_minutes: float,
 ) -> None:
     """
-    After a LIVE TP/SL exit, try to BUY the (possibly updated) top candidate
-    again in the same run.
+    After a LIVE TP/SL/SPIKE-FADE exit, try to BUY the (possibly updated)
+    top candidate again in the same run.
 
     - Re-reads the momentum CSV (in case the list changed).
     - Uses current USD balance (after the sell).
+    - Respects cooldown: won't immediately re-enter a coin we just sold.
     """
     if dry_run == "ON":
         # Should never be called with DRY_RUN=ON, but guard anyway.
@@ -412,6 +445,18 @@ def reenter_after_exit(
 
     # Re-pick in case the candidate list changed.
     new_symbol = pick_symbol_from_csv() or previous_symbol
+
+    # Respect cooldown if we just sold this same symbol.
+    now_ts = time.time()
+    cd_secs = cooldown_minutes * 60.0
+    last_sell = cooldowns.get(new_symbol)
+    if last_sell is not None and (now_ts - last_sell) < cd_secs:
+        remaining = int(cd_secs - (now_ts - last_sell))
+        print(
+            f"[RE-ENTRY] Cooldown active for {new_symbol} "
+            f"({remaining} seconds left) → staying flat."
+        )
+        return
 
     balances = api.get_balance()
     usd_balance = get_usd_balance(balances)
@@ -445,28 +490,34 @@ def reenter_after_exit(
 
 
 def main() -> None:
+    ensure_state_dir()
+
     api_key = os.environ.get("KRAKEN_API_KEY", "").strip()
     api_secret = os.environ.get("KRAKEN_API_SECRET", "").strip()
     if not api_key or not api_secret:
         raise SystemExit("Missing KRAKEN_API_KEY or KRAKEN_API_SECRET")
 
     # A1 tuning defaults
-    buy_usd = env_float("BUY_USD", 10.0)
-    tp_pct = env_float("TP_PCT", 10.0)
+    buy_usd = env_float("BUY_USD", 7.0)
+    tp_pct = env_float("TP_PCT", 12.0)
     sl_pct = env_float("SL_PCT", 1.0)
     dry_run = os.environ.get("DRY_RUN", "ON").upper()
 
-    # min trade threshold used for top symbol SELLs
-    min_trade_usd = max(5.0, 0.5 * buy_usd)
+    # B & C tuning
+    spike_arm_pct = env_float("SPIKE_ARM_PCT", 8.0)
+    spike_fade_drop_pct = env_float("SPIKE_FADE_DROP_PCT", 3.0)
+    cooldown_minutes = env_float("COOLDOWN_MINUTES", 60.0)
 
     print("============================================================")
     print("  Kraken — 1-Coin Rotation (Monday Baseline v3 — Rotation with Guards)")
     print("------------------------------------------------------------")
-    print(f"BUY_USD       : {buy_usd}")
-    print(f"TP_PCT        : {tp_pct}")
-    print(f"SL_PCT        : {sl_pct}")
-    print(f"DRY_RUN       : {dry_run}")
-    print(f"MIN_TRADE_USD : {min_trade_usd:.2f}")
+    print(f"BUY_USD           : {buy_usd}")
+    print(f"TP_PCT            : {tp_pct}")
+    print(f"SL_PCT            : {sl_pct}")
+    print(f"SPIKE_ARM_PCT     : {spike_arm_pct}")
+    print(f"SPIKE_FADE_DROP   : {spike_fade_drop_pct}")
+    print(f"COOLDOWN_MINUTES  : {cooldown_minutes}")
+    print(f"DRY_RUN           : {dry_run}")
     print("============================================================")
 
     symbol = pick_symbol_from_csv()
@@ -475,6 +526,10 @@ def main() -> None:
         return
 
     api = KrakenTradeAPI(api_key, api_secret)
+
+    # Load persistent spike + cooldown state
+    spike_state: Dict[str, Dict[str, float]] = load_json_state(SPIKE_STATE_PATH, {})
+    cooldowns: Dict[str, float] = load_json_state(COOLDOWN_STATE_PATH, {})
 
     # Balances & trades
     balances = api.get_balance()
@@ -485,10 +540,13 @@ def main() -> None:
     # -------------------------------------------------------------------------
     # 1) ROTATION SWEEP — sell non-top coins (with dust + winner guards)
     # -------------------------------------------------------------------------
-    sweep_non_top_positions(api, balances, symbol, dry_run, trades)
+    sweep_non_top_positions(api, balances, symbol, dry_run, trades, cooldowns)
+
+    # Save cooldowns potentially updated by sweep
+    save_json_state(COOLDOWN_STATE_PATH, cooldowns)
 
     # -------------------------------------------------------------------------
-    # 2) Now handle the top candidate: either BUY if flat or TP/SL if long
+    # 2) Now handle the top candidate: either BUY if flat or TP/SL/SPIKE-FADE if long
     # -------------------------------------------------------------------------
     position_size, avg_entry = infer_position_from_trades(trades, symbol)
     price = api.get_ticker_price(symbol)
@@ -500,23 +558,22 @@ def main() -> None:
     if avg_entry:
         print(f"Average entry price   : {avg_entry:.6f} USD")
 
-    # If the current position is extremely small, treat it as dust (no SELL).
-    est_position_usd = position_size * price
-    if position_size > 0 and est_position_usd < min_trade_usd:
-        print(
-            f"[STATE] Live position is ≈{est_position_usd:.2f} USD "
-            f"< min_trade_usd ({min_trade_usd:.2f}); treating as dust "
-            f"→ no SELL order will be sent."
-        )
-        # For the rest of the logic, treat as flat so we can re-enter later.
-        position_size = 0.0
-        avg_entry = None
-
     is_flat = position_size <= 1e-8
 
-    # CASE 1: FLAT -> BUY top candidate
+    # CASE 1: FLAT -> BUY top candidate (respect cooldown)
     if is_flat:
-        print("\n[STATE] Flat in this symbol (after rotation sweep / dust check).")
+        print("\n[STATE] Flat in this symbol (after rotation sweep).")
+
+        now_ts = time.time()
+        cd_secs = cooldown_minutes * 60.0
+        last_sell = cooldowns.get(symbol)
+        if last_sell is not None and (now_ts - last_sell) < cd_secs:
+            remaining = int(cd_secs - (now_ts - last_sell))
+            print(
+                f"[COOLDOWN] Recently sold {symbol}; {remaining}s left on cooldown. "
+                "Skipping BUY this run."
+            )
+            return
 
         if usd_balance < buy_usd * 1.02:
             print("Not enough USD to buy; skipping.")
@@ -530,11 +587,14 @@ def main() -> None:
             return
 
         print("[LIVE] Sending MARKET BUY...")
-        result = api.market_buy(symbol, volume)
-        print("BUY result:", result)
+        try:
+            result = api.market_buy(symbol, volume)
+            print("BUY result:", result)
+        except Exception as e:
+            print(f"[ERROR] Failed to BUY {symbol}: {e}")
         return
 
-    # CASE 2: LONG -> TP/SL check on the top candidate
+    # CASE 2: LONG -> TP/SL/SPIKE-FADE check on the top candidate
     print("\n[STATE] Long position detected for this symbol (top candidate).")
     if not avg_entry:
         print("Cannot compute avg entry; holding position.")
@@ -543,14 +603,35 @@ def main() -> None:
     pnl_pct = (price - avg_entry) / avg_entry * 100.0
     print(f"Unrealized PnL: {pnl_pct:.2f}%")
 
+    # Maintain per-symbol spike max PnL
+    sym_state = spike_state.get(symbol, {})
+    max_pnl = float(sym_state.get("max_pnl", pnl_pct))
+    if pnl_pct > max_pnl:
+        max_pnl = pnl_pct
+        sym_state["max_pnl"] = max_pnl
+        spike_state[symbol] = sym_state
+        save_json_state(SPIKE_STATE_PATH, spike_state)
+
+    print(f"[SPIKE] Max PnL seen for {symbol}: {max_pnl:.2f}%")
+
     take_profit = pnl_pct >= tp_pct
     stop_loss = pnl_pct <= -sl_pct
 
-    if not (take_profit or stop_loss):
-        print("Neither TP nor SL hit; holding.")
+    # Spike-fade condition: once we've seen a decent spike, if PnL falls off enough, exit.
+    spike_armed = max_pnl >= spike_arm_pct
+    spike_fade = spike_armed and (pnl_pct <= (max_pnl - spike_fade_drop_pct))
+
+    if not (take_profit or stop_loss or spike_fade):
+        print("No TP/SL or spike-fade condition hit; holding.")
         return
 
-    reason = "TP" if take_profit else "SL"
+    if take_profit:
+        reason = "TP"
+    elif stop_loss:
+        reason = "SL"
+    else:
+        reason = "SPIKE_FADE"
+
     print(f"{reason} condition met -> will SELL all of {symbol}.")
 
     if dry_run == "ON":
@@ -558,17 +639,24 @@ def main() -> None:
         return
 
     print("[LIVE] Sending MARKET SELL...")
-    result = api.market_sell_all(symbol, position_size)
-    print("SELL result:", result)
+    try:
+        result = api.market_sell_all(symbol, position_size)
+        print("SELL result:", result)
+        # Reset spike state on exit so a new trade starts fresh.
+        if symbol in spike_state:
+            del spike_state[symbol]
+            save_json_state(SPIKE_STATE_PATH, spike_state)
+        # Start cooldown from this SELL moment.
+        cooldowns[symbol] = time.time()
+        save_json_state(COOLDOWN_STATE_PATH, cooldowns)
+    except Exception as e:
+        print(f"[ERROR] Failed to SELL {symbol}: {e}")
+        return
 
     # After exiting, immediately try to buy the top candidate again
-    # in the same RUN (using fresh CSV + balances).
-    reenter_after_exit(api, symbol, buy_usd, dry_run)
+    # in the same RUN (using fresh CSV + balances) if cooldown allows.
+    reenter_after_exit(api, symbol, buy_usd, dry_run, cooldowns, cooldown_minutes)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"[BOT ERROR] Unhandled exception in Kraken LIVE bot: {e!r}")
-        print("[BOT ERROR] Exception swallowed so GitHub step should remain green.")
+    main()
